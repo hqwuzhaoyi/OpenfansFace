@@ -173,3 +173,29 @@
   .archive-inlinePlayer video { height:220px; }
 }
 .archive-inlinePlayer + .archive-paths { margin-top:20px; }
+
+.archive-batch { display:block; }
+.archive-batchMain { display:flex; align-items:center; gap:6px; }
+.archive-rowActions { margin:7px 0 0 38px; padding:8px 0 0; border-top:1px solid var(--border); }
+.archive-rowReasons { color:#d2b282; font-size:11px; line-height:1.6; overflow-wrap:anywhere; }
+.archive-rowReasons p+p { margin-top:4px; }
+.archive-rowReasons span { color:var(--muted-foreground); }
+.archive-rowActionButtons { display:flex; flex-wrap:wrap; gap:6px; margin-top:7px; }
+.archive-rowActionButtons button { min-height:28px; padding:3px 8px; border:1px solid var(--border); border-radius:5px; font-size:11px; background:var(--background); }
+.archive-rowActionButtons button:disabled { cursor:not-allowed; opacity:.45; }
+.archive-rowActions>small { display:block; margin-top:6px; font-size:10px; color:var(--muted-foreground); }
+.archive-waveVideo { display:block; padding-block:4px; }
+.archive-waveVideoMain { display:flex; align-items:center; gap:6px; min-height:42px; }
+.archive-waveVideoMain>button { display:flex; align-items:center; align-self:stretch; gap:12px; flex:1; min-width:0; text-align:left; font-size:12px; }
+.archive-waveVideoMain>button>span:first-child { flex:1; min-width:0; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+.archive-waveVideoMain>button>small { color:var(--muted-foreground); white-space:nowrap; font-size:10px; }
+.archive-waveVideoMain>button>span:last-child { font-size:10px; max-width:80px; }
+.archive-waveVideo .archive-rowActions { margin:0 0 4px 38px; padding-top:6px; }
+@media(hover:hover) and (pointer:fine) { .archive-rowActionButtons button:not(:disabled):hover { background:var(--accent); } }
+@media(max-width:767px) {
+  .archive-rowActions { margin-left:50px; }
+  .archive-rowActionButtons button { min-height:40px; }
+  .archive-waveVideoMain>button { gap:8px; font-size:11px; }
+  .archive-waveVideoMain>button>small { display:none; }
+  .archive-waveVideo .archive-rowActions { margin-left:50px; }
+}
