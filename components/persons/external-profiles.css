@@ -7,6 +7,11 @@
 .external-profiles small,.external-profiles footer,.external-profile-basis{color:var(--muted-foreground);font-size:11px}
 .external-profile-bio{white-space:pre-line;max-height:8em;overflow:auto}
 .external-profiles footer{margin-top:10px}
+.external-profile-search{display:flex;flex-wrap:wrap;gap:6px;margin:10px 0}
+.external-profile-search input{min-width:100px;flex:1;border:1px solid var(--border);border-radius:6px;padding:6px 8px;background:transparent;color:inherit;font-size:16px}
+.external-profile-search button{min-height:36px;border:1px solid var(--border);border-radius:6px;padding:4px 8px;text-decoration:none;cursor:pointer}
+.external-profile-search button:disabled{opacity:.45;cursor:default}
+.pw .external-profile-search input,.pw .external-profile-search button{border-color:var(--wb-border)}
 .pw .external-profiles{margin:0 20px 12px;border-color:var(--wb-border);background:var(--wb-bg);color:var(--wb-text);max-height:240px;overflow:auto;flex-shrink:0}
 .pw .external-profiles article{border-color:var(--wb-border)}
 .pw .external-profiles small,.pw .external-profiles footer,.pw .external-profile-basis{color:var(--wb-muted)}

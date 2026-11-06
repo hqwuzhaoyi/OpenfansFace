@@ -40,6 +40,6 @@ export function mergeReviewedCreatorProfiles(profiles: CreatorProfile[], name: s
     result.set(profile.id, { profile, basis: link.confidence === 'reference' ? 'reviewed-reference' : 'reviewed-candidate',
       evidence: link.evidence, reviewed_at: link.reviewed_at })
   }
-  const order = { 'confirmed-account': 0, 'x-account': 1, 'reviewed-reference': 2, 'unverified-handle': 3, 'same-name': 4, 'name-part': 5, 'reviewed-candidate': 6 }
-  return [...result.values()].sort((a, b) => order[a.basis] - order[b.basis] || a.profile.handle.localeCompare(b.profile.handle))
+  const order = { 'confirmed-account': 0, 'x-account': 1, 'reviewed-reference': 2, 'unverified-handle': 3, 'same-name': 4, 'name-part': 5, 'reviewed-candidate': 6, 'normalized-name': 7, 'profile-mention': 8, 'name-contains': 8, 'similar-account': 8 }
+  return [...result.values()].sort((a, b) => order[a.basis] - order[b.basis] || (b.relevance || 0) - (a.relevance || 0) || a.profile.handle.localeCompare(b.profile.handle))
 }
