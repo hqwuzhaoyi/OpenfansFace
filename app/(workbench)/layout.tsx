@@ -28,7 +28,7 @@ export default function WorkbenchLayout({ children }: { children: React.ReactNod
   if (pathname === "/integration") return (
     <div className="flex h-dvh overflow-hidden bg-background text-foreground">
       <aside aria-label="工作台导航" className="hidden w-14 shrink-0 flex-col items-center gap-4 border-r bg-sidebar py-3 md:flex">
-        <Link href="/" title="人脸策展台" aria-label="人脸策展台总览" className="grid size-9 place-items-center rounded-lg bg-foreground text-background"><Clapperboard className="size-5" /></Link>
+        <Link href="/" title="OpenfansFace" aria-label="OpenfansFace总览" className="grid size-9 place-items-center rounded-lg bg-foreground text-background"><Clapperboard className="size-5" /></Link>
         <nav className="flex flex-col gap-1">
           {NAV.map(n => <Link key={n.href} href={n.href} title={n.label} aria-label={n.label} aria-current={pathname === n.href ? "page" : undefined} className={`grid size-10 place-items-center rounded-md outline-none focus-visible:ring-2 focus-visible:ring-ring ${pathname === n.href ? "bg-accent text-foreground" : "text-muted-foreground hover:bg-accent hover:text-foreground"}`}><n.icon className="size-[18px]" /></Link>)}
         </nav>
@@ -46,7 +46,7 @@ export default function WorkbenchLayout({ children }: { children: React.ReactNod
       <aside className="fixed inset-y-0 left-0 z-10 hidden w-60 flex-col border-r bg-sidebar md:flex">
         <div className="flex h-14 items-center gap-2 border-b px-4">
           <Clapperboard className="h-5 w-5" />
-          <span className="font-bold">人脸策展台</span>
+          <span className="font-bold">OpenfansFace</span>
         </div>
         <nav className="flex-1 space-y-1 p-2">
           <p className="px-2 pb-1 text-xs font-medium text-muted-foreground">策展</p>
@@ -70,7 +70,7 @@ export default function WorkbenchLayout({ children }: { children: React.ReactNod
       <div className="flex-1 md:pl-60">
         <header className="flex h-14 items-center gap-3 border-b px-4 md:hidden">
           <Clapperboard className="h-5 w-5" />
-          <span className="font-bold">人脸策展台</span>
+          <span className="font-bold">OpenfansFace</span>
         </header>
         <div className="pb-24 md:pb-0">{children}</div>
       </div>

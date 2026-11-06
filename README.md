@@ -1,4 +1,4 @@
-# Face Admin Next · 人脸策展台
+# OpenfansFace · 视频人物识别与归档
 
 面向本地视频库的人物核对与批量归档工作台。使用 Next.js、React、TypeScript、SQLite 和可选的 Python 校准服务。
 

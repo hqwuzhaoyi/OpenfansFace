@@ -3,8 +3,8 @@ import "./globals.css"
 import { Toaster } from "sonner"
 
 export const metadata: Metadata = {
-  title: "人脸策展台",
-  description: "8919 face curation workbench",
+  title: "OpenfansFace · 视频人物识别与归档",
+  description: "视频人物核对、批量归名与归档工作台",
 }
 
 export const viewport: Viewport = { width: "device-width", initialScale: 1, viewportFit: "cover", themeColor: "#09090b" }
