@@ -8,6 +8,7 @@ import './external-profiles.css'
 const labels: Record<CreatorMatch['basis'], string> = {
   'confirmed-account': '已确认账号关联', 'x-account': 'X 账号匹配',
   'unverified-handle': '同账号字样 · 待核对平台', 'same-name': '同昵称 · 待核对',
+  'name-part': '名称片段一致 · 待核对',
 }
 const dateText = (value: string) => new Date(value).toLocaleString('zh-CN')
 
@@ -34,7 +35,7 @@ export function ExternalProfiles({ name, token, platform }: { name?: string; tok
     {current?.error && <p role="status">{current.error} <button type="button" onClick={() => setRetry(n => n + 1)}>重试</button></p>}
     {current?.data && <>
       {current.data.warning && <p role="status">{current.data.warning}</p>}
-      {!current.data.matches.length && <p>该资料站暂无精确匹配。</p>}
+      {!current.data.matches.length && <p>暂未找到匹配的账号或昵称资料。</p>}
       {current.data.matches.map(({ profile, basis, evidence }) => <article key={profile.id}>
         <div className="external-profile-heading"><a href={`https://x.com/${profile.handle}`} target="_blank" rel="noopener noreferrer" referrerPolicy="no-referrer"><strong>{profile.name}</strong> <span>@{profile.handle} ↗</span></a><span className="external-profile-basis">{labels[basis]}</span></div>
         {profile.description && <p className="external-profile-bio">{profile.description}</p>}

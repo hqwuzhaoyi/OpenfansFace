@@ -11,7 +11,7 @@ export interface CreatorProfile {
 }
 export interface CreatorMatch {
   profile: CreatorProfile
-  basis: 'confirmed-account' | 'x-account' | 'unverified-handle' | 'same-name'
+  basis: 'confirmed-account' | 'x-account' | 'unverified-handle' | 'same-name' | 'name-part'
   evidence: string
 }
 export interface CreatorAccountRule {
@@ -74,9 +74,21 @@ export function matchWatermarkAccount(profiles: CreatorProfile[], token: string,
 export function matchPersonProfiles(profiles: CreatorProfile[], name: string, mappings: CreatorAccountRule[]): CreatorMatch[] {
   const matches = new Map<string, CreatorMatch>()
   const normalized = name.trim().normalize('NFC')
+  // Split only explicit name separators. Never strip underscores, dots or suffixes.
+  const parts = [...new Set(normalized.split(/[\s()（）\[\]【】|｜,，、;；]+/u))]
+    .filter(part => part !== normalized && (/^[\x00-\x7f]+$/.test(part) ? part.length >= 3 : [...part].length >= 2))
   for (const profile of profiles) {
+    const part = parts.find(part => part.toLowerCase() === profile.name.trim().normalize('NFC').toLowerCase())
+    if (part) matches.set(profile.id, { profile, basis: 'name-part',
+      evidence: `人物名片段「${part}」与外部昵称「${profile.name}」一致，身份待核对` })
     if (profile.name.trim().normalize('NFC') === normalized) matches.set(profile.id, {
       profile, basis: 'same-name', evidence: `昵称与人物名「${name}」完全一致，身份待核对` })
+  }
+  for (const part of parts) {
+    for (const match of matchWatermarkAccount(profiles, part, 'unknown')) {
+      if (matches.get(match.profile.id)?.basis === 'same-name') continue
+      matches.set(match.profile.id, { ...match, evidence: `人物名片段「${part}」与 X 账号字样一致，原平台待核对` })
+    }
   }
   const explicitX = /^(?:https?:\/\/)?(?:www\.)?(?:x\.com|twitter\.com)\//i.test(name.trim())
   for (const match of matchWatermarkAccount(profiles, name, explicitX ? 'X' : 'unknown')) matches.set(match.profile.id, match)
@@ -89,6 +101,6 @@ export function matchPersonProfiles(profiles: CreatorProfile[], name: string, ma
         evidence: `已确认的 X 账号规则：${mapping.token} → ${name}` } : match)
     }
   }
-  const order = { 'confirmed-account': 0, 'x-account': 1, 'unverified-handle': 2, 'same-name': 3 }
+  const order = { 'confirmed-account': 0, 'x-account': 1, 'unverified-handle': 2, 'same-name': 3, 'name-part': 4 }
   return [...matches.values()].sort((a, b) => order[a.basis] - order[b.basis] || a.profile.handle.localeCompare(b.profile.handle))
 }

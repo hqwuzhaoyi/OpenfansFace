@@ -6,6 +6,32 @@ const raw = (id = '1', screen_name = 'Alice_01', name = '小雨') => ({ id, scre
 const profiles = parseCreatorDirectory([raw(), raw('2', 'Alice_02', '小雨')])
 const rule = (platform = 'X', kind = 'person', creator = '本地名字') => ({ key: 'rule', token: 'Alice_01', platform, kind, creator, text: '@Alice_01', confirmed_at: '2026-11-06' })
 
+test('composite person names find complete external nickname fields without rewriting account punctuation', () => {
+  const directory = parseCreatorDirectory([raw('10', 'HongKong_Doll', 'HongKongDoll')])
+  for (const name of ['HongKongDoll 玩偶姐姐', '玩偶姐姐（HongKongDoll）', 'hongkongdoll｜玩偶姐姐']) {
+    const matches = matchPersonProfiles(directory, name, [])
+    assert.equal(matches.length, 1)
+    assert.equal(matches[0].profile.handle, 'HongKong_Doll')
+    assert.equal(matches[0].basis, 'name-part')
+    assert.match(matches[0].evidence, /片段/)
+  }
+  for (const name of ['HongKong 玩偶姐姐', 'HongKongDollExtra 玩偶姐姐', 'HongKong-Doll 玩偶姐姐']) {
+    assert.deepEqual(matchPersonProfiles(directory, name, []), [])
+  }
+  assert.deepEqual(matchWatermarkAccount(directory, 'HongKongDoll', 'X'), [])
+})
+
+test('composite name clues stay tentative, preserve multiple candidates, and yield to confirmed rules', () => {
+  assert.equal(matchPersonProfiles(profiles, 'Alice_01 小雨姐姐', [])[0].basis, 'unverified-handle')
+  const matches = matchPersonProfiles(profiles, '小雨 别称', [])
+  assert.equal(matches.length, 2)
+  assert.ok(matches.every(m => m.basis === 'name-part'))
+  assert.deepEqual(matchPersonProfiles(profiles, 'Alice01 别称', []), [])
+  const [confirmed] = matchPersonProfiles(profiles, 'Alice_01 小雨姐姐', [rule('X', 'person', 'Alice_01 小雨姐姐')])
+  assert.equal(confirmed.basis, 'confirmed-account')
+  assert.deepEqual(matchPersonProfiles(parseCreatorDirectory([raw('3', 'Different', 'A')]), 'A 别称', []), [])
+})
+
 test('X handles preserve punctuation and suffixes; arbitrary URLs and post URLs never match', () => {
   for (const input of ['@ALICE_01', 'Alice_01', 'https://x.com/Alice_01', 'https://twitter.com/Alice_01/']) assert.equal(xHandle(input), 'alice_01')
   for (const input of ['alice.01', 'alice-01', 'alice_01 extra', 'https://evil.example/Alice_01', 'https://x.com/Alice_01/status/1', 'https://x.com.evil/Alice_01', 'Alice_01?x=1']) assert.equal(xHandle(input), null)
