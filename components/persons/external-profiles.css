@@ -1,0 +1,12 @@
+.external-profiles{min-width:0;border:1px solid var(--border);border-radius:8px;padding:12px;font-size:12px;line-height:1.6;color:var(--foreground);background:var(--card)}
+.external-profiles header,.external-profile-heading{display:flex;flex-wrap:wrap;align-items:baseline;justify-content:space-between;gap:6px 12px}
+.external-profiles a,.external-profiles button{color:inherit;text-decoration:underline;text-underline-offset:3px}
+.external-profiles a:focus-visible,.external-profiles button:focus-visible{outline:2px solid currentColor;outline-offset:3px}
+.external-profiles p{margin:6px 0;overflow-wrap:anywhere}
+.external-profiles article{margin-top:10px;padding-top:10px;border-top:1px solid var(--border);overflow-wrap:anywhere}
+.external-profiles small,.external-profiles footer,.external-profile-basis{color:var(--muted-foreground);font-size:11px}
+.external-profile-bio{white-space:pre-line;max-height:8em;overflow:auto}
+.external-profiles footer{margin-top:10px}
+.pw .external-profiles{margin:0 20px 12px;border-color:var(--wb-border);background:var(--wb-bg);color:var(--wb-text);max-height:240px;overflow:auto;flex-shrink:0}
+.pw .external-profiles article{border-color:var(--wb-border)}
+.pw .external-profiles small,.pw .external-profiles footer,.pw .external-profile-basis{color:var(--wb-muted)}
