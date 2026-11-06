@@ -21,6 +21,16 @@
 
 账号规则从已有的 `FACES_BASE/watermarks/mappings.json` 只读加载；没有水印功能或规则文件时仍可按人物名查询。
 
+## 逐条核对的参考资料
+
+逐条检索结果保存于私有运行文件 `FACES_BASE/external-profiles/reviewed-links.json`，不把本地人物清单写进代码仓库。人物页将这份结果与自动匹配合并；账号水印的直接查询仍只采用原来的精确匹配。
+
+文件格式为 `{ "version": 1, "source": "nv-pu-sa", "links": [...] }`。每条包含 `person`、`profile_id`、`handle`、`confidence`、`evidence`、`reviewed_at`。`confidence` 为 `reference` 时显示“已核对文字线索”，为 `candidate` 时显示“疑似关联 · 待核对”。两者都不代表已确认视频归属。
+
+同一人物可以保留多个候选。参考资料绑定站内稳定 ID 和核对时的账号；账号被重新分配、改名或资料被移除时，不沿用旧关联。既有已确认 X 规则优先，参考资料不写入水印规则、归名队列或人物合并记录。
+
+后续只更新这份运行文件即可更新参考资料，无需重新构建镜像。更新前备份原文件，按人物与资料 ID 合并，原子替换后从接口读回核对。
+
 ## 验证
 
 `node --test tests/creator-directory*.test.mjs` 覆盖精确匹配、同名歧义、平台隔离、来源规则排除、并发合并、缓存复用及异常数据保护。

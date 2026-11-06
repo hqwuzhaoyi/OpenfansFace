@@ -9,6 +9,7 @@ const labels: Record<CreatorMatch['basis'], string> = {
   'confirmed-account': '已确认账号关联', 'x-account': 'X 账号匹配',
   'unverified-handle': '同账号字样 · 待核对平台', 'same-name': '同昵称 · 待核对',
   'name-part': '名称片段一致 · 待核对',
+  'reviewed-reference': '已核对文字线索', 'reviewed-candidate': '疑似关联 · 待核对',
 }
 const dateText = (value: string) => new Date(value).toLocaleString('zh-CN')
 
@@ -36,10 +37,11 @@ export function ExternalProfiles({ name, token, platform }: { name?: string; tok
     {current?.data && <>
       {current.data.warning && <p role="status">{current.data.warning}</p>}
       {!current.data.matches.length && <p>暂未找到匹配的账号或昵称资料。</p>}
-      {current.data.matches.map(({ profile, basis, evidence }) => <article key={profile.id}>
+      {current.data.matches.map(({ profile, basis, evidence, reviewed_at }) => <article key={profile.id}>
         <div className="external-profile-heading"><a href={`https://x.com/${profile.handle}`} target="_blank" rel="noopener noreferrer" referrerPolicy="no-referrer"><strong>{profile.name}</strong> <span>@{profile.handle} ↗</span></a><span className="external-profile-basis">{labels[basis]}</span></div>
         {profile.description && <p className="external-profile-bio">{profile.description}</p>}
         <p>{evidence}</p>
+        {reviewed_at && <p><small>资料核对：{dateText(reviewed_at)}{basis === 'reviewed-candidate' ? ' · 尚未确认账号归属' : ' · 仅核对文字资料'}</small></p>}
         <small>{profile.followers !== null && `${profile.followers.toLocaleString('zh-CN')} 关注者`}{profile.synced_at && ` · 来源更新 ${dateText(profile.synced_at)}`}</small>
       </article>)}
       <footer>仅关联公开账号资料，视频归属仍以核对为准。<br/>资料获取：{dateText(current.data.fetched_at)}{current.data.stale ? ' · 缓存待更新' : ''}</footer>

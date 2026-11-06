@@ -11,8 +11,9 @@ export interface CreatorProfile {
 }
 export interface CreatorMatch {
   profile: CreatorProfile
-  basis: 'confirmed-account' | 'x-account' | 'unverified-handle' | 'same-name' | 'name-part'
+  basis: 'confirmed-account' | 'x-account' | 'unverified-handle' | 'same-name' | 'name-part' | 'reviewed-reference' | 'reviewed-candidate'
   evidence: string
+  reviewed_at?: string
 }
 export interface CreatorAccountRule {
   token: string
@@ -101,6 +102,6 @@ export function matchPersonProfiles(profiles: CreatorProfile[], name: string, ma
         evidence: `已确认的 X 账号规则：${mapping.token} → ${name}` } : match)
     }
   }
-  const order = { 'confirmed-account': 0, 'x-account': 1, 'unverified-handle': 2, 'same-name': 3, 'name-part': 4 }
+  const order = { 'confirmed-account': 0, 'x-account': 1, 'reviewed-reference': 2, 'unverified-handle': 3, 'same-name': 4, 'name-part': 5, 'reviewed-candidate': 6 }
   return [...matches.values()].sort((a, b) => order[a.basis] - order[b.basis] || a.profile.handle.localeCompare(b.profile.handle))
 }
