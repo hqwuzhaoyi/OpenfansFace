@@ -10,9 +10,6 @@
 .archive-iconActions { display:flex; gap:4px; }
 .archive-iconButton { display:grid; place-items:center; width:32px; height:32px; min-width:32px; color:var(--muted-foreground); border-radius:5px; }
 .archive-iconButton:disabled { opacity:.4; cursor:not-allowed; }
-.archive-wave { margin:0 16px 12px; flex-shrink:0; }
-.archive-wave select { width:100%; font-size:12px; color:var(--muted-foreground); background:var(--card); padding:6px 0; }
-.archive-wave small { display:block; margin-top:4px; font-size:10px; color:var(--muted-foreground); }
 .archive-search { display:flex; align-items:center; gap:8px; min-height:36px; margin:0 16px 12px; padding:0 10px; border:1px solid var(--border); border-radius:6px; color:var(--muted-foreground); flex-shrink:0; }
 .archive-search input { width:100%; min-width:0; background:transparent; font-size:12px; outline:none; }
 .archive-search kbd { font-size:10px; }
@@ -131,3 +128,48 @@
   .archive-notice { padding:10px 16px; }
   .archive-metadata { flex-wrap:wrap; }
 }
+
+/* Batches are the selectable inbox items; opening one never changes selection. */
+.archive-batch { position:relative; display:flex; align-items:center; gap:6px; padding:12px 14px 12px 10px; border-bottom:1px solid var(--border); border-left:2px solid transparent; }
+.archive-batch[data-selected=true] { background:color-mix(in srgb,var(--foreground) 4%,transparent); }
+.archive-batch[data-active=true] { background:var(--accent); border-left-color:var(--ring); }
+.archive-batchOpen { flex:1; min-width:0; text-align:left; }
+.archive-batchTitle { display:flex; align-items:baseline; gap:12px; }
+.archive-batchTitle strong { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:13px; font-weight:600; }
+.archive-batchTitle time { flex-shrink:0; color:var(--muted-foreground); font-size:10px; }
+.archive-batchMeta { display:flex; align-items:center; gap:9px; margin-top:8px; font-size:10px; color:var(--muted-foreground); flex-wrap:wrap; }
+.archive-batchMeta>span { display:inline-flex; gap:4px; align-items:center; }
+.archive-batchMeta .archive-selectedCount { margin-left:auto; color:var(--foreground); }
+.archive-batchExcerpt { display:block; margin-top:6px; color:var(--muted-foreground); font-size:10px; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+.archive-waveDetail { border-bottom:1px solid var(--border); margin-bottom:22px; padding-bottom:20px; }
+.archive-waveHeading { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:12px; }
+.archive-waveHeading h2 { font-size:18px; font-weight:600; overflow-wrap:anywhere; }
+.archive-waveHeading p { color:var(--muted-foreground); font-size:11px; margin-top:4px; }
+.archive-waveVideos { max-height:220px; overflow-y:auto; border:1px solid var(--border); border-radius:6px; overscroll-behavior:contain; scrollbar-width:thin; scrollbar-color:#3f3f46 transparent; }
+.archive-waveVideo { display:flex; align-items:center; gap:6px; min-height:46px; padding:0 10px 0 4px; border-bottom:1px solid var(--border); }
+.archive-waveVideo:last-child { border-bottom:0; }
+.archive-waveVideo[data-active=true] { background:var(--accent); }
+.archive-waveVideo>button { display:flex; align-items:center; align-self:stretch; gap:12px; flex:1; min-width:0; text-align:left; font-size:12px; }
+.archive-waveVideo>button>span:first-child { flex:1; min-width:0; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
+.archive-waveVideo>button>small { color:var(--muted-foreground); white-space:nowrap; font-size:10px; }
+.archive-waveVideo>button>span:last-child { font-size:10px; max-width:80px; }
+.archive-inlinePlayer { margin:0; background:#000; border:1px solid var(--border); border-radius:6px; overflow:hidden; }
+.archive-inlinePlayer video { display:block; width:100%; height:clamp(200px,36dvh,480px); background:#000; object-fit:contain; }
+.archive-playerError { padding:14px; background:var(--card); color:#d2b282; font-size:12px; }
+.archive-playerError p,.archive-playerError>div { display:flex; align-items:center; gap:8px; }
+.archive-playerError small { display:block; margin-top:8px; }
+.archive-playerError>div { margin-top:12px; }
+.archive-playerError a { text-decoration:underline; }
+.archive-hiddenSelection { color:var(--foreground); text-decoration:underline; text-underline-offset:3px; font-size:11px; margin-top:4px; }
+.archive-confirmIssues { color:#d2b282; border:1px solid #695330; border-radius:6px; padding:12px; font-size:12px; }
+.archive-confirmIssues ul { margin-top:8px; overflow-wrap:anywhere; }
+.archive-confirmIssues li { margin-top:4px; }
+@media(hover:hover) and (pointer:fine) { .archive-batch:not([data-active=true]):hover { background:var(--accent); } }
+@media(max-width:767px) {
+  .archive-batch { padding:10px 14px 10px 4px; min-height:88px; }
+  .archive-waveVideo>button { gap:8px; font-size:11px; }
+  .archive-waveVideo>button>small { display:none; }
+  .archive-waveVideos { max-height:190px; }
+  .archive-inlinePlayer video { height:220px; }
+}
+.archive-inlinePlayer + .archive-paths { margin-top:20px; }
