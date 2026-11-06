@@ -25,6 +25,22 @@ export default function WorkbenchLayout({ children }: { children: React.ReactNod
     window.addEventListener("pointerdown", pointer, true)
     return () => { window.removeEventListener("keydown", keyboard, true); window.removeEventListener("pointerdown", pointer, true) }
   }, [])
+  if (pathname === "/integration") return (
+    <div className="flex h-dvh overflow-hidden bg-background text-foreground">
+      <aside aria-label="工作台导航" className="hidden w-14 shrink-0 flex-col items-center gap-4 border-r bg-sidebar py-3 md:flex">
+        <Link href="/" title="人脸策展台" aria-label="人脸策展台总览" className="grid size-9 place-items-center rounded-lg bg-foreground text-background"><Clapperboard className="size-5" /></Link>
+        <nav className="flex flex-col gap-1">
+          {NAV.map(n => <Link key={n.href} href={n.href} title={n.label} aria-label={n.label} aria-current={pathname === n.href ? "page" : undefined} className={`grid size-10 place-items-center rounded-md outline-none focus-visible:ring-2 focus-visible:ring-ring ${pathname === n.href ? "bg-accent text-foreground" : "text-muted-foreground hover:bg-accent hover:text-foreground"}`}><n.icon className="size-[18px]" /></Link>)}
+        </nav>
+      </aside>
+      <div className="flex min-h-0 min-w-0 flex-1 flex-col">
+        <div className="min-h-0 flex-1">{children}</div>
+        <nav aria-label="工作台导航" className="flex shrink-0 border-t bg-sidebar pb-[env(safe-area-inset-bottom)] md:hidden">
+          {NAV.map(n => <Link key={n.href} href={n.href} aria-current={pathname === n.href ? "page" : undefined} className={`flex min-h-12 min-w-0 flex-1 flex-col items-center justify-center gap-1 text-[10px] ${pathname === n.href ? "text-foreground" : "text-muted-foreground"}`}><n.icon className="size-[18px]" />{n.label}</Link>)}
+        </nav>
+      </div>
+    </div>
+  )
   return (
     <div className="flex min-h-dvh bg-background text-foreground">
       <aside className="fixed inset-y-0 left-0 z-10 hidden w-60 flex-col border-r bg-sidebar md:flex">
