@@ -1,0 +1,10 @@
+export const BASE = process.env.FACES_BASE || '/data/base'
+export const MEDIA2 = process.env.MEDIA2_ROOT || '/mnt/media2'
+export const CREATORS = `${process.env.MEDIA2_ROOT || '/mnt/media2'}/pikpak/creators`
+export const MYTG = `${process.env.MEDIA2_ROOT || '/mnt/media2'}/pikpak/My Telegram`
+export const STAGE = `${process.env.MEDIA2_ROOT || '/mnt/media2'}/pikpak/.face-cleanup-staging`
+export const QUEUE_F = `${BASE}/integration-queue.json`
+export const DECISIONS_F = `${BASE}/review-decisions.json`
+export const MANIFESTS_D = `${BASE}/manifests`
+export const OVR_F = `${BASE}/template-overrides.json`
+export const DRIVE = 'R:'

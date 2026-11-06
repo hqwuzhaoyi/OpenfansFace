@@ -1,0 +1,13 @@
+node_modules
+.next
+.git
+*.log
+
+.env*
+__pycache__
+*.bak
+*.db*
+data
+backups
+thumbs
+media

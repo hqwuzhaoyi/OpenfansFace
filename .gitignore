@@ -39,3 +39,36 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# Local runtime data and generated artifacts
+!.env.example
+__pycache__/
+*.py[cod]
+*.bak
+*.bak-*
+*.db
+*.db-*
+*.sqlite*
+*.tar
+*.tgz
+*.log
+/data/
+/backups/
+/thumbs/
+/manifests/
+/media/
+report.json
+clusters.json
+claims-detail*.json
+integration-queue.json
+archive-history.json
+review-decisions.json
+people-manual.json
+video-health*.json
+template-overrides.json
+*.mp4
+*.mkv
+*.mov
+*.webm
+*.npy
+*.npz

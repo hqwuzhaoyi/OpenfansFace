@@ -1,0 +1,23 @@
+[Unit]
+Description=Face admin read-only video health inspection
+After=network-online.target mnt-media2.mount
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=FACES_BASE=/var/lib/face-admin
+Environment=MEDIA2_ROOT=/mnt/media2
+EnvironmentFile=/etc/face-admin/health.env
+User=face-admin
+Group=face-admin
+ExecStart=/usr/bin/python3 /opt/face-admin-next/maintenance/video_health.py --budget 300 --seconds 1200
+TimeoutStartSec=30min
+Nice=10
+CPUQuota=25%
+IOWeight=10
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/var/lib/face-admin
+ReadOnlyPaths=/mnt/media2
