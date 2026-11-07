@@ -1,0 +1,14 @@
+{
+  "fixture": "synthetic-portrait.jpg",
+  "purpose": "isolated face detection and keypoint consistency only; never identity matching",
+  "source": "built-in image_gen",
+  "generated_on": "2026-11-08",
+  "prompt": "Completely fictional anonymous adult, photorealistic frontal face, neutral expression, eyes open, no glasses or occlusion, even daylight, plain gray background, head and shoulders, portrait 1024x1536, no text/logos/watermark, no resemblance to a named public figure. Detection-box and keypoint consistency only; no identity lookup.",
+  "real_person_reference": false,
+  "source_png_sha256": "2be25950d40dcd53c2fffdb8b3fa2f05d56d0d0be9f53b454a924e467a6ae44b",
+  "sha256": "670bfee8dbe1d2e45ad352161c8179d6e29096c3cb730861fda5f96f78cd05af",
+  "encoding": "JPEG quality 94 subsampling 0; original dimensions preserved",
+  "width": 1024,
+  "height": 1536,
+  "bytes": 482366
+}

@@ -75,5 +75,8 @@ class Client:
     def cancel(self, request_id: str, attempt_id: str) -> dict:
         return self._call('/v1/cancel', {'request_id': token(request_id), 'attempt_id': token(attempt_id)})
 
+    def drain(self) -> dict:
+        return self._call('/v1/drain', {})
+
     def ready(self) -> dict:
         return self._call('/health/ready')

@@ -143,7 +143,8 @@ class Handler(BaseHTTPRequestHandler):
         if self.command == 'GET':
             self.upload_timer.cancel()
         if self.command == 'GET' and self.path == '/health/live':
-            return 200, {'live': True, 'service_instance': self.server.broker.instance}
+            return 200, {'live': True, 'service_instance': self.server.broker.instance,
+                         'release': self.server.broker.release}
         if self.command == 'GET' and self.path == '/health/ready':
             health = self.server.broker.health()
             return 200 if health['accepting'] else 503, health
@@ -152,6 +153,9 @@ class Handler(BaseHTTPRequestHandler):
             job = self.server.broker.submit(request)
             # The deadline governs waiting, not cancellation of an already-running kernel.
             return 200, self.server.broker.wait(job)
+        if self.command == 'POST' and self.path == '/v1/drain':
+            fields(self._body(), '')
+            return 200, self.server.broker.begin_drain()
         if self.command == 'POST' and self.path == '/v1/cancel':
             body = self._body()
             fields(body, 'request_id attempt_id')
@@ -184,6 +188,7 @@ def main():
     parser.add_argument('--model', required=True)
     parser.add_argument('--model-sha256', required=True)
     parser.add_argument('--token-file', required=True)
+    parser.add_argument('--release-manifest', help='Required by the deployment unit; validates code, lock and runtime')
     parser.add_argument('--detector-size', type=int, choices=(160, 640), default=640)
     parser.add_argument('--arena-mib', type=int, choices=range(64, 257), default=128)
     parser.add_argument('--min-free-mib', type=int, default=600)
@@ -195,6 +200,17 @@ def main():
     if token_path.stat().st_mode & 0o077:
         parser.error('token file must be private (mode 0600)')
     auth_token = token_path.read_text().strip()
+    release = None
+    if args.release_manifest:
+        from .environment import check_environment
+        from .release import verify_manifest
+        release = verify_manifest(args.release_manifest)
+        check_environment()
+        policy = release['admission']
+        if (args.model_sha256 != release['model_sha256'] or args.detector_size != release['detector_size'] or
+                args.arena_mib != policy['arena_mib'] or args.min_free_mib != policy['min_free_mib'] or
+                args.waiting != policy['waiting']):
+            parser.error('arguments differ from immutable release manifest')
     resources = ResourcePolicy(min_free_mib=args.min_free_mib)
     model, fault = None, None
     if resources.sample()['busy']:
@@ -208,6 +224,8 @@ def main():
             fault = 'model_initialization_failed'
     broker = Broker(model, resources, waiting=args.waiting)
     broker.fault = fault
+    from .release import health_release
+    broker.release = health_release(release)
     server = Server((args.host, args.port), broker, auth_token)
     def stop(*_):
         threading.Thread(target=server.shutdown, daemon=True).start()

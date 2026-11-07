@@ -1,0 +1,56 @@
+[Unit]
+Description=Image-only GPU detector (WSL2 isolated runtime)
+After=network.target
+ConditionPathExists=/dev/dxg
+ConditionPathExists=/opt/face-gpu/current/release.json
+
+[Service]
+Type=exec
+DynamicUser=yes
+User=face-gpu
+WorkingDirectory=/opt/face-gpu/current
+LoadCredential=api-token:/etc/face-gpu/api-token
+Environment=PYTHONNOUSERSITE=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=OPENBLAS_NUM_THREADS=1
+Environment=OMP_NUM_THREADS=1
+Environment=MKL_NUM_THREADS=1
+Environment=PATH=/opt/face-gpu/current/venv/bin:/usr/lib/wsl/lib:/usr/bin
+EnvironmentFile=/etc/face-gpu/model.env
+ExecStart=/opt/face-gpu/current/venv/bin/python -m services.gpu_inference.server --host 127.0.0.1 --port 8921 --model /opt/face-gpu/model/det_10g.onnx --model-sha256 ${GPU_DETECTOR_SHA256} --token-file %d/api-token --release-manifest /opt/face-gpu/current/release.json
+Restart=no
+TimeoutStopSec=130
+KillMode=control-group
+UMask=0077
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressDeny=any
+IPAddressAllow=localhost
+DevicePolicy=closed
+DeviceAllow=/dev/dxg rw
+ReadOnlyPaths=/opt/face-gpu
+InaccessiblePaths=-/mnt -/media -/srv -/data -/var/lib -/var/log -/var/cache
+TemporaryFileSystem=/tmp:rw,nosuid,nodev,noexec,size=64M
+MemoryHigh=1G
+MemoryMax=1536M
+TasksMax=64
+LimitNOFILE=128
+
+[Install]
+WantedBy=multi-user.target
