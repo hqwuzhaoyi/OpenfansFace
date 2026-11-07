@@ -103,15 +103,90 @@ pub fn execute(engine: &mut Engine, command: &str, mut body: Value) -> Result<Va
                 && ["rolled_back", "recovery_needed", "failed"].contains(&record.status.as_str())
                 && record.status != "not_started"
             {
-                return Ok(failure_result(&record.plan, &record.status, &error.error));
+                let cause = record
+                    .error
+                    .as_ref()
+                    .map(|e| e.error.as_str())
+                    .unwrap_or(&error.error);
+                let result = failure_result(
+                    &record.plan,
+                    &record.status,
+                    cause,
+                    &engine.store.failures(&id)?,
+                );
+                // Keep the terminal operation state; only its compatibility receipt is published.
+                // An uncertain/recovery-needed operation must never gain a final result that
+                // could short-circuit the common executor's reconciliation.
+                if ["rolled_back", "failed"].contains(&record.status.as_str()) {
+                    let changed=engine.store.db.execute("UPDATE operations SET result=?,revision=revision+1,updated_at=CURRENT_TIMESTAMP WHERE id=? AND status=? AND result IS NULL",rusqlite::params![serde_json::to_string(&result)?,id,record.status])?;
+                    if changed != 1 {
+                        return Err(Error::new(503, "outcome_unknown", "归档回执发布结果待核对"));
+                    }
+                }
+                return Ok(result);
             }
             Err(error)
         }
         Err(error) => Err(error),
     }
 }
-fn failure_result(plan: &crate::model::Plan, status: &str, error: &str) -> Value {
-    json!({"ok":false,"id":plan.id,"moved":0,"staged":0,"ledger":0,"remaining":plan.execution.as_ref().map(|e|e.data["queue_count"].clone()).unwrap_or(json!(0)),"errors":[error],"failures":[],"rolled_back":status=="rolled_back","recovery_needed":status=="recovery_needed","manifest":format!("rust:{}",plan.id)})
+fn failure_result(
+    plan: &crate::model::Plan,
+    status: &str,
+    error: &str,
+    skipped: &[Value],
+) -> Value {
+    // All accepted files are still unfinished after an aggregate failure. Keep the
+    // original per-file skip reason instead of replacing it with the ledger error.
+    let mut result = archive::result(plan, &[], skipped);
+    let mut failures = skipped.to_vec();
+    for (index, file) in plan.files.iter().enumerate() {
+        if !skipped
+            .iter()
+            .any(|failure| failure["file_index"].as_u64() == Some(index as u64))
+        {
+            let message = if status == "rolled_back" {
+                format!("本轮已执行的变更已回退：{error}")
+            } else if status == "recovery_needed" {
+                format!("结果待核对，暂不能重试：{error}")
+            } else {
+                error.to_owned()
+            };
+            failures.push(json!({"file_index":index,"src":file.src,"dst":file.dst,"error":{"error":message,"code":if status=="rolled_back"{"archive_rolled_back"}else{"archive_incomplete"},"step":status}}));
+        }
+    }
+    result["failures"] = archive::result(plan, &[], &failures)["failures"].clone();
+    let mut seen = std::collections::BTreeSet::new();
+    if let Some(rows) = result["failures"].as_array_mut() {
+        rows.retain(|row| seen.insert(row["vid"].as_str().unwrap_or("").to_owned()));
+        for row in rows {
+            row["retryable"] = json!(status != "recovery_needed");
+        }
+    }
+    let errors = result["errors"].as_array_mut().unwrap();
+    if !errors.iter().any(|message| message == error) {
+        errors.push(json!(error));
+    }
+    result["ok"] = json!(false);
+    result["rolled_back"] = json!(status == "rolled_back");
+    result["recovery_needed"] = json!(status == "recovery_needed");
+    result
+}
+fn journal_failures(db: &rusqlite::Connection, id: &str) -> Result<Vec<Value>> {
+    db::rows(
+        db,
+        "SELECT evidence FROM steps WHERE operation_id=? AND phase='file_failed' ORDER BY revision",
+        [id],
+    )?
+    .into_iter()
+    .map(|row| {
+        Ok(serde_json::from_str(
+            row["evidence"]
+                .as_str()
+                .ok_or_else(|| Error::conflict("文件失败回执格式无效"))?,
+        )?)
+    })
+    .collect()
 }
 pub fn progress(config: &Config, id: Option<&str>) -> Result<Value> {
     let db = db::open(&config.state_db())?;
@@ -150,7 +225,7 @@ pub fn progress(config: &Config, id: Option<&str>) -> Result<Value> {
     } else if state == "complete" {
         "归档完成"
     } else if state == "rolled_back" {
-        "已恢复文件"
+        "本轮已移动的文件已恢复"
     } else if state == "recovery_needed" {
         "需要核对恢复"
     } else if phase.contains("ledger") {
@@ -174,6 +249,7 @@ pub fn progress(config: &Config, id: Option<&str>) -> Result<Value> {
             plan,
             state,
             status["error"].as_str().unwrap_or("归档未完成"),
+            &journal_failures(&db, &id)?,
         );
     }
     if state == "cancelled" {

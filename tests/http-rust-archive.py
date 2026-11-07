@@ -610,33 +610,124 @@ def claim_and_fence():
 
 
 def subset_ledger_failure():
-    f = Fixture(2)
+    for skipped in ("target", "source"):
+        f = Fixture(2)
+        try:
+            f.confirm()
+            preview = f.preview()
+            operation_id = str(uuid.uuid4())
+            f.fault("destination_publish_intent:0", milliseconds=700)
+            with sqlite3.connect(f.ledger) as db:
+                db.execute(
+                    "CREATE TRIGGER subset_failure BEFORE UPDATE OF path ON asset BEGIN SELECT RAISE(ABORT,'subset ledger failure'); END"
+                )
+            with concurrent.futures.ThreadPoolExecutor() as pool:
+                future = pool.submit(f.apply, preview, None, operation_id)
+                wait_fault(f)
+                late = (
+                    f.creators / "Momoyih" / f.sources[1].name
+                    if skipped == "target"
+                    else f.sources[1]
+                )
+                late.write_bytes(b"external skipped bytes")
+                result = future.result()
+            assert not result["ok"] and result["rolled_back"], result
+            assert len(f.queue()) == 2 and all(p.exists() for p in f.sources)
+            assert f.sources[0].read_bytes() == BYTES + b"0"
+            assert not (f.creators / "Momoyih" / f.sources[0].name).exists()
+            assert late.read_bytes() == b"external skipped bytes"
+            if skipped == "target":
+                assert f.sources[1].read_bytes() == BYTES + b"1"
+            else:
+                assert not (f.creators / "Momoyih" / f.sources[1].name).exists()
+            failures = {row["vid"]: row for row in result["failures"]}
+            assert len(result["failures"]) == len(failures) == 2, result
+            assert failures[f.ids[1]]["name"] == f.sources[1].name
+            assert (
+                "目标文件已存在" if skipped == "target" else "源文件已变化"
+            ) in failures[f.ids[1]]["message"], result
+            assert "subset ledger failure" not in failures[f.ids[1]]["message"]
+            assert "subset ledger failure" in failures[f.ids[0]]["message"]
+            assert "本轮已执行的变更已回退" in failures[f.ids[0]]["message"]
+            assert all(row["retryable"] for row in result["failures"])
+            assert any(
+                failures[f.ids[1]]["message"] in message for message in result["errors"]
+            )
+            assert any(
+                "subset ledger failure" in message for message in result["errors"]
+            )
+            with sqlite3.connect(f.ledger) as db:
+                assert db.execute("SELECT path FROM asset ORDER BY id").fetchall() == [
+                    (v,) for v in f.ids
+                ]
+            with sqlite3.connect(
+                f.base / "file-operations-rust/operations.sqlite3"
+            ) as db:
+                state, receipt = db.execute(
+                    "SELECT status,result FROM operations WHERE id=?", (operation_id,)
+                ).fetchone()
+                assert state == "rolled_back" and json.loads(receipt) == result
+                steps = db.execute(
+                    "SELECT COUNT(*) FROM steps WHERE operation_id=?", (operation_id,)
+                ).fetchone()[0]
+            progress = f.call(id=operation_id)
+            assert progress["result"] == result
+            assert progress["job"]["stage"] == "本轮已移动的文件已恢复"
+            assert f.apply(preview, op=operation_id) == result
+            f.stop()
+            (f.root / "rust-fault.json").unlink()
+            f.start()
+            assert f.call(id=operation_id)["result"] == result
+            assert f.apply(preview, op=operation_id) == result
+            with sqlite3.connect(
+                f.base / "file-operations-rust/operations.sqlite3"
+            ) as db:
+                assert (
+                    db.execute(
+                        "SELECT COUNT(*) FROM steps WHERE operation_id=?",
+                        (operation_id,),
+                    ).fetchone()[0]
+                    == steps
+                )
+            assert late.read_bytes() == b"external skipped bytes"
+            assert f.sources[0].read_bytes() == BYTES + b"0"
+            print(
+                "PASS aggregate rollback retains skipped and restored-file diagnostics, durable replay:",
+                skipped,
+            )
+        finally:
+            f.stop()
+
+
+def uncertain_archive_failures_are_not_retryable():
+    f = Fixture(1)
     try:
         f.confirm()
         preview = f.preview()
-        f.fault("destination_publish_intent:0", milliseconds=700)
-        with sqlite3.connect(f.ledger) as db:
-            db.execute(
-                "CREATE TRIGGER subset_failure BEFORE UPDATE OF path ON asset BEGIN SELECT RAISE(ABORT,'subset ledger failure'); END"
-            )
+        operation_id = str(uuid.uuid4())
+        f.fault("ledger_commit_intent", milliseconds=700)
         with concurrent.futures.ThreadPoolExecutor() as pool:
-            future = pool.submit(f.apply, preview)
+            future = pool.submit(f.apply, preview, None, operation_id)
             wait_fault(f)
-            late = f.creators / "Momoyih" / f.sources[1].name
-            late.write_bytes(b"late target bytes")
+            with sqlite3.connect(f.ledger) as db:
+                db.execute(
+                    "INSERT INTO asset(location,path) VALUES('late foreign location',?)",
+                    (f.ids[0],),
+                )
             result = future.result()
-        assert not result["ok"] and result["rolled_back"], result
-        assert len(f.queue()) == 2 and all(p.exists() for p in f.sources)
-        assert (
-            not (f.creators / "Momoyih" / f.sources[0].name).exists()
-            and late.read_bytes() == b"late target bytes"
-        )
-        with sqlite3.connect(f.ledger) as db:
-            assert db.execute("SELECT path FROM asset ORDER BY id").fetchall() == [
-                (v,) for v in f.ids
-            ]
+        assert result["recovery_needed"] and not result["rolled_back"], result
+        assert result["failures"] and all(
+            not row["retryable"] for row in result["failures"]
+        ), result
+        assert f.call(id=operation_id)["result"] == result
+        with sqlite3.connect(f.base / "file-operations-rust/operations.sqlite3") as db:
+            state, receipt = db.execute(
+                "SELECT status,result FROM operations WHERE id=?", (operation_id,)
+            ).fetchone()
+            assert state == "recovery_needed" and receipt is None
+        assert (f.base / ".review-write.lock").exists()
         print(
-            "PASS ledger failure compensates only successful subset while preserving late target"
+            "PASS uncertain archive lists unfinished files without making them retryable or caching a terminal receipt"
         )
     finally:
         f.stop()
@@ -780,6 +871,7 @@ if __name__ == "__main__":
     archive_restart()
     claim_and_fence()
     subset_ledger_failure()
+    uncertain_archive_failures_are_not_retryable()
     preview_scope()
     request_boundaries_and_late_rule_write()
     local_constraints_and_missing_ledger()
