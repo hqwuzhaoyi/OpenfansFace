@@ -72,4 +72,47 @@ python3 tests/http-file-operation-backend.py \
 
 Fault injection is enabled only with `FILE_OPERATIONS_FIXTURE_ROOT` resolving to a correctly marked `/tmp/face-admin-person-fileops-*` root containing **all** configured storage paths, with loopback binding. A `rust-fault.json` file supplies `{phase,mode:"exit"|"error"|"pause",milliseconds?}`; production has no enabled hook. The phase names are the journal checkpoint names in `engine.rs`. Exit code 86 is intentional fixture termination.
 
-The sanitized core Peach schema fixture is structural evidence, not full deployment compatibility. It omits application views/FTS, maintenance triggers and other tables. Full isolated Peach deployment, NFS UID/GID/ACL behavior and production cutover remain subsequent acceptance work. Unregistered files, cross-directory moves, identity operations, automatic recovery and other write routes are outside this ticket.
+The sanitized core Peach schema fixture is structural evidence, not full deployment compatibility. It omits application views/FTS, maintenance triggers and other tables. Full isolated Peach deployment and production cutover remain subsequent acceptance work. NFS UID/GID/ACL acceptance is documented below. Unregistered files, cross-directory moves, identity operations, automatic recovery and other write routes are outside this ticket.
+
+## NFS acceptance and deployment identity (Rust 04)
+
+`permissions.rs` uses effective-identity `accessat` through no-follow directory descriptors. It checks readable source content and writable/searchable source and destination parents, or the nearest existing destination ancestor. Both a fresh/cached preview and final pre-admission validation run these checks. A denial returns HTTP 403 with `step` (`source_directory`, `destination_directory`, `source_read`) and the concrete blocking `path`; real storage errors remain 503 rather than being mislabeled permissions or empty directories. Existing serialized errors without `step` remain readable. An admitted failure retains the error step and recovery gate.
+
+Build Linux AMD64 **on a development/build machine**, then transfer the image to the NFS client; do not compile on the resource-limited service host:
+
+```sh
+docker build --platform linux/amd64 -f services/file-operations/Dockerfile \
+  --target acceptance -t face-file-operations:nfs-ticket04 .
+docker save face-file-operations:nfs-ticket04 > /tmp/face-rust-nfs-image.tar
+```
+
+The `runtime` target is the deployable service; it defaults to `USER 1000:1000`. `RUST_IMAGE` and `RUNTIME_IMAGE` build arguments permit a trusted mirror or locally cached compatible Debian image. The `acceptance` target adds only the fixture driver and ACL inspector. Production database directories must remain local, with WAL/SHM siblings and permissions for the chosen service UID. This Dockerfile alone does not authorize production rollout or change export protection.
+
+Provision one new child under `<media-export>/.face-admin-rust-fixtures/<unique-run>` **outside all watched media directories**. Write `.rust-nfs-fixture` containing exactly `rust nfs acceptance\n`. Only that owned child may be granted service UID 1000 access/default ACL; never change the export root, existing datasets, root-squash or existing file owners. Inspect `getfacl -pn` before and after. For example, on the NAS after creating the marked new child, `setfacl -m u:1000:rwx,d:u:1000:rwx,d:m:rwx "$owned_fixture"` grants that isolated directory's service identity. Other inherited ACL entries must remain intact.
+
+After loading the image on the Linux NFS client, run the checked-in wrapper as the host's UID 1000 (requires `sudo -n docker` and local-directory ownership permission):
+
+```sh
+tests/run-rust-nfs.sh /tmp/face-admin-person-fileops-nfs-unique \
+  /mounted/export/.face-admin-rust-fixtures/unique-run 1000:1000 ESTALE
+```
+
+Use a **fresh pair of local/NFS roots per run**. Repeat with `0:0` if matching a current root container whose export maps root to 1000, and with `EIO` / `ETIMEDOUT` to cover I/O and unavailable-mount errors. The wrapper mounts only those fixtures, uses no container network and exposes no port. SQLite stays under the local root; only `media` is NFS. It preserves artifacts for inspection and never recursively cleans a supplied path.
+
+The native `storage-probe` executable tests mkdir/default inheritance, hard link, source unlink, no-replace rollback, synced exclusive copy, rejection of an occupied copy destination, and concrete destination/nearest-ancestor permission errors. The HTTP driver then verifies source permission denial in preview/apply, real registered-video rename with native metadata/Peach receipts, duplicate result lookup, bounded queue overload and responsive status while the writer is paused. No Python operation is used as evidence of a Rust media mutation; Python only seeds/checks fixtures.
+
+The marked fixture checkpoint supports `io_error` with only `EIO`, `ESTALE` or `ETIMEDOUT`. These are deterministic injected kernel-style failures, **not a claim that the shared production mount or network was disconnected**. A blocked kernel call can still outlive an HTTP request: the single worker and 32-slot queue bound admitted execution, status reads run separately, and no timeout is interpreted as cancelled I/O. The filesystem probe's copy/rollback is primitive acceptance; production cross-filesystem moves and crash recovery belong to their own tickets.
+
+### Recorded isolated rehearsal — 2026-11-08
+
+The image `sha256:44055bb5a04f9bdb9981d1f94f92e37f8b1cde00a77bd5f6d2f23bd614ac2e8d` was built locally for Linux AMD64 with Rust 1.95, the public ECR Rust mirror and a cached Debian Bookworm Node image as the runtime-base override. Node was not invoked. It ran on the actual NFS client in three disposable containers with synthetic local ext4 databases and marked NFS media. No production service was restarted and no production media/database was written.
+
+| Container UID:GID | NAS file UID:GID | Injected error | Result |
+| --- | --- | --- | --- |
+| 0:0 (matching existing web service) | 1000:1000 via root-squash | ESTALE | All primitive/HTTP checks passed; failure retained bytes and recovery gate |
+| 1000:1000 (runtime default) | 1000:1000 | EIO | Same |
+| 1000:1000 | 1000:1000 | ETIMEDOUT | Same |
+
+Every run rejected 14 requests beyond the single active worker plus 32 queue slots; status/liveness remained responsive, and duplicate successful requests returned the same receipt. NAS-side `getfacl -pn` confirmed `user:1000:rwx` and `default:user:1000:rwx` on Rust-created directories without a post-creation chmod. The NFS client's `getfacl` showed mode entries only, so client output alone was **not** used to claim ACL inheritance. The observed mount was NFS 4.2 with `root_squash`, anonymous UID/GID 1000, `soft,timeo=50,retrans=2`; these export/mount settings were inspected, not changed.
+
+All pre-existing native HTTP scenarios, `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and the Linux release build passed. This proves the isolated same-directory rename and storage primitives under the actual identity/mount mapping. It does not prove full Peach application compatibility, cross-device move recovery, hard-mounted NFS timeout behavior, or production cutover readiness.

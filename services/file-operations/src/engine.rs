@@ -24,6 +24,14 @@ impl Engine {
             if record.request_hash != hash(&request) {
                 return Err(Error::conflict("同一操作编号不能更换请求"));
             }
+            if record.status == "not_started" {
+                files::PinnedMove::new(
+                    &self.config,
+                    &record.plan.person,
+                    &record.plan.file().src,
+                    &record.plan.file().dst,
+                )?;
+            }
             return Ok(serde_json::to_value(record.plan)?);
         }
         let plan = self.plan(request)?;
@@ -187,7 +195,8 @@ impl Engine {
                     "recovery_required",
                     format!("操作 {} 需要核对恢复，已暂停写入：{}", plan.id, error.error),
                 )
-                .at(error.path.unwrap_or_else(|| plan.file().dst.clone()));
+                .at(error.path.unwrap_or_else(|| plan.file().dst.clone()))
+                .during(error.step.unwrap_or_else(|| "execution".into()));
                 self.store.fail(&plan.id, &failure, true)?;
                 Err(failure)
             }

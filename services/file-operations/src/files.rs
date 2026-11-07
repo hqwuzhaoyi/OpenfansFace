@@ -3,7 +3,7 @@ use crate::{
     config::Config,
     model::{Error, Result, hash},
 };
-use rustix::fs::{Access, AtFlags, Mode, OFlags, accessat, linkat, open, openat, unlinkat};
+use rustix::fs::{AtFlags, Mode, OFlags, linkat, open, openat, unlinkat};
 use serde_json::json;
 use std::{
     fs::{self, File, OpenOptions},
@@ -104,23 +104,17 @@ impl PinnedMove {
                 Error::new(400, "invalid_request", "文件路径超出人物目录或包含无效路径").at(src),
             );
         }
+        crate::permissions::require_move_permissions(src_path, dst_path)?;
         let parent: File = directory(src_path.parent().unwrap())
-            .map_err(|e| e.at(src))?
+            .map_err(|e| e.at(src).during("source_directory"))?
             .into();
-        accessat(
-            &parent,
-            ".",
-            Access::WRITE_OK | Access::EXEC_OK,
-            AtFlags::EACCESS,
-        )
-        .map_err(|e| Error::from(e).at(src))?;
         let source: File = openat(
             &parent,
             src_path.file_name().unwrap(),
             OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         )
-        .map_err(|e| Error::from(e).at(src))?
+        .map_err(|e| Error::from(e).at(src).during("source_read"))?
         .into();
         if !source.metadata()?.is_file() {
             return Err(Error::new(409, "source_changed", "只允许操作普通视频文件").at(src));
@@ -180,7 +174,7 @@ impl PinnedMove {
             Path::new(&self.dst).file_name().unwrap(),
             AtFlags::empty(),
         )
-        .map_err(|e| Error::from(e).at(&self.dst))?;
+        .map_err(|e| Error::from(e).at(&self.dst).during("destination_publish"))?;
         self.parent.sync_all()?;
         self.verify_destination(expected)
     }
@@ -207,7 +201,7 @@ impl PinnedMove {
             Path::new(&self.src).file_name().unwrap(),
             AtFlags::empty(),
         )
-        .map_err(|e| Error::from(e).at(&self.src))?;
+        .map_err(|e| Error::from(e).at(&self.src).during("source_remove"))?;
         self.parent.sync_all()?;
         Ok(())
     }
