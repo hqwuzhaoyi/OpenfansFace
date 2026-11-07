@@ -38,7 +38,7 @@ The calibrator requires `FILE_OPERATIONS_RUST_URL` and the matching token. Deplo
 | --- | --- |
 | `lib/person-accounts.ts`, `/api/persons/accounts` | Native account-link/unlink; read/search/cache remains in Next |
 | `/api/persons/recommendations` | Native reject/undo, same source fingerprint and matching undo ID |
-| `/api/watermarks` PUT | Native mapping save/remove; after success, existing independent task scheduler may request re-analysis; scheduling failure returns a warning without losing the saved rule |
+| `/api/watermarks` PUT | Native mapping save/remove plus selected-task CAS requeue/attempt fencing across active stages; evidence is retained, normal VM discovery/claim/retry remains independent |
 | `lib/people-catalog.ts:rememberPerson` | Queue/claim native operations already remember people in their transaction; typed person-remember covers other explicit callers. Old direct helper fails closed under Rust |
 | `/api/plan/queue`, `/api/claims/decide` | #5 native queue/decision/people transaction; optional rule and task restoration have separate bound receipts |
 | `/api/plan/resolve`, `/api/plan/apply`, `/api/plan/progress` | #4/#5 native archive state, file/ledger execution and receipts |
@@ -50,7 +50,7 @@ The calibrator requires `FILE_OPERATIONS_RUST_URL` and the matching token. Deplo
 | `lib/creator-directory.ts` | Public directory fetch and cache only; not a manual association or ledger writer; deliberately unchanged |
 | `maintenance/processing_store.py`, processing worker, `/api/processing` | Independent analysis queue/progress remains owned by the operations/#19 thread. Exact affected native task rows use transaction CAS; unrelated task progress is not blocked. No wholesale queue rewrite in #13 |
 | `maintenance/processing_faces.py` | Model NPZ/reference caches are analysis cache, not business JSON or Peach writes |
-| Legacy watermark worker job/results/progress | Separate analysis evidence, stable video/file fingerprints; does not write mappings/manual links/claims. Existing automatic-processing gate disables obsolete scan admission when its DB is present |
+| Legacy watermark worker job/results/progress | #19 native processing-result now publishes authoritative results.json for admitted automated attempts. Retire/gate the old standalone results writer before cutover; imported OCR computation writes only attempt-local artifacts. Existing automatic-processing gate already disables obsolete scan admission when its DB is present |
 | `maintenance/video_health.py`, `/api/video-health/report` | #17 owns migration to native health scheduling/publication, with file fingerprint checks; mandatory final cutover gate |
 | `/api/delete`, legacy `/api/plan/rollback` | Retired/gated by preceding migration tickets; no direct rename/Python ledger parity fallback |
 
@@ -65,3 +65,5 @@ The calibrator requires `FILE_OPERATIONS_RUST_URL` and the matching token. Deplo
 - `python3 tests/http-rust-person-rename.py`: existing native rename/metadata/index/Peach, affected-candidate, fault/restart and guarded-foreign-edit scenarios passed.
 - `node --experimental-strip-types --test tests/person-accounts.test.mjs`: three manual/inferred/corrupt-record tests passed.
 - Python calibrator/runner/script compilation passed. No model accuracy claim, production mutation, deployment, or new UI behavior is included.
+
+Native per-attempt publication, commit-only recovery, feature integrity and current worker boundaries are documented in [Analysis result publication](processing-result-publication.md).

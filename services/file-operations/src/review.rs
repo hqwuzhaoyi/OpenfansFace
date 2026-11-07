@@ -116,6 +116,23 @@ pub fn creator_with_aliases(value: &Value, aliases: &Value) -> Result<String> {
     Ok(name)
 }
 pub fn sources(config: &Config) -> Result<BTreeMap<String, String>> {
+    let mut out = indexed_sources(config)?;
+    let path = config.base.join("processing/processing.db");
+    if path.exists() {
+        for row in db::rows(
+            &db::open(&path)?,
+            "SELECT vid,path FROM tasks ORDER BY vid",
+            [],
+        )? {
+            if let (Some(id), Some(path)) = (row["vid"].as_str(), row["path"].as_str()) {
+                out.entry(id.into()).or_insert_with(|| path.into());
+            }
+        }
+    }
+    Ok(out)
+}
+/// Index/explicit overrides outrank analysis discovery; whole-report inputs exclude task-only paths.
+pub fn indexed_sources(config: &Config) -> Result<BTreeMap<String, String>> {
     let mut out = BTreeMap::new();
     for row in db::rows(
         &db::open(&config.base.join("faces.db"))?,
@@ -790,40 +807,65 @@ fn prepare_rule(config: &Config, body: &Value) -> Result<Prepared> {
         optional_rule: None,
         optional_restore: None,
     };
-    let jobs_path = config.base.join("processing/processing.db");
-    if jobs_path.exists() {
-        for task in db::rows(
-            &db::open(&jobs_path)?,
-            "SELECT * FROM tasks ORDER BY vid",
-            [],
-        )? {
-            if task["stage"] != "review" || number(&task["manual"]).unwrap_or(0) != 0 {
-                continue;
-            }
-            let data = task_data(&task)?;
-            if !data["watermark"]["candidates"]
-                .as_array()
-                .is_some_and(|rows| rows.iter().any(|r| r["key"] == key))
-            {
-                continue;
-            }
-            let mut next = task.clone();
-            next["stage"] = json!("queued");
+    (out.jobs, out.job_updates) = rule_task_updates(config, key, at)?;
+    Ok(out)
+}
+
+/// Rule edits invalidate interpretation even between text completion and the next face claim.
+/// Preserve visible evidence/manual fields; only the affected analysis attempts are fenced.
+pub fn rule_task_updates(config: &Config, key: &str, at: &str) -> Result<(Vec<Value>, Vec<Value>)> {
+    let path = config.base.join("processing/processing.db");
+    let mut before = vec![];
+    let mut after = vec![];
+    if !path.exists() {
+        return Ok((before, after));
+    }
+    for task in db::rows(&db::open(&path)?, "SELECT * FROM tasks ORDER BY vid", [])? {
+        if number(&task["manual"]).unwrap_or(0) != 0
+            || !matches!(
+                task["stage"].as_str(),
+                Some("queued" | "text" | "face" | "face_queued" | "review" | "retry" | "error")
+            )
+        {
+            continue;
+        }
+        let data = task_data(&task)?;
+        if !data["watermark"]["candidates"]
+            .as_array()
+            .is_some_and(|rows| rows.iter().any(|r| r["key"] == key))
+        {
+            continue;
+        }
+        let mut next = task.clone();
+        next["stage"] = json!("queued");
+        if task.get("retry_stage").is_some() {
             next["retry_stage"] = json!("text");
-            for field in ["text_attempts", "face_attempts", "next_retry"] {
+        }
+        for field in [
+            "text_attempts",
+            "face_attempts",
+            "next_retry",
+            "lease_expires_at",
+        ] {
+            if task.get(field).is_some() {
                 next[field] = if task[field].is_number() {
                     json!(0.0)
                 } else {
                     integer(0)
-                }
+                };
             }
-            next["priority"] = integer(number(&task["priority"]).unwrap_or(0).max(1));
-            next["updated_at"] = json!(timestamp(at)?);
-            out.jobs.push(task);
-            out.job_updates.push(next);
         }
+        if task.get("run_id").is_some() {
+            next["run_id"] = json!("");
+        }
+        if task.get("priority").is_some() {
+            next["priority"] = integer(number(&task["priority"]).unwrap_or(0).max(1));
+        }
+        next["updated_at"] = json!(timestamp(at)?);
+        before.push(task);
+        after.push(next);
     }
-    Ok(out)
+    Ok((before, after))
 }
 
 fn prepare_restore(config: &Config, body: &Value) -> Result<Prepared> {
