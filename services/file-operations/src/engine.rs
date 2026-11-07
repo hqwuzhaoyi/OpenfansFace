@@ -20,9 +20,11 @@ impl Engine {
         let store = Store::start(&config)?;
         let mut engine = Self { config, store };
         engine.recover_startup()?;
+        crate::person_batch::recover(&mut engine)?;
         Ok(engine)
     }
     pub fn preview(&mut self, request: Request) -> Result<Value> {
+        crate::person_batch::reject_child(&self.store, &request.id)?;
         validate(&request)?;
         files::claim_owner_for(&self.config, &request.id, &request.action)?;
         if self.store.fenced(&request.id)? {
@@ -137,6 +139,7 @@ impl Engine {
         Ok(plan)
     }
     pub fn apply(&mut self, request: Request, version: String) -> Result<Value> {
+        crate::person_batch::reject_child(&self.store, &request.id)?;
         validate(&request)?;
         files::claim_owner_for(&self.config, &request.id, &request.action)?;
         if self.store.fenced(&request.id)? {
@@ -175,16 +178,26 @@ impl Engine {
         }
         // Busy is retryable and MUST NOT consume the untouched preview.
         let gate = WriteGate::acquire(&self.config, &request.id)?;
+        self.apply_under_gate(record.plan, version, gate)
+    }
+    /// The batch coordinator owns this exact child gate, never a parent gate.
+    pub(crate) fn apply_under_gate(
+        &mut self,
+        stored: Plan,
+        version: String,
+        gate: WriteGate,
+    ) -> Result<Value> {
+        let request = stored.request.clone();
         self.store.remember_gate(&request.id, &gate.evidence()?)?;
         crate::fault::checkpoint(&self.config, "gate_acquired")?;
-        if crate::staging_delete::action(&record.plan.action) {
-            return crate::staging_delete::apply(self, &record.plan, gate);
+        if crate::staging_delete::action(&stored.action) {
+            return crate::staging_delete::apply(self, &stored, gate);
         }
         let prepared = (|| {
-            let current = if record.plan.execution.is_some() {
-                validate_plan(&self.config, &record.plan)?;
-                native::revalidate(&self.config, &record.plan)?;
-                record.plan.clone()
+            let current = if stored.execution.is_some() {
+                validate_plan(&self.config, &stored)?;
+                native::revalidate(&self.config, &stored)?;
+                stored.clone()
             } else {
                 self.plan(request.clone())?
             };
@@ -291,6 +304,7 @@ impl Engine {
         request: Request,
         version: Option<String>,
     ) -> Result<Value> {
+        crate::person_batch::reject_child(&self.store, &request.id)?;
         validate(&request)?;
         files::claim_owner_for(&self.config, &request.id, &request.action)?;
         if let Some(record) = self.store.get(&request.id)? {
@@ -340,7 +354,7 @@ impl Engine {
         }
         Ok(())
     }
-    fn recover_one(&mut self, id: &str) {
+    pub(crate) fn recover_one(&mut self, id: &str) {
         let outcome = (|| -> Result<()> {
             let record = self
                 .store

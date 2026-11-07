@@ -50,14 +50,93 @@ fn table(
         after,
     })
 }
-fn unique(rows: Vec<Value>, keys: &[String]) -> Vec<Value> {
-    let mut out = vec![];
-    for row in rows {
-        if !out.iter().any(|old| key(old, keys) == key(&row, keys)) {
-            out.push(row)
+/// Match all actual unique constraints, not only the row primary key. Some
+/// supported ledgers use an integer id plus UNIQUE(asset_id,entity_id,role).
+fn unique_constraints(conn: &Connection, name: &str) -> Result<Vec<Vec<(String, String)>>> {
+    let mut constraints = vec![
+        primary(conn, name)?
+            .into_iter()
+            .map(|k| (k, "BINARY".into()))
+            .collect(),
+    ];
+    for index in db::rows(conn, &format!("PRAGMA index_list({})", quote(name)), [])? {
+        if db::integer(&index["unique"])? == 0 {
+            continue;
+        }
+        if db::integer(&index["partial"])? != 0 {
+            return Err(Error::conflict("Peach 关联表存在需核对的条件唯一索引").at(name));
+        }
+        let mut keys = vec![];
+        for column in db::rows(
+            conn,
+            &format!(
+                "PRAGMA index_xinfo({})",
+                quote(index["name"].as_str().unwrap())
+            ),
+            [],
+        )? {
+            if db::integer(&column["key"])? == 0 {
+                continue;
+            }
+            let field = column["name"]
+                .as_str()
+                .ok_or_else(|| Error::conflict("Peach 关联表存在需核对的表达式唯一索引"))?;
+            keys.push((
+                field.into(),
+                column["coll"].as_str().unwrap_or("BINARY").into(),
+            ));
+        }
+        constraints.push(keys);
+    }
+    Ok(constraints)
+}
+fn collides(
+    conn: &Connection,
+    old: &Value,
+    row: &Value,
+    constraints: &[Vec<(String, String)>],
+) -> Result<bool> {
+    for keys in constraints {
+        // SQLite unique indexes permit multiple NULLs (including newly allocated IDs).
+        if keys
+            .iter()
+            .any(|(k, _)| old[k].is_null() || row[k].is_null())
+        {
+            continue;
+        }
+        let sql = format!(
+            "SELECT {}",
+            keys.iter()
+                .map(|(_, coll)| format!("(? COLLATE {}) = ?", quote(coll)))
+                .collect::<Vec<_>>()
+                .join(" AND ")
+        );
+        let values = keys
+            .iter()
+            .flat_map(|(k, _)| [&old[k], &row[k]])
+            .map(db::sql_value)
+            .collect::<Result<Vec<_>>>()?;
+        if conn.query_row(&sql, rusqlite::params_from_iter(values), |r| {
+            r.get::<_, bool>(0)
+        })? {
+            return Ok(true);
         }
     }
-    out
+    Ok(false)
+}
+fn push_unique(
+    conn: &Connection,
+    rows: &mut Vec<Value>,
+    row: Value,
+    constraints: &[Vec<(String, String)>],
+) -> Result<()> {
+    for old in rows.iter() {
+        if collides(conn, old, &row, constraints)? {
+            return Ok(());
+        }
+    }
+    rows.push(row);
+    Ok(())
 }
 fn creator(conn: &Connection, name: &str) -> Result<Vec<Value>> {
     let rows = db::rows(
@@ -261,8 +340,8 @@ pub fn snapshot(config: &Config, plan: &Plan) -> Result<ledger::Delta> {
         }
     }
     let links = by_asset.values().flatten().cloned().collect::<Vec<_>>();
-    let link_keys = primary(&tx, "asset_entity")?;
-    // Existing target rows win exact primary-key collisions; all other roles and sources transfer.
+    let link_keys = unique_constraints(&tx, "asset_entity")?;
+    // Existing target rows win collisions on any actual unique key; other roles/sources transfer.
     let mut after_links = links
         .iter()
         .filter(|r| Some(&r["entity_id"]) != source_id.as_ref())
@@ -273,12 +352,7 @@ pub fn snapshot(config: &Config, plan: &Plan) -> Result<ledger::Delta> {
         let mut row = source.clone();
         row["entity_id"] = target_id.clone().unwrap_or(Value::Null);
         if target_id.is_some() {
-            if !after_links
-                .iter()
-                .any(|old| key(old, &link_keys) == key(&row, &link_keys))
-            {
-                after_links.push(row)
-            }
+            push_unique(&tx, &mut after_links, row, &link_keys)?;
         } else {
             pending.push(row)
         }
@@ -322,20 +396,18 @@ pub fn snapshot(config: &Config, plan: &Plan) -> Result<ledger::Delta> {
         .chain(&target_aliases)
         .cloned()
         .collect::<Vec<_>>();
-    let alias_keys = primary(&tx, "entity_alias")?;
+    let alias_keys = unique_constraints(&tx, "entity_alias")?;
     let mut after_aliases = target_aliases.clone();
     let mut pending_aliases = vec![];
     for alias in &source_aliases {
         let mut row = alias.clone();
         row["entity_id"] = target_id.clone().unwrap_or(Value::Null);
         if target_id.is_some() {
-            after_aliases.push(row)
+            push_unique(&tx, &mut after_aliases, row, &alias_keys)?;
         } else {
             pending_aliases.push(row)
         }
     }
-    after_aliases = unique(after_aliases, &alias_keys);
-    pending_aliases = unique(pending_aliases, &alias_keys);
     let mut metadata = target
         .first()
         .map(person_metadata)
