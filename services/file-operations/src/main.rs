@@ -19,6 +19,7 @@ mod person_batch;
 mod person_delete;
 mod person_directory;
 mod person_ledger;
+mod person_library;
 mod person_merge;
 mod person_merge_ledger;
 mod person_merge_metadata;
@@ -310,6 +311,11 @@ async fn serve() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .route("/v1/person-batch", get(batch_status).post(batch_post))
         .route("/v1/archive", get(archive_status).post(archive_post))
         .route("/v1/staging", get(staging_list))
+        .route("/v1/person-library", get(library_list))
+        .route(
+            "/v1/person-library/observations",
+            axum::routing::post(library_observations),
+        )
         .route("/v1/video-health", get(health_summary).post(health_report))
         .route("/v1/metadata", axum::routing::post(metadata_post))
         .layer(DefaultBodyLimit::max(8 * 1024 * 1024))
@@ -514,4 +520,81 @@ async fn health_report(
     Ok(Json(wait.await.map_err(|_| {
         Error::new(503, "outcome_unknown", "报告回执未知，请查询原操作编号")
     })??))
+}
+
+async fn library_list(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<Value>> {
+    authorize(&app.config, &headers)?;
+    if let Some(name) = query.get("name") {
+        files::validate_name(name)?;
+    }
+    let permit = app
+        .media_reads
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| Error::new(503, "reader_busy", "媒体目录读取繁忙，请稍后重试"))?;
+    Ok(Json(
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            media_listing_checkpoint(
+                &app.config,
+                query
+                    .get("offset")
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(0),
+            )?;
+            person_library::list(
+                &app.config,
+                query.get("name").map(String::as_str),
+                query.get("stats").is_some_and(|s| s == "1"),
+            )
+        })
+        .await
+        .map_err(|_| Error::new(503, "unavailable", "人物目录读取失败"))??,
+    ))
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LibraryObservationQuery {
+    vids: Vec<String>,
+}
+async fn library_observations(
+    State(app): State<App>,
+    headers: HeaderMap,
+    payload: std::result::Result<
+        Json<LibraryObservationQuery>,
+        axum::extract::rejection::JsonRejection,
+    >,
+) -> Result<Json<Value>> {
+    authorize(&app.config, &headers)?;
+    let Json(query) = payload.map_err(|_| Error::new(400, "invalid_request", "视频清单无效"))?;
+    if query.vids.len() > 512
+        || query
+            .vids
+            .iter()
+            .any(|id| id.is_empty() || id.len() > 8192 || id.chars().any(char::is_control))
+    {
+        return Err(Error::new(
+            400,
+            "invalid_request",
+            "单次最多读取 512 个有效视频编号",
+        ));
+    }
+    let permit = app
+        .media_reads
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| Error::new(503, "reader_busy", "媒体目录读取繁忙，请稍后重试"))?;
+    Ok(Json(
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            crate::video_health::library_observations(&app.config, &query.vids)
+        })
+        .await
+        .map_err(|_| Error::new(503, "unavailable", "视频依据读取失败"))??,
+    ))
 }

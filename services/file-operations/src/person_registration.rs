@@ -78,8 +78,8 @@ impl SourceIndex {
                 .as_str()
                 .or_else(|| historical.get(id).copied())
                 .unwrap_or(path);
-            let candidates: Vec<_> = [effective, id]
-                .into_iter()
+            let candidates: Vec<_> = std::iter::once(effective)
+                .chain(overrides[id].is_null().then_some(id))
                 .filter_map(|p| disk(config, p))
                 .collect();
             if !candidates.iter().any(|p| selected.contains(p.as_str())) {

@@ -76,7 +76,7 @@ pub fn fingerprint(path: &str, stat: &fs::Metadata) -> String {
 pub fn identity(stat: &fs::Metadata) -> serde_json::Value {
     json!({"dev":stat.dev().to_string(),"ino":stat.ino().to_string(),"size":stat.len().to_string(),"mtime_ns":mtime_ns(stat)})
 }
-fn directory(path: &Path) -> Result<OwnedFd> {
+pub(crate) fn directory(path: &Path) -> Result<OwnedFd> {
     // Walk from /, including configured roots: no intermediary symlink may redirect a mutation.
     let mut fd = open(
         "/",
