@@ -16,6 +16,8 @@ pub struct Error {
     pub status: u16,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<String>,
 }
 impl Error {
     pub fn new(status: u16, code: &str, message: impl Into<String>) -> Self {
@@ -24,10 +26,15 @@ impl Error {
             code: code.into(),
             error: message.into(),
             path: None,
+            step: None,
         }
     }
     pub fn at(mut self, path: impl Into<String>) -> Self {
         self.path = Some(path.into());
+        self
+    }
+    pub fn during(mut self, step: impl Into<String>) -> Self {
+        self.step = Some(step.into());
         self
     }
     pub fn conflict(message: impl Into<String>) -> Self {

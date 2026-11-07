@@ -6,6 +6,7 @@ mod files;
 mod ledger;
 mod metadata;
 mod model;
+mod permissions;
 mod store;
 
 use crate::{
