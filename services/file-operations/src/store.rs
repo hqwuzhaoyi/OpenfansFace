@@ -26,7 +26,7 @@ impl Store {
         crate::control::verify_path(&ownership, &path)?;
         let conn = Connection::open(config.state_db())?;
         let schema: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if schema > 5 {
+        if schema > 7 {
             return Err(Error::new(
                 503,
                 "schema_version",
@@ -47,7 +47,11 @@ impl Store {
             operation_id TEXT NOT NULL REFERENCES operations(id), revision INTEGER NOT NULL,
             phase TEXT NOT NULL, evidence TEXT NOT NULL, at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY(operation_id,revision)
-          ); PRAGMA user_version=5;")?;
+          );
+          CREATE TABLE IF NOT EXISTS review_sessions(id TEXT PRIMARY KEY, expires INTEGER NOT NULL, snapshot TEXT NOT NULL);
+          CREATE TABLE IF NOT EXISTS review_deliveries(token TEXT PRIMARY KEY, session TEXT NOT NULL, vid TEXT NOT NULL, evidence TEXT NOT NULL, FOREIGN KEY(session) REFERENCES review_sessions(id) ON DELETE CASCADE);
+          CREATE INDEX IF NOT EXISTS review_delivery_session ON review_deliveries(session,vid);
+          PRAGMA user_version=7;")?;
         let stat = identity(&ownership.metadata()?);
         let identity = serde_json::to_string(&json!({"dev":stat["dev"],"ino":stat["ino"]}))?;
         conn.execute("INSERT OR IGNORE INTO authority VALUES(1,?)", [&identity])?;
