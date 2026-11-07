@@ -1,8 +1,9 @@
 """Automatic media discovery, text evidence, conditional face analysis and review readiness."""
 import argparse
+from concurrent.futures import ThreadPoolExecutor
+import signal
 import datetime as dt
 import fcntl
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -14,11 +15,12 @@ import threading
 import time
 import urllib.request
 from task_progress import TaskProgress, stage_progress
-import uuid
 
-from processing_store import connect, setting, set_setting, event, reconcile, claim, finish, fail, recover
+from processing_store import connect, setting, set_setting, event, reconcile, claim, fail, recover, release_task, effective_concurrency
+from processing_publication import prepare, publish_result, recover_publications, attempt_directory, PublicationError, native
+from processing_gpu import inference_status
 from processing_logic import folder_hints, candidates_from_text, can_skip_face, resolve_candidates
-from processing_faces import mapped, build_references, analyze, canonical_person, FACE_VERSION
+from processing_faces import mapped, build_references, analyze, canonical_person, FACE_VERSION, capture_references
 from watermark_worker import PIPELINE, PaddleEngine, read_json, publish, scan_video, same_file, validate_source, now
 
 
@@ -87,11 +89,10 @@ def discover(base, root, api_url, assets=None):
             with urllib.request.urlopen(api_url.rstrip('/') + '/api/processing/inventory', timeout=45) as response:
                 assets = json.load(response)['assets']
         progress.update(stage='登记新文件', done=0, total=len(assets), unit='条记录')
-        faces = sqlite3.connect(base / 'faces.db', timeout=15)
+        faces = sqlite3.connect('file:' + str(base / 'faces.db') + '?mode=ro', uri=True, timeout=15)
         try:
             sources = dict(faces.execute('SELECT vid,path FROM videos'))
             seen_paths = {mapped(p, root) or mapped(vid, root) for vid, p in sources.items()}
-            columns = {row[1] for row in faces.execute('PRAGMA table_info(videos)')}
             registered = 0
             for asset_index, asset in enumerate(assets):
                 if asset_index % 100 == 0:
@@ -104,13 +105,8 @@ def discover(base, root, api_url, assets=None):
                 item = source_item(asset['path'], path, root)
                 if not item:
                     continue
-                record = dict(vid=asset['path'], path=path, name=item['name'], size=item['size'], duration=asset.get('duration'),
-                              zone='discovered', collection=str(Path(path).parent), status='pipeline')
-                keys = [key for key in record if key in columns]
-                cursor = faces.execute(f"INSERT INTO videos({','.join(keys)}) VALUES ({','.join('?' for _ in keys)}) ON CONFLICT(vid) DO NOTHING", [record[key] for key in keys])
-                sources[record['vid']] = path; seen_paths.add(path); registered += cursor.rowcount
-            faces.commit()
-            sources = dict(faces.execute('SELECT vid,path FROM videos'))
+                # Discovery owns only the analysis queue. Native business writers own videos.
+                sources[asset['path']] = path; seen_paths.add(path); registered += 1
         finally:
             faces.close()
         resolved, resolved_paths = handled(base, root, sources)
@@ -167,21 +163,30 @@ def discover(base, root, api_url, assets=None):
         con.close()
 
 
+def max_concurrency():
+    try:
+        return max(1, min(2, int(os.environ.get('PROCESSING_MAX_CONCURRENCY', '1'))))
+    except ValueError:
+        return 1
+
+
+def was_handled(base, vid):
+    return any(r['vid'] == vid for r in read_json(base / 'integration-queue.json', []) + read_json(base / 'archive-history.json', []))
+
+
 def text_stage(task, base, root):
     progress = stage_progress(task, base)
     progress.update(stage="检查文字缓存")
     validate_source(task, root)
-    directory = base / 'watermarks'; directory.mkdir(exist_ok=True)
-    records = read_json(directory / 'results.json', {})
+    directory = attempt_directory(base, task) / 'watermarks'; directory.mkdir(exist_ok=True)
+    records = read_json(base / 'watermarks/results.json', {})
     existing = records.get(task['vid'], {})
     if existing.get('status') == 'done' and existing.get('pipeline') == PIPELINE and same_file(existing, task):
         return existing
     progress.update(stage='加载文字模型', done=None, total=None)
-    result = scan_video(task, root, directory, PaddleEngine(), 'automatic-' + hashlib.sha256((task['vid'] + task['mtime_ns']).encode()).hexdigest()[:16], progress=progress)
+    result = scan_video(task, root, directory, PaddleEngine(), task['run_id'], progress=progress)
     record = {key: task[key] for key in ('vid', 'path', 'size', 'mtime_ns')}
-    record.update(result, status='done', pipeline=PIPELINE, job_id=task['batch_id'], checked_at=now())
-    records[task['vid']] = record
-    publish(directory / 'results.json', records)
+    record.update(result, status='done', pipeline=PIPELINE, job_id=task['batch_id'], checked_at=now(), artifact_attempt=task['run_id'], execution={'backend': 'cpu', 'stage': 'ocr', 'pipeline': PIPELINE})
     return record
 
 
@@ -192,31 +197,43 @@ def stage_subprocess(task, base, root):
         manifest.write_text(json.dumps(task, ensure_ascii=False))
         command = [sys.executable, str(Path(__file__).resolve()), '--base', str(base), '--root', str(root),
                    '--stage', task['stage'], '--task', str(manifest), '--result', str(result)]
-        process = subprocess.run(command, capture_output=True, text=True, timeout=600)
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+        try:
+            stdout, stderr = process.communicate(timeout=600)
+        except BaseException:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.communicate()
+            raise
         if process.returncode or not result.exists():
-            raise RuntimeError(('文字提取失败：' if task['stage'] == 'text' else '人脸分析失败：') + (process.stderr or process.stdout)[-450:])
+            raise RuntimeError(('文字提取失败：' if task['stage'] == 'text' else '人脸分析失败：') + (stderr or stdout)[-450:])
         return json.loads(result.read_text())
 
 
-def process_one(base, root, runner=stage_subprocess):
+def process_one(base, root, runner=stage_subprocess, capacity=1, publisher=publish_result, preparer=prepare, reference_loader=capture_references):
     con = connect(base)
     try:
         if not media_available(con, root):
             return False
-        task = claim(con)
+        task = claim(con, capacity=capacity)
         if not task:
             return False
-        task["_progress_id"] = str(uuid.uuid4())
-        progress = stage_progress(task, base, attach=False)
+        task["_progress_id"] = task["run_id"]
+        progress = None
         try:
-            resolved = {r['vid'] for r in read_json(base / 'integration-queue.json', []) + read_json(base / 'archive-history.json', [])}
-            if task['vid'] in resolved:
-                with con:
-                    con.execute("UPDATE tasks SET stage='excluded',updated_at=? WHERE vid=?", (time.time(), task['vid']))
+            progress = stage_progress(task, base, attach=False)
+            if was_handled(base, task['vid']):
+                release_task(con, task, '已由人工处理', excluded=True)
                 progress.finish()
                 return True
             validate_source(task, root)
             data = json.loads(task['data'])
+            people = catalog(base)
+            mapping = read_json(base / 'watermarks/mappings.json', {})
+            keys = set(mapping) | {c['key'] for c in data.get('watermark', {}).get('candidates', [])}
+            preparer(task, base, people, keys)
+            if task['stage'] == 'face':
+                reference_loader(task, base, root)
             if task['stage'] == 'text':
                 watermark = runner(task, base, root)
                 folder = folder_hints(task['path'], catalog(base))
@@ -224,6 +241,7 @@ def process_one(base, root, runner=stage_subprocess):
                 text_candidates = candidates_from_text(watermark, mapping, folder)
                 legacy = [p['name'] for p in read_json(base / 'report.json', {}).get('identities', []) if any(v['vid'] == task['vid'] for v in p.get('vids', []))]
                 skip = can_skip_face(text_candidates, legacy)
+                data.pop('face', None); data.pop('face_complete', None)
                 data.update(watermark=watermark, folder=folder, text_candidates=text_candidates, text_complete=True,
                             face_skipped=skip, ready=skip, **resolve_candidates(text_candidates))
                 next_stage = 'review' if skip else 'face_queued'
@@ -231,20 +249,30 @@ def process_one(base, root, runner=stage_subprocess):
                 face = runner(task, base, root)
                 data.update(face=face, face_complete=True, ready=True, **resolve_candidates(data.get('text_candidates', []) + face['matches']))
                 next_stage = 'review'
+            if was_handled(base, task['vid']):
+                release_task(con, task, '分析期间已由人工处理', excluded=True)
+                progress.finish()
+                return True
             validate_source(task, root)
-            finish(con, task, data, next_stage)
+            publisher(task, base, data, next_stage)
             progress.finish()
         except Exception as error:
-            if media_available(con, root):
+            if isinstance(error, PublicationError) and error.uncertain:
+                # Keep active attempt fenced until exact receipt replay resolves it.
+                with con:
+                    event(con, task['vid'], 'publication_unknown', str(error))
+            elif isinstance(error, PublicationError) and error.status >= 500 and not error.operation_id:
+                release_task(con, task, '原生协调器不可用，等待恢复')
+                with con:
+                    con.execute("UPDATE tasks SET next_retry=? WHERE vid=? AND run_id=? AND stage='retry' AND manual=0", (time.time() + 30, task['vid'], task['run_id']))
+            elif was_handled(base, task['vid']):
+                release_task(con, task, '分析期间已由人工处理', excluded=True)
+            elif media_available(con, root):
                 fail(con, task, error)
             else:
-                field = 'text_attempts' if task['stage'] == 'text' else 'face_attempts'
-                with con:
-                    con.execute(f"""UPDATE tasks SET stage='retry',next_retry=0,{field}=MAX(0,{field}-1),
-                        error='媒体挂载不可读，等待恢复',updated_at=?
-                        WHERE vid=? AND stage=? AND size=? AND mtime_ns=?""",
-                        (time.time(), task['vid'], task['stage'], task['size'], task['mtime_ns']))
-            progress.finish(error)
+                release_task(con, task, '媒体挂载不可读，等待恢复')
+            if progress:
+                progress.finish(error)
         return True
     finally:
         con.close()
@@ -264,17 +292,28 @@ def main():
         result = text_stage(task, base, root) if args.stage == 'text' else analyze(task, base, root)
         publish(args.result, result)
         return
+    if not os.environ.get('FILE_OPERATIONS_RUST_URL'):
+        raise SystemExit('原生结果协调器未配置，尚未领取任务')
+    native('state', {'scope': {}})
     folder = base / 'processing'; folder.mkdir(exist_ok=True)
     with (folder / '.worker.lock').open('w') as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise SystemExit('Processing coordinator already running')
+        recover_publications(base)
         con = connect(base); recover(con); con.close()
         stop = threading.Event()
         def heartbeats():
             while not stop.is_set():
-                publish(folder / 'heartbeat.json', dict(at=time.time(), pid=os.getpid(), text_pipeline=PIPELINE))
+                state = connect(base)
+                try:
+                    desired = effective_concurrency(state, max_concurrency())
+                    active = state.execute("SELECT COUNT(*) FROM tasks WHERE stage IN ('text','face')").fetchone()[0]
+                    publish(folder / 'heartbeat.json', dict(at=time.time(), pid=os.getpid(), text_pipeline=PIPELINE,
+                            protocol=3, max_concurrency=max_concurrency(), concurrency=desired, active=active, inference=inference_status()))
+                finally:
+                    state.close()
                 stop.wait(10)
         def discovery():
             due = 0
@@ -296,13 +335,36 @@ def main():
             stop.set(); heartbeat.join(timeout=12)
             return
         discover_thread = threading.Thread(target=discovery, daemon=True); discover_thread.start()
+        signal.signal(signal.SIGTERM, lambda *_: stop.set())
+        signal.signal(signal.SIGINT, lambda *_: stop.set())
         try:
-            while True:
-                if not process_one(base, root):
-                    time.sleep(2)
+            with ThreadPoolExecutor(max_workers=max_concurrency(), thread_name_prefix='processing') as executor:
+                inflight = set()
+                while not stop.is_set():
+                    for future in list(inflight):
+                        if future.done():
+                            inflight.remove(future)
+                            try:
+                                future.result()
+                            except Exception as error:
+                                print('Coordinator stage:', str(error), flush=True)
+                    state = connect(base)
+                    try:
+                        if not inflight and state.execute("SELECT COUNT(*) FROM tasks WHERE stage IN ('text','face')").fetchone()[0]:
+                            recover_publications(base)
+                            recover(state)
+                        desired = effective_concurrency(state, max_concurrency())
+                        paused = setting(state, 'paused', False)
+                    finally:
+                        state.close()
+                    if not paused:
+                        while len(inflight) < desired:
+                            inflight.add(executor.submit(process_one, base, root, capacity=max_concurrency()))
+                    stop.wait(1)
         finally:
             stop.set(); heartbeat.join(timeout=12)
-            publish(folder / 'heartbeat.json', dict(at=0))
+            publish(folder / 'heartbeat.json', dict(at=0, protocol=2, max_concurrency=max_concurrency()))
+
 
 
 if __name__ == '__main__':

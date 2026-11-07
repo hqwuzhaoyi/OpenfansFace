@@ -28,7 +28,13 @@ def read_json(path, fallback):
         return fallback
 
 
+def native_results_owned():
+    return os.environ.get('FILE_OPERATIONS_BACKEND') == 'rust' or bool(os.environ.get('FILE_OPERATIONS_RUST_URL'))
+
+
 def publish(path, data):
+    if path.name == 'results.json' and path.parent.name == 'watermarks' and native_results_owned():
+        raise RuntimeError('共享水印结果由原生协调器管理；请使用自动处理队列')
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix='.' + path.name, dir=path.parent)
     try:
@@ -273,6 +279,8 @@ def process_job(job, directory, root, engine_factory=PaddleEngine, scanner=scan_
 
 
 def main():
+    if native_results_owned():
+        raise SystemExit('Rust 模式下已停用独立水印写入 worker；使用 processing_worker.py')
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--base', type=Path, default=Path(os.environ.get('FACES_BASE', '/data/base')))
     parser.add_argument('--root', type=Path, default=Path(os.environ.get('MEDIA2_ROOT', '/mnt/media2')))
