@@ -145,3 +145,10 @@ Peach 归档在移动前核对源／目标账本，按 `canonical_name` 或小�
 NAS 的 `/mnt/mnt2/media` 使用 `root_squash,anonuid=1000,anongid=1000`。媒体服务目录由 `maintenance/media-directory-permissions.py` 配置 UID 1000 的访问和默认 ACL，范围仅为 `pikpak/creators`、`pikpak/My Telegram`、`pikpak/.face-cleanup-staging` 的目录；已有文件、属主和其他主体的有效权限保持不变。工具默认只读，`--apply --backup <媒体树外的新目录>` 才写入，原 ACL 可通过 `setfacl --restore=<backup>/before.acl` 回退。外部工具显式 chmod 或替换 ACL 仍可能破坏继承，应在导入端保持同一服务身份。
 
 `tests/archive-ledger.test.mjs`、`tests/file-permissions.test.mjs`、`tests/http-archive-reliability.py` 和 `tests/test_media_directory_permissions.py` 覆盖名称规范化、事务回执、迟到请求、权限拦截及 ACL 有效权限保留。HTTP 测试仅使用明确标记的隔离夹具与专用端口。
+
+
+### 后台分析与人物预览版本
+
+SQLite 版本只纳入本次操作会改写的视频索引和任务：选中的视频 ID、源路径／目录，以及人物名或别名相关的候选资料。无关任务的阶段、重试次数、更新时间和无关视频索引变化不再使合并／删除预览失效；相关记录、文件指纹、JSON 资料与 Peach 账本的过期校验仍保留。
+
+`tests/http-person-version.py` 在独立夹具中复现无关后台更新导致的误报，验证连续后台更新时可以合并，并确认相关视频索引、候选资料、账本及真实文件变化仍拦截旧确认。

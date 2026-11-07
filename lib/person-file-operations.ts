@@ -31,11 +31,23 @@ function openDatabase(){
   return db
 }
 function jobRows(db:Database.Database){return (db.prepare('PRAGMA database_list').all() as any[]).some(r=>r.name==='jobs')?db.prepare('SELECT * FROM jobs.tasks ORDER BY vid').all() as any[]:[]}
-function databaseState(db:Database.Database,plan:Pick<PersonFilePlan,'action'|'files'>){
+function databaseState(db:Database.Database,plan:PersonFilePlan){
   const ids=new Set(plan.files.flatMap(f=>f.vids)),paths=new Set(plan.files.map(f=>f.src))
-  return {videos:db.prepare('SELECT vid,path FROM videos ORDER BY vid').all(),jobs:jobRows(db).filter(row=>['rename-person','merge-person','delete-person'].includes(plan.action)||ids.has(row.vid)||paths.has(row.path))}
+  const affected=(row:{vid:string;path:string})=>ids.has(row.vid)||paths.has(row.path)||remappedPath(row.path,plan)!==row.path
+  const identityChange=['rename-person','merge-person','delete-person'].includes(plan.action)
+  return {
+    videos:(db.prepare('SELECT vid,path FROM videos ORDER BY vid').all() as {vid:string;path:string}[]).filter(affected),
+    jobs:jobRows(db).filter(row=>{
+      if(affected(row))return true
+      if(!identityChange)return false
+      // Bind only records this operation can modify. Background inference on
+      // unrelated videos must not expire a person's confirmation every second.
+      const data=JSON.parse(row.data)
+      return JSON.stringify(transformPersonData(data,plan))!==JSON.stringify(data)
+    }),
+  }
 }
-function metadataVersion(plan:Pick<PersonFilePlan,'action'|'files'>,db?:Database.Database){
+function metadataVersion(plan:PersonFilePlan,db?:Database.Database){
   const own=!db;db=db||openDatabase()
   try{return hash({json:jsonSnapshot().map(file=>[file.name,file.raw]),database:databaseState(db,plan)})}finally{if(own)db.close()}
 }
