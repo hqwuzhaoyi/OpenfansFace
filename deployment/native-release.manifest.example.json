@@ -13,8 +13,8 @@
   "ledger": "/PRIVATE/local-peach/ledger.db",
   "authority_dir": "/PRIVATE/local-metadata/file-operations-rust",
   "authority_identity": {
-    "dev": 0,
-    "ino": 0
+    "dev": "0",
+    "ino": "0"
   },
   "native_url": "http://127.0.0.1:8930",
   "native_token_env": "FILE_OPERATIONS_RUST_TOKEN",
@@ -232,5 +232,11 @@
     "/PRIVATE/media/pikpak/creators",
     "/PRIVATE/media/pikpak/staging"
   ],
-  "minimum_free_after_backup_bytes": 2147483648
+  "minimum_free_after_backup_bytes": 2147483648,
+  "legacy_health": {
+    "adapter": "systemd",
+    "timer": "face-video-health.timer",
+    "service": "face-video-health.service"
+  },
+  "legacy_terminal_acknowledgements": {}
 }
