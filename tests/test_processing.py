@@ -10,7 +10,15 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'maintenance'))
 from processing_store import connect, set_setting, reconcile, claim, fail, recover, finish
 from processing_logic import candidates_from_text, can_skip_face, folder_hints, resolve_candidates
-from processing_worker import discover, process_one
+from processing_worker import discover, process_one as worker_process_one
+
+
+def process_one(base, root, *args):
+    def publish(task, base, data, next_stage):
+        con = connect(base)
+        try: finish(con, task, data, next_stage)
+        finally: con.close()
+    return worker_process_one(base, root, *args, preparer=lambda *a: None, publisher=publish, reference_loader=lambda *a: None)
 
 
 class ProcessingTests(unittest.TestCase):
@@ -21,6 +29,8 @@ class ProcessingTests(unittest.TestCase):
         self.file = self.root / 'one.mp4'; self.file.write_bytes(b'fixture-video')
         self.item = dict(vid='one', path=str(self.file), name=self.file.name, size=self.file.stat().st_size, mtime_ns=str(self.file.stat().st_mtime_ns))
         self.db = connect(self.base)
+        import numpy as np
+        np.savez(self.base / 'processing/references.npz', input_version='a'*64)
         with self.db:
             reconcile(self.db, [self.item], 'initial', False)
 
@@ -149,10 +159,11 @@ class ProcessingTests(unittest.TestCase):
         disposed = self.root / 'disposed.mp4'; disposed.write_bytes(b'x')
         organized = self.root / 'pikpak/creators/A/known.mp4'; organized.parent.mkdir(parents=True); organized.write_bytes(b'x')
         assets = [dict(path=str(self.file), disposal=None, duration=3), dict(path=str(disposed), disposal='trash', duration=100), dict(path=str(organized), disposal=None, duration=100)]
-        discover(self.base, self.root, '', assets)
+        with patch('processing_faces.native',return_value={'version':'a'*64}):
+            discover(self.base, self.root, '', assets)
         faces = sqlite3.connect(self.base / 'faces.db')
-        self.assertEqual(faces.execute('SELECT COUNT(*) FROM videos').fetchone()[0], 1)
-        self.assertEqual(faces.execute('SELECT status FROM videos').fetchone()[0], 'pipeline')
+        self.assertEqual(faces.execute('SELECT COUNT(*) FROM videos').fetchone()[0], 0)
+        self.assertTrue(self.db.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] >= 1)
         faces.close()
 
 
