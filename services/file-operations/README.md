@@ -366,3 +366,11 @@ protected repeated reconcile/retry, no false rollback, and held gates. It also
 checks an unresolved syscall journal on restart, ordinary pre-effect rollback,
 and disconnected HTTP waiter completion. No shared NFS mount or network is
 interrupted.
+
+## Read availability lanes
+
+Local receipt reads (`GET /v1/person-files?id=…` and `GET /v1/archive[?id=…]`) share four local-status permits. Media traversal (`GET /v1/staging`) uses a separate four-permit media lane. Admission happens before `spawn_blocking`; additional media reads return HTTP 503 `reader_busy` immediately, without adding tasks to the blocking pool. Authentication and request validation remain before admission. Health is independent of both lanes.
+
+Each blocking closure owns its permit until its actual read finishes, including after its HTTP waiter disconnects. A timeout or disconnect does not cancel a blocked filesystem syscall, free its media capacity, or claim that NFS is healthy. Four stalled media reads therefore exhaust listing capacity while local journal progress remains available. Keep future read-only metadata endpoints on a bounded local lane only if they do not inspect media; writer commands retain the existing execution queue.
+
+`python3 tests/http-rust-read-lanes.py` uses the fully guarded marked fixture and `media_listing` pause checkpoint. It observes four admitted readers, proves extra reads are rejected before blocking task admission, verifies file/archive/health response latency under saturation, disconnects the waiters without releasing their capacity early, and verifies capacity returns only after real read completion. The pause and per-offset admission markers are ignored when the full fixture configuration is absent.
