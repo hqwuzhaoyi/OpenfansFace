@@ -19,7 +19,7 @@ pub struct Error {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub step: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mutation_outcome: Option<String>,
+    pub mutation_outcome: Option<Box<str>>,
 }
 impl Error {
     pub fn new(status: u16, code: &str, message: impl Into<String>) -> Self {
