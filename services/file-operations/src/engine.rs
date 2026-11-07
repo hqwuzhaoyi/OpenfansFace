@@ -256,6 +256,9 @@ impl Engine {
         }
     }
     fn recovery_failure(&mut self, plan: &Plan, error: &Error) -> Result<()> {
+        if error.code == "recovery_required" && error.mutation_outcome.is_some() {
+            return self.store.fail(&plan.id, error, true);
+        }
         let failure = Error::new(
             503,
             "recovery_required",
@@ -268,6 +271,11 @@ impl Engine {
                 .unwrap_or_default()
         }))
         .during(error.step.clone().unwrap_or_else(|| "execution".into()));
+        let failure = if error.mutation_outcome.is_some() {
+            failure.ambiguous_mutation()
+        } else {
+            failure
+        };
         self.store.fail(&plan.id, &failure, true)
     }
     /// Explicit reconciliation fences an unreceived/unstarted request before any late POST.
@@ -379,6 +387,34 @@ impl Engine {
             let _ = self.recovery_failure(&record.plan, &error);
         }
     }
+    fn require_resolved_mutation(&self, id: &str, cause: Option<&Error>) -> Result<()> {
+        let phase: Option<String> = self.store.db.query_row(
+            "SELECT phase FROM steps WHERE operation_id=? AND phase IN ('filesystem_mutation_intent','filesystem_mutation_resolved') ORDER BY revision DESC LIMIT 1",
+            [id], |r| r.get(0)).optional()?;
+        let stored = self.store.get(id)?.and_then(|record| record.error);
+        if cause.is_some_and(|error| error.mutation_outcome.is_some())
+            || phase.as_deref() == Some("filesystem_mutation_intent")
+            || stored
+                .as_ref()
+                .is_some_and(|error| error.mutation_outcome.is_some())
+        {
+            let cause = cause
+                .filter(|error| error.mutation_outcome.is_some())
+                .or(stored.as_ref())
+                .or(cause);
+            if let Some(error) = cause.filter(|error| {
+                error.code == "recovery_required" && error.mutation_outcome.is_some()
+            }) {
+                return Err(error.clone());
+            }
+            return Err(Error::new(503, "recovery_required",
+                format!("文件系统变更结果不确定，可能仍有远端延迟写入；保留写锁，需人工确认存储端静止后恢复，路径观察或超时不能解除保护：{}", cause.map(|e| e.error.as_str()).unwrap_or("缺少系统调用结果回执")))
+                .at(cause.and_then(|e| e.path.clone()).unwrap_or_default())
+                .during(cause.and_then(|e| e.step.clone()).unwrap_or_else(|| "filesystem_mutation".into()))
+                .ambiguous_mutation());
+        }
+        Ok(())
+    }
     fn reconcile(
         &mut self,
         plan: &Plan,
@@ -386,6 +422,7 @@ impl Engine {
         rollback: bool,
         cause: &Error,
     ) -> Result<Option<Value>> {
+        self.require_resolved_mutation(&plan.id, Some(cause))?;
         let (domain, selected) = self.commit_scope(plan, accepted)?;
         let snapshot = &domain.metadata;
         let ledger_state = self.ledger_state(plan, &domain)?;
@@ -508,13 +545,20 @@ impl Engine {
                         &mut |phase, evidence| self.file_checkpoint(plan, index, phase, evidence),
                     )?;
                 } else {
-                    pinned.compensate(&self.config, &file.version)?;
+                    let config = self.config.clone();
+                    pinned.compensate_recoverable(
+                        &config,
+                        &file.version,
+                        &mut |phase, proof| self.file_checkpoint(plan, index, phase, proof),
+                    )?;
                 }
                 crate::fault::checkpoint(&self.config, "compensation_file_restored")?;
             }
             for path in plan.directories.iter().rev() {
                 if let Some(proof) = self.store.directory_evidence(&plan.id, path)? {
-                    files::remove_owned_directory(&proof)?;
+                    files::remove_owned_directory(&proof, &mut |phase, proof| {
+                        self.checkpoint(&plan.id, phase, json!({"directory":proof}))
+                    })?;
                 }
             }
             self.store.rolled_back(&plan.id, cause)?;
@@ -642,6 +686,7 @@ impl Engine {
     }
     fn execute(&mut self, plan: &Plan, accepted: &DomainSnapshot) -> Result<Value> {
         let id = &plan.id;
+        self.require_resolved_mutation(id, None)?;
         if plan.execution.is_none() {
             self.checkpoint(
                 id,
@@ -727,7 +772,9 @@ impl Engine {
                                 &mut |phase, proof| self.file_checkpoint(plan, index, phase, proof),
                             )?;
                         } else {
-                            pinned.publish(&file.version)?;
+                            pinned.publish_recorded(&file.version, &mut |phase, proof| {
+                                self.file_checkpoint(plan, index, phase, proof)
+                            })?;
                         }
                     }
                     crate::fault::checkpoint(&self.config, "destination_published_unrecorded")?;
@@ -739,7 +786,9 @@ impl Engine {
                     crate::archive::verify_duplicate(&self.config, plan, index, false)?;
                     self.file_checkpoint(plan, index, "source_remove_intent", &pinned.evidence)?;
                     if pinned.position(&file.version)?.0 {
-                        pinned.remove_source(&file.version)?;
+                        pinned.remove_source_recorded(&file.version, &mut |phase, proof| {
+                            self.file_checkpoint(plan, index, phase, proof)
+                        })?;
                     }
                     crate::fault::checkpoint(&self.config, "source_removed_unrecorded")?;
                     crate::fault::checkpoint(
@@ -874,7 +923,13 @@ impl Engine {
                     "source_directory_remove_intent",
                     json!({"directory":directory}),
                 )?;
-                if let Err(error) = files::remove_source_directory(directory) {
+                let config = self.config.clone();
+                if let Err(error) =
+                    files::remove_source_directory(&config, directory, &mut |phase| {
+                        self.checkpoint(id, phase, json!({"directory":directory}))
+                    })
+                {
+                    self.require_resolved_mutation(id, Some(&error))?;
                     self.checkpoint(
                         id,
                         "source_directory_cleanup_warning",
@@ -1316,6 +1371,57 @@ mod shared_tests {
             assert!(Path::new(&file.dst).exists());
         }
         assert!(!config.base.join(".review-write.lock").exists());
+    }
+    #[test]
+    fn shared_mutation_unknown_stops_remaining_files_and_survives_restart() {
+        for step in ["destination_publish", "source_remove"] {
+            let (config, plan, domain) = fixture(2);
+            let (mut engine, gate) = admitted(&config, &plan, &domain);
+            let fault = config.fixture.as_ref().unwrap().join("rust-fault.json");
+            fs::write(
+                &fault,
+                serde_json::to_vec(&json!({"phase":format!("mutation:{step}"),
+                "mode":"mutation_error_after","errno":"EIO"}))
+                .unwrap(),
+            )
+            .unwrap();
+            let error = engine.execute(&plan, &domain).unwrap_err();
+            assert_eq!(error.mutation_outcome.as_deref(), Some("unknown"));
+            let unknown = engine.reconcile(&plan, &domain, true, &error).unwrap_err();
+            engine.recovery_failure(&plan, &unknown).unwrap();
+            fs::remove_file(fault).unwrap();
+            let starts: i64 = engine.store.db.query_row(
+                "SELECT COUNT(*) FROM steps WHERE operation_id=? AND phase='filesystem_mutation_intent'",
+                [&plan.id], |r| r.get(0)).unwrap();
+            drop(engine);
+            drop(gate);
+            let mut engine = Engine::new(config.clone()).unwrap();
+            engine.recover_one(&plan.id);
+            assert_eq!(
+                engine.store.get(&plan.id).unwrap().unwrap().status,
+                "recovery_needed"
+            );
+            assert!(config.base.join(".review-write.lock").exists());
+            assert!(Path::new(&plan.files[0].dst).exists());
+            assert_eq!(
+                Path::new(&plan.files[0].src).exists(),
+                step != "source_remove"
+            );
+            assert!(Path::new(&plan.files[1].src).exists());
+            assert!(!Path::new(&plan.files[1].dst).exists());
+            assert!(!config.base.join("fixture.json").exists());
+            assert!(
+                engine
+                    .store
+                    .latest_step(&plan.id, "compensation_intent")
+                    .unwrap()
+                    .is_none()
+            );
+            let after: i64 = engine.store.db.query_row(
+                "SELECT COUNT(*) FROM steps WHERE operation_id=? AND phase='filesystem_mutation_intent'",
+                [&plan.id], |r| r.get(0)).unwrap();
+            assert_eq!(starts, after);
+        }
     }
     #[test]
     fn old_request_and_plan_serialization_do_not_gain_optional_fields() {

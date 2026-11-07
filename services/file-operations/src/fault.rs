@@ -57,3 +57,34 @@ pub fn copy_required(config: &Config) -> Result<bool> {
     let value: serde_json::Value = serde_json::from_str(&raw)?;
     Ok(value["force_copy"] == true)
 }
+
+/// These modes model a syscall response, not an HTTP waiter timeout. Only marked
+/// fixture configurations can supply a root. Delayed effects are released by the
+/// acceptance harness after the service has returned the ambiguous response.
+pub fn mutation_error(root: Option<&std::path::Path>, step: &str, after: bool) -> Result<()> {
+    let Some(root) = root else {
+        return Ok(());
+    };
+    let Some(raw) = read_optional(&root.join("rust-fault.json"))? else {
+        return Ok(());
+    };
+    let value: serde_json::Value = serde_json::from_str(&raw)?;
+    if value["phase"] != format!("mutation:{step}") {
+        return Ok(());
+    }
+    let expected = if after {
+        "mutation_error_after"
+    } else {
+        "mutation_error_delayed"
+    };
+    if value["mode"] != expected {
+        return Ok(());
+    }
+    let errno = match value["errno"].as_str() {
+        Some("EIO") => rustix::io::Errno::IO,
+        Some("ESTALE") => rustix::io::Errno::STALE,
+        Some("ETIMEDOUT") => rustix::io::Errno::TIMEDOUT,
+        _ => return Err(Error::new(400, "fixture_fault", "未知变更 I/O 故障")),
+    };
+    Err(Error::mutation(std::io::Error::from_raw_os_error(errno.raw_os_error())).during(step))
+}

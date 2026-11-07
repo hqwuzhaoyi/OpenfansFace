@@ -328,3 +328,41 @@ Control JSON reads walk parent directories without following symlinks, open the 
 Gate evidence reads the already held read/write descriptor rather than reopening `.review-write.lock`. Startup recovery and routing markers are bounded to 1 MiB. Metadata and legacy JSON documents default to 256 MiB per file; `FILE_OPERATIONS_CONTROL_MAX_BYTES` accepts a positive byte count when a known valid larger document requires it. Limits are checked against file size before allocation and against bytes read if the file grows. No content is truncated or silently skipped. The executor lock also opens nonblocking/no-follow, must be regular and must retain its directory-entry identity before authority checks. Rejected/replaced gate entries remain in place and uncertain operations retain recovery protection.
 
 `python3 tests/http-rust-control-files.py` exercises actual FIFO/symlink/oversize metadata and markers, prompt startup/recovery behavior, and a 2 MiB legacy document through normal execution and restart. Rust control tests additionally replace an already-held gate with a FIFO, symlink and byte-identical new regular inode, verify that evidence/release reject all replacements without deleting them, and check exact byte-limit boundaries.
+
+### Ambiguous native filesystem responses
+
+Media mutation boundaries (link publication, source unlink, copy creation/write/
+publication, compensation, directory creation/publication/removal and their sync)
+now durably record `filesystem_mutation_intent` before the call and
+`filesystem_mutation_resolved` only after success or a known failure. At these
+boundaries EIO, ESTALE and ETIMEDOUT carry `mutation_outcome: "unknown"`; the same
+errno from a read/preflight, an injected pre-effect checkpoint, or an HTTP waiter
+timeout does not by itself classify a write as ambiguous.
+
+An unresolved marker or unknown mutation outcome prevents automatic execution,
+compensation, new writes and gate release. Status remains `recovery_needed` /
+`io_state: "unknown"` across repeated reconcile requests and process restarts.
+This includes a crash between the syscall and its outcome journal: even a source
+that still exists with an absent destination cannot prove the server will not
+complete a delayed RPC. Known completed receipts and ordinary rollback retain
+their existing recovery behavior. These markers do not retrospectively certify
+older operations recorded before this change; deployment still requires draining
+or explicitly settling existing operations.
+
+**Recovery limit:** the service has no protocol that fences already-submitted NAS
+RPCs or proves remote quiescence, and deliberately provides no automatic “clear
+unknown” endpoint. Restarting the process, waiting for a timeout, or observing
+stable paths is insufficient. An administrator must establish storage/client
+quiescence outside the service, retain the operation evidence, verify actual file
+identities and all store receipts, and perform an audited repair before releasing
+protection. This change does not claim that local fixture tests prove NFS server
+cancellation or durability.
+
+`python3 tests/http-rust-mutation-uncertainty.py` uses only the existing marked
+`/tmp` fixture guard. It injects EIO/ESTALE/ETIMEDOUT after actual publication and
+source removal, models delayed publication/removal released by the fixture
+harness after a response and restart, and checks unchanged mutation attempt counts,
+protected repeated reconcile/retry, no false rollback, and held gates. It also
+checks an unresolved syscall journal on restart, ordinary pre-effect rollback,
+and disconnected HTTP waiter completion. No shared NFS mount or network is
+interrupted.

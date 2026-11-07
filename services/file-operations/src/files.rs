@@ -12,6 +12,29 @@ use std::{
     path::{Component, Path},
 };
 
+/// A pending durable marker survives a crash or a failed outcome journal write.
+/// Path observations cannot resolve this marker: remote RPC completion may be late.
+fn mutation<T>(
+    fixture: Option<&Path>,
+    path: &str,
+    step: &str,
+    record: &mut impl FnMut(&str) -> Result<()>,
+    effect: impl FnOnce() -> std::io::Result<T>,
+) -> Result<T> {
+    record("filesystem_mutation_intent")?;
+    let result = (|| {
+        crate::fault::mutation_error(fixture, step, false)?;
+        let value = effect().map_err(Error::mutation)?;
+        crate::fault::mutation_error(fixture, step, true)?;
+        Ok(value)
+    })()
+    .map_err(|e: Error| e.at(path).during(step));
+    if result.is_ok() || result.as_ref().is_err_and(|e| e.mutation_outcome.is_none()) {
+        record("filesystem_mutation_resolved")?;
+    }
+    result
+}
+
 pub fn validate_name(name: &str) -> Result<()> {
     if name.trim() != name
         || name.is_empty()
@@ -188,10 +211,11 @@ pub struct PinnedMove {
     pub src: String,
     pub dst: String,
     pub evidence: MoveEvidence,
+    fixture: Option<std::path::PathBuf>,
 }
 pub fn prepare_move(config: &Config, scope: &MoveScope, file: &FileMove) -> Result<PinnedMove> {
     check_move(config, scope, file)?;
-    PinnedMove::open(file, MoveEvidence::default())
+    PinnedMove::open(config, file, MoveEvidence::default())
 }
 pub fn recover_move(
     config: &Config,
@@ -200,12 +224,12 @@ pub fn recover_move(
     evidence: MoveEvidence,
 ) -> Result<PinnedMove> {
     scoped(config, scope, file)?;
-    let pinned = PinnedMove::open(file, evidence)?;
+    let pinned = PinnedMove::open(config, file, evidence)?;
     pinned.position(&file.version)?;
     Ok(pinned)
 }
 impl PinnedMove {
-    fn open(file: &FileMove, mut evidence: MoveEvidence) -> Result<Self> {
+    fn open(config: &Config, file: &FileMove, mut evidence: MoveEvidence) -> Result<Self> {
         let parent: File = directory(Path::new(&file.src).parent().unwrap())?.into();
         let destination_parent: File = directory(Path::new(&file.dst).parent().unwrap())?.into();
         for (actual, expected) in [
@@ -241,6 +265,7 @@ impl PinnedMove {
             src: file.src.clone(),
             dst: file.dst.clone(),
             evidence,
+            fixture: config.fixture.clone(),
         })
     }
     pub fn new(config: &Config, person: &str, src: &str, dst: &str) -> Result<Self> {
@@ -260,7 +285,7 @@ impl PinnedMove {
         };
         scoped(config, &scope, &file)?;
         crate::permissions::require_move_permissions(Path::new(src), Path::new(dst))?;
-        let pinned = Self::open(&file, MoveEvidence::default())?;
+        let pinned = Self::open(config, &file, MoveEvidence::default())?;
         if !pinned.source.metadata()?.is_file() {
             return Err(Error::conflict("只允许操作普通视频文件"));
         }
@@ -396,19 +421,36 @@ impl PinnedMove {
         }
         Ok(())
     }
-    pub fn publish(&self, expected: &str) -> Result<()> {
+    pub fn publish_recorded(
+        &self,
+        expected: &str,
+        record: &mut impl FnMut(&str, &MoveEvidence) -> Result<()>,
+    ) -> Result<()> {
         self.verify(expected)?;
-        linkat(
-            &self.parent,
-            Path::new(&self.src).file_name().unwrap(),
-            &self.destination_parent,
-            Path::new(&self.dst).file_name().unwrap(),
-            AtFlags::empty(),
-        )
-        .map_err(|e| Error::from(e).at(&self.dst).during("destination_publish"))?;
-        self.destination_parent.sync_all()?;
+        self.link_destination(record)?;
         self.position(expected)?;
         Ok(())
+    }
+    fn link_destination(
+        &self,
+        record: &mut impl FnMut(&str, &MoveEvidence) -> Result<()>,
+    ) -> Result<()> {
+        mutation(
+            self.fixture.as_deref(),
+            &self.dst,
+            "destination_publish",
+            &mut |phase| record(phase, &self.evidence),
+            || {
+                linkat(
+                    &self.parent,
+                    Path::new(&self.src).file_name().unwrap(),
+                    &self.destination_parent,
+                    Path::new(&self.dst).file_name().unwrap(),
+                    AtFlags::empty(),
+                )?;
+                self.destination_parent.sync_all()
+            },
+        )
     }
     pub fn publish_recoverable(
         &mut self,
@@ -420,29 +462,40 @@ impl PinnedMove {
             return self.copy_publish(false, expected, record);
         }
         self.verify(expected)?;
-        match linkat(
-            &self.parent,
-            Path::new(&self.src).file_name().unwrap(),
-            &self.destination_parent,
-            Path::new(&self.dst).file_name().unwrap(),
-            AtFlags::empty(),
-        ) {
-            Ok(()) => {
-                self.destination_parent.sync_all()?;
-                self.position(expected)?;
-                Ok(())
-            }
-            Err(e)
-                if [
-                    rustix::io::Errno::XDEV,
-                    rustix::io::Errno::OPNOTSUPP,
-                    rustix::io::Errno::PERM,
-                ]
-                .contains(&e) =>
-            {
-                self.copy_publish(false, expected, record)
-            }
-            Err(e) => Err(Error::from(e).at(&self.dst).during("destination_publish")),
+        // Fallback is permitted only for a known no-effect hard-link rejection.
+        // Keep the errno check inside the syscall, not inferred from generic error text.
+        let mut fallback = false;
+        mutation(
+            self.fixture.as_deref(),
+            &self.dst,
+            "destination_publish",
+            &mut |phase| record(phase, &self.evidence),
+            || match linkat(
+                &self.parent,
+                Path::new(&self.src).file_name().unwrap(),
+                &self.destination_parent,
+                Path::new(&self.dst).file_name().unwrap(),
+                AtFlags::empty(),
+            ) {
+                Ok(()) => self.destination_parent.sync_all(),
+                Err(e)
+                    if [
+                        rustix::io::Errno::XDEV,
+                        rustix::io::Errno::OPNOTSUPP,
+                        rustix::io::Errno::PERM,
+                    ]
+                    .contains(&e) =>
+                {
+                    fallback = true;
+                    Ok(())
+                }
+                Err(e) => Err(e.into()),
+            },
+        )?;
+        if fallback {
+            self.copy_publish(false, expected, record)
+        } else {
+            self.position(expected).map(|_| ())
         }
     }
     fn copy_publish(
@@ -477,15 +530,28 @@ impl PinnedMove {
         let mut proof = proof.unwrap();
         if proof.identity.is_null() {
             // A pre-existing name without inode proof is never adopted after a crash.
-            let output: File = openat(
-                to_parent,
-                proof.temp.as_str(),
-                OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::from_raw_mode(0o666),
-            )?
-            .into();
-            output.sync_all()?;
-            to_parent.sync_all()?;
+            let output = mutation(
+                self.fixture.as_deref(),
+                to,
+                "copy_create",
+                &mut |phase| record(phase, &self.evidence),
+                || {
+                    let output: File = openat(
+                        to_parent,
+                        proof.temp.as_str(),
+                        OFlags::RDWR
+                            | OFlags::CREATE
+                            | OFlags::EXCL
+                            | OFlags::NOFOLLOW
+                            | OFlags::CLOEXEC,
+                        Mode::from_raw_mode(0o666),
+                    )?
+                    .into();
+                    output.sync_all()?;
+                    to_parent.sync_all()?;
+                    Ok(output)
+                },
+            )?;
             proof.identity = identity(&output.metadata()?);
             if reverse {
                 self.evidence.restored = Some(proof.clone());
@@ -505,7 +571,7 @@ impl PinnedMove {
             if !same_inode(&identity(&output.metadata()?), &proof.identity) {
                 return Err(Error::conflict("临时复制文件被替换"));
             }
-            output.set_len(0)?;
+
             let mut input: File = openat(
                 from_parent,
                 Path::new(from).file_name().unwrap(),
@@ -528,9 +594,20 @@ impl PinnedMove {
             }
             input.seek(SeekFrom::Start(0))?;
             let before = identity(&input.metadata()?);
-            std::io::copy(&mut input, &mut output)?;
-            output.set_times(fs::FileTimes::new().set_modified(input.metadata()?.modified()?))?;
-            output.sync_all()?;
+            mutation(
+                self.fixture.as_deref(),
+                to,
+                "copy_write",
+                &mut |phase| record(phase, &self.evidence),
+                || {
+                    output.set_len(0)?;
+                    std::io::copy(&mut input, &mut output)?;
+                    output.set_times(
+                        fs::FileTimes::new().set_modified(input.metadata()?.modified()?),
+                    )?;
+                    output.sync_all()
+                },
+            )?;
             let checksum = digest(&mut input)?;
             if before != identity(&input.metadata()?) || digest(&mut output)? != checksum {
                 return Err(Error::conflict("复制期间源文件变化或校验失败"));
@@ -557,33 +634,51 @@ impl PinnedMove {
         }
         self.position(expected)?;
         record("copy_publish_intent", &self.evidence)?;
-        rustix::fs::renameat_with(
-            to_parent,
-            proof.temp.as_str(),
-            to_parent,
-            Path::new(to).file_name().unwrap(),
-            rustix::fs::RenameFlags::NOREPLACE,
-        )
-        .map_err(|e| Error::from(e).at(to).during("copy_publish"))?;
-        to_parent.sync_all()?;
+        mutation(
+            self.fixture.as_deref(),
+            to,
+            "copy_publish",
+            &mut |phase| record(phase, &self.evidence),
+            || {
+                rustix::fs::renameat_with(
+                    to_parent,
+                    proof.temp.as_str(),
+                    to_parent,
+                    Path::new(to).file_name().unwrap(),
+                    rustix::fs::RenameFlags::NOREPLACE,
+                )?;
+                to_parent.sync_all()
+            },
+        )?;
         record("copy_published", &self.evidence)
     }
+    #[cfg(test)]
     pub fn remove_source(&self, expected: &str) -> Result<()> {
+        self.remove_source_recorded(expected, &mut |_, _| Ok(()))
+    }
+    pub fn remove_source_recorded(
+        &self,
+        expected: &str,
+        record: &mut impl FnMut(&str, &MoveEvidence) -> Result<()>,
+    ) -> Result<()> {
         self.verify(expected)?;
         if !self.position(expected)?.1 {
             return Err(Error::conflict("目标尚未发布"));
         }
-        unlinkat(
-            &self.parent,
-            Path::new(&self.src).file_name().unwrap(),
-            AtFlags::empty(),
+        mutation(
+            self.fixture.as_deref(),
+            &self.src,
+            "source_remove",
+            &mut |phase| record(phase, &self.evidence),
+            || {
+                unlinkat(
+                    &self.parent,
+                    Path::new(&self.src).file_name().unwrap(),
+                    AtFlags::empty(),
+                )?;
+                self.parent.sync_all()
+            },
         )
-        .map_err(|e| Error::from(e).at(&self.src).during("source_remove"))?;
-        self.parent.sync_all()?;
-        Ok(())
-    }
-    pub fn compensate(&mut self, config: &Config, expected: &str) -> Result<()> {
-        self.compensate_recoverable(config, expected, &mut |_, _| Ok(()))
     }
     pub fn compensate_recoverable(
         &mut self,
@@ -596,26 +691,42 @@ impl PinnedMove {
             if self.evidence.copy.is_some() {
                 self.copy_publish(true, expected, record)?;
             } else {
-                linkat(
-                    &self.destination_parent,
-                    Path::new(&self.dst).file_name().unwrap(),
-                    &self.parent,
-                    Path::new(&self.src).file_name().unwrap(),
-                    AtFlags::empty(),
+                mutation(
+                    self.fixture.as_deref(),
+                    &self.src,
+                    "compensation_source_publish",
+                    &mut |phase| record(phase, &self.evidence),
+                    || {
+                        linkat(
+                            &self.destination_parent,
+                            Path::new(&self.dst).file_name().unwrap(),
+                            &self.parent,
+                            Path::new(&self.src).file_name().unwrap(),
+                            AtFlags::empty(),
+                        )?;
+                        self.parent.sync_all()
+                    },
                 )?;
-                self.parent.sync_all()?;
             }
         }
         crate::fault::checkpoint(config, "compensation_source_published")?;
         self.position(expected)?;
         if target {
             crate::fault::checkpoint(config, "compensation_destination_remove_intent")?;
-            unlinkat(
-                &self.destination_parent,
-                Path::new(&self.dst).file_name().unwrap(),
-                AtFlags::empty(),
+            mutation(
+                self.fixture.as_deref(),
+                &self.dst,
+                "compensation_destination_remove",
+                &mut |phase| record(phase, &self.evidence),
+                || {
+                    unlinkat(
+                        &self.destination_parent,
+                        Path::new(&self.dst).file_name().unwrap(),
+                        AtFlags::empty(),
+                    )?;
+                    self.destination_parent.sync_all()
+                },
             )?;
-            self.destination_parent.sync_all()?;
             crate::fault::checkpoint(config, "compensation_destination_removed")?;
         }
         for (parent, proof) in [
@@ -634,8 +745,16 @@ impl PinnedMove {
                         if !same_inode(&identity(&file.metadata()?), &proof.identity) {
                             return Err(Error::conflict("临时复制文件被替换"));
                         }
-                        unlinkat(parent, proof.temp.as_str(), AtFlags::empty())?;
-                        parent.sync_all()?;
+                        mutation(
+                            self.fixture.as_deref(),
+                            &proof.temp,
+                            "copy_cleanup",
+                            &mut |phase| record(phase, &self.evidence),
+                            || {
+                                unlinkat(parent, proof.temp.as_str(), AtFlags::empty())?;
+                                parent.sync_all()
+                            },
+                        )?;
                     }
                     Err(rustix::io::Errno::NOENT) => (),
                     Err(e) => return Err(e.into()),
@@ -834,16 +953,25 @@ pub fn create_directory(
         proof
     };
     if proof.identity.is_null() {
-        rustix::fs::mkdirat(&parent, proof.temp.as_str(), Mode::from_raw_mode(0o777))?;
-        let owned: File = openat(
-            &parent,
-            proof.temp.as_str(),
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )?
-        .into();
-        owned.sync_all()?;
-        parent.sync_all()?;
+        let owned = mutation(
+            None,
+            &proof.path,
+            "directory_create",
+            &mut |phase| record(phase, &proof),
+            || {
+                rustix::fs::mkdirat(&parent, proof.temp.as_str(), Mode::from_raw_mode(0o777))?;
+                let owned: File = openat(
+                    &parent,
+                    proof.temp.as_str(),
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )?
+                .into();
+                owned.sync_all()?;
+                parent.sync_all()?;
+                Ok(owned)
+            },
+        )?;
         proof.identity = identity(&owned.metadata()?);
         record("directory_owned", &proof)?;
     }
@@ -873,21 +1001,32 @@ pub fn create_directory(
                 return Err(Error::conflict("临时目录被替换"));
             }
             record("directory_publish_intent", &proof)?;
-            rustix::fs::renameat_with(
-                &parent,
-                proof.temp.as_str(),
-                &parent,
-                path.file_name().unwrap(),
-                rustix::fs::RenameFlags::NOREPLACE,
+            mutation(
+                None,
+                &proof.path,
+                "directory_publish",
+                &mut |phase| record(phase, &proof),
+                || {
+                    rustix::fs::renameat_with(
+                        &parent,
+                        proof.temp.as_str(),
+                        &parent,
+                        path.file_name().unwrap(),
+                        rustix::fs::RenameFlags::NOREPLACE,
+                    )?;
+                    parent.sync_all()
+                },
             )?;
-            parent.sync_all()?;
         }
         Err(e) => return Err(e.into()),
     }
     record("directory_published", &proof)?;
     Ok(proof)
 }
-pub fn remove_owned_directory(proof: &DirectoryProof) -> Result<()> {
+pub fn remove_owned_directory(
+    proof: &DirectoryProof,
+    record: &mut impl FnMut(&str, &DirectoryProof) -> Result<()>,
+) -> Result<()> {
     let path = Path::new(&proof.path);
     let parent: File = directory(path.parent().unwrap())?.into();
     if !same_inode(&identity(&parent.metadata()?), &proof.parent) {
@@ -906,11 +1045,17 @@ pub fn remove_owned_directory(proof: &DirectoryProof) -> Result<()> {
                     return Err(Error::conflict("清理目录已被替换"));
                 }
                 // ENOTEMPTY is safe: preserve any external additions, never recursive-delete.
-                match unlinkat(&parent, name, AtFlags::REMOVEDIR) {
-                    Ok(()) => parent.sync_all()?,
-                    Err(rustix::io::Errno::NOTEMPTY) => (),
-                    Err(e) => return Err(e.into()),
-                }
+                mutation(
+                    None,
+                    &proof.path,
+                    "directory_remove",
+                    &mut |phase| record(phase, proof),
+                    || match unlinkat(&parent, name, AtFlags::REMOVEDIR) {
+                        Ok(()) => parent.sync_all(),
+                        Err(rustix::io::Errno::NOTEMPTY) => Ok(()),
+                        Err(e) => Err(e.into()),
+                    },
+                )?;
             }
             Err(rustix::io::Errno::NOENT) => (),
             Err(e) => return Err(e.into()),
@@ -954,7 +1099,11 @@ pub fn inspect_owned_directory(proof: &DirectoryProof) -> Result<()> {
 /// Remove an accepted source directory after all stores committed. Never removes contents,
 /// follows symlinks, or treats a replaced inode as ours. Missing is accepted only by the
 /// caller's durable post-commit cleanup intent.
-pub fn remove_source_directory(proof: &crate::person_directory::Directory) -> Result<()> {
+pub fn remove_source_directory(
+    config: &Config,
+    proof: &crate::person_directory::Directory,
+    record: &mut impl FnMut(&str) -> Result<()>,
+) -> Result<()> {
     let path = Path::new(&proof.src);
     let parent: File = match directory(path.parent().unwrap()) {
         Ok(fd) => fd.into(),
@@ -977,9 +1126,16 @@ pub fn remove_source_directory(proof: &crate::person_directory::Directory) -> Re
     if !same_inode(&identity(&owned.metadata()?), &proof.identity) {
         return Err(Error::conflict("来源目录已被替换").at(&proof.src));
     }
-    unlinkat(&parent, path.file_name().unwrap(), AtFlags::REMOVEDIR)?;
-    parent.sync_all()?;
-    Ok(())
+    mutation(
+        config.fixture.as_deref(),
+        &proof.src,
+        "source_directory_remove",
+        record,
+        || {
+            unlinkat(&parent, path.file_name().unwrap(), AtFlags::REMOVEDIR)?;
+            parent.sync_all()
+        },
+    )
 }
 
 /// Verify a committed destination after source-directory cleanup removed its parent.
@@ -1255,10 +1411,10 @@ mod tests {
         let proof = create_directory(&path, proof, &mut |_, _| Ok(())).unwrap();
         inspect_owned_directory(&proof).unwrap();
         fs::write(Path::new(&path).join("external.txt"), b"external").unwrap();
-        remove_owned_directory(&proof).unwrap();
+        remove_owned_directory(&proof, &mut |_, _| Ok(())).unwrap();
         assert!(Path::new(&path).exists());
         fs::remove_file(Path::new(&path).join("external.txt")).unwrap();
-        remove_owned_directory(&proof).unwrap();
+        remove_owned_directory(&proof, &mut |_, _| Ok(())).unwrap();
         assert!(!Path::new(&path).exists());
     }
     #[test]
