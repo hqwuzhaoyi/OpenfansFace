@@ -45,6 +45,9 @@ fn new_row(connection: &Connection, table: &str, fields: Value) -> Result<Value>
     Ok(Value::Object(row))
 }
 pub fn snapshot(config: &Config, plan: &Plan) -> Result<ledger::Delta> {
+    if plan.action == "rename-person" {
+        return rename_snapshot(config, plan);
+    }
     let mut connection = db::open(&config.ledger)?;
     let tx = connection.transaction()?;
     let mut assets = vec![];
@@ -264,5 +267,145 @@ pub fn snapshot(config: &Config, plan: &Plan) -> Result<ledger::Delta> {
             guards,
         },
         creators,
+    })
+}
+
+fn rename_snapshot(config: &Config, plan: &Plan) -> Result<ledger::Delta> {
+    let mut connection = db::open(&config.ledger)?;
+    let tx = connection.transaction()?;
+    let source = db::rows(
+        &tx,
+        "SELECT * FROM entity WHERE kind='creator' AND (canonical_name=? OR normalized_name=?) ORDER BY id",
+        params![plan.person, plan.person.to_lowercase()],
+    )?;
+    let target = db::rows(
+        &tx,
+        "SELECT * FROM entity WHERE kind='creator' AND (canonical_name=? OR normalized_name=?) ORDER BY id",
+        params![plan.target_person, plan.target_person.to_lowercase()],
+    )?;
+    if source.len() > 1 {
+        return Err(Error::conflict("Peach 来源人物记录不唯一"));
+    }
+    if !target.is_empty() {
+        return Err(Error::conflict("Peach 已有同名人物，不能直接覆盖或合并"));
+    }
+    let after_entities = source
+        .iter()
+        .map(|r| {
+            let mut next = r.clone();
+            next["canonical_name"] = json!(plan.target_person);
+            next["normalized_name"] = json!(plan.target_person.to_lowercase());
+            next
+        })
+        .collect::<Vec<_>>();
+    let old = format!(
+        "{}\\",
+        win(
+            config,
+            &config.creators().join(&plan.person).display().to_string()
+        )
+    );
+    let new = format!(
+        "{}\\",
+        win(
+            config,
+            &config
+                .creators()
+                .join(&plan.target_person)
+                .display()
+                .to_string()
+        )
+    );
+    let assets = db::rows(
+        &tx,
+        "SELECT * FROM asset WHERE substr(path,1,length(?))=? ORDER BY id",
+        [&old, &old],
+    )?;
+    let occupied = db::rows(
+        &tx,
+        "SELECT * FROM asset WHERE substr(path,1,length(?))=? ORDER BY id",
+        [&new, &new],
+    )?;
+    if !occupied.is_empty() {
+        return Err(Error::conflict("Peach 目标人物目录已有资产记录"));
+    }
+    let mut unique_paths = std::collections::BTreeSet::new();
+    if assets
+        .iter()
+        .any(|row| !unique_paths.insert(row["path"].as_str().unwrap()))
+    {
+        return Err(Error::conflict("Peach 来源目录有重复资产路径，请先核对"));
+    }
+    let after_assets = assets
+        .iter()
+        .map(|r| {
+            let mut next = r.clone();
+            next["path"] = json!(format!(
+                "{}{}",
+                new,
+                &r["path"].as_str().unwrap()[old.len()..]
+            ));
+            next
+        })
+        .collect::<Vec<_>>();
+    let mut guards = vec![
+        db::Guard::CreatorName {
+            canonical: plan.person.clone(),
+            normalized: plan.person.to_lowercase(),
+            before: source.clone(),
+            after: vec![],
+        },
+        db::Guard::CreatorName {
+            canonical: plan.target_person.clone(),
+            normalized: plan.target_person.to_lowercase(),
+            before: vec![],
+            after: after_entities.clone(),
+        },
+        db::Guard::AssetPrefix {
+            prefix: old,
+            before: assets.clone(),
+            after: vec![],
+        },
+        db::Guard::AssetPrefix {
+            prefix: new,
+            before: vec![],
+            after: after_assets.clone(),
+        },
+    ];
+    let mut links = vec![];
+    for asset in &assets {
+        let found = db::rows(
+            &tx,
+            "SELECT * FROM asset_entity WHERE asset_id=? ORDER BY entity_id,role,source",
+            [db::integer(&asset["id"])?],
+        )?;
+        guards.push(db::Guard::AssetLinks {
+            asset_id: asset["id"].clone(),
+            before: found.clone(),
+            after: found.clone(),
+        });
+        links.extend(found);
+    }
+    Ok(ledger::Delta {
+        changes: db::Delta {
+            tables: vec![
+                db::TableDelta {
+                    table: db::Table::Entity,
+                    key_columns: vec!["id".into()],
+                    scope: source.iter().map(|r| key(r, &["id"])).collect(),
+                    before: source,
+                    after: after_entities,
+                },
+                db::TableDelta {
+                    table: db::Table::Asset,
+                    key_columns: vec!["id".into()],
+                    scope: assets.iter().map(|r| key(r, &["id"])).collect(),
+                    before: assets,
+                    after: after_assets,
+                },
+            ],
+            guards,
+        },
+        creators: vec![],
     })
 }

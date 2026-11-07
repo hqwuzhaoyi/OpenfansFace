@@ -943,6 +943,63 @@ pub fn inspect_owned_directory(proof: &DirectoryProof) -> Result<()> {
     Ok(())
 }
 
+/// Remove an accepted source directory after all stores committed. Never removes contents,
+/// follows symlinks, or treats a replaced inode as ours. Missing is accepted only by the
+/// caller's durable post-commit cleanup intent.
+pub fn remove_source_directory(proof: &crate::person_directory::Directory) -> Result<()> {
+    let path = Path::new(&proof.src);
+    let parent: File = match directory(path.parent().unwrap()) {
+        Ok(fd) => fd.into(),
+        Err(e) if e.code == "source_changed" => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if !same_inode(&identity(&parent.metadata()?), &proof.parent) {
+        return Err(Error::conflict("来源父目录已被替换"));
+    }
+    let owned: File = match openat(
+        &parent,
+        path.file_name().unwrap(),
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd.into(),
+        Err(rustix::io::Errno::NOENT) => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    if !same_inode(&identity(&owned.metadata()?), &proof.identity) {
+        return Err(Error::conflict("来源目录已被替换").at(&proof.src));
+    }
+    unlinkat(&parent, path.file_name().unwrap(), AtFlags::REMOVEDIR)?;
+    parent.sync_all()?;
+    Ok(())
+}
+
+/// Verify a committed destination after source-directory cleanup removed its parent.
+/// This retains the same inode/content evidence as PinnedMove::position, including EXDEV copies.
+pub fn inspect_committed_destination(file: &FileMove, evidence: &MoveEvidence) -> Result<()> {
+    let parent: File = directory(Path::new(&file.dst).parent().unwrap())?.into();
+    if !same_inode(&identity(&parent.metadata()?), &evidence.destination_parent) {
+        return Err(Error::conflict("目标父目录已被替换").at(&file.dst));
+    }
+    let mut opened: File = openat(
+        &parent,
+        Path::new(&file.dst).file_name().unwrap(),
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?
+    .into();
+    if !opened.metadata()?.is_file()
+        || !(fingerprint(&file.src, &opened.metadata()?) == file.version
+            || evidence
+                .copy
+                .as_ref()
+                .is_some_and(|p| PinnedMove::proof_matches(&mut opened, p).unwrap_or(false)))
+    {
+        return Err(Error::conflict("已提交文件身份已变化").at(&file.dst));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

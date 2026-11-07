@@ -13,6 +13,7 @@ test('provider selection defaults to legacy and Rust opt-in selects migrated ren
  const enabled={FILE_OPERATIONS_BACKEND:'rust',FILE_OPERATIONS_ENABLE_RUST:'1'}
  assert.equal(selectedPersonFileBackend('rename-file',enabled),'rust')
  assert.equal(selectedPersonFileBackend('move-files',enabled),'rust')
+ assert.equal(selectedPersonFileBackend('rename-person',enabled),'rust')
  assert.equal(selectedPersonFileBackend('merge-person',enabled),'legacy')
  assert.throws(()=>selectedPersonFileBackend('rename-file',{FILE_OPERATIONS_BACKEND:'typo'}),{status:503})
 })

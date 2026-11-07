@@ -57,6 +57,9 @@ pub fn mapped(config: &Config, value: &str, plan: &Plan) -> String {
             return win(config, &file.dst);
         }
     }
+    if plan.action == "rename-person" {
+        return crate::person_rename::mapped(config, value, plan);
+    }
     value.into()
 }
 pub fn transform(config: &Config, value: &Value, plan: &Plan) -> Value {
@@ -604,7 +607,7 @@ fn validate_delta_domain(delta: &db::Delta, jobs: bool) -> Result<()> {
     if delta
         .guards
         .iter()
-        .any(|guard| !matches!(guard, db::Guard::LocalFiles { table, .. } if *table == expected))
+        .any(|guard| !matches!(guard, db::Guard::LocalFiles { table, .. } | db::Guard::LocalIdentity { table, .. } if *table == expected))
     {
         return Err(Error::conflict("本地事务包含其他存储域的查询保护"));
     }

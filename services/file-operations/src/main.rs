@@ -10,10 +10,12 @@ mod metadata;
 mod model;
 mod native;
 mod permissions;
+mod person_directory;
 mod person_ledger;
 mod person_metadata;
 mod person_move;
 mod person_registration;
+mod person_rename;
 mod store;
 
 use crate::{

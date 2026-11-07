@@ -55,9 +55,50 @@ fn owner_transform(value: &Value, plan: &Plan) -> Value {
 }
 fn updated(config: &Config, name: &str, value: &Value, plan: &Plan) -> Value {
     if name.starts_with("external-profiles/") {
-        return value.clone();
+        if plan.action != "rename-person" {
+            return value.clone();
+        }
+        let mut next = value.clone();
+        let field = if name.contains("manual-links") {
+            "creator"
+        } else {
+            "person"
+        };
+        if let Some(links) = next.get_mut("links").and_then(Value::as_array_mut) {
+            for link in links {
+                if link[field]
+                    .as_str()
+                    .is_some_and(|s| crate::person_rename::names(plan).iter().any(|n| n == s))
+                {
+                    link[field] = json!(plan.target_person);
+                }
+            }
+        }
+        return next;
     }
     let mut next = owner_transform(&metadata::transform(config, value, plan), plan);
+    if plan.action == "rename-person" {
+        next = crate::person_rename::transform(&next, plan);
+        if name == "person-renames.json" {
+            next = value.clone();
+            for current in next.as_object_mut().unwrap().values_mut() {
+                if *current == plan.person {
+                    *current = json!(plan.target_person)
+                }
+            }
+            next[&plan.person] = json!(plan.target_person);
+            next.as_object_mut().unwrap().remove(&plan.target_person);
+        }
+        if name == "template-overrides.json" {
+            let mut sources = crate::person_rename::names(plan);
+            sources.sort_by_key(|name| name == &plan.person);
+            for source in sources {
+                if let Some(value) = next.as_object_mut().unwrap().remove(&source) {
+                    next[&plan.target_person] = value;
+                }
+            }
+        }
+    }
     if name == "video-path-overrides.json" {
         next = Value::Object(
             value
@@ -180,6 +221,54 @@ fn selected_rows(
     table: &str,
     plan: &Plan,
 ) -> Result<Vec<Value>> {
+    if plan.action == "rename-person" {
+        let rows = crate::delta::local_identity(
+            connection,
+            if table == "videos" {
+                db::Table::Videos
+            } else {
+                db::Table::Tasks
+            },
+            &plan
+                .files
+                .iter()
+                .flat_map(|f| f.vids.clone())
+                .collect::<Vec<_>>(),
+            &plan
+                .files
+                .iter()
+                .flat_map(|f| {
+                    [
+                        f.src.clone(),
+                        f.dst.clone(),
+                        metadata::win(config, &f.src),
+                        metadata::win(config, &f.dst),
+                    ]
+                })
+                .collect::<Vec<_>>(),
+            &identity_prefixes(config, plan),
+            &crate::person_rename::names(plan),
+        )?;
+        let target = config
+            .creators()
+            .join(&plan.target_person)
+            .display()
+            .to_string();
+        let prefixes = [
+            format!("{target}/"),
+            format!("{}\\", metadata::win(config, &target)),
+        ];
+        if rows.iter().any(|r| {
+            r["path"]
+                .as_str()
+                .is_some_and(|p| prefixes.iter().any(|prefix| p.starts_with(prefix)))
+        }) {
+            return Err(crate::model::Error::conflict(
+                "目标人物目录已有视频或处理任务索引，请先核对",
+            ));
+        }
+        return Ok(rows);
+    }
     let mut ids = BTreeSet::new();
     let mut paths = BTreeSet::new();
     let mut targets = BTreeSet::new();
@@ -254,12 +343,24 @@ fn delta(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    let guard = db::Guard::LocalFiles {
-        table,
-        vids,
-        paths,
-        before: before.clone(),
-        after: after.clone(),
+    let guard = if plan.action == "rename-person" {
+        db::Guard::LocalIdentity {
+            table,
+            vids,
+            paths,
+            prefixes: identity_prefixes(config, plan),
+            names: crate::person_rename::names(plan),
+            before: before.clone(),
+            after: after.clone(),
+        }
+    } else {
+        db::Guard::LocalFiles {
+            table,
+            vids,
+            paths,
+            before: before.clone(),
+            after: after.clone(),
+        }
     };
     db::Delta {
         tables: vec![db::TableDelta {
@@ -328,6 +429,18 @@ pub fn snapshot(config: &Config, plan: &Plan) -> Result<Snapshot> {
                         json!(Path::new(&file.dst).parent().unwrap().to_string_lossy());
                 }
             }
+            if plan.action == "rename-person" && next == *row {
+                next = metadata::transform(config, row, plan);
+                if next["path"] != row["path"] {
+                    let path = Path::new(next["path"].as_str().unwrap()).to_owned();
+                    if row.get("name").is_some() {
+                        next["name"] = json!(path.file_name().unwrap().to_string_lossy());
+                    }
+                    if row.get("collection").is_some() {
+                        next["collection"] = json!(path.parent().unwrap().to_string_lossy());
+                    }
+                }
+            }
             next
         })
         .collect();
@@ -365,6 +478,31 @@ pub fn snapshot(config: &Config, plan: &Plan) -> Result<Snapshot> {
                     plan
                 ))?);
             }
+            if plan.action == "rename-person" {
+                let data: Value = serde_json::from_str(
+                    row["data"]
+                        .as_str()
+                        .ok_or_else(|| crate::model::Error::conflict("任务数据无效"))?,
+                )?;
+                let changed = crate::person_rename::transform(
+                    &metadata::transform(config, &data, plan),
+                    plan,
+                );
+                next["data"] = json!(serde_json::to_string(&changed)?);
+                if next["path"] == row["path"] {
+                    next["path"] = json!(metadata::mapped(
+                        config,
+                        row["path"].as_str().unwrap(),
+                        plan
+                    ));
+                    let path = Path::new(next["path"].as_str().unwrap()).to_owned();
+                    next["name"] = json!(path.file_name().unwrap().to_string_lossy());
+                    if ["face", "text"].contains(&row["stage"].as_str().unwrap_or("")) {
+                        next["stage"] = json!("queued");
+                    }
+                }
+                next["updated_at"] = json!(updated_at);
+            }
             after.push(next);
         }
         Some(delta(config, plan, db::Table::Tasks, before, after))
@@ -378,4 +516,19 @@ pub fn snapshot(config: &Config, plan: &Plan) -> Result<Snapshot> {
         faces_delta,
         jobs_delta,
     })
+}
+
+fn identity_prefixes(config: &Config, plan: &Plan) -> Vec<String> {
+    [
+        config.creators().join(&plan.person),
+        config.creators().join(&plan.target_person),
+    ]
+    .iter()
+    .flat_map(|p| {
+        [
+            format!("{}/", p.display()),
+            format!("{}\\", metadata::win(config, &p.display().to_string())),
+        ]
+    })
+    .collect()
 }

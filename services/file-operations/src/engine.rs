@@ -419,7 +419,25 @@ impl Engine {
         };
         let cause = persisted_cause.as_ref().unwrap_or(cause);
         let rollback = rollback || failed_rollback;
+        let directory_cleanup = self
+            .store
+            .latest_step(&plan.id, "source_directory_cleanup_intent")?
+            .is_some();
+        if directory_cleanup {
+            if ledger_state != "committed" {
+                return Err(Error::conflict("来源目录清理缺少已提交账本"));
+            }
+            for (index, file) in plan.files.iter().enumerate() {
+                files::inspect_committed_destination(
+                    file,
+                    &self.store.file_evidence(&plan.id, index)?,
+                )?;
+            }
+        }
         for (index, file) in plan.files.iter().enumerate() {
+            if directory_cleanup {
+                continue;
+            }
             if failures.iter().any(|f| f["file_index"] == index) {
                 continue;
             }
@@ -815,11 +833,50 @@ impl Engine {
         };
         crate::fault::checkpoint(&self.config, "ledger_committed_unrecorded")?;
         self.checkpoint(id, "ledger_committed", evidence)?;
-        let result = if plan.execution.is_some() {
+        let mut directory_warning = None;
+        if let Some(inventory) = crate::person_directory::intent(plan)? {
+            self.checkpoint(
+                id,
+                "source_directory_cleanup_intent",
+                json!({"directories":inventory.directories}),
+            )?;
+            for (index, file) in plan.files.iter().enumerate() {
+                files::inspect_committed_destination(
+                    file,
+                    &self.store.file_evidence(&plan.id, index)?,
+                )?;
+            }
+            for directory in inventory.directories.iter().rev() {
+                self.checkpoint(
+                    id,
+                    "source_directory_remove_intent",
+                    json!({"directory":directory}),
+                )?;
+                if let Err(error) = files::remove_source_directory(directory) {
+                    self.checkpoint(
+                        id,
+                        "source_directory_cleanup_warning",
+                        json!({"directory":directory,"error":error}),
+                    )?;
+                    directory_warning = Some("操作已完成，旧目录中还有新文件或空目录待核对");
+                    break;
+                }
+                crate::fault::checkpoint(&self.config, "source_directory_removed_unrecorded")?;
+                self.checkpoint(
+                    id,
+                    "source_directory_removed",
+                    json!({"directory":directory}),
+                )?;
+            }
+        }
+        let mut result = if plan.execution.is_some() {
             native::result(plan, &successful, &self.store.failures(id)?)
         } else {
             model::final_result(plan)
         };
+        if let Some(warning) = directory_warning {
+            result["warning"] = json!(warning);
+        }
         self.checkpoint(id, "final_receipt_intent", json!({"result":result}))?;
         self.store.complete(plan, &result)?;
         crate::fault::checkpoint(&self.config, "final_receipt_unreleased")?;
@@ -930,7 +987,8 @@ fn validate_plan(config: &Config, plan: &Plan) -> Result<()> {
             if !identities.insert((
                 identity["dev"].clone().to_string(),
                 identity["ino"].clone().to_string(),
-            )) {
+            )) && plan.action != "rename-person"
+            {
                 return Err(Error::conflict("同一物理文件不能重复移动"));
             }
         }
@@ -938,17 +996,19 @@ fn validate_plan(config: &Config, plan: &Plan) -> Result<()> {
             return Err(Error::conflict("源路径与目标路径不能相互覆盖"));
         }
         for directory in &plan.directories {
-            if !plan.files.iter().enumerate().any(|(index, file)| {
-                Path::new(&file.dst)
-                    .parent()
-                    .is_some_and(|p| p.starts_with(directory))
-                    && files::approved_directory(
-                        config,
-                        &execution.scopes[index],
-                        Path::new(directory),
-                    )
-                    .unwrap_or(false)
-            }) {
+            if !crate::person_directory::approved(config, plan, directory)
+                && !plan.files.iter().enumerate().any(|(index, file)| {
+                    Path::new(&file.dst)
+                        .parent()
+                        .is_some_and(|p| p.starts_with(directory))
+                        && files::approved_directory(
+                            config,
+                            &execution.scopes[index],
+                            Path::new(directory),
+                        )
+                        .unwrap_or(false)
+                })
+            {
                 return Err(Error::conflict("创建目录不在文件目标范围内"));
             }
         }
