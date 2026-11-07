@@ -1086,6 +1086,73 @@ pub fn needs_recovery(config: &Config) -> Result<bool> {
     Ok(report(config)?["status"] == "running")
 }
 
+/// Person-workbench evidence reads only the requested registered/active IDs. Reuse the
+/// health inventory's authoritative current path and restoration generation, with one
+/// metadata snapshot for the entire bounded batch. This never probes or publishes health.
+pub fn library_observations(config: &Config, ids: &[String]) -> Result<Value> {
+    let current = inventory(config)?;
+    let mut assigned_paths = BTreeSet::new();
+    for document in ["integration-queue.json", "archive-history.json"] {
+        let rows = read(config, document, json!([]))?;
+        for row in rows
+            .as_array()
+            .ok_or_else(|| Error::conflict("归名记录格式无效"))?
+        {
+            if let Some(path) = row["vid"]
+                .as_str()
+                .and_then(|id| current.get(id))
+                .and_then(|item| item["path"].as_str())
+            {
+                assigned_paths.insert(path.to_owned());
+            }
+        }
+    }
+    let report = report(config)?;
+    let age = clock(config) - epoch(&report["last_success_at"]);
+    let fresh = (0..7 * DAY).contains(&age);
+    let mut rows = serde_json::Map::new();
+    for id in ids {
+        let Some(item) = current.get(id) else {
+            rows.insert(
+                id.clone(),
+                json!({"status":"missing","eligible":false,"path":null}),
+            );
+            continue;
+        };
+        let Some(path) = item["path"].as_str() else {
+            rows.insert(
+                id.clone(),
+                json!({"status":"unmapped","eligible":false,"path":null}),
+            );
+            continue;
+        };
+        let stat = match files::regular_stat(path) {
+            Ok(stat) => stat,
+            Err(error) if error.code == "source_changed" => {
+                rows.insert(
+                    id.clone(),
+                    json!({"status":"missing","eligible":false,"path":path}),
+                );
+                continue;
+            }
+            Err(error) => return Err(error.at(path).during("library_observation")),
+        };
+        let fingerprint = files::fingerprint(path, &stat);
+        let saved = &report["records"][id];
+        let hidden = fresh
+            && saved["hidden"] == true
+            && saved["path"] == path
+            && saved["fingerprint"] == fingerprint
+            && saved["material"] == item["material"];
+        let eligible = !Path::new(path).starts_with(config.creators())
+            && !Path::new(path).starts_with(crate::staging::root(config))
+            && !hidden;
+        use std::os::unix::fs::MetadataExt;
+        rows.insert(id.clone(), json!({"status":"present","eligible":eligible,"hidden":hidden,"assigned":assigned_paths.contains(path),"path":path,"size":stat.len(),"mtime_ns":files::mtime_ns(&stat),"modified_ms":stat.mtime() as f64*1000.0+stat.mtime_nsec() as f64/1000000.0,"version":fingerprint}));
+    }
+    Ok(json!({"observations":rows}))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

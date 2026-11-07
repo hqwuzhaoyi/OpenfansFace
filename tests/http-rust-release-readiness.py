@@ -22,6 +22,10 @@ def drain():
         assert x.call({'mode':'apply','request':p['request'],'version':p['version']},status=503)['code']=='admission_closed'
         assert x.call(route='/v1/readiness',token=False,status=401)['code']=='unauthorized'
         assert x.status(p)['status'] in ('accepted','running')
+        assert '甲' in x.call(route='/v1/person-library')['names']
+        observed=x.call({'vids':[f.VID]},'/v1/person-library/observations')
+        assert observed['observations'][f.VID]['path']==str(x.source)
+        assert x.call(route='/v1/readiness')['pending']==1
         (x.root/'rust-fault.json').unlink();t.join(timeout=10);assert result
         state=x.call(route='/v1/readiness');assert state['drained'] and not state['accepting'],state
         x.stop()
@@ -63,6 +67,18 @@ def parity():
         auxiliary={str(p):p.read_bytes() for p in (root/'base').rglob('*-shm')}
         x.env.pop('FILE_OPERATIONS_FIXTURE_ROOT');x.env.update(FACES_BASE=str(root/'base'),PEACH_LEDGER_PATH=str(root/'ledger.db'),FILE_OPERATIONS_PARITY_ROOT=str(root),VIDEO_HEALTH_ENABLED='1')
         x.start();p=x.preview();assert p['files'][0]['src']==str(x.source)
+        modes={p:p.stat().st_mode & 0o777 for p in [x.media,*x.media.rglob('*')]}
+        try:
+            for path in modes:path.chmod(0o555 if path.is_dir() else 0o444)
+            if os.geteuid()!=0:assert not os.access(x.source,os.W_OK) and not os.access(x.source.parent,os.W_OK)
+            assert '甲' in x.call(route='/v1/person-library')['names']
+            listing=x.call(route='/v1/person-library?name=%E7%94%B2')
+            assert listing['directory_exists'] and listing['files'][0]['path']==str(x.source)
+            assert x.call(route='/v1/person-library?stats=1')['stats']['甲']['video_count']==1
+            observed=x.call({'vids':[f.VID]},'/v1/person-library/observations')
+            assert observed['observations'][f.VID]['path']==str(x.source)
+        finally:
+            for path,mode in modes.items():path.chmod(mode)
         for route,body in [('/v1/person-files',{'mode':'apply','request':p['request'],'version':p['version']}),('/v1/person-files',{'mode':'reconcile','request':p['request']}),('/v1/person-batch',{'mode':'apply'}),('/v1/archive',{'command':'queue-confirm','body':{}}),('/v1/metadata',{'command':'processing-result','body':{}}),('/v1/video-health',{})]:
             assert x.call(body,route,status=403)['code']=='read_only_parity'
         assert x.call({'accepting':True},'/v1/admission',status=403)['code']=='read_only_parity'
