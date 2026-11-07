@@ -11,11 +11,11 @@ export function validateFileOperationId(value:unknown):asserts value is string {
   if(typeof value!=='string'||!/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(value))throw new FileOperationRoutingError('操作编号无效',400)
 }
 
-/** Only the first migrated capability can opt into Rust. All others retain their existing owner. */
+/** Migrated file capabilities opt into the same Rust authority; other actions retain their owner. */
 export function selectedPersonFileBackend(action:string,env:NodeJS.ProcessEnv=process.env):FileOperationBackendName {
   const selected=env.FILE_OPERATIONS_BACKEND||'legacy'
   if(selected!=='legacy'&&selected!=='rust')throw new FileOperationRoutingError('文件操作后端配置无效',503)
-  if(action!=='rename-file'||selected==='legacy')return 'legacy'
+  if(!['rename-file','move-files'].includes(action)||selected==='legacy')return 'legacy'
   if(env.FILE_OPERATIONS_ENABLE_RUST!=='1')throw new FileOperationRoutingError('Rust 文件操作尚未启用',503)
   return 'rust'
 }

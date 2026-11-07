@@ -7,11 +7,12 @@ import {randomUUID} from 'node:crypto'
 import {claimFileOperation,fileOperationOwner,selectedPersonFileBackend} from '../lib/file-operation-routing.ts'
 
 function fixture(t){const base=fs.mkdtempSync(path.join(os.tmpdir(),'face-routing-test-'));t.after(()=>fs.rmSync(base,{recursive:true,force:true}));return base}
-test('provider selection defaults to legacy and Rust opt-in changes only rename-file',()=>{
+test('provider selection defaults to legacy and Rust opt-in selects migrated rename and move capabilities',()=>{
  assert.equal(selectedPersonFileBackend('rename-file',{}),'legacy')
  assert.throws(()=>selectedPersonFileBackend('rename-file',{FILE_OPERATIONS_BACKEND:'rust'}),{status:503})
  const enabled={FILE_OPERATIONS_BACKEND:'rust',FILE_OPERATIONS_ENABLE_RUST:'1'}
  assert.equal(selectedPersonFileBackend('rename-file',enabled),'rust')
+ assert.equal(selectedPersonFileBackend('move-files',enabled),'rust')
  assert.equal(selectedPersonFileBackend('merge-person',enabled),'legacy')
  assert.throws(()=>selectedPersonFileBackend('rename-file',{FILE_OPERATIONS_BACKEND:'typo'}),{status:503})
 })

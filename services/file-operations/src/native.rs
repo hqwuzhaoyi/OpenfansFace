@@ -10,17 +10,29 @@ pub struct DomainSnapshot {
     pub ledger: Option<crate::ledger::Delta>,
 }
 
-pub fn validate(_request: &Request) -> Result<()> {
-    Err(Error::new(400, "unsupported_scope", "此原生操作尚未启用"))
+pub fn validate(request: &Request) -> Result<()> {
+    match request.action.as_str() {
+        "move-files" | "rename-file" => crate::person_move::validate(request),
+        _ => Err(Error::new(400, "unsupported_scope", "此原生操作尚未启用")),
+    }
 }
-pub fn plan(_config: &Config, _request: Request) -> Result<Plan> {
-    Err(Error::new(409, "unsupported_scope", "此原生操作尚未启用"))
+pub fn plan(config: &Config, request: Request) -> Result<Plan> {
+    match request.action.as_str() {
+        "move-files" | "rename-file" => crate::person_move::plan(config, request),
+        _ => Err(Error::new(400, "unsupported_scope", "此原生操作尚未启用")),
+    }
 }
-pub fn snapshot(_config: &Config, _plan: &Plan, _successful: &[usize]) -> Result<DomainSnapshot> {
-    Err(Error::new(400, "unsupported_scope", "此原生操作尚未启用"))
+pub fn snapshot(config: &Config, plan: &Plan, successful: &[usize]) -> Result<DomainSnapshot> {
+    match plan.action.as_str() {
+        "move-files" | "rename-file" => crate::person_move::snapshot(config, plan, successful),
+        _ => Err(Error::new(400, "unsupported_scope", "此原生操作尚未启用")),
+    }
 }
-pub fn revalidate(_config: &Config, _plan: &Plan) -> Result<()> {
-    Ok(())
+pub fn revalidate(config: &Config, plan: &Plan) -> Result<()> {
+    match plan.action.as_str() {
+        "move-files" | "rename-file" => crate::person_move::revalidate(config, plan),
+        _ => Err(Error::new(400, "unsupported_scope", "此原生操作尚未启用")),
+    }
 }
 
 pub fn result(
