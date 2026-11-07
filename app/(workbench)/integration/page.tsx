@@ -312,7 +312,7 @@ function Integration() {
         <AlertDialogFooter><AlertDialogCancel>返回继续检查（Esc）</AlertDialogCancel><AlertDialogAction ref={confirmButton} onClick={apply}><Check className="mr-1 h-4 w-4" />确认归档 {validChosen.length} 个（Enter）</AlertDialogAction></AlertDialogFooter>
       </AlertDialogContent>
     </AlertDialog>
-    {resolving && plan && <ArchiveResolutionDialog key={resolving.map(row => row.vid).join()} rows={resolving} version={plan.version} onClose={() => setResolving(null)} onSaved={async () => {
+    {resolving && plan && <ArchiveResolutionDialog fallbackFocus={searchInput} key={resolving.map(row => row.vid).join()} rows={resolving} version={plan.version} onClose={() => setResolving(null)} onSaved={async () => {
       const data = await load()
       if (!data) { toast.warning('选择已保存，预览刷新失败，请点刷新后继续。', toastOptions); return }
       toast.success('处理方式已保存，所有仍在队列中的勾选已保留。点击归档才会移动文件。', toastOptions)

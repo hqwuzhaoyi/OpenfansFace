@@ -72,10 +72,11 @@ impl SourceIndex {
         let selected: BTreeSet<&str> = selected_paths.iter().map(String::as_str).collect();
         let mut by_path = BTreeMap::<String, Vec<String>>::new();
         let mut consider = |id: &str, path: &str| {
-            let effective = historical
-                .get(id)
-                .copied()
-                .or(overrides[id].as_str())
+            // A staged/restored source can have a historical canonical target.
+            // Its explicit current override remains the authoritative location.
+            let effective = overrides[id]
+                .as_str()
+                .or_else(|| historical.get(id).copied())
                 .unwrap_or(path);
             let candidates: Vec<_> = [effective, id]
                 .into_iter()
@@ -118,6 +119,27 @@ impl SourceIndex {
     pub fn ids_for_path(&self, path: &str) -> Vec<String> {
         self.by_path.get(path).cloned().unwrap_or_default()
     }
+    /// Whole-directory moves carry attachments but register only actual videos as new IDs.
+    pub fn tracked_ids(&self, path: &str, stat: &fs::Metadata) -> Result<Vec<String>> {
+        let ids = self.ids_for_path(path);
+        if !ids.is_empty() {
+            return Ok(ids);
+        }
+        let extension = Path::new(path)
+            .extension()
+            .and_then(|v| v.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        if [
+            "mp4", "m4v", "mov", "mkv", "webm", "avi", "wmv", "ts", "mts", "m2ts",
+        ]
+        .contains(&extension.as_str())
+        {
+            self.selected_ids(path, path, stat)
+        } else {
+            Ok(vec![])
+        }
+    }
     pub fn selected_ids(
         &self,
         path: &str,
@@ -140,6 +162,11 @@ impl SourceIndex {
 pub fn canonical(config: &Config, name: &str) -> Result<String> {
     files::validate_name(name)?;
     let (_, aliases) = document(config, "person-renames.json", false)?;
+    canonical_in(name, &aliases)
+}
+/// Resolve against one accepted alias document, avoiding repeated IO for whole-person scope.
+pub fn canonical_in(name: &str, aliases: &Value) -> Result<String> {
+    files::validate_name(name)?;
     let mut current = name.to_owned();
     let mut seen = BTreeSet::new();
     while let Some(next) = aliases[&current].as_str() {

@@ -57,6 +57,9 @@ pub fn mapped(config: &Config, value: &str, plan: &Plan) -> String {
             return win(config, &file.dst);
         }
     }
+    if plan.action == "rename-person" {
+        return crate::person_rename::mapped(config, value, plan);
+    }
     value.into()
 }
 pub fn transform(config: &Config, value: &Value, plan: &Plan) -> Value {
@@ -227,7 +230,8 @@ pub fn registered_ids(config: &Config, src: &str) -> Result<Vec<String>> {
             .rev()
             .find(|r| r["vid"] == id)
             .and_then(|r| r["win_dst"].as_str().or(r["dst"].as_str()));
-        let stored = archived.or(overrides[id].as_str()).or(row["path"].as_str());
+        // Explicit current locations outrank historical canonical archive targets.
+        let stored = overrides[id].as_str().or(archived).or(row["path"].as_str());
         let candidates: Vec<String> = stored
             .into_iter()
             .chain(std::iter::once(id))
@@ -604,7 +608,7 @@ fn validate_delta_domain(delta: &db::Delta, jobs: bool) -> Result<()> {
     if delta
         .guards
         .iter()
-        .any(|guard| !matches!(guard, db::Guard::LocalFiles { table, .. } if *table == expected))
+        .any(|guard| !matches!(guard, db::Guard::LocalFiles { table, .. } | db::Guard::LocalIdentity { table, .. } if *table == expected))
     {
         return Err(Error::conflict("本地事务包含其他存储域的查询保护"));
     }

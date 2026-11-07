@@ -339,3 +339,42 @@ before/after evidence and mutation-intent/resolved unlink records distinguish
 completed, failed, unexecuted and recovery-required items. Deleted bytes never
 enter reversible mover compensation. Unknown syscall outcomes retain the gate.
 See [the contract and isolated verification](../../docs/verification/rust-staging-permanent-delete.md).
+
+## Whole-person rename (#9)
+
+`rename-person` accepts the existing public `{person,new_name}` request (the native typed
+request also accepts `target_person`). It inventories the entire real directory, including
+attachments, hidden files and empty directories; symlinks/special files, existing targets,
+NFC/case-equivalent people, foreign aliases and target template settings reject the operation.
+Unindexed videos receive stable override IDs; unindexed attachments do not become videos.
+`person_directory` records immutable directory identity/parent proofs, while `person_registration`
+provides shared whole-directory stable-ID scope for later identity operations.
+
+The common runner moves every accepted file, publishes all destination directories and retains
+source directories throughout rollback-capable phases. Only after confirmed aggregate commits
+are the old empty directories removed deepest-first, with durable intents and inode checks.
+Late additions or known cleanup failures produce a completed result with a warning and preserve
+foreign contents. A failed/unknown core consistency check keeps recovery blocked. Restart after
+cleanup verifies destination parent and file/copy evidence without requiring removed source parents.
+
+Identity metadata includes aliases, manual account relations (not profile snapshots), reviewed
+clues, templates, queues, rejections and candidate names. Historical IDs, raw text and task audit
+events remain unchanged. Absent optional documents remain absent. Related active candidate tasks
+return to queued; physically moved tasks become excluded. LocalIdentity guards include exact IDs,
+paths, literal directory prefixes and semantic task JSON references, so new matching rows are
+caught while unrelated analysis progress remains valid. Peach changes the ambiguity-checked source
+entity in place and every asset below its literal prefix, including historical/disposed rows;
+all relation roles, alias rows and entity IDs survive. No new entity is allocated and no implicit
+merge occurs. All stores use the same native exact before/after delta and guarded receipt protocol.
+
+```sh
+python3 tests/http-rust-person-rename.py --port 18989
+python3 tests/http-rust-person-rename-gateway.py \
+  --root /tmp/face-admin-person-fileops-example --url http://127.0.0.1:18988
+```
+
+Acceptance uses the full production task schema and observed Peach schema, real files, concurrent
+unrelated updates, relevant changes, actual transaction failure, per-store crash boundaries,
+protected restoration, empty directories, hardlinks, old aliases and HTTP Range. The existing
+person rename dialog uses Radix initial focus so Escape/close returns to its trigger. Local
+fixture/build/browser evidence does not constitute production deployment or NFS acceptance.

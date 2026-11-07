@@ -613,3 +613,89 @@ fn local_file_guard_unions_duplicates_and_large_selector_chunks() {
     };
     delta::inspect(&conn, &delta, false).unwrap();
 }
+
+#[test]
+fn identity_scope_ignores_raw_evidence_and_catches_new_related_tasks() {
+    let mut conn = fixture();
+    conn.execute(
+        "INSERT INTO tasks VALUES('related','outside.mp4',?)",
+        [r#"{"candidates":[{"name":"Old"}],"ocr":"Old"}"#],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO tasks VALUES('unrelated','other.mp4',?)",
+        [r#"{"ocr":"Old","vid":"Old","note":"Old"}"#],
+    )
+    .unwrap();
+    let before = delta::local_identity(
+        &conn,
+        Table::Tasks,
+        &[],
+        &[],
+        &["/source/".into()],
+        &["Old".into()],
+    )
+    .unwrap();
+    assert_eq!(before.len(), 1);
+    let mut after = before.clone();
+    after[0]["data"] = json!(r#"{"candidates":[{"name":"New"}],"ocr":"Old"}"#);
+    let d = Delta {
+        tables: vec![change(
+            Table::Tasks,
+            &["vid"],
+            before.clone(),
+            after.clone(),
+        )],
+        guards: vec![Guard::LocalIdentity {
+            table: Table::Tasks,
+            vids: vec!["related".into()],
+            paths: vec![],
+            prefixes: vec!["/source/".into()],
+            names: vec!["Old".into()],
+            before,
+            after,
+        }],
+    };
+    conn.execute("UPDATE tasks SET data='{}' WHERE vid='unrelated'", [])
+        .unwrap();
+    let tx = conn.transaction().unwrap();
+    delta::apply(&tx, &d).unwrap();
+    tx.commit().unwrap();
+    delta::inspect(&conn, &d, true).unwrap();
+    conn.execute(
+        "UPDATE tasks SET data=? WHERE vid='unrelated'",
+        [r#"{"suggested":"Old"}"#],
+    )
+    .unwrap();
+    assert!(delta::inspect(&conn, &d, true).is_err());
+    let tx = conn.transaction().unwrap();
+    assert!(delta::restore(&tx, &d).is_err());
+}
+
+#[test]
+fn asset_prefix_guard_is_literal_including_percent_and_underscore() {
+    let conn = fixture();
+    conn.execute("UPDATE asset SET path='/Old%_/one' WHERE id=1", [])
+        .unwrap();
+    let before = db::rows(&conn, "SELECT * FROM asset WHERE id=1", []).unwrap();
+    let d = Delta {
+        tables: vec![],
+        guards: vec![Guard::AssetPrefix {
+            prefix: "/Old%_/".into(),
+            before: before.clone(),
+            after: before,
+        }],
+    };
+    conn.execute(
+        "INSERT INTO asset(location,path) VALUES('fixture','/OldAB/other')",
+        [],
+    )
+    .unwrap();
+    delta::inspect(&conn, &d, false).unwrap();
+    conn.execute(
+        "INSERT INTO asset(location,path) VALUES('fixture','/Old%_/late')",
+        [],
+    )
+    .unwrap();
+    assert!(delta::inspect(&conn, &d, false).is_err());
+}

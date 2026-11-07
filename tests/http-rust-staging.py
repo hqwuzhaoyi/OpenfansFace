@@ -193,5 +193,30 @@ def special_files():
         print('PASS FIFO excluded/rejected without blocking shared writer')
     finally:f.stop()
 
+def restore_after_source_person_rename():
+    f=Fixture()
+    try:
+        with sqlite3.connect(f.ledger) as db:
+            db.execute("INSERT INTO asset_entity(asset_id,entity_id,role,source) VALUES(1,1,'performer','fixture-extra')")
+        deletion=delete(f);f.apply(deletion)
+        row=listing(f)['rows'][0];historical=row['origin'].copy()
+        rename=f.preview({'id':str(uuid.uuid4()),'action':'rename-person','person':'甲','new_name':'新甲'})
+        f.apply(rename)
+        row=listing(f)['rows'][0]
+        assert row['origin']['person']=='甲' and row['origin']['original_path']==str(f.source)
+        plan=f.preview({'id':str(uuid.uuid4()),'action':'restore-files','person':'','files':[{k:row[k] for k in ('vid','path','version')}],'target_person':'丙'})
+        assert plan['person']=='新甲' and plan['target_person']=='丙'
+        f.apply(plan)
+        with sqlite3.connect(f.ledger) as db:
+            assert db.execute("SELECT DISTINCT e.canonical_name FROM asset_entity a JOIN entity e ON e.id=a.entity_id WHERE a.asset_id=1 AND a.role='creator'").fetchall()==[('丙',)]
+            assert db.execute("SELECT source FROM asset_entity WHERE asset_id=1 AND entity_id=1 AND role='performer'").fetchall()==[('fixture-extra',)]
+        history=json.loads((f.base/'archive-history.json').read_text())
+        assert history[0]['creator']=='丙' and history[0]['dst']==plan['files'][0]['dst']
+        audit=json.loads((f.base/'staging-origins.json').read_text())[row['path']]
+        assert all(audit[k]==v for k,v in historical.items())
+        assert Path(plan['files'][0]['dst']).read_bytes()==PAYLOAD
+        print('PASS restore after source-person rename uses current identity and preserves historical origin')
+    finally:f.stop()
+
 if __name__=='__main__':
-    success();guards();unknown_and_deleted();rollback();legacy();crashes();nested_and_native_receipt();database_failures();special_files()
+    success();guards();unknown_and_deleted();rollback();legacy();crashes();nested_and_native_receipt();database_failures();special_files();restore_after_source_person_rename()

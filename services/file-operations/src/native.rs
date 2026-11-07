@@ -11,6 +11,7 @@ pub struct DomainSnapshot {
 }
 fn review_action(action: &str) -> bool {
     [
+        "archive-resolve",
         "queue-confirm",
         "queue-undo",
         "claim-decide",
@@ -31,6 +32,7 @@ pub fn validate(request: &Request) -> Result<()> {
         }
         "delete-files" | "restore-files" => crate::staging::validate(request),
         "delete-staged" | "clear-staging" => crate::staging_delete::validate(request),
+        "rename-person" => crate::person_rename::validate(request),
         _ => Err(Error::new(400, "unsupported_scope", "此原生操作尚未启用")),
     }
 }
@@ -40,6 +42,7 @@ pub fn plan(config: &Config, request: Request) -> Result<Plan> {
         "archive" => crate::archive::plan(config, request),
         action if review_action(action) => crate::review::plan(config, request),
         "delete-files" | "restore-files" => crate::staging::plan(config, request),
+        "rename-person" => crate::person_rename::plan(config, request),
         _ => Err(Error::new(400, "unsupported_scope", "此原生操作尚未启用")),
     }
 }
@@ -49,6 +52,7 @@ pub fn snapshot(config: &Config, plan: &Plan, successful: &[usize]) -> Result<Do
         "archive" => crate::archive::snapshot(config, plan, successful),
         action if review_action(action) => crate::review::snapshot(config, plan, successful),
         "delete-files" | "restore-files" => crate::staging::snapshot(config, plan, successful),
+        "rename-person" => crate::person_rename::snapshot(config, plan, successful),
         _ => Err(Error::new(400, "unsupported_scope", "此原生操作尚未启用")),
     }
 }
@@ -58,6 +62,7 @@ pub fn revalidate(config: &Config, plan: &Plan) -> Result<()> {
         "archive" => crate::archive::revalidate(config, plan),
         action if review_action(action) => crate::review::revalidate(config, plan),
         "delete-files" | "restore-files" => crate::staging::revalidate(config, plan),
+        "rename-person" => crate::person_rename::revalidate(config, plan),
         _ => Err(Error::new(400, "unsupported_scope", "此原生操作尚未启用")),
     }
 }

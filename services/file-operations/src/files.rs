@@ -454,10 +454,11 @@ impl PinnedMove {
     }
     pub fn publish_recoverable(
         &mut self,
+        config: &Config,
         expected: &str,
         record: &mut impl FnMut(&str, &MoveEvidence) -> Result<()>,
     ) -> Result<()> {
-        if self.evidence.copy.is_some() {
+        if self.evidence.copy.is_some() || crate::fault::copy_required(config)? {
             return self.copy_publish(false, expected, record);
         }
         self.verify(expected)?;
@@ -1106,6 +1107,147 @@ pub fn inspect_owned_directory(proof: &DirectoryProof) -> Result<()> {
     Ok(())
 }
 
+/// Remove an accepted source directory after all stores committed. Never removes contents,
+/// follows symlinks, or treats a replaced inode as ours. Missing is accepted only by the
+/// caller's durable post-commit cleanup intent.
+pub fn remove_source_directory(proof: &crate::person_directory::Directory) -> Result<()> {
+    let path = Path::new(&proof.src);
+    let parent: File = match directory(path.parent().unwrap()) {
+        Ok(fd) => fd.into(),
+        Err(e) if e.code == "source_changed" => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if !same_inode(&identity(&parent.metadata()?), &proof.parent) {
+        return Err(Error::conflict("来源父目录已被替换"));
+    }
+    let owned: File = match openat(
+        &parent,
+        path.file_name().unwrap(),
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd.into(),
+        Err(rustix::io::Errno::NOENT) => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    if !same_inode(&identity(&owned.metadata()?), &proof.identity) {
+        return Err(Error::conflict("来源目录已被替换").at(&proof.src));
+    }
+    unlinkat(&parent, path.file_name().unwrap(), AtFlags::REMOVEDIR)?;
+    parent.sync_all()?;
+    Ok(())
+}
+
+/// Verify a committed destination after source-directory cleanup removed its parent.
+/// This retains the same inode/content evidence as PinnedMove::position, including EXDEV copies.
+pub fn inspect_committed_destination(file: &FileMove, evidence: &MoveEvidence) -> Result<()> {
+    let parent: File = directory(Path::new(&file.dst).parent().unwrap())?.into();
+    if !same_inode(&identity(&parent.metadata()?), &evidence.destination_parent) {
+        return Err(Error::conflict("目标父目录已被替换").at(&file.dst));
+    }
+    let mut opened: File = openat(
+        &parent,
+        Path::new(&file.dst).file_name().unwrap(),
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?
+    .into();
+    if !opened.metadata()?.is_file()
+        || !(fingerprint(&file.src, &opened.metadata()?) == file.version
+            || evidence
+                .copy
+                .as_ref()
+                .is_some_and(|p| PinnedMove::proof_matches(&mut opened, p).unwrap_or(false)))
+    {
+        return Err(Error::conflict("已提交文件身份已变化").at(&file.dst));
+    }
+    Ok(())
+}
+
+/// Open every parent and the leaf without following symlinks. Also used for read-only
+/// canonical duplicate evidence, so a symlink can never become an approved target.
+fn regular_file(path: &str) -> Result<File> {
+    let p = Path::new(path);
+    let parent = directory(
+        p.parent()
+            .ok_or_else(|| Error::conflict("文件父目录无效"))?,
+    )?;
+    let file: File = openat(
+        &parent,
+        p.file_name().ok_or_else(|| Error::conflict("文件名无效"))?,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?
+    .into();
+    if !file.metadata()?.is_file() {
+        return Err(Error::conflict("路径不是普通文件").at(path));
+    }
+    Ok(file)
+}
+pub fn regular_stat(path: &str) -> Result<fs::Metadata> {
+    Ok(regular_file(path)?.metadata()?)
+}
+/// Bounded full byte comparison and SHA-256, with pinned descriptors and path
+/// fingerprints checked on both sides before and after the complete read.
+pub fn identical_files(
+    config: &Config,
+    source: &FileMove,
+    target: &str,
+    target_version: &str,
+) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    let mut left = regular_file(&source.src)?;
+    let mut right = regular_file(target)?;
+    let before = [left.metadata()?, right.metadata()?];
+    let check = |left: &File, right: &File| -> Result<()> {
+        for (file, initial) in [(left, &before[0]), (right, &before[1])] {
+            let now = file.metadata()?;
+            if (now.ctime(), now.ctime_nsec()) != (initial.ctime(), initial.ctime_nsec()) {
+                return Err(Error::conflict(
+                    "完整内容校验期间文件状态已变化，请重新核对",
+                ));
+            }
+        }
+        if fingerprint(&source.src, &left.metadata()?) != source.version
+            || fingerprint(target, &right.metadata()?) != target_version
+            || fingerprint(&source.src, &regular_stat(&source.src)?) != source.version
+            || fingerprint(target, &regular_stat(target)?) != target_version
+        {
+            return Err(Error::conflict(
+                "完整内容校验前后文件状态已变化，请重新核对",
+            ));
+        }
+        Ok(())
+    };
+    check(&left, &right)?;
+    let mut remaining = source.size;
+    let mut a = vec![0; 1024 * 1024];
+    let mut b = vec![0; 1024 * 1024];
+    let mut left_sha = Sha256::new();
+    let mut right_sha = Sha256::new();
+    while remaining > 0 {
+        let n = remaining.min(a.len() as u64) as usize;
+        left.read_exact(&mut a[..n])?;
+        right.read_exact(&mut b[..n])?;
+        if a[..n] != b[..n] {
+            return Err(Error::new(
+                409,
+                "content_mismatch",
+                "完整内容校验不一致，源文件未移动。请改选“保留两份”",
+            ));
+        }
+        left_sha.update(&a[..n]);
+        right_sha.update(&b[..n]);
+        remaining -= n as u64;
+        crate::fault::checkpoint(config, "duplicate_comparison_chunk")?;
+    }
+    if left_sha.finalize() != right_sha.finalize() {
+        return Err(Error::conflict("完整内容摘要校验不一致，源文件未移动"));
+    }
+    check(&left, &right)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1150,7 +1292,7 @@ mod tests {
         let mut pinned = prepare_move(&config, &scope, &file).unwrap();
         let evidence = pinned.evidence.clone();
         pinned
-            .publish_recoverable(&file.version, &mut |_, _| Ok(()))
+            .publish_recoverable(&config, &file.version, &mut |_, _| Ok(()))
             .unwrap();
         pinned.remove_source(&file.version).unwrap();
         drop(pinned);

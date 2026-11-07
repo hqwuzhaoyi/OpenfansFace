@@ -266,7 +266,14 @@ pub fn plan(config: &Config, request: Request) -> Result<Plan> {
                 },
             )
         } else {
-            source_person = source_origin["person"].as_str().unwrap_or("").to_owned();
+            let historical_person = source_origin["person"].as_str().unwrap_or("");
+            // The origin remains immutable audit; active metadata and ledger roles
+            // follow the currently known alias of that historical source person.
+            source_person = if historical_person.is_empty() {
+                String::new()
+            } else {
+                registration::canonical(config, historical_person)?
+            };
             let dst = if let Some(target) = &request.target_person {
                 target_person = registration::canonical(config, target)?;
                 config
