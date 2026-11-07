@@ -259,6 +259,8 @@ pub fn delta(prepared: &Value, successful: &[usize]) -> Result<crate::ledger::De
                 creators
                     .entry(normalized.into())
                     .or_insert_with(|| crate::ledger::CreatorIntent {
+                        aliases: vec![],
+                        metadata_json: None,
                         canonical_name: row["entity"]["canonical_name"].as_str().unwrap().into(),
                         normalized_name: normalized.into(),
                         links: vec![],

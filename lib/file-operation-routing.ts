@@ -15,7 +15,7 @@ export function validateFileOperationId(value:unknown):asserts value is string {
 export function selectedPersonFileBackend(action:string,env:NodeJS.ProcessEnv=process.env):FileOperationBackendName {
   const selected=env.FILE_OPERATIONS_BACKEND||'legacy'
   if(selected!=='legacy'&&selected!=='rust')throw new FileOperationRoutingError('文件操作后端配置无效',503)
-  if(!['rename-file','move-files','delete-files','restore-files','delete-staged','clear-staging','rename-person','delete-person'].includes(action)||selected==='legacy')return 'legacy'
+  if(!['rename-file','move-files','delete-files','restore-files','delete-staged','clear-staging','rename-person','merge-person','delete-person'].includes(action)||selected==='legacy')return 'legacy'
   if(env.FILE_OPERATIONS_ENABLE_RUST!=='1')throw new FileOperationRoutingError('Rust 文件操作尚未启用',503)
   return 'rust'
 }

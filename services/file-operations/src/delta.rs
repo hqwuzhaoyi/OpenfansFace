@@ -17,6 +17,7 @@ pub enum Table {
     Entity,
     Asset,
     AssetEntity,
+    EntityAlias,
 }
 impl Table {
     fn name(self) -> &'static str {
@@ -27,6 +28,7 @@ impl Table {
             Self::Entity => "entity",
             Self::Asset => "asset",
             Self::AssetEntity => "asset_entity",
+            Self::EntityAlias => "entity_alias",
         }
     }
 }
@@ -43,6 +45,16 @@ pub struct Delta {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub enum Guard {
+    EntityLinks {
+        entity_id: Value,
+        before: Vec<Value>,
+        after: Vec<Value>,
+    },
+    EntityAliases {
+        entity_id: Value,
+        before: Vec<Value>,
+        after: Vec<Value>,
+    },
     AssetPrefix {
         prefix: String,
         before: Vec<Value>,
@@ -256,6 +268,22 @@ fn validate(conn: &Connection, delta: &Delta) -> Result<BTreeMap<Table, Schema>>
     }
     for guard in &delta.guards {
         let (table, before, after) = match guard {
+            Guard::EntityLinks {
+                entity_id,
+                before,
+                after,
+            } => {
+                db::integer(entity_id)?;
+                ("asset_entity", before, after)
+            }
+            Guard::EntityAliases {
+                entity_id,
+                before,
+                after,
+            } => {
+                db::integer(entity_id)?;
+                ("entity_alias", before, after)
+            }
             Guard::AssetPath { before, after, .. } | Guard::AssetPrefix { before, after, .. } => {
                 ("asset", before, after)
             }
@@ -373,6 +401,32 @@ fn inspect_rows(conn: &Connection, delta: &Delta, after: bool) -> Result<()> {
     }
     for guard in &delta.guards {
         let (actual, expected, table) = match guard {
+            Guard::EntityLinks {
+                entity_id,
+                before,
+                after: next,
+            } => (
+                db::rows(
+                    conn,
+                    "SELECT * FROM asset_entity WHERE entity_id=?",
+                    [db::sql_value(entity_id)?],
+                )?,
+                if after { next } else { before },
+                "asset_entity",
+            ),
+            Guard::EntityAliases {
+                entity_id,
+                before,
+                after: next,
+            } => (
+                db::rows(
+                    conn,
+                    "SELECT * FROM entity_alias WHERE entity_id=?",
+                    [db::sql_value(entity_id)?],
+                )?,
+                if after { next } else { before },
+                "entity_alias",
+            ),
             Guard::AssetPrefix {
                 prefix,
                 before,

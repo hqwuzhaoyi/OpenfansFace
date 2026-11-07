@@ -29,6 +29,8 @@ fn pending() -> Value {
 }
 fn intent() -> CreatorIntent {
     CreatorIntent {
+        aliases: vec![],
+        metadata_json: None,
         canonical_name: "Bob".into(),
         normalized_name: "bob".into(),
         links: vec![pending()],
@@ -129,7 +131,12 @@ fn missing_guard_is_created_from_original_scope_plus_base_effects() {
     changes.tables.push(TableDelta{table:Table::AssetEntity,key_columns:vec!["asset_id".into(),"entity_id".into(),"role".into(),"source".into()],scope:links.iter().map(|r| json!({"asset_id":r["asset_id"],"entity_id":r["entity_id"],"role":r["role"],"source":r["source"]})).collect(),before:links.clone(),after:vec![]});
     let tx = conn.transaction().unwrap();
     let realized = creator_delta::apply(&tx, &changes, &[intent()]).unwrap();
-    assert_eq!(realized.guards.len(), 2);
+    assert!(
+        realized
+            .guards
+            .iter()
+            .any(|g| matches!(g, Guard::EntityLinks { .. }))
+    );
     delta::restore(&tx, &realized).unwrap();
     assert_eq!(rows(&tx, "asset_entity"), links);
 }

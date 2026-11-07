@@ -156,6 +156,8 @@ pub fn snapshot(config: &Config, plan: &Plan) -> Result<ledger::Delta> {
             pending_links.push(row);
         }
         creators.push(ledger::CreatorIntent {
+            aliases: vec![],
+            metadata_json: None,
             canonical_name: plan.target_person.clone(),
             normalized_name: plan.target_person.to_lowercase(),
             links: pending_links,
