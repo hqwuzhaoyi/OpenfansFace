@@ -492,7 +492,8 @@ pub fn prepare(
                     && !(data["ready"] == true
                         && (task["stage"] == "face"
                             || task["stage"] == "face_queued"
-                            || task["stage"] == "retry" && task["retry_stage"] == "face"))
+                            || (task["stage"] == "retry" || task["stage"] == "error")
+                                && task["retry_stage"] == "face"))
                 {
                     return Err(Error::conflict("视频尚未就绪或状态已变化"));
                 }

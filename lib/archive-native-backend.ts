@@ -1,3 +1,4 @@
+import { nativeJsonRequest } from './native-json-transport'
 import fs from 'node:fs'
 import path from 'node:path'
 import { BASE } from './env'
@@ -28,19 +29,5 @@ export async function nativeArchiveProgress(id:string|null):Promise<Pick<Archive
   return current
 }
 async function request(payload:unknown,id?:string):Promise<unknown>{
-  const configured=process.env.FILE_OPERATIONS_RUST_URL
-  if(!configured)throw Object.assign(new Error('Rust 文件操作服务地址未配置'),{status:503})
-  let url:URL
-  try{url=new URL('v1/archive',configured.endsWith('/')?configured:configured+'/');if(!['http:','https:'].includes(url.protocol))throw new Error()}
-  catch{throw Object.assign(new Error('Rust 文件操作服务地址无效'),{status:503})}
-  if(id)url.searchParams.set('id',id)
-  const headers:Record<string,string>={'Content-Type':'application/json'}
-  if(process.env.FILE_OPERATIONS_RUST_TOKEN)headers.Authorization='Bearer '+process.env.FILE_OPERATIONS_RUST_TOKEN
-  let response:Response
-  try{response=await fetch(url,{method:id===undefined?'POST':'GET',headers,...(id===undefined?{body:JSON.stringify(payload)}:{}),cache:'no-store',signal:AbortSignal.timeout(120_000)})}
-  catch{throw Object.assign(new Error('后端连接中断，结果尚未确认；请查询原操作回执'),{status:503})}
-  const value=await response.json().catch(()=>null)
-  if(!response.ok)throw Object.assign(new Error(value?.error||'归档后端拒绝请求'),{status:response.status,code:value?.code,path:value?.path,step:value?.step})
-  if(!value||typeof value!=='object')throw Object.assign(new Error('归档后端未返回可核对的结果'),{status:502})
-  return value
+  return nativeJsonRequest('v1/archive',payload,{label:'归档',completion:'required',error:(message,status)=>Object.assign(new Error(message),{status})},id)
 }

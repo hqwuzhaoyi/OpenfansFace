@@ -777,7 +777,14 @@ pub fn execute(engine: &mut Engine, command: &str, mut body: Value) -> Result<Va
     if command == "processing-result" {
         return crate::processing_result::execute(engine, body);
     }
-    if ["state", "check-state", "analysis-state"].contains(&command) {
+    if [
+        "state",
+        "check-state",
+        "analysis-state",
+        "reference-relocation",
+    ]
+    .contains(&command)
+    {
         if engine.store.blocked()? {
             return Err(Error::new(
                 503,
@@ -798,6 +805,7 @@ pub fn execute(engine: &mut Engine, command: &str, mut body: Value) -> Result<Va
         };
         check_gate()?;
         let result = match command {
+            "reference-relocation" => crate::reference_relocation::verify(engine, &body),
             "state" => material_state(&engine.config, &body["scope"]),
             "check-state" => check_state(&engine.config, &body["scope"], string(&body, "version")?),
             _ => analysis_state(&engine.config),

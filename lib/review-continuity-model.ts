@@ -4,4 +4,4 @@ export function canAutoRefreshReview({now,lastActivity,protectedWork,requestActi
   return !protectedWork && now-lastActivity>=REVIEW_IDLE_MS && requestActivity===currentActivity
 }
 
-export function isReviewAvailable(task:ProcessingTask){return task.stage==='review'||!!task.manual||task.data.ready===true&&(task.stage==='face'||task.stage==='face_queued'||task.stage==='retry'&&task.retry_stage==='face')}
+export function isReviewAvailable(task:ProcessingTask){return task.stage==='review'||!!task.manual||task.data.ready===true&&(task.stage==='face'||task.stage==='face_queued'||(task.stage==='retry'||task.stage==='error')&&task.retry_stage==='face')}

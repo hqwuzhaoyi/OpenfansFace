@@ -140,8 +140,10 @@ are for the central release owner after the missing gates are satisfied.
    Run `fence-peers --execute`: pause worker claims and wait for current worker
    and calibrator publication to finish. For an existing native service, close and
    drain it next, allowing its already-admitted health publication to finish
-   before the external deployment fence can block it. Acquire `.review-write.lock` using
-   exclusive create only **after** any existing holder finishes. A held or
+   before the external deployment fence can block it. Publish `.review-write.lock` with an exclusive same-filesystem hard link only
+   **after** any existing holder finishes. The prepared regular file is fsynced,
+   and its exact inode/token/hash ownership receipt and receipt directory are
+   durable before that shared link becomes visible. A held or
    dangling foreign marker times out without stopping web, deleting the marker
    or inferring ownership from PID/age. The deployment marker has a unique token,
    exact inode/byte evidence and durable private intent/ownership receipts.
@@ -152,7 +154,9 @@ are for the central release owner after the missing gates are satisfied.
 
    Legacy active/recovery states block release. Unclassified old-format history
    requires an individually reviewed `legacy_terminal_acknowledgements` path→hash;
-   this cannot override an explicitly active or recovery-required record. Once
+   this cannot override an explicitly active or recovery-required record. The
+   parser checks `status`, staging `state`, nested `result.status` and job states;
+   `state:finished` cannot conceal `result.status:recovery_needed`. Once
    all peers are stopped and journals/timer are checked again, release only the
    exact owned deployment fence, then close/drain native. Replacement refuses
    any remaining shared marker, including before first native bootstrap.
@@ -160,7 +164,12 @@ are for the central release owner after the missing gates are satisfied.
    evidence. After resolving the cause and stopping all old peers, the central
    owner can use `release-fence --execute` with the original release ID; it
    verifies inode, bytes, token-bound receipt and peer states and cannot remove
-   a foreign replacement. Never delete the shared lock by hand or force-stop
+   a foreign replacement. Reads are bounded, nonblocking and no-follow, so a
+   replacement FIFO, symlink, oversized marker or corrupt receipt fails promptly.
+   Recovery also finishes a crash after shared unlink but before the release
+   receipt. Before ownership was saved, recovery records `not_published` only
+   when the shared path is absent and leaves the unowned prepared file untouched.
+   Never delete the shared lock by hand or force-stop
    uncertain accepted work to make the checks pass.
 4. `POST /v1/admission {"accepting":false}` persists closure before returning.
    Already queued work and an already admitted health scan finish; new HTTP and
@@ -240,7 +249,7 @@ Thus no unrelated original-worktree WIP was imported. Preserve #16 staging and
   homepage archive, retired endpoints and stable video Range. The gateway was
   deliberately configured with the obsolete `legacy` flag and still used native.
 - Python: 36 processing cases; retirement assertions for health/watermark
-  publishers; 19 controller tests covering schema/container/drain/capacity
+  publishers; 24 controller tests covering schema/container/drain/capacity
   refusal, SQLite snapshots and partial replacement receipts. The watermark
   frame-extraction case is skipped without Pillow in the local worker venv.
 
@@ -280,3 +289,11 @@ justify a complete backup plus images/reserve. The controller does not drop
 immutable caches/thumbnail bytes silently; choose an approved persistent backup
 destination or capacity plan, keeping live SQLite local. Full GPU coexistence,
 real-data parity and final joint checks remain required.
+
+Review follow-up evidence: `tests/evidence/review-fixes-20261108.json`. The
+controller additionally injects ownership-receipt failure, interruption before
+and after shared publication, directory-sync interruption and post-unlink receipt
+failure. Marker and ownership-record FIFO/symlink/oversize/corruption cases are
+bounded and preserve foreign objects. The actual Docker controller rehearsal
+was rerun with the repaired prepared-inode publication protocol; its simulated
+peer/GPU boundaries above still apply.

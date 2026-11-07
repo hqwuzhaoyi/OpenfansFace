@@ -90,4 +90,55 @@ def lane_slots_and_relevant_guards():
   assert t['vid'] not in [r['vid'] for r in f.call('review-page')['rows']]
   print('PASS stable lane append, atomic failed review batch, task-path guard, relevant health only',f.root)
  finally:f.stop()
-if __name__=='__main__':main();lane_slots_and_relevant_guards()
+def exhausted_face_retries(f, page):
+ # Exercise the real worker transition, including lease/run IDs and third failure.
+ for row in page['rows']:
+  vid=row['vid'];edit(f,[vid],stage='face_queued',retry_stage='face')
+  for expected in ['retry','retry','error']:
+   edit(f,[vid],next_retry=0)
+   with n.processing.connect(f.base) as con:
+    task=n.processing.claim(con);assert task and task['vid']==vid and task['stage']=='face'
+   assert f.call('review-page',{'session':page['session']})['rows']==page['rows']
+   with n.processing.connect(f.base) as con:n.processing.fail(con,task,RuntimeError('isolated GPU unavailable'))
+   with sqlite3.connect(f.base/'processing/processing.db') as con:
+    state=con.execute('SELECT stage,data,manual FROM tasks WHERE vid=?',[vid]).fetchone()
+    assert state[0]==expected and json.loads(state[1])==row['data'] and state[2]==0
+
+def inference_failure_and_refresh_receipts():
+ f=n.Fixture(7)
+ try:
+  page=f.call('review-page');exhausted_face_retries(f,page)
+  refreshed_after_failure=f.call('review-page');assert len(refreshed_after_failure['rows'])==7
+  edit(f,[page['rows'][-1]['vid']],retry_stage='text')
+  assert len(f.call('review-page')['rows'])==6
+  edit(f,[page['rows'][-1]['vid']],retry_stage='face')
+  first,note,defer,file,rule,manual,other=page['rows']
+  # Delivered evidence remains actionable after exhausted inference attempts.
+  f.call('queue-confirm',confirm(f,page,[first]))
+  f.call('review-note',{**confirm(f,page,[note]),'note':'GPU unavailable; evidence reviewed'})
+  f.call('review-defer',confirm(f,page,[defer]))
+  assert [r['vid'] for r in f.queue()]==[first['vid']]
+  current=f.call('review-page',{'session':page['session']})
+  assert next(r for r in current['rows'] if r['vid']==note['vid'])['note']=='GPU unavailable; evidence reviewed'
+  # A new snapshot cannot take ownership of an older confirmation receipt.
+  refreshed=f.call('review-page');assert refreshed['session']!=page['session']
+  f.call('queue-undo',{'vids':[first['vid']],'review_session':refreshed['session']},status=409)
+  f.call('queue-undo',{'vids':[first['vid']],'review_session':page['session']})
+  edit(f,[first['vid']],stage='review')
+  another=f.call('review-page');row=next(r for r in another['rows'] if r['vid']==first['vid'])
+  f.call('queue-confirm',confirm(f,another,[row]))
+  f.call('queue-undo',{'vids':[first['vid']],'review_session':page['session']},status=409)
+  assert [r['vid'] for r in f.queue()]==[first['vid']]
+  # Real material changes still reject all three human mutation kinds.
+  path=Path(file['path']);path.write_bytes(path.read_bytes()+b'changed')
+  f.call('queue-confirm',confirm(f,page,[file]),status=409)
+  n.write(f.base/'watermarks/mappings.json',{'X:fixture':{'kind':'source'}})
+  f.call('review-note',{**confirm(f,page,[rule]),'note':'must not save'},status=409)
+  n.write(f.base/'watermarks/mappings.json',{})
+  edit(f,[manual['vid']],manual=1)
+  f.call('review-defer',confirm(f,page,[manual]),status=409)
+  # Original tokens remain stale after a successful note, even under inference failure.
+  f.call('queue-confirm',confirm(f,page,[note]),status=409)
+  print('PASS real face claim/retry/error preserves delivered confirm/note/defer; file/rule/manual/ABA guards; refreshed undo origin and subsequent confirmation protection',f.root)
+ finally:f.stop()
+if __name__=='__main__':main();lane_slots_and_relevant_guards();inference_failure_and_refresh_receipts()

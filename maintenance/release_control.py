@@ -33,13 +33,59 @@ def fail(message):
     raise RuntimeError(message)
 
 
-def private_json(path, value):
+CONTROL_LIMIT = 1024 * 1024
+
+
+def private_bytes(path, body):
+    """Publish a complete durable private record exclusively, never a partial JSON."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-    with os.fdopen(fd, 'w') as out:
-        json.dump(value, out, ensure_ascii=False, indent=2)
-        out.flush(); os.fsync(out.fileno())
+    temporary = path.with_name('.'+path.name+'.'+uuid.uuid4().hex+'.tmp')
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+    held = os.fstat(fd)
+    try:
+        with os.fdopen(fd, 'wb') as out:
+            out.write(body); out.flush(); os.fsync(out.fileno())
+        os.link(temporary, path, follow_symlinks=False)
+        sync_directory(path.parent)
+    finally:
+        try:
+            current = temporary.lstat()
+            if (held.st_dev, held.st_ino) == (current.st_dev, current.st_ino):
+                temporary.unlink(); sync_directory(path.parent)
+        except FileNotFoundError:
+            pass
+
+
+def private_json(path, value):
+    private_bytes(path, json.dumps(value, ensure_ascii=False, indent=2).encode())
+
+
+def read_control(path):
+    """Bounded nonblocking control read; a foreign FIFO/symlink is never opened blocking."""
+    path = Path(path)
+    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    try:
+        held = os.fstat(fd)
+        if not stat.S_ISREG(held.st_mode) or held.st_size > CONTROL_LIMIT:
+            fail('control file is not a bounded regular file: '+str(path))
+        raw = bytearray()
+        while len(raw) <= CONTROL_LIMIT:
+            chunk = os.read(fd, min(65536, CONTROL_LIMIT+1-len(raw)))
+            if not chunk: break
+            raw.extend(chunk)
+        after, current = os.fstat(fd), path.lstat()
+        if len(raw)>CONTROL_LIMIT or (held.st_dev,held.st_ino,held.st_size,held.st_mtime_ns)!=(after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns) or (held.st_dev,held.st_ino)!=(current.st_dev,current.st_ino):
+            fail('control file changed during read: '+str(path))
+        return bytes(raw), {'dev':str(held.st_dev),'ino':str(held.st_ino)}
+    finally:
+        os.close(fd)
+
+
+def control_json(path):
+    value=json.loads(read_control(path)[0])
+    if not isinstance(value,dict): fail('control receipt is not an object')
+    return value
 
 
 def run(*args):
@@ -184,15 +230,24 @@ def legacy_journals(manifest):
     for path in sorted(paths):
         if path.is_symlink(): fail('legacy journal is a symlink')
         raw=path.read_bytes();record=json.loads(raw);relative=str(path.relative_to(base));digest=hashlib.sha256(raw).hexdigest()
-        state=record.get('status');result=record.get('result') or {};job=record.get('job') or record
+        if not isinstance(record,dict): fail('legacy journal is not an object: '+relative)
+        result=record.get('result') or {};job=record.get('job') or record
+        if not isinstance(result,dict) or not isinstance(job,dict): fail('legacy journal has invalid state objects: '+relative)
+        state=record.get('status') or record.get('state')
+        states=[value for obj in (record,result,job) for key in ('status','state') if (value:=obj.get(key)) is not None]
+        if any(not isinstance(value,str) for value in states): fail('legacy journal has invalid state: '+relative)
+        active={'preparing','checking','prepared','accepted','running','moving','updating_ledger','committing','recovery_needed','rolling_back','unknown','outcome_unknown'}
+        uncertain=any(value in active for value in states) or any(obj.get('recovery_needed') or obj.get('recovery_errors') for obj in (record,result,job))
         terminal=state in ('complete','partial','rolled_back','cancelled','preview','not_started')
         if state=='failed' and not record.get('moves'): terminal=True
+        if state=='failed' and record.get('moves'): uncertain=True
+        if relative.startswith('staging-operations/'):
+            terminal=record.get('state')=='preview' or (record.get('state')=='finished' and result.get('status') in ('complete','partial','rolled_back','cancelled','error'))
         if relative.startswith('archive-runs/') or relative=='jobs/archive.json':
             terminal=job.get('status') in ('complete','error') and job.get('finished_at') is not None
-        if record.get('recovery_needed') or result.get('recovery_needed') or record.get('recovery_errors'): terminal=False
         acknowledged=manifest.get('legacy_terminal_acknowledgements',{}).get(relative)==digest
-        # Explicitly active/uncertain states are never overridden by an acknowledgement.
-        if state in ('preparing','checking','prepared','accepted','running','moving','updating_ledger','committing','recovery_needed','rolling_back') or job.get('status')=='running' or record.get('recovery_needed') or result.get('recovery_needed') or record.get('recovery_errors'): acknowledged=False
+        # Actual known states take precedence over hash acknowledgements of old formats.
+        if uncertain: terminal=False;acknowledged=False
         if not terminal and not acknowledged: fail('legacy journal remains unresolved or unclassified: '+relative)
         rows.append({'path':relative,'sha256':digest,'state':state or job.get('status'),'terminal_acknowledgement':acknowledged})
     return rows
@@ -204,37 +259,102 @@ def sync_directory(path):
     finally: os.close(descriptor)
 
 
-def acquire_deploy_fence(manifest,directory,timeout):
+def fence_evidence(manifest,directory):
+    evidence=control_json(directory/'fence-owned.json')
     path=Path(manifest['base'])/'.review-write.lock'
-    marker={'backend':'deployment','release_id':manifest['release_id'],'token':str(uuid.uuid4()),'at':time.time()}
-    body=json.dumps(marker,sort_keys=True,separators=(',',':')).encode()
-    private_json(directory/'fence-intent.json',{'path':str(path),'marker':marker,'sha256':hashlib.sha256(body).hexdigest()})
+    marker=evidence.get('marker',{})
+    if evidence.get('path')!=str(path) or marker.get('release_id')!=manifest['release_id'] or marker.get('backend')!='deployment':
+        fail('deployment fence evidence does not match release')
+    prepared=Path(evidence['prepared'])
+    if prepared.parent!=path.parent or prepared.name!='.review-write-fence-'+marker['token']:
+        fail('deployment prepared fence path does not match release')
+    return evidence
+
+
+def verify_fence_file(path,evidence):
+    raw,identity=read_control(path)
+    if identity!=evidence['identity'] or hashlib.sha256(raw).hexdigest()!=evidence['sha256'] or json.loads(raw)!=evidence['marker']:
+        fail('deployment fence changed; never remove a foreign marker')
+
+
+def acquire_deploy_fence(manifest,directory,timeout):
+    directory=Path(directory);path=Path(manifest['base'])/'.review-write.lock'
+    if (directory/'fence-release-intent.json').exists() or (directory/'fence-released.json').exists():
+        fail('this fence has entered release; finish recovery with the original release ID')
+    try: intent=control_json(directory/'fence-intent.json')
+    except FileNotFoundError:
+        marker={'backend':'deployment','release_id':manifest['release_id'],'token':str(uuid.uuid4()),'at':time.time()}
+        body=json.dumps(marker,sort_keys=True,separators=(',',':')).encode()
+        intent={'path':str(path),'prepared':str(path.with_name('.review-write-fence-'+marker['token'])),'marker':marker,'sha256':hashlib.sha256(body).hexdigest()}
+        private_json(directory/'fence-intent.json',intent)
+    if intent['path']!=str(path) or intent['marker']['release_id']!=manifest['release_id']:
+        fail('deployment fence intent does not match release')
+    body=json.dumps(intent['marker'],sort_keys=True,separators=(',',':')).encode()
+    prepared=Path(intent['prepared'])
+    if prepared!=path.with_name('.review-write-fence-'+intent['marker']['token']) or hashlib.sha256(body).hexdigest()!=intent['sha256']:
+        fail('deployment fence intent changed')
+    try: evidence=fence_evidence(manifest,directory)
+    except FileNotFoundError: evidence=None
     deadline=time.monotonic()+timeout
     while True:
-        try: descriptor=os.open(path,os.O_WRONLY|os.O_CREAT|os.O_EXCL|os.O_NOFOLLOW,0o600);break
-        except FileExistsError:
+        if os.path.lexists(path):
+            if evidence:
+                try: verify_fence_file(path,evidence)
+                except (OSError,ValueError,RuntimeError): pass
+                else: sync_directory(path.parent);return evidence
             if time.monotonic()>=deadline: fail('existing shared write lock did not drain; no web stop and no foreign lock removal')
-            time.sleep(.2)
-    try:
-        os.write(descriptor,body);os.fsync(descriptor);held=os.fstat(descriptor)
-    finally: os.close(descriptor)
-    sync_directory(path.parent)
-    evidence={'path':str(path),'marker':marker,'identity':{'dev':str(held.st_dev),'ino':str(held.st_ino)},'sha256':hashlib.sha256(body).hexdigest()}
-    private_json(directory/'fence-owned.json',evidence)
-    return evidence
+            time.sleep(.2);continue
+        if evidence is None:
+            try: private_bytes(prepared,body)
+            except FileExistsError: pass
+            raw,identity=read_control(prepared)
+            if raw!=body: fail('prepared deployment fence changed')
+            evidence={**intent,'identity':identity}
+            # Both complete receipt bytes and its directory entry must be durable
+            # BEFORE the same inode is atomically published at the shared path.
+            private_json(directory/'fence-owned.json',evidence)
+        verify_fence_file(prepared,evidence)
+        sync_directory(directory)
+        try: os.link(prepared,path,follow_symlinks=False)
+        except FileExistsError: continue
+        sync_directory(path.parent)
+        verify_fence_file(path,evidence)
+        return evidence
 
 
 def release_deploy_fence(manifest,directory):
     check_peer_drain(manifest)
-    evidence=json.loads((directory/'fence-owned.json').read_text());path=Path(evidence['path'])
-    if path!=Path(manifest['base'])/'.review-write.lock' or evidence['marker']['release_id']!=manifest['release_id']: fail('deployment fence evidence does not match release')
-    descriptor=os.open(path,os.O_RDONLY|os.O_NOFOLLOW)
+    directory=Path(directory)
+    try: evidence=fence_evidence(manifest,directory)
+    except FileNotFoundError:
+        # Before durable ownership, this protocol cannot have published a shared
+        # fence. Close that interrupted attempt without removing any inode.
+        intent=control_json(directory/'fence-intent.json');path=Path(manifest['base'])/'.review-write.lock'
+        if intent.get('path')!=str(path) or intent.get('marker',{}).get('release_id')!=manifest['release_id'] or os.path.lexists(path):
+            fail('deployment fence lacks ownership proof; never remove an existing marker')
+        try: previous=control_json(directory/'fence-released.json')
+        except FileNotFoundError:
+            private_json(directory/'fence-released.json',{'at':time.time(),'not_published':True,'retained_prepared':intent.get('prepared')})
+        else:
+            if previous.get('not_published') is not True: fail('deployment release receipt changed')
+        return
+    path=Path(evidence['path']);prepared=Path(evidence['prepared'])
+    try: release_intent=control_json(directory/'fence-release-intent.json')
+    except FileNotFoundError:
+        release_intent={'identity':evidence['identity'],'sha256':evidence['sha256']}
+        private_json(directory/'fence-release-intent.json',release_intent)
+    if release_intent!={'identity':evidence['identity'],'sha256':evidence['sha256']}: fail('deployment release intent changed')
+    # Missing paths are a recoverable interruption after unlink. Foreign paths,
+    # including FIFOs and identical-byte replacements, remain untouched.
+    for owned in (path,prepared):
+        try: verify_fence_file(owned,evidence)
+        except FileNotFoundError: continue
+        owned.unlink();sync_directory(owned.parent)
     try:
-        held=os.fstat(descriptor);raw=os.read(descriptor,1024*1024);current=path.lstat()
-        if not stat.S_ISREG(held.st_mode) or {'dev':str(held.st_dev),'ino':str(held.st_ino)}!=evidence['identity'] or (held.st_dev,held.st_ino)!=(current.st_dev,current.st_ino) or hashlib.sha256(raw).hexdigest()!=evidence['sha256']: fail('deployment fence changed; never remove a foreign marker')
-        path.unlink();sync_directory(path.parent)
-    finally: os.close(descriptor)
-    private_json(directory/'fence-released.json',{'at':time.time(),'identity':evidence['identity']})
+        previous=control_json(directory/'fence-released.json')
+        if previous.get('identity')!=evidence['identity']: fail('deployment release receipt changed')
+    except FileNotFoundError:
+        private_json(directory/'fence-released.json',{'at':time.time(),'identity':evidence['identity']})
 
 
 def peer_idle(manifest):

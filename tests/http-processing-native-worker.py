@@ -80,9 +80,30 @@ try:
         confirmed=x.call({'command':'queue-confirm','body':{'creator':'甲','vids':[vid],'source':'review','fingerprints':{vid:{'path':str(file),'size':file.stat().st_size,'mtime_ns':str(file.stat().st_mtime_ns)}},'review_group':{'key':'none','deferred':False},**confirmation_scope}},'/v1/archive')
         assert build_references(x.base,x.media)['people']==1
         preview=x.call({'command':'archive-preview','body':{}},'/v1/archive')
+        if os.environ.get('PROCESSING_COPY_RELOCATION')=='1':f.write(x.root/'rust-fault.json',{'force_copy':True})
         result=x.call({'command':'archive-apply','body':{'vids':[vid],'version':preview['version'],'operation_id':str(uuid.uuid4())}},'/v1/archive')
         destination=Path(json.loads((x.base/'video-path-overrides.json').read_text())[vid])
         assert destination!=file and destination.is_file(),result
+        assert build_references(x.base,x.media)['people']==1
+        # A second native move must bridge through the now-absent intermediate path.
+        request=x.request(destination,filename='renamed-reference.mp4',vid=vid)
+        plan=x.call({'mode':'preview','request':request})
+        x.call({'mode':'apply','request':request,'version':plan['version']})
+        destination=destination.with_name('renamed-reference.mp4')
+        assert build_references(x.base,x.media)['people']==1
+        stored=json.loads(con.execute('SELECT data FROM tasks WHERE vid=?',[vid]).fetchone()[0])
+        cache=Path(stored['face']['feature_cache']);payload=cache.read_bytes();current=destination.stat()
+        with np.load(cache,allow_pickle=False) as saved:
+            origin={'path':str(saved['path']),'size':str(int(saved['size'])),'mtime_ns':str(saved['mtime_ns']),'dev':str(int(saved['source_dev'])),'ino':str(int(saved['source_ino']))}
+        binding={'vid':vid,'source':str(destination),'cache':str(cache),'cache_sha256':hashlib.sha256(payload).hexdigest(),'origin':origin,'current_identity':{k:str(getattr(current,'st_'+k)) for k in ('dev','ino','size','mtime_ns')}}
+        proof=native('reference-relocation',binding)
+        unrelated=x.preview(x.request(filename='unrelated-renamed.mp4'));x.apply(unrelated)
+        assert native('reference-relocation',binding)['version']==proof['version']
+        accepted_caches={Path(json.loads(row[0])['data']['face']['feature_cache']) for row in con.execute("SELECT result FROM _face_admin_processing_results WHERE json_extract(result,'$.vid')=? AND json_type(result,'$.data.face.feature_cache')='text'",[vid])}
+        originals={path:path.read_bytes() for path in accepted_caches}
+        for path,raw in originals.items():path.write_bytes(raw+b'changed-cache')
+        assert build_references(x.base,x.media)['people']==0
+        for path,raw in originals.items():path.write_bytes(raw)
         assert build_references(x.base,x.media)['people']==1
         old=destination.stat();replacement=destination.with_suffix('.replacement');replacement.write_bytes(destination.read_bytes());os.utime(replacement,ns=(old.st_atime_ns,old.st_mtime_ns));os.replace(replacement,destination)
         assert build_references(x.base,x.media)['people']==0

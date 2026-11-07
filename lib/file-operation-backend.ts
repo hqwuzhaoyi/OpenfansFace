@@ -1,3 +1,4 @@
+import { nativeJsonRequest } from './native-json-transport'
 import fs from 'node:fs'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
@@ -26,25 +27,7 @@ const legacy:PersonFileBackend={
   },
 }
 export async function rustRequest<T>(body:unknown,id?:string,route="v1/person-files"):Promise<T>{
-  const configured=process.env.FILE_OPERATIONS_RUST_URL
-  if(!configured)throw new FileOperationRoutingError('Rust 文件操作服务地址未配置',503)
-  let url:URL
-  try{url=new URL(route,configured.endsWith('/')?configured:configured+'/');if(!['http:','https:'].includes(url.protocol))throw new Error()}
-  catch{throw new FileOperationRoutingError('Rust 文件操作服务地址无效',503)}
-  if(id)url.searchParams.set('id',id)
-  const headers:Record<string,string>={'Content-Type':'application/json'}
-  if(process.env.FILE_OPERATIONS_RUST_TOKEN)headers.Authorization='Bearer '+process.env.FILE_OPERATIONS_RUST_TOKEN
-  let response:Response
-  try{response=await fetch(url,{method:body===null?'GET':'POST',headers,...(body===null?{}:{body:JSON.stringify(body)}),cache:'no-store',signal:AbortSignal.timeout(120_000)})}
-  catch{throw new FileOperationRoutingError('文件操作后端连接中断，结果尚未确认；请查询原操作回执，不要重复提交',503)}
-  const data=await response.json().catch(()=>null)
-  if(response.status===202)throw new FileOperationRoutingError('操作已受理但尚未完成，请查询原操作回执',503)
-  if(!response.ok){
-    const error=new FileOperationRoutingError([data?.error||'文件操作后端拒绝请求',data?.step,data?.path].filter(value=>typeof value==='string'&&value).join(' · '),response.status)
-    throw Object.assign(error,{code:data?.code,path:data?.path,step:data?.step})
-  }
-  if(!data||typeof data!=='object')throw new FileOperationRoutingError('文件操作后端未返回可核对的回执',502)
-  return data as T
+  return nativeJsonRequest<T>(route,body,{label:'文件操作',completion:'required',error:(message,status)=>new FileOperationRoutingError(message,status)},id)
 }
 const rust:PersonFileBackend={
   async preview(request){

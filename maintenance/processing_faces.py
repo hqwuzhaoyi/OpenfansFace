@@ -107,17 +107,15 @@ def reference_features(base, vid, source):
                     cache = face.get('feature_cache')
                     if not cache or not face.get('feature_cache_sha256'):
                         continue
-                    identity = face.get('source_identity') or receipt.get('source_identity') or {}
-                    if int(identity.get('dev', -1)) != stat.st_dev or int(identity.get('ino', -1)) != stat.st_ino:
-                        continue
                     file = Path(cache)
                     if file.name != 'features.npz' or not file.resolve().is_relative_to((Path(base) / 'processing/attempts').resolve()):
                         continue
-                    candidates.append((file, face['feature_cache_sha256'], True))
+                    candidates.append((file, face['feature_cache_sha256'], face.get('source_identity') or receipt.get('source_identity') or {}))
         finally:
             con.close()
-    candidates.append((cache_path(base, vid), None, False))
-    for file, expected, accepted in candidates:
+    candidates.append((cache_path(base, vid), None, None))
+    for file, expected, receipt_identity in candidates:
+        accepted = receipt_identity is not None
         try:
             if not file.is_file() or file.is_symlink():
                 continue
@@ -129,11 +127,26 @@ def reference_features(base, vid, source):
                     continue
                 if str(cached['version']) != FACE_VERSION or int(cached['size']) != stat.st_size or str(cached['mtime_ns']) != str(stat.st_mtime_ns):
                     continue
-                if accepted:
-                    if int(cached['source_dev']) != stat.st_dev or int(cached['source_ino']) != stat.st_ino:
-                        continue
-                elif str(cached['path']) != str(source):
+                if accepted and (int(cached['source_dev']) != int(receipt_identity.get('dev', -1)) or int(cached['source_ino']) != int(receipt_identity.get('ino', -1))):
                     continue
+                same_origin = str(cached['path']) == str(source)
+                if accepted:
+                    same_origin = same_origin and int(cached['source_dev']) == stat.st_dev and int(cached['source_ino']) == stat.st_ino
+                if not same_origin:
+                    origin = {'path': str(cached['path']), 'size': str(int(cached['size'])), 'mtime_ns': str(cached['mtime_ns'])}
+                    if accepted:
+                        origin.update(dev=str(int(cached['source_dev'])), ino=str(int(cached['source_ino'])))
+                    current_identity = {key: str(getattr(stat, 'st_' + key)) for key in ('dev', 'ino', 'size', 'mtime_ns')}
+                    try:
+                        proof = native('reference-relocation', {'vid': vid, 'source': str(source), 'cache': str(file),
+                            'cache_sha256': hashlib.sha256(payload).hexdigest(), 'origin': origin, 'current_identity': current_identity})
+                    except PublicationError:
+                        continue
+                    if proof.get('verified') is not True or proof.get('current_identity') != current_identity:
+                        continue
+                    after = source.stat()
+                    if any(getattr(after, 'st_' + key) != getattr(stat, 'st_' + key) for key in ('dev', 'ino', 'size', 'mtime_ns')):
+                        continue
                 vectors = cached['embeddings'][:24].copy()
                 if vectors.ndim != 2 or vectors.shape[1] != 512 or not np.isfinite(vectors).all():
                     continue
