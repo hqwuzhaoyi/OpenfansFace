@@ -38,6 +38,9 @@ class MoveFixture(Fixture):
     def assert_moved(self,plan):
         result=self.status(plan);assert result['status']=='complete',result
         assert result['result']['changed']==len(plan['files'])
+        assert result['committed']==len(plan['files']) and result['processed']==len(plan['files'])
+        assert [item['file_index'] for item in result['files']]==list(range(len(plan['files'])))
+        assert all(item['status']=='complete' for item in result['files'])
         for file in plan['files']:
             assert Path(file['dst']).exists() and not Path(file['src']).exists()
             for vid in file['vids']:
@@ -170,6 +173,8 @@ def crash_checkpoint(phase,replace=False):
             if reached.exists() and json.loads(reached.read_text())['phase']==phase:break
             time.sleep(.01)
         else:raise AssertionError(('checkpoint not reached',phase,f.root))
+        observed=f.status(plan);assert len(observed['files'])==2 and observed['committed']==0
+        if phase.endswith(':1'):assert observed['files'][0]['status']=='moved_pending_commit' and observed['files'][1]['file_index']==1
         f.process.send_signal(signal.SIGKILL);f.process.wait(timeout=5);client.close()
         (f.root/'rust-fault.json').unlink();f.stop()
         if replace:
