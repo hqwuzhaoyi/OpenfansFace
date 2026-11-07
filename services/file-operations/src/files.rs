@@ -109,6 +109,7 @@ fn root(config: &Config, scope: &ScopeRoot) -> Result<std::path::PathBuf> {
             Ok(config.creators().join(person))
         }
         ScopeRoot::Unorganized => Ok(config.media.join("pikpak")),
+        ScopeRoot::Staging => Ok(config.media.join("pikpak/.face-cleanup-staging")),
     }
 }
 fn scoped(config: &Config, scope: &MoveScope, file: &FileMove) -> Result<()> {

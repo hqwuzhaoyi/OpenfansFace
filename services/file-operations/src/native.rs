@@ -13,24 +13,28 @@ pub struct DomainSnapshot {
 pub fn validate(request: &Request) -> Result<()> {
     match request.action.as_str() {
         "move-files" | "rename-file" => crate::person_move::validate(request),
+        "delete-files" | "restore-files" => crate::staging::validate(request),
         _ => Err(Error::new(400, "unsupported_scope", "此原生操作尚未启用")),
     }
 }
 pub fn plan(config: &Config, request: Request) -> Result<Plan> {
     match request.action.as_str() {
         "move-files" | "rename-file" => crate::person_move::plan(config, request),
+        "delete-files" | "restore-files" => crate::staging::plan(config, request),
         _ => Err(Error::new(400, "unsupported_scope", "此原生操作尚未启用")),
     }
 }
 pub fn snapshot(config: &Config, plan: &Plan, successful: &[usize]) -> Result<DomainSnapshot> {
     match plan.action.as_str() {
         "move-files" | "rename-file" => crate::person_move::snapshot(config, plan, successful),
+        "delete-files" | "restore-files" => crate::staging::snapshot(config, plan, successful),
         _ => Err(Error::new(400, "unsupported_scope", "此原生操作尚未启用")),
     }
 }
 pub fn revalidate(config: &Config, plan: &Plan) -> Result<()> {
     match plan.action.as_str() {
         "move-files" | "rename-file" => crate::person_move::revalidate(config, plan),
+        "delete-files" | "restore-files" => crate::staging::revalidate(config, plan),
         _ => Err(Error::new(400, "unsupported_scope", "此原生操作尚未启用")),
     }
 }

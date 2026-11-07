@@ -26,17 +26,17 @@ const legacy:PersonFileBackend={
     }catch(e){if((e as NodeJS.ErrnoException).code==='ENOENT')return {id,backend:'legacy',status:'not_started'};throw e}
   },
 }
-async function rustRequest<T>(body:unknown,id?:string):Promise<T>{
+export async function rustRequest<T>(body:unknown,id?:string,route="v1/person-files"):Promise<T>{
   const configured=process.env.FILE_OPERATIONS_RUST_URL
   if(!configured)throw new FileOperationRoutingError('Rust 文件操作服务地址未配置',503)
   let url:URL
-  try{url=new URL('v1/person-files',configured.endsWith('/')?configured:configured+'/');if(!['http:','https:'].includes(url.protocol))throw new Error()}
+  try{url=new URL(route,configured.endsWith('/')?configured:configured+'/');if(!['http:','https:'].includes(url.protocol))throw new Error()}
   catch{throw new FileOperationRoutingError('Rust 文件操作服务地址无效',503)}
   if(id)url.searchParams.set('id',id)
   const headers:Record<string,string>={'Content-Type':'application/json'}
   if(process.env.FILE_OPERATIONS_RUST_TOKEN)headers.Authorization='Bearer '+process.env.FILE_OPERATIONS_RUST_TOKEN
   let response:Response
-  try{response=await fetch(url,{method:id?'GET':'POST',headers,...(id?{}:{body:JSON.stringify(body)}),cache:'no-store',signal:AbortSignal.timeout(120_000)})}
+  try{response=await fetch(url,{method:body===null?'GET':'POST',headers,...(body===null?{}:{body:JSON.stringify(body)}),cache:'no-store',signal:AbortSignal.timeout(120_000)})}
   catch{throw new FileOperationRoutingError('文件操作后端连接中断，结果尚未确认；请查询原操作回执，不要重复提交',503)}
   const data=await response.json().catch(()=>null)
   if(response.status===202)throw new FileOperationRoutingError('操作已受理但尚未完成，请查询原操作回执',503)

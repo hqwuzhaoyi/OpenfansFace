@@ -152,3 +152,15 @@ NAS 的 `/mnt/mnt2/media` 使用 `root_squash,anonuid=1000,anongid=1000`。媒�
 SQLite 版本只纳入本次操作会改写的视频索引和任务：选中的视频 ID、源路径／目录，以及人物名或别名相关的候选资料。无关任务的阶段、重试次数、更新时间和无关视频索引变化不再使合并／删除预览失效；相关记录、文件指纹、JSON 资料与 Peach 账本的过期校验仍保留。
 
 `tests/http-person-version.py` 在独立夹具中复现无关后台更新导致的误报，验证连续后台更新时可以合并，并确认相关视频索引、候选资料、账本及真实文件变化仍拦截旧确认。
+
+## Rust 暂存与恢复
+
+开启 `FILE_OPERATIONS_BACKEND=rust` 和 `FILE_OPERATIONS_ENABLE_RUST=1` 后，`delete-files` 与单文件 `restore-files` 使用同一原生执行器、写锁、逐文件步骤和完整范围补偿。删除保留相对子目录，移入 `.face-cleanup-staging/person-deletions/<操作编号>/<人物>/`，同名但不同目录的视频各自保留。暂存与恢复更新稳定编号的实际路径、本地 SQLite / JSON 和 Peach 路径；恢复到另一个明确人物时同步主归属。原始账号、规则和审核决定不会从旧备份自动恢复；只有实际恢复到人物目录才清除该人物的删除标记。
+
+`GET /api/staging` 在 Rust 模式返回统计及每页最多 100 个真实文件（`rows`, `offset`, `next_offset`）；`GET /api/staging?id=<编号>` 查询原后端回执。`POST /api/staging` 支持 `preview/apply/reconcile`，请求为 `{action:"restore-files",person:"",files:[{vid,path,version}],target_person?,target_folder?}`；缺省目标只允许有可核对原位置的文件。指定人物可创建缺失目录，确认前展示完整目的路径；同名目标、晚到文件、来源或账本变化均阻止旧确认，绝不覆盖。
+
+来源保存在事务快照中的 `staging-origins.json`，并能读取原生及旧 `person-operations` 已完成回执的精确路径映射。来源未知的历史文件显示未知，必须明确指定目标人物。旧回执保持原样。暂存列表不跟随符号链接，扫描错误返回错误，超过 100,000 个目录项拒绝单次扫描；这不是可安全永久清空的范围证明。
+
+`/api/delete` 的旧直接移动入口已返回 410，应使用人物文件预览操作。永久删除和清空不属于此恢复接口；已追加的迁移票 #16 必须在最终切换前完成，且需合并 #6 重复件和整个人物删除的来源约定。其他暂存功能并行发布时仍须按其实际合同补充联合验证，不能把未验收的 Node/Python 实现作为原生回退。
+
+隔离验收：`python3 tests/http-rust-staging.py --port 18987` 覆盖删除／恢复、未知与旧来源、相对目录同名保留、晚到冲突、本地及 Peach 故障、账本已提交的核对、SIGKILL 后恢复和稳定引用。`tests/http-rust-staging-gateway.py` 仅访问标记夹具 `/tmp/face-admin-person-fileops-staging-08` 的 Next `18986`，验证公开 API 和 Range 字节；其末尾保留一份样片供浏览器恢复验收。
