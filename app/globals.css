@@ -4,8 +4,8 @@
    No transition: concealing media must never expose an intermediate frame. */
 html:not([data-privacy="off"]) [data-private-media]:not([data-privacy-revealed="true"]),
 html:not([data-privacy="off"]) [data-state="closed"] [data-private-media] {
-  filter: blur(18px) !important;
-  opacity: .3 !important;
+  filter: blur(20px) saturate(.12) contrast(.65) !important;
+  opacity: .28 !important;
   clip-path: inset(0);
   pointer-events: none;
   user-select: none;
@@ -14,6 +14,15 @@ html:not([data-privacy="off"]) [data-state="closed"] [data-private-media] {
 }
 .privacy-video { display: block; position: relative; min-width: 0; overflow: hidden; border-radius: 8px; }
 .privacy-video > video { display: block; width: 100%; }
+html:not([data-privacy="off"]) .privacy-video { background: var(--muted); }
+/* Keep the player's dimensions, but paint no frame or poster until revealed.
+   First-frame thumbnails outside the player retain the frosted image treatment. */
+html:not([data-privacy="off"]) .privacy-video > video:not([data-privacy-revealed="true"]),
+html:not([data-privacy="off"]) [data-state="closed"] .privacy-video > video {
+  visibility: hidden;
+  opacity: 0 !important;
+  filter: none !important;
+}
 .privacy-image { display: inline-grid; position: relative; max-width: 100%; min-width: 44px; min-height: 44px; overflow: hidden; border-radius: 6px; vertical-align: middle; }
 .privacy-reveal { position: absolute; z-index: 1; left: 50%; top: 50%; transform: translate(-50%, -50%); white-space: nowrap; border-radius: 8px; border: 1px solid var(--border); background: var(--background); color: var(--foreground); }
 [data-revealed="true"] > .privacy-reveal { left: auto; top: 8px; right: 8px; transform: none; }
