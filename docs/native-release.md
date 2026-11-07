@@ -38,17 +38,24 @@ the authoritative native executor. Keep needed read-side web Docker access until
 its separate readers are migrated. No broad recursive media permission changes.
 
 Before draining, run `maintenance/release_control.py permissions --manifest
-PRIVATE.json` under the native UID/GID. It inspects actual nested business
-parents (watermarks/evidence, external-profiles, processing/attempts/faces,
-groups, jobs, routing, authority), SQLite files and WAL directories, and the
-listed media parents, without creating files. Root-owned BASE alone is not proof
+PRIVATE.json` under the native UID/GID. It checks RWX on actual native mutation parents (BASE, watermarks,
+external-profiles, processing's SQLite/WAL directory, routing and authority), RW
+on databases, and READ on existing atomically replaced JSON documents. Worker
+attempts/faces/evidence, groups and legacy jobs/receipt directories require only
+RX; optionally list exact accepted artifact files in `permission_read_files`
+for READ checks. Native does not need to chown root-owned read-only `jobs`.
+Listed mutable media parents require RWX. No probe creates files. Root-owned BASE alone is not proof
 that UID 1000 can replace a nested JSON file. Review denied paths and arrange
 only the necessary ownership/ACL correction centrally. Preserve this report
 alongside the marked NFS write-fixture acceptance; access checks alone cannot
 prove every NFS operation.
 
 `check` also verifies all candidate images are local and the backup destination
-has capacity for the entire BASE plus ledger and a configured reserve. It does
+has capacity for BASE plus ledger and a configured reserve. The only omitted
+namespace is `processing/tmp`, disposable worker scratch frames; this exclusion
+is recorded. Accepted `processing/attempts`, publication payloads, native state,
+business JSON and all receipts remain included. Unreadable durable directories
+fail capacity inventory instead of being silently counted as empty. It does
 not prune images, delete unrelated data, or silently omit a large part of the
 backup. A full VM filesystem blocks release until an approved persistent backup
 location/capacity plan is available.
@@ -65,7 +72,8 @@ python3 maintenance/release_control.py parity-snapshot \
 
 The destination must be new and outside the source. The helper rejects symlinks,
 backs up all SQLite files consistently per database, excludes live native
-authority and the shared write marker, preserves historical receipts, and emits
+authority, the shared write marker and disposable `processing/tmp` scratch,
+preserves accepted attempts and historical receipts, and emits
 a snapshot marker. It does not claim a cross-database atomic snapshot: fence
 writers for final acceptance, or record source changes during read-only capture
 and repeat affected comparisons. Preserve the actual media path namespace.
@@ -120,13 +128,40 @@ are for the central release owner after the missing gates are satisfied.
    below, then use that bundle's `deploy/control.py` to drain the same instance,
    confirm no requests remain, switch the approved unit/bundle and record the
    new accepting instance before replacing VM peers.
-3. Run `fence-peers --execute`: pause worker claims through the existing API,
-   stop web to fence new calibrator triggers, wait for running worker tasks and
-   calibrator rebuilds to finish while native publication remains open, then
-   stop only the named worker/calibrator. It closes native admission last.
-   Legacy external schedulers are an explicit retirement prerequisite, not
-   covered by native's queue count. In-flight task publication uncertainty is a
-   drain blocker; never cancel it or mark it complete merely to deploy.
+3. Verify the system `face-video-health.timer` is inactive and disabled/masked
+   (or absent), and its service is inactive. An inactive **static** service is
+   valid; it does not need an artificial disabled state. The controller performs
+   fresh `systemctl show` checks before fencing, replacement and reopening; it
+   never disables/stops that host timer itself. The observed production timer
+   remains active/enabled, so the central owner must explicitly fence it after
+   authorization. Retiring the repository Python file alone does not change
+   the previously deployed timer/script. Do not enable Rust health alongside it.
+
+   Run `fence-peers --execute`: pause worker claims and wait for current worker
+   and calibrator publication to finish. For an existing native service, close and
+   drain it next, allowing its already-admitted health publication to finish
+   before the external deployment fence can block it. Acquire `.review-write.lock` using
+   exclusive create only **after** any existing holder finishes. A held or
+   dangling foreign marker times out without stopping web, deleting the marker
+   or inferring ownership from PID/age. The deployment marker has a unique token,
+   exact inode/byte evidence and durable private intent/ownership receipts.
+   Under this fence, verify person/batch/archive/staging journals are terminal,
+   then stop web, recheck worker/calibrator idle and stop those named peers.
+   No known long legacy file copy is killed merely to drain. A late publisher
+   that remains busy causes bounded failure with the owned fence retained.
+
+   Legacy active/recovery states block release. Unclassified old-format history
+   requires an individually reviewed `legacy_terminal_acknowledgements` path→hash;
+   this cannot override an explicitly active or recovery-required record. Once
+   all peers are stopped and journals/timer are checked again, release only the
+   exact owned deployment fence, then close/drain native. Replacement refuses
+   any remaining shared marker, including before first native bootstrap.
+   Failure receipts preserve actual stopped/running services and owned fence
+   evidence. After resolving the cause and stopping all old peers, the central
+   owner can use `release-fence --execute` with the original release ID; it
+   verifies inode, bytes, token-bound receipt and peer states and cannot remove
+   a foreign replacement. Never delete the shared lock by hand or force-stop
+   uncertain accepted work to make the checks pass.
 4. `POST /v1/admission {"accepting":false}` persists closure before returning.
    Already queued work and an already admitted health scan finish; new HTTP and
    background writes are rejected. `/v1/readiness` reports pending commands,
@@ -205,10 +240,43 @@ Thus no unrelated original-worktree WIP was imported. Preserve #16 staging and
   homepage archive, retired endpoints and stable video Range. The gateway was
   deliberately configured with the obsolete `legacy` flag and still used native.
 - Python: 36 processing cases; retirement assertions for health/watermark
-  publishers; eight controller tests covering schema/container/drain/capacity
+  publishers; 19 controller tests covering schema/container/drain/capacity
   refusal, SQLite snapshots and partial replacement receipts. The watermark
   frame-extraction case is skipped without Pillow in the local worker venv.
 
-Controller Docker/systemd replacement and rollback have **not** been executed.
-The controller's mock command-boundary checks do not replace a deployment-host
-rehearsal, the final full-schema/native/GPU joint checks or the evidence gates.
+## Actual local Docker controller rehearsal
+
+`tests/docker-release-rehearsal.py --execute-isolated --native-image IMAGE
+--controller-image PYTHON_DOCKER_CLI_IMAGE` uses an actual Linux schema-9 native
+binary, real SQLite/files and Docker stop/rename/create/start commands. Every
+container/network has a unique rehearsal label; all paths are under a newly
+marked `/tmp/face-admin-release-rehearsal-*` root. Cleanup removes only those
+owned containers/networks. The native source used in this rehearsal is frozen
+at `13fc3bf`; the script records immutable image and controller hashes.
+
+Passed: an active legacy timer blocks before mutation; a held legacy shared lock
+times out with web alive and foreign marker untouched; an unresolved legacy
+journal retains the owned fence and exact-owner recovery releases it only after
+peers stop; initial native bootstrap; a real isolated rename and receipt; compatible
+replacement preserving authority device/inode and historical query; an actual
+Docker create error after native replacement with durable partial receipts and
+closed admission; explicit fixture repair; unresolved-operation rollback refusal;
+compatible native rollback; and refusal of a deliberately seeded future schema
+before stopping the current native container. The future-schema fixture is never
+downgraded. Short, bounded retry tolerates endpoint startup only; wrong identity,
+contract or authorization still fails.
+
+Web/worker/calibrator/Peach HTTP processes and the external GPU response are
+**protocol simulators**, not application/model acceptance. Their evidence carries
+`simulated:true`; the controller rejects it outside a marked rehearsal manifest
+and explicit `FILE_OPERATIONS_RELEASE_REHEARSAL_ROOT`. It verifies owned existing
+container labels before any rehearsal mutation. These manifests cannot authorize
+production or claim full GPU/NFS/application acceptance.
+
+This is an actual **local Docker controller** rehearsal, not a deployment-host,
+WSL/systemd or production rollout/rollback. Production capacity remains a gate:
+the observed roughly 4.6 GiB BASE and 6 GiB available root filesystem do not
+justify a complete backup plus images/reserve. The controller does not drop
+immutable caches/thumbnail bytes silently; choose an approved persistent backup
+destination or capacity plan, keeping live SQLite local. Full GPU coexistence,
+real-data parity and final joint checks remain required.
