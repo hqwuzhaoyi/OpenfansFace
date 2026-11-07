@@ -1,9 +1,13 @@
 import { NextRequest, NextResponse } from "next/server"
 import fs from "fs"
 import { MANIFESTS_D } from "@/lib/env"
+import { acquireReviewLock } from "@/lib/review-store"
 import { peachExec } from "@/lib/peach"
 
 export async function POST(req: NextRequest) {
+  let release:ReturnType<typeof acquireReviewLock>|undefined
+  try{
+  release=acquireReviewLock()
   const mf = ((await req.json()).manifest as string) || ""
   if (!mf.startsWith(MANIFESTS_D) || !fs.existsSync(/*turbopackIgnore: true*/ mf)) return NextResponse.json({ error: "bad manifest" }, { status: 400 })
   const m = JSON.parse(fs.readFileSync(/*turbopackIgnore: true*/ mf, "utf8"))
@@ -29,4 +33,6 @@ print(n)`
     if (up.code === 0) await peachExec(script)
   }
   return NextResponse.json({ ok: true, undone })
+  }catch(error:any){return NextResponse.json({error:error.message||'恢复操作失败'},{status:error.status||500})}
+  finally{release?.()}
 }
