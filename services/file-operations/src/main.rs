@@ -25,6 +25,7 @@ mod person_metadata;
 mod person_move;
 mod person_registration;
 mod person_rename;
+mod processing_result;
 mod review;
 mod shared_metadata;
 mod staging;

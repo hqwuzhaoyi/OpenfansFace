@@ -177,6 +177,9 @@ impl Engine {
         let gate = WriteGate::acquire(&self.config, &request.id)?;
         self.store.remember_gate(&request.id, &gate.evidence()?)?;
         crate::fault::checkpoint(&self.config, "gate_acquired")?;
+        if record.plan.action == "processing-result" {
+            return crate::processing_result::apply(self, &record.plan, gate);
+        }
         if crate::staging_delete::action(&record.plan.action) {
             return crate::staging_delete::apply(self, &record.plan, gate);
         }
@@ -351,6 +354,9 @@ impl Engine {
                 .evidence(id)?
                 .ok_or_else(|| Error::conflict("缺少持久化执行证据"))?;
             let gate = WriteGate::recover(&self.config, id, &evidence["gate"])?;
+            if record.plan.action == "processing-result" {
+                return crate::processing_result::recover(self, &record.plan, gate);
+            }
             if crate::staging_delete::action(&record.plan.action) {
                 return crate::staging_delete::recover(self, &record.plan, gate);
             }

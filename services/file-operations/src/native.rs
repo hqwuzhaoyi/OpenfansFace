@@ -23,6 +23,7 @@ fn review_action(action: &str) -> bool {
 pub fn validate(request: &Request) -> Result<()> {
     crate::model::validate_id(&request.id)?;
     match request.action.as_str() {
+        "processing-result" => crate::processing_result::validate(request),
         "move-files" | "rename-file" => crate::person_move::validate(request),
         action if action == "archive" || action == "metadata-write" || review_action(action) => {
             if !request.files.is_empty() {
@@ -41,6 +42,7 @@ pub fn validate(request: &Request) -> Result<()> {
 pub fn plan(config: &Config, request: Request) -> Result<Plan> {
     match request.action.as_str() {
         "move-files" | "rename-file" => crate::person_move::plan(config, request),
+        "processing-result" => crate::processing_result::plan(config, request),
         "archive" => crate::archive::plan(config, request),
         "metadata-write" => crate::shared_metadata::plan(config, request),
         action if review_action(action) => crate::review::plan(config, request),
@@ -54,6 +56,7 @@ pub fn plan(config: &Config, request: Request) -> Result<Plan> {
 pub fn snapshot(config: &Config, plan: &Plan, successful: &[usize]) -> Result<DomainSnapshot> {
     match plan.action.as_str() {
         "move-files" | "rename-file" => crate::person_move::snapshot(config, plan, successful),
+        "processing-result" => Ok(crate::processing_result::snapshot()),
         "archive" => crate::archive::snapshot(config, plan, successful),
         "metadata-write" => crate::shared_metadata::snapshot(config, plan, successful),
         action if review_action(action) => crate::review::snapshot(config, plan, successful),
@@ -67,6 +70,7 @@ pub fn snapshot(config: &Config, plan: &Plan, successful: &[usize]) -> Result<Do
 pub fn revalidate(config: &Config, plan: &Plan) -> Result<()> {
     match plan.action.as_str() {
         "move-files" | "rename-file" => crate::person_move::revalidate(config, plan),
+        "processing-result" => crate::processing_result::validate(&plan.request),
         "archive" => crate::archive::revalidate(config, plan),
         "metadata-write" => crate::shared_metadata::revalidate(config, plan),
         action if review_action(action) => crate::review::revalidate(config, plan),

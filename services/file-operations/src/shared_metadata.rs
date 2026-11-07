@@ -175,7 +175,9 @@ pub fn material_state(config: &Config, scope: &Value) -> Result<Value> {
             let mut out = serde_json::Map::new();
             for (k, v) in value.as_object().unwrap() {
                 let keep = if *name == "watermarks/mappings.json" {
-                    keys.contains(k) || relevant(config, v, &people, &vids)?
+                    scope["all_watermark_rules"] == true
+                        || keys.contains(k)
+                        || relevant(config, v, &people, &vids)?
                 } else if *name == "person-rejections.json" {
                     v["vid"].as_str().is_some_and(|id| vids.contains(id))
                         && relevant(config, v, &people, &vids)?
@@ -240,7 +242,7 @@ pub fn analysis_state(config: &Config) -> Result<Value> {
         );
         tx.commit()?;
     }
-    let sources = review::sources(config)?;
+    let sources = review::indexed_sources(config)?;
     input.insert(
         "files".into(),
         json!(
@@ -249,6 +251,10 @@ pub fn analysis_state(config: &Config) -> Result<Value> {
                 .map(|vid| file_guard_from(config, vid, &sources))
                 .collect::<Result<Vec<_>>>()?
         ),
+    );
+    input.insert(
+        "assigned_feature_caches".into(),
+        crate::processing_result::assigned_reference_inputs(config)?,
     );
     Ok(json!({"version":model::hash(&input)}))
 }
@@ -324,6 +330,8 @@ fn recommendation_exists(config: &Config, name: &str, vid: &str) -> Result<bool>
 #[derive(Clone, Serialize, Deserialize)]
 struct Prepared {
     documents: Vec<Document>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    jobs_delta: Option<db::Delta>,
     guards: Value,
     result: Value,
 }
@@ -340,6 +348,7 @@ fn prepare(config: &Config, body: &Value, id: &str) -> Result<Prepared> {
     }
     let mut out = Prepared {
         documents: vec![],
+        jobs_delta: None,
         guards: json!({}),
         result: json!({"ok":true}),
     };
@@ -615,6 +624,18 @@ fn prepare(config: &Config, body: &Value, id: &str) -> Result<Prepared> {
                 }
             }
             add("watermarks/mappings.json", before, value)?;
+            let (jobs, updates) = review::rule_task_updates(config, key, at)?;
+            if !jobs.is_empty() {
+                out.jobs_delta = Some(db::Delta {
+                    tables: vec![crate::archive_ledger::table(
+                        db::Table::Tasks,
+                        vec!["vid".into()],
+                        jobs,
+                        updates,
+                    )],
+                    guards: vec![],
+                });
+            }
         }
         _ => return Err(bad("未知资料保存命令")),
     }
@@ -643,7 +664,7 @@ pub fn plan(config: &Config, request: Request) -> Result<Plan> {
             failure_policy: FailurePolicy::Rollback,
             stores: AffectedStores {
                 faces: false,
-                jobs: false,
+                jobs: prepared.jobs_delta.is_some(),
                 ledger: false,
             },
             data: serde_json::to_value(&prepared)?,
@@ -669,7 +690,7 @@ pub fn snapshot(_config: &Config, plan: &Plan, successful: &[usize]) -> Result<D
             videos: vec![],
             jobs: vec![],
             faces_delta: None,
-            jobs_delta: None,
+            jobs_delta: p.jobs_delta,
         },
         ledger: None,
     })
@@ -677,6 +698,9 @@ pub fn snapshot(_config: &Config, plan: &Plan, successful: &[usize]) -> Result<D
 pub fn execute(engine: &mut Engine, command: &str, mut body: Value) -> Result<Value> {
     if !body.is_object() {
         return Err(bad("资料请求必须是对象"));
+    }
+    if command == "processing-result" {
+        return crate::processing_result::execute(engine, body);
     }
     if ["state", "check-state", "analysis-state"].contains(&command) {
         if engine.store.blocked()? {

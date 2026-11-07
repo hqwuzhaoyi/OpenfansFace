@@ -35,8 +35,7 @@ export async function PUT(req: NextRequest) {
       const candidate=evidence?.watermark?.candidates.find(c=>c.key===body.key)
       if(body.kind!=='remove'&&!candidate)throw new ReviewError('水印证据已变化，请刷新后重新确认',409)
       const result=await nativeMetadata('watermark-set',{name:creator,key:body.key,kind:body.kind,candidate,evidence_vid:evidence?.vid})
-      // Independent task scheduling is still owned by the analysis worker; no business JSON write.
-      try{watermarkRuleChanged(body.key)}catch{return NextResponse.json({...result,warning:'规则已保存，分析重试尚未安排'})}
+      // Native receipt includes selected-task requeue and in-flight attempt fencing.
       return NextResponse.json(result)
     }
     release = acquireReviewLock()
