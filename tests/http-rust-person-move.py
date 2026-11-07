@@ -243,8 +243,34 @@ def source_identity_resolution():
             print('PASS normalized source identity', 'ambiguity rejects' if ambiguous else 'old creator links removed, unrelated role retained')
         finally:f.stop()
 
+
+def late_unstarted_file():
+    for kind in ('target','source'):
+        f=MoveFixture()
+        try:
+            plan=f.preview(f.move_request(folder=''))
+            f.fault('source_removed:0','pause',milliseconds=900)
+            client=http.client.HTTPConnection('127.0.0.1',f.port,timeout=15)
+            client.request('POST','/v1/person-files',json.dumps({'mode':'apply','request':plan['request'],'version':plan['version']}),{'Content-Type':'application/json','Authorization':'Bearer fixture-token'})
+            reached=f.root/'rust-fault-reached.json'
+            for _ in range(500):
+                if reached.exists() and json.loads(reached.read_text())['phase']=='source_removed:0':break
+                time.sleep(.01)
+            else:raise AssertionError('first file checkpoint missing')
+            if kind=='target':Path(plan['files'][1]['dst']).write_bytes(b'late foreign target')
+            else:f.other.write_bytes(b'late external source content')
+            response=client.getresponse();body=json.load(response);client.close()
+            assert response.status==409,body
+            assert f.status(plan)['status']=='rolled_back',f.status(plan)
+            assert f.source.read_bytes()==PAYLOAD and not Path(plan['files'][0]['dst']).exists()
+            if kind=='target':assert f.other.read_bytes()==PAYLOAD+b'second' and Path(plan['files'][1]['dst']).read_bytes()==b'late foreign target'
+            else:assert f.other.read_bytes()==b'late external source content' and not Path(plan['files'][1]['dst']).exists()
+            assert not (f.base/'.review-write.lock').exists()
+            print('PASS later selected file '+kind+' change compensates earlier move, preserves external bytes')
+        finally:f.stop()
+
 if __name__=='__main__':
-    success();guards();registration();rollback();identity_resolution();source_identity_resolution();boundary()
+    success();guards();registration();rollback();identity_resolution();source_identity_resolution();late_unstarted_file();boundary()
     for phase in ('destination_published:1','source_removed:1','faces_committed','ledger_committed_unrecorded'):
         crash_checkpoint(phase)
     crash_checkpoint('destination_published:1',replace=True)
