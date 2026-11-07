@@ -89,6 +89,21 @@ try:
     assert call('/api/plan/progress')['job']['id']==op
     assert call('/api/plan/progress?id='+legacy_id)['result']==legacy_result
     assert any(j['id']==op for j in call('/api/home/tasks')['jobs'])
+    # Retired writers must keep all historical receipt readers immutable.
+    person_id, batch_id, staged_id = [str(native.uuid.uuid4()) for _ in range(3)]
+    person_path = f.base/'person-operations'/person_id/'operation.json'
+    batch_path = f.base/'person-operations/batches'/f'{batch_id}.json'
+    staged_path = f.base/'staging-operations'/staged_id/'operation.json'
+    native.write(person_path, {'status':'complete','plan':{'action':'delete-person'},'result':{'ok':True,'person':'historical-person'}})
+    native.write(batch_path, {'status':'complete','plan':{'plans':[]},'result':{'ok':True,'completed':[{'person':'historical-batch','result':{}}],'remaining':[]}})
+    native.write(staged_path, {'state':'complete','plan':{'rows':[]},'result':{'ok':True,'status':'complete','historical':'staging'}})
+    raw = {path:path.read_bytes() for path in (person_path,batch_path,staged_path)}
+    person = call('/api/persons/manage?id='+person_id)
+    assert person['backend']=='legacy' and person['result']['person']=='historical-person'
+    assert call('/api/persons/batch?id='+batch_id)['completed']==['historical-batch']
+    staged = call('/api/staging?id='+staged_id)
+    assert staged['legacy'] and staged['result']['historical']=='staging'
+    assert all(path.read_bytes()==content for path,content in raw.items())
     for route in ('/api/plan/rollback','/api/watermarks'):
         request=urllib.request.Request(base+route,data=b'{}',headers={'Content-Type':'application/json'})
         try:urllib.request.urlopen(request);raise AssertionError('retired writer accepted')
