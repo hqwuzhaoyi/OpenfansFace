@@ -9,46 +9,71 @@ pub struct DomainSnapshot {
     pub metadata: crate::metadata::Snapshot,
     pub ledger: Option<crate::ledger::Delta>,
 }
-
+fn review_action(action: &str) -> bool {
+    [
+        "queue-confirm",
+        "queue-undo",
+        "claim-decide",
+        "queue-rule",
+        "queue-restore",
+    ]
+    .contains(&action)
+}
 pub fn validate(request: &Request) -> Result<()> {
+    crate::model::validate_id(&request.id)?;
     match request.action.as_str() {
         "move-files" | "rename-file" => crate::person_move::validate(request),
+        action if action == "archive" || review_action(action) => {
+            if !request.files.is_empty() {
+                return Err(Error::new(400, "invalid_request", "范围必须由原生计划确定"));
+            }
+            Ok(())
+        }
         _ => Err(Error::new(400, "unsupported_scope", "此原生操作尚未启用")),
     }
 }
 pub fn plan(config: &Config, request: Request) -> Result<Plan> {
     match request.action.as_str() {
         "move-files" | "rename-file" => crate::person_move::plan(config, request),
+        "archive" => crate::archive::plan(config, request),
+        action if review_action(action) => crate::review::plan(config, request),
         _ => Err(Error::new(400, "unsupported_scope", "此原生操作尚未启用")),
     }
 }
 pub fn snapshot(config: &Config, plan: &Plan, successful: &[usize]) -> Result<DomainSnapshot> {
     match plan.action.as_str() {
         "move-files" | "rename-file" => crate::person_move::snapshot(config, plan, successful),
+        "archive" => crate::archive::snapshot(config, plan, successful),
+        action if review_action(action) => crate::review::snapshot(config, plan, successful),
         _ => Err(Error::new(400, "unsupported_scope", "此原生操作尚未启用")),
     }
 }
 pub fn revalidate(config: &Config, plan: &Plan) -> Result<()> {
     match plan.action.as_str() {
         "move-files" | "rename-file" => crate::person_move::revalidate(config, plan),
+        "archive" => crate::archive::revalidate(config, plan),
+        action if review_action(action) => crate::review::revalidate(config, plan),
         _ => Err(Error::new(400, "unsupported_scope", "此原生操作尚未启用")),
     }
 }
-
 pub fn result(
     plan: &Plan,
     successful: &[usize],
     failures: &[serde_json::Value],
 ) -> serde_json::Value {
-    let mut result = plan
-        .execution
-        .as_ref()
-        .map(|e| e.result.clone())
-        .unwrap_or_else(|| serde_json::json!({}));
-    result["id"] = serde_json::json!(plan.id);
-    result["ok"] = serde_json::json!(true);
-    result["changed"] = serde_json::json!(successful.len());
-    result["successful_file_indexes"] = serde_json::json!(successful);
-    result["failures"] = serde_json::json!(failures);
-    result
+    if plan.action == "archive" {
+        crate::archive::result(plan, successful, failures)
+    } else {
+        let mut result = plan
+            .execution
+            .as_ref()
+            .map(|e| e.result.clone())
+            .unwrap_or_else(|| serde_json::json!({}));
+        result["id"] = serde_json::json!(plan.id);
+        result["ok"] = serde_json::json!(failures.is_empty());
+        result["changed"] = serde_json::json!(successful.len());
+        result["successful_file_indexes"] = serde_json::json!(successful);
+        result["failures"] = serde_json::json!(failures);
+        result
+    }
 }

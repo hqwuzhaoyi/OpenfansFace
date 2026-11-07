@@ -1,3 +1,4 @@
+import { nativeArchiveEnabled, nativeArchive } from '@/lib/archive-native-backend'
 import { rememberPerson } from '@/lib/people-catalog'
 import { canonicalPersonName } from '@/lib/person-names'
 import { isStagedPath } from '@/lib/person-file-paths'
@@ -12,6 +13,8 @@ import { acquireReviewLock, queuedWithOrigin, loadDecisions, loadArchive, videoI
 import { enqueueItems, origin, ReviewError, validateCreator } from '@/lib/review-logic'
 
 export async function POST(req: NextRequest) {
+  try {if(nativeArchiveEnabled())return NextResponse.json(await nativeArchive('claim-decide',await req.json()),{headers:{'Cache-Control':'no-store'}})}
+  catch(error:any){return NextResponse.json({error:error.message,code:error.code,path:error.path,step:error.step},{status:error.status||500})}
   let release: (() => void) | undefined
   try {
     const { vid, approve, creator } = await req.json()

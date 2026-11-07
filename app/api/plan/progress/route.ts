@@ -1,3 +1,4 @@
+import { nativeArchiveEnabled, nativeArchive, nativeArchiveProgress } from '@/lib/archive-native-backend'
 import fs from 'node:fs'
 import path from 'node:path'
 import { NextRequest,NextResponse } from 'next/server'
@@ -7,6 +8,8 @@ import { normalizeJob } from '@/lib/home-model'
 import { acquireReviewLock } from '@/lib/review-store'
 import { loadQueue } from '@/lib/jsonio'
 export async function GET(req:NextRequest){
+  try {if(nativeArchiveEnabled())return NextResponse.json(await nativeArchiveProgress(req.nextUrl.searchParams.get('id')),{headers:{'Cache-Control':'no-store'}})}
+  catch(error:any){return NextResponse.json({error:error.message},{status:error.status||500})}
   try{
     let id=req.nextUrl.searchParams.get('id')
     if(!id){try{id=JSON.parse(fs.readFileSync(path.join(BASE,'jobs/archive.json'),'utf8')).id}catch(e){if((e as NodeJS.ErrnoException).code!=='ENOENT')throw e}}
@@ -20,6 +23,8 @@ export async function GET(req:NextRequest){
 
 /** A missing receipt alone cannot disprove a delayed POST. Fence its ID before retrying. */
 export async function POST(req:NextRequest){
+  try {if(nativeArchiveEnabled())return NextResponse.json(await nativeArchive('archive-reconcile',await req.json()),{headers:{'Cache-Control':'no-store'}})}
+  catch(error:any){return NextResponse.json({error:error.message},{status:error.status||500})}
   let release:ReturnType<typeof acquireReviewLock>|undefined
   try{
     const {id}=await req.json()

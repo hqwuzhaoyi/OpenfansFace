@@ -1,3 +1,4 @@
+import { nativeArchiveEnabled, nativeArchive } from '@/lib/archive-native-backend'
 import fs from 'node:fs'
 import path from 'node:path'
 import { createHash, randomUUID } from 'node:crypto'
@@ -17,6 +18,8 @@ import { readArchiveRun, saveArchiveRun, validArchiveId } from '@/lib/archive-ru
 import type { ArchiveRun, ArchiveResult, ArchiveFailure } from '@/lib/archive-run-model'
 
 export async function POST(req: NextRequest) {
+  try {if(nativeArchiveEnabled())return NextResponse.json(await nativeArchive('archive-apply',await req.json()),{headers:{'Cache-Control':'no-store'}})}
+  catch(error:any){return NextResponse.json({error:error.message,code:error.code,path:error.path,step:error.step},{status:error.status||500})}
   let release: ReturnType<typeof acquireReviewLock> | undefined, keepLock=false
   let progress: ReturnType<typeof startArchiveJob> | undefined, run:ArchiveRun|undefined
   let ledgerState='reserved', mf='', operationId=''
