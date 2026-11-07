@@ -111,9 +111,14 @@ class Service:
 
     def script(self, body):
         path = self.root / 'controlled-ffprobe'
-        path.write_text('#!/bin/sh\n' + body)
+        path.write_text('#!/bin/sh\nif [ \"$1\" = \"--health-fixture-exec-check\" ]; then exit 0; fi\n' + body)
         path.chmod(0o755)
         self.env['VIDEO_HEALTH_FIXTURE_PROBE'] = str(path)
+        try:
+            subprocess.run([str(path), '--health-fixture-exec-check'], check=True, timeout=2)
+        except PermissionError as error:
+            mount = subprocess.run(['findmnt', '-n', '-T', str(path), '-o', 'TARGET,FSTYPE,OPTIONS'], capture_output=True, text=True, timeout=3)
+            raise RuntimeError('Controlled probe cannot execute; use a dedicated executable persistent /tmp volume. Mount: ' + mount.stdout.strip()) from error
 
     def launch(self):
         self.log = (self.root / 'service.log').open('ab')
@@ -143,6 +148,15 @@ class Service:
         return identity
 
     def stop(self):
+        if sys.exc_info()[0] is not None:
+            evidence = {'fixture': str(self.root), 'error': str(sys.exc_info()[1])}
+            for name, path in [('service_log_tail', self.root / 'service.log'), ('report_prefix', self.base / 'video-health.json')]:
+                try:
+                    with path.open() as stream:
+                        evidence[name] = stream.read(16384)
+                except OSError as error:
+                    evidence[name] = str(error)
+            print(json.dumps({'health_fixture_failure': evidence}, ensure_ascii=False), flush=True)
         if self.process and self.process.poll() is None:
             self.process.send_signal(signal.SIGTERM)
             try:
