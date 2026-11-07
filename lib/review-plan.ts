@@ -8,7 +8,7 @@ import { CREATORS } from './env'
 import { readVideoSources, videoSource } from './video-sources'
 import { queuedWithOrigin, videoInfo } from './review-store'
 import { validateCreator, type QueueItem } from './review-logic'
-import { alternateName, validateArchiveName } from './archive-files'
+import { alternateName, validateArchiveName } from './archive-paths'
 import { thumbUrl } from './db'
 import { healthScope } from './video-health'
 

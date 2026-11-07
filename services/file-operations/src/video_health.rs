@@ -984,11 +984,7 @@ pub fn summary(config: &Config) -> Result<Value> {
     Ok(value)
 }
 
-fn dispatch(
-    worker: &std::sync::mpsc::SyncSender<crate::Work>,
-    command: &str,
-    body: Value,
-) -> Result<Value> {
+fn dispatch(worker: &crate::admission::Worker, command: &str, body: Value) -> Result<Value> {
     let (reply, wait) = tokio::sync::oneshot::channel();
     worker
         .send(crate::Work {
@@ -1009,11 +1005,7 @@ fn configured(key: &str, default: u64, max: u64) -> u64 {
         .unwrap_or(default)
         .min(max)
 }
-fn scheduled(
-    config: Config,
-    worker: std::sync::mpsc::SyncSender<crate::Work>,
-    stop: Arc<AtomicBool>,
-) {
+fn scheduled(config: Config, worker: crate::admission::Worker, stop: Arc<AtomicBool>) {
     let budget = configured("VIDEO_HEALTH_BUDGET", 300, 1000) as usize;
     let seconds = configured("VIDEO_HEALTH_SECONDS", 1200, 1200);
     let mut next = report(&config)
@@ -1054,7 +1046,7 @@ fn scheduled(
 }
 pub fn spawn(
     config: Config,
-    worker: std::sync::mpsc::SyncSender<crate::Work>,
+    worker: crate::admission::Worker,
     stop: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
@@ -1102,6 +1094,7 @@ mod tests {
             ledger: root.join("ledger.db"),
             bind: "127.0.0.1:0".into(),
             token: None,
+            parity_root: None,
             fixture: Some(root),
         };
         let db = rusqlite::Connection::open(config.base.join("faces.db")).unwrap();

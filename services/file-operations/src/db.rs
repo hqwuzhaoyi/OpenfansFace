@@ -9,7 +9,45 @@ use rusqlite::{
 use serde_json::{Map, Value, json};
 use std::{path::Path, time::Duration};
 
+static PARITY_ROOT: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+pub fn configure_parity(root: std::path::PathBuf) -> Result<()> {
+    PARITY_ROOT
+        .set(root)
+        .map_err(|_| Error::new(503, "configuration", "只读对照已初始化"))
+}
+
 pub fn open(path: &Path) -> Result<Connection> {
+    if let Some(root) = PARITY_ROOT.get() {
+        if path.starts_with(root.join("base")) || path == root.join("ledger.db") {
+            // SQLite backup snapshots contain no live WAL. immutable avoids SHM creation,
+            // recovery, journal deletion, or any other incidental database-file writes.
+            let encoded: String = path
+                .as_os_str()
+                .as_encoded_bytes()
+                .iter()
+                .map(|b| {
+                    if b.is_ascii_alphanumeric() || b"/._-".contains(b) {
+                        (*b as char).to_string()
+                    } else {
+                        format!("%{b:02X}")
+                    }
+                })
+                .collect();
+            return Ok(Connection::open_with_flags(
+                format!("file:{encoded}?immutable=1"),
+                OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | OpenFlags::SQLITE_OPEN_URI
+                    | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )?);
+        }
+        if !path.starts_with(root.join("state")) {
+            return Err(Error::new(
+                403,
+                "read_only_parity",
+                "只读对照禁止打开快照之外的数据库",
+            ));
+        }
+    }
     let db = Connection::open_with_flags(
         path,
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,

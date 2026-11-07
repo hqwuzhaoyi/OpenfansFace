@@ -803,6 +803,9 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     sync_parent(path)
 }
 pub fn claim_owner_for(config: &Config, id: &str, action: &str) -> Result<()> {
+    if config.parity_root.is_some() {
+        return Ok(());
+    }
     let dir = config.base.join("file-operation-routing");
     fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{id}.json"));
@@ -854,6 +857,7 @@ pub struct WriteGate {
 }
 impl WriteGate {
     pub fn acquire(config: &Config, id: &str) -> Result<Self> {
+        config.require_writer()?;
         let path = config.base.join(".review-write.lock");
         let mut file = OpenOptions::new()
             .read(true)
@@ -890,6 +894,7 @@ impl WriteGate {
     }
     /// Caller must hold the process-lifetime executor flock. PID/TTL never confer authority.
     pub fn recover(config: &Config, id: &str, evidence: &serde_json::Value) -> Result<Self> {
+        config.require_writer()?;
         let path = config.base.join(".review-write.lock");
         let file: File = open(
             &path,
@@ -1397,6 +1402,7 @@ mod tests {
             ledger: root.join("ledger.db"),
             bind: "127.0.0.1:0".into(),
             token: None,
+            parity_root: None,
             fixture: None,
         };
         let src = config.creators().join("甲/input.mp4");

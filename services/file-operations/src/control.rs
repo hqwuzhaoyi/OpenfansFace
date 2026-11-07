@@ -221,6 +221,7 @@ mod tests {
             ledger: root.join("ledger.db"),
             bind: "127.0.0.1:0".into(),
             token: None,
+            parity_root: None,
             fixture: Some(root),
         }
     }
