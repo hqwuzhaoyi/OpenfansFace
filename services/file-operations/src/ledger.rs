@@ -219,6 +219,7 @@ fn validate_delta(delta: &Delta) -> Result<()> {
         !matches!(
             guard,
             db::Guard::AssetPath { .. }
+                | db::Guard::AssetPrefix { .. }
                 | db::Guard::CreatorName { .. }
                 | db::Guard::CreatorCanonical { .. }
                 | db::Guard::AssetLinks { .. }

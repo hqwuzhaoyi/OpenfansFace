@@ -99,10 +99,12 @@ pub struct Request {
     pub id: String,
     pub action: String,
     pub person: String,
+    #[serde(default)]
     pub files: Vec<SelectedFile>,
     #[serde(default)]
     pub filename: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(alias = "new_name")]
     pub target_person: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_folder: Option<String>,

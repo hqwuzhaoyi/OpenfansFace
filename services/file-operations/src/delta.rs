@@ -43,6 +43,20 @@ pub struct Delta {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub enum Guard {
+    AssetPrefix {
+        prefix: String,
+        before: Vec<Value>,
+        after: Vec<Value>,
+    },
+    LocalIdentity {
+        table: Table,
+        vids: Vec<String>,
+        paths: Vec<String>,
+        prefixes: Vec<String>,
+        names: Vec<String>,
+        before: Vec<Value>,
+        after: Vec<Value>,
+    },
     AssetPath {
         path: String,
         before: Vec<Value>,
@@ -242,7 +256,9 @@ fn validate(conn: &Connection, delta: &Delta) -> Result<BTreeMap<Table, Schema>>
     }
     for guard in &delta.guards {
         let (table, before, after) = match guard {
-            Guard::AssetPath { before, after, .. } => ("asset", before, after),
+            Guard::AssetPath { before, after, .. } | Guard::AssetPrefix { before, after, .. } => {
+                ("asset", before, after)
+            }
             Guard::CreatorName { before, after, .. }
             | Guard::CreatorCanonical { before, after, .. } => ("entity", before, after),
             Guard::AssetLinks {
@@ -255,6 +271,12 @@ fn validate(conn: &Connection, delta: &Delta) -> Result<BTreeMap<Table, Schema>>
                 ("asset_entity", before, after)
             }
             Guard::LocalFiles {
+                table,
+                before,
+                after,
+                ..
+            }
+            | Guard::LocalIdentity {
                 table,
                 before,
                 after,
@@ -351,6 +373,32 @@ fn inspect_rows(conn: &Connection, delta: &Delta, after: bool) -> Result<()> {
     }
     for guard in &delta.guards {
         let (actual, expected, table) = match guard {
+            Guard::AssetPrefix {
+                prefix,
+                before,
+                after: next,
+            } => (
+                db::rows(
+                    conn,
+                    "SELECT * FROM asset WHERE substr(path,1,length(?))=? ORDER BY id",
+                    [prefix, prefix],
+                )?,
+                if after { next } else { before },
+                "asset",
+            ),
+            Guard::LocalIdentity {
+                table,
+                vids,
+                paths,
+                prefixes,
+                names,
+                before,
+                after: next,
+            } => (
+                local_identity(conn, *table, vids, paths, prefixes, names)?,
+                if after { next } else { before },
+                local_table(*table)?,
+            ),
             Guard::AssetPath {
                 path,
                 before,
@@ -656,4 +704,110 @@ pub fn apply(conn: &Connection, delta: &Delta) -> Result<()> {
 /// Validate after before restoring. External changes block compensation.
 pub fn restore(conn: &Connection, delta: &Delta) -> Result<()> {
     mutate(conn, delta, true)
+}
+
+/// Native identity predicate. Raw OCR, identifiers and notes are never identity matches.
+fn identity_reference(
+    value: &Value,
+    names: &[String],
+    paths: &[String],
+    prefixes: &[String],
+) -> bool {
+    match value {
+        Value::Array(rows) => rows
+            .iter()
+            .any(|v| identity_reference(v, names, paths, prefixes)),
+        Value::Object(map) => map.iter().any(|(key, v)| {
+            v.as_str().is_some_and(|s| {
+                ([
+                    "path",
+                    "src",
+                    "dst",
+                    "win_dst",
+                    "win_src",
+                    "original_dst",
+                    "canonical_dst",
+                    "collection",
+                    "root",
+                ]
+                .contains(&key.as_str())
+                    && (paths.iter().any(|p| p == s)
+                        || prefixes
+                            .iter()
+                            .any(|p| s.starts_with(p) || s == p.trim_end_matches(['/', '\\']))))
+                    || ((["name", "creator", "suggested"].contains(&key.as_str())
+                        || key == "source_id" && value["source"] == "person")
+                        && names.iter().any(|n| n == s))
+                    || (key == "return_href"
+                        && names
+                            .iter()
+                            .any(|n| s == format!("/persons/{}", encode_identity(n))))
+            }) || identity_reference(v, names, paths, prefixes)
+        }),
+        _ => false,
+    }
+}
+fn encode_identity(s: &str) -> String {
+    s.bytes()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || b"-_.!~*'()".contains(&c) {
+                (c as char).to_string()
+            } else {
+                format!("%{c:02X}")
+            }
+        })
+        .collect()
+}
+pub fn local_identity(
+    conn: &Connection,
+    table: Table,
+    vids: &[String],
+    paths: &[String],
+    prefixes: &[String],
+    names: &[String],
+) -> Result<Vec<Value>> {
+    let table_name = local_table(table)?;
+    let mut found = BTreeMap::new();
+    for row in local_files(conn, table, vids, paths)? {
+        found.insert(row["vid"].as_str().unwrap().to_owned(), row);
+    }
+    // Stream to keep memory bounded by the relevant result, even during unrelated worker progress.
+    let mut stmt = conn.prepare(&format!(
+        "SELECT vid,path{} FROM {table_name}",
+        if table == Table::Tasks { ",data" } else { "" }
+    ))?;
+    let mut rows = stmt.query([])?;
+    let mut related = Vec::new();
+    while let Some(row) = rows.next()? {
+        let vid: String = row.get(0)?;
+        let path: Option<String> = row.get(1)?;
+        let path_related = path
+            .as_ref()
+            .is_some_and(|p| prefixes.iter().any(|prefix| p.starts_with(prefix)));
+        let data_related = if table == Table::Tasks {
+            let raw: String = row.get(2)?;
+            let data: Value = serde_json::from_str(&raw)?;
+            identity_reference(&data, names, paths, prefixes)
+        } else {
+            false
+        };
+        if path_related || data_related {
+            related.push(vid)
+        }
+    }
+    drop(rows);
+    drop(stmt);
+    for chunk in related.chunks(400) {
+        for row in db::rows(
+            conn,
+            &format!(
+                "SELECT * FROM {table_name} WHERE vid IN ({})",
+                vec!["?"; chunk.len()].join(",")
+            ),
+            params_from_iter(chunk),
+        )? {
+            found.insert(row["vid"].as_str().unwrap().to_owned(), row);
+        }
+    }
+    Ok(found.into_values().collect())
 }
