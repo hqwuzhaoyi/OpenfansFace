@@ -59,7 +59,9 @@ struct Work {
 struct App {
     config: Config,
     worker: mpsc::SyncSender<Work>,
-    reads: Arc<Semaphore>,
+    // Local journal reads must remain available while media/NFS reads are stalled.
+    status_reads: Arc<Semaphore>,
+    media_reads: Arc<Semaphore>,
 }
 fn authorize(config: &Config, headers: &HeaderMap) -> Result<()> {
     if let Some(token) = &config.token
@@ -113,7 +115,7 @@ async fn status(
         .ok_or_else(|| Error::new(400, "invalid_request", "缺少操作编号"))?;
     model::validate_id(&id)?;
     let permit = app
-        .reads
+        .status_reads
         .clone()
         .acquire_owned()
         .await
@@ -140,19 +142,42 @@ async fn staging_list(
         .map_err(|_| Error::new(400, "invalid_request", "分页位置无效"))?
         .unwrap_or(0);
     let permit = app
-        .reads
+        .media_reads
         .clone()
-        .acquire_owned()
-        .await
-        .map_err(|_| Error::new(503, "unavailable", "读取服务不可用"))?;
+        .try_acquire_owned()
+        .map_err(|_| Error::new(503, "reader_busy", "媒体目录读取繁忙，请稍后重试"))?;
     Ok(Json(
         tokio::task::spawn_blocking(move || {
+            // A disconnected HTTP waiter cannot cancel a blocking syscall. Keep the
+            // permit here until the real read returns; never admit replacement work early.
             let _permit = permit;
+            media_listing_checkpoint(&app.config, offset)?;
             staging::list(&app.config, offset)
         })
         .await
         .map_err(|_| Error::new(503, "unavailable", "暂存列表读取失败"))??,
     ))
+}
+/// Slow-media test hook, only reachable with Config's full marked-fixture guard.
+/// The per-request marker proves admission happened inside the bounded blocking lane.
+fn media_listing_checkpoint(config: &Config, offset: usize) -> Result<()> {
+    let Some(root) = &config.fixture else {
+        return Ok(());
+    };
+    let Some(raw) = control::read(&root.join("rust-fault.json"), control::MARKER_LIMIT)? else {
+        return Ok(());
+    };
+    let fault: Value = serde_json::from_str(&raw)?;
+    if fault["phase"] != "media_listing" {
+        return Ok(());
+    }
+    if fault["mode"] == "pause" {
+        files::atomic_write(
+            &root.join(format!("media-read-{offset}.started")),
+            b"admitted",
+        )?;
+    }
+    fault::checkpoint(config, "media_listing")
 }
 #[tokio::main]
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
@@ -186,7 +211,8 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let app = App {
         config: config.clone(),
         worker,
-        reads: Arc::new(Semaphore::new(4)),
+        status_reads: Arc::new(Semaphore::new(4)),
+        media_reads: Arc::new(Semaphore::new(4)),
     };
     let router = Router::new()
         .route(
@@ -252,7 +278,7 @@ async fn archive_status(
 ) -> Result<Json<Value>> {
     authorize(&app.config, &headers)?;
     let permit = app
-        .reads
+        .status_reads
         .clone()
         .acquire_owned()
         .await
