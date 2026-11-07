@@ -135,6 +135,8 @@ pub struct Request {
 #[serde(deny_unknown_fields)]
 pub struct Envelope {
     pub mode: String,
+    #[serde(default)]
+    pub confirmation: Option<String>,
     pub request: Request,
     pub version: Option<String>,
 }
@@ -177,6 +179,8 @@ pub struct MoveScope {
 pub enum FailurePolicy {
     Rollback,
     ContinueUnchanged,
+    /// Staged-byte disposal is irreversible; never run mover compensation.
+    StopIrreversible,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AffectedStores {

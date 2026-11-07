@@ -20,6 +20,7 @@ mod person_move;
 mod person_registration;
 mod review;
 mod staging;
+mod staging_delete;
 mod store;
 
 use crate::{
@@ -42,7 +43,7 @@ use std::{
 use tokio::sync::{Semaphore, oneshot};
 
 enum Command {
-    Files(Envelope),
+    Files(Box<Envelope>),
     Archive { command: String, body: Value },
 }
 struct Work {
@@ -80,7 +81,7 @@ async fn post(
     let (reply, wait) = oneshot::channel();
     app.worker
         .try_send(Work {
-            command: Command::Files(envelope),
+            command: Command::Files(Box::new(envelope)),
             reply,
         })
         .map_err(|_| {
@@ -142,7 +143,14 @@ async fn staging_list(
     Ok(Json(
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            staging::list(&app.config, offset)
+            if let Some(id) = query.get("id") {
+                return staging_delete::historical_status(&app.config, id);
+            }
+            staging::list(
+                &app.config,
+                offset,
+                query.get("q").map(String::as_str).unwrap_or(""),
+            )
         })
         .await
         .map_err(|_| Error::new(503, "unavailable", "暂存列表读取失败"))??,
@@ -164,6 +172,19 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                     Command::Files(envelope) => match envelope.mode.as_str() {
                         "preview" => engine.preview(envelope.request),
                         "reconcile" => engine.reconcile_request(envelope.request, envelope.version),
+                        "apply"
+                            if staging_delete::action(&envelope.request.action)
+                                && envelope.confirmation.as_deref()
+                                    != Some(staging_delete::confirmation(
+                                        &envelope.request.action,
+                                    )) =>
+                        {
+                            Err(Error::new(
+                                400,
+                                "confirmation_required",
+                                "请输入完整确认文字：永久删除或清空回收站",
+                            ))
+                        }
                         "apply" => match envelope.version {
                             Some(version) => engine.apply(envelope.request, version),
                             None => Err(Error::new(400, "invalid_request", "缺少预览版本")),

@@ -815,6 +815,17 @@ pub fn claim_owner_for(config: &Config, id: &str, action: &str) -> Result<()> {
     {
         return Err(Error::conflict("此编号已有旧后端执行记录"));
     }
+    if read_optional(
+        &config
+            .base
+            .join("staging-operations")
+            .join(id)
+            .join("operation.json"),
+    )?
+    .is_some()
+    {
+        return Err(Error::conflict("此编号已有旧暂存执行记录"));
+    }
     let expected = json!({"id":id,"backend":"rust","action":action});
     match OpenOptions::new().write(true).create_new(true).open(&path) {
         Ok(mut file) => {
@@ -1274,5 +1285,127 @@ mod tests {
         fs::rename(parent, parent.with_extension("old")).unwrap();
         fs::create_dir(parent).unwrap();
         assert!(recover_move(&config, &scope, &file, evidence).is_err());
+    }
+}
+
+/// Permanent disposal pins the parent and regular source. It has no inverse operation.
+pub struct PinnedDelete {
+    parent: File,
+    source: Option<File>,
+    path: String,
+    parent_proof: serde_json::Value,
+}
+impl PinnedDelete {
+    pub fn open(
+        config: &Config,
+        path: &str,
+        parent_proof: Option<&serde_json::Value>,
+    ) -> Result<Self> {
+        let p = Path::new(path);
+        let root = crate::staging::root(config);
+        if !p.is_absolute()
+            || !p.starts_with(&root)
+            || p == root
+            || p.components()
+                .any(|c| !matches!(c, Component::RootDir | Component::Normal(_)))
+        {
+            return Err(Error::conflict("永久删除路径超出暂存根目录").at(path));
+        }
+        let parent: File =
+            directory(p.parent().ok_or_else(|| Error::conflict("缺少父目录"))?)?.into();
+        let proof = identity(&parent.metadata()?);
+        if parent_proof.is_some_and(|v| !same_inode(v, &proof)) {
+            return Err(Error::conflict("暂存父目录被替换，不能核对删除结果").at(path));
+        }
+        let source = match openat(
+            &parent,
+            p.file_name().unwrap(),
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => Some(File::from(fd)),
+            Err(rustix::io::Errno::NOENT) => None,
+            Err(e) => return Err(Error::from(e).at(path)),
+        };
+        if let Some(file) = &source
+            && !file.metadata()?.is_file()
+        {
+            return Err(Error::conflict("仅允许永久删除普通文件").at(path));
+        }
+        Ok(Self {
+            parent,
+            source,
+            path: path.into(),
+            parent_proof: proof,
+        })
+    }
+    pub fn proof(&self) -> Result<serde_json::Value> {
+        let stat = self
+            .source
+            .as_ref()
+            .ok_or_else(|| Error::conflict("暂存文件已消失"))?
+            .metadata()?;
+        let parent = self.parent.metadata()?;
+        Ok(
+            json!({"parent":self.parent_proof,"version":fingerprint(&self.path,&stat),"mode":stat.mode(),"uid":stat.uid(),"gid":stat.gid(),"parent_mode":parent.mode(),"parent_uid":parent.uid(),"parent_gid":parent.gid()}),
+        )
+    }
+    pub fn present(&self) -> bool {
+        self.source.is_some()
+    }
+    pub fn verify(&self, expected: &serde_json::Value) -> Result<()> {
+        let current = self.proof()?;
+        // Directory size/mtime change when siblings are removed; only inode and permission bits matter.
+        if current["version"] != expected["version"]
+            || !same_inode(&current["parent"], &expected["parent"])
+            || [
+                "mode",
+                "uid",
+                "gid",
+                "parent_mode",
+                "parent_uid",
+                "parent_gid",
+            ]
+            .iter()
+            .any(|k| current[k] != expected[k])
+        {
+            return Err(Error::conflict("文件身份或权限已变化，请重新预览").at(&self.path));
+        }
+        crate::permissions::writable_directory(
+            Path::new(&self.path).parent().unwrap(),
+            "staging_delete",
+        )?;
+        let named = std::fs::symlink_metadata(&self.path)?;
+        if !named.is_file()
+            || fingerprint(&self.path, &named) != expected["version"].as_str().unwrap_or("")
+            || !same_inode(&parent_identity(&self.path)?, &expected["parent"])
+        {
+            return Err(Error::conflict("执行前暂存路径已变化").at(&self.path));
+        }
+        Ok(())
+    }
+    pub fn unlink(
+        &self,
+        config: &Config,
+        expected: &serde_json::Value,
+        mut record: impl FnMut(&str) -> Result<()>,
+    ) -> Result<()> {
+        self.verify(expected)?;
+        mutation(
+            config.fixture.as_deref(),
+            &self.path,
+            "staging_unlink",
+            &mut record,
+            || {
+                unlinkat(
+                    &self.parent,
+                    Path::new(&self.path).file_name().unwrap(),
+                    AtFlags::empty(),
+                )
+                .map_err(std::io::Error::from)?;
+                self.parent.sync_all()
+            },
+        )?;
+        Ok(())
     }
 }

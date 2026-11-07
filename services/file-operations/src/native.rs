@@ -30,6 +30,7 @@ pub fn validate(request: &Request) -> Result<()> {
             Ok(())
         }
         "delete-files" | "restore-files" => crate::staging::validate(request),
+        "delete-staged" | "clear-staging" => crate::staging_delete::validate(request),
         _ => Err(Error::new(400, "unsupported_scope", "此原生操作尚未启用")),
     }
 }

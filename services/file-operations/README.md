@@ -327,3 +327,15 @@ Control JSON reads walk parent directories without following symlinks, open the 
 Gate evidence reads the already held read/write descriptor rather than reopening `.review-write.lock`. Startup recovery and routing markers are bounded to 1 MiB. Metadata and legacy JSON documents default to 256 MiB per file; `FILE_OPERATIONS_CONTROL_MAX_BYTES` accepts a positive byte count when a known valid larger document requires it. Limits are checked against file size before allocation and against bytes read if the file grows. No content is truncated or silently skipped. The executor lock also opens nonblocking/no-follow, must be regular and must retain its directory-entry identity before authority checks. Rejected/replaced gate entries remain in place and uncertain operations retain recovery protection.
 
 `python3 tests/http-rust-control-files.py` exercises actual FIFO/symlink/oversize metadata and markers, prompt startup/recovery behavior, and a 2 MiB legacy document through normal execution and restart. Rust control tests additionally replace an already-held gate with a FIFO, symlink and byte-identical new regular inode, verify that evidence/release reject all replacements without deleting them, and check exact byte-limit boundaries.
+
+### Explicit permanent staging disposal (#16)
+
+`delete-staged` and `clear-staging` are native irreversible intents under the
+shared authority. They require saved previews and exact Chinese confirmations;
+ordinary `delete-files` still retains bytes in staging. Clearing strictly scans
+the full staged scope, independently of paginated/search listings. Journal
+schema 4 fences schema-3 downgrade. Per-item native store receipts, scoped JSON
+before/after evidence and mutation-intent/resolved unlink records distinguish
+completed, failed, unexecuted and recovery-required items. Deleted bytes never
+enter reversible mover compensation. Unknown syscall outcomes retain the gate.
+See [the contract and isolated verification](../../docs/verification/rust-staging-permanent-delete.md).
