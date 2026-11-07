@@ -20,6 +20,7 @@ mod person_move;
 mod person_registration;
 mod person_rename;
 mod review;
+mod shared_metadata;
 mod staging;
 mod store;
 
@@ -44,6 +45,7 @@ use tokio::sync::{Semaphore, oneshot};
 
 enum Command {
     Files(Envelope),
+    Metadata { command: String, body: Value },
     Archive { command: String, body: Value },
 }
 struct Work {
@@ -162,6 +164,9 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                     Command::Archive { command, body } => {
                         archive_api::execute(&mut engine, &command, body)
                     }
+                    Command::Metadata { command, body } => {
+                        shared_metadata::execute(&mut engine, &command, body)
+                    }
                     Command::Files(envelope) => match envelope.mode.as_str() {
                         "preview" => engine.preview(envelope.request),
                         "reconcile" => engine.reconcile_request(envelope.request, envelope.version),
@@ -188,6 +193,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .route("/v1/person-files", get(status).post(post))
         .route("/v1/archive", get(archive_status).post(archive_post))
         .route("/v1/staging", get(staging_list))
+        .route("/v1/metadata", axum::routing::post(metadata_post))
         .layer(DefaultBodyLimit::max(8 * 1024 * 1024))
         .with_state(app);
     let listener = tokio::net::TcpListener::bind(&config.bind).await?;
@@ -258,4 +264,36 @@ async fn archive_status(
         .await
         .map_err(|_| Error::new(503, "unavailable", "状态读取失败"))??,
     ))
+}
+
+async fn metadata_post(
+    State(app): State<App>,
+    headers: HeaderMap,
+    payload: std::result::Result<Json<Value>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<Value>> {
+    authorize(&app.config, &headers)?;
+    let Json(payload) = payload.map_err(|e| {
+        Error::new(
+            400,
+            "invalid_request",
+            format!("操作请求无效：{}", e.body_text()),
+        )
+    })?;
+    let command = payload["command"]
+        .as_str()
+        .ok_or_else(|| Error::new(400, "invalid_request", "缺少命令"))?
+        .to_owned();
+    let (reply, wait) = oneshot::channel();
+    app.worker
+        .try_send(Work {
+            command: Command::Metadata {
+                command,
+                body: payload["body"].clone(),
+            },
+            reply,
+        })
+        .map_err(|_| Error::new(503, "writer_busy", "执行队列已满"))?;
+    Ok(Json(wait.await.map_err(|_| {
+        Error::new(503, "outcome_unknown", "执行连接中断")
+    })??))
 }

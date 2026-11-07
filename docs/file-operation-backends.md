@@ -30,13 +30,15 @@ Cutover must drain or reconcile in-flight operations before changing ownership c
 | Archive files, duplicates, queue/history and archive receipts | Plan apply/resolve/progress interfaces | Shared review lock; remains legacy until its ticket migrates it. |
 | Archive recovery | Legacy plan rollback interface | Now acquires the review lock. Existing overwrite-capable rename and shared Peach temporary payload are legacy hazards; replace/retire before Rust production cutover, not a parity target. |
 | Confirmation queue, review decisions, manual person remembrance, optional watermark mapping | Plan queue and claims decision interfaces, people catalog called from them | Shared review lock at caller; native queue/confirmation ticket owns the complete write transaction. |
-| Manual account links | Person accounts interface | Shared review lock; must use the future shared writer coordinator. External profile cache is separate read-model data. |
-| Rejected recommendations and confirmed watermark rules | Recommendations and watermark mapping interfaces | Shared review lock; preserve manual versus inferred evidence. |
-| Person-template overrides | Calibrator `identity_pick`, reached through the calibration proxy | **Bypass at baseline:** sidecar writes directly and launches identification. Coordinate persistence before cutover; model execution may remain Python. |
+| Manual account links | Person accounts interface | Migrated in #13 to native account-link/unlink with durable receipts and document CAS. External profile cache remains separate read-model data. |
+| Rejected recommendations and confirmed watermark rules | Recommendations and watermark mapping interfaces | Migrated in #13 to native recommendation reject/undo and watermark save/remove; selected evidence/file versions and manual versus inferred evidence are retained. |
+| Person-template overrides | Calibrator `identity_pick`, reached through the calibration proxy | **Baseline bypass closed in #13:** native template save, isolated Python F_OUT computation, then version-checked native report publication. Deployment must retire direct unwrapped script invocations. |
 | Video index discovery and analysis state | Processing worker, processing interfaces | Independent SQLite transactions. Preserve unrelated progress; protect only records affected by a file operation. |
 | Video-health reports | Video-health report interface | Shared review lock for reports; maintenance scanner has a separate health lock and does not authorize media moves. |
 | Analysis caches, progress and external profile cache | Watermark/processing workers, creator-directory loader | Separate operational/cache records; do not accidentally turn this migration into an analysis-algorithm rewrite. |
 | Imported media and NAS ownership/ACL | External importers and permission provisioning | Not governed by the web mutex. Native execution must validate paths/fingerprints and actual effective permissions. |
+
+Current shared metadata endpoints, remaining worker/health cutover ownership and verification are maintained in [Shared metadata authority](shared-metadata-coordination.md).
 
 Read `person-file-metadata.ts` for the authoritative transforms: aliases, manual accounts, reviewed clues, templates, rejections, pending queue, archive history, path overrides, report/claims/clusters, deleted-person markers and affected processing candidates. A generic recursive string replacement is not equivalent.
 

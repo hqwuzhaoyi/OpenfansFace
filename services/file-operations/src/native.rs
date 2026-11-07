@@ -23,7 +23,7 @@ pub fn validate(request: &Request) -> Result<()> {
     crate::model::validate_id(&request.id)?;
     match request.action.as_str() {
         "move-files" | "rename-file" => crate::person_move::validate(request),
-        action if action == "archive" || review_action(action) => {
+        action if action == "archive" || action == "metadata-write" || review_action(action) => {
             if !request.files.is_empty() {
                 return Err(Error::new(400, "invalid_request", "范围必须由原生计划确定"));
             }
@@ -38,6 +38,7 @@ pub fn plan(config: &Config, request: Request) -> Result<Plan> {
     match request.action.as_str() {
         "move-files" | "rename-file" => crate::person_move::plan(config, request),
         "archive" => crate::archive::plan(config, request),
+        "metadata-write" => crate::shared_metadata::plan(config, request),
         action if review_action(action) => crate::review::plan(config, request),
         "delete-files" | "restore-files" => crate::staging::plan(config, request),
         "rename-person" => crate::person_rename::plan(config, request),
@@ -48,6 +49,7 @@ pub fn snapshot(config: &Config, plan: &Plan, successful: &[usize]) -> Result<Do
     match plan.action.as_str() {
         "move-files" | "rename-file" => crate::person_move::snapshot(config, plan, successful),
         "archive" => crate::archive::snapshot(config, plan, successful),
+        "metadata-write" => crate::shared_metadata::snapshot(config, plan, successful),
         action if review_action(action) => crate::review::snapshot(config, plan, successful),
         "delete-files" | "restore-files" => crate::staging::snapshot(config, plan, successful),
         "rename-person" => crate::person_rename::snapshot(config, plan, successful),
@@ -58,6 +60,7 @@ pub fn revalidate(config: &Config, plan: &Plan) -> Result<()> {
     match plan.action.as_str() {
         "move-files" | "rename-file" => crate::person_move::revalidate(config, plan),
         "archive" => crate::archive::revalidate(config, plan),
+        "metadata-write" => crate::shared_metadata::revalidate(config, plan),
         action if review_action(action) => crate::review::revalidate(config, plan),
         "delete-files" | "restore-files" => crate::staging::revalidate(config, plan),
         "rename-person" => crate::person_rename::revalidate(config, plan),

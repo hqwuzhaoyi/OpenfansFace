@@ -174,6 +174,7 @@ fn updated(config: &Config, name: &str, value: &Value, plan: &Plan) -> Value {
 fn is_array(name: &str) -> bool {
     [
         "claims-detail.json",
+        "promoted.json",
         "clusters.json",
         "integration-queue.json",
         "archive-history.json",
