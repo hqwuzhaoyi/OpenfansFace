@@ -11,9 +11,10 @@ export interface CreatorProfile {
 }
 export interface CreatorMatch {
   profile: CreatorProfile
-  basis: 'confirmed-account' | 'x-account' | 'unverified-handle' | 'same-name' | 'name-part' | 'reviewed-reference' | 'reviewed-candidate' | 'normalized-name' | 'name-contains' | 'profile-mention' | 'similar-account'
+  basis: 'manual-link' | 'confirmed-account' | 'x-account' | 'unverified-handle' | 'same-name' | 'name-part' | 'reviewed-reference' | 'reviewed-candidate' | 'normalized-name' | 'name-contains' | 'profile-mention' | 'similar-account'
   evidence: string
   reviewed_at?: string
+  manual_link_id?:string
   /** Search ordering only; never an identity probability. */
   relevance?: number
 }
@@ -105,6 +106,6 @@ export function matchPersonProfiles(profiles: CreatorProfile[], name: string, ma
         evidence: `已确认的 X 账号规则：${mapping.token} → ${name}` } : match)
     }
   }
-  const order = { 'confirmed-account': 0, 'x-account': 1, 'reviewed-reference': 2, 'unverified-handle': 3, 'same-name': 4, 'name-part': 5, 'reviewed-candidate': 6, 'normalized-name': 7, 'profile-mention': 8, 'name-contains': 8, 'similar-account': 8 }
+  const order = { 'manual-link': -1, 'confirmed-account': 0, 'x-account': 1, 'reviewed-reference': 2, 'unverified-handle': 3, 'same-name': 4, 'name-part': 5, 'reviewed-candidate': 6, 'normalized-name': 7, 'profile-mention': 8, 'name-contains': 8, 'similar-account': 8 }
   return [...matches.values()].sort((a, b) => order[a.basis] - order[b.basis] || a.profile.handle.localeCompare(b.profile.handle))
 }

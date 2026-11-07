@@ -2,8 +2,10 @@
 FROM node:22-slim AS build
 COPY --from=oven/bun:1 /usr/local/bin/bun /usr/local/bin/bun
 WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends python3 make g++ && rm -rf /var/lib/apt/lists/*
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
-RUN corepack enable && corepack prepare pnpm@10.10.0 --activate && pnpm install --frozen-lockfile
+RUN npm install --global node-gyp@11 && corepack enable && corepack prepare pnpm@10.10.0 --activate && pnpm install --frozen-lockfile
+RUN node -e "const Database=require('better-sqlite3'); const db=new Database(':memory:'); db.prepare('SELECT 1').get(); db.close()"
 COPY . .
 RUN pnpm build
 

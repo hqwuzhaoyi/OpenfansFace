@@ -12,7 +12,10 @@ export async function GET(req: NextRequest) {
   let real: string
   try { real = fs.realpathSync(/*turbopackIgnore: true*/ mapped) }
   catch { return new Response('not found', {status:404}) }
-  if (!real.startsWith(MEDIA2 + '/')) return new Response('forbidden', {status:403})
+  let mediaRoot: string
+  try { mediaRoot = fs.realpathSync(/*turbopackIgnore: true*/ MEDIA2) }
+  catch { return new Response('not found', {status:404}) }
+  if (!real.startsWith(mediaRoot + '/')) return new Response('forbidden', {status:403})
   const st = fs.statSync(/*turbopackIgnore: true*/ real), size = st.size
   if (!st.isFile() || !size) return new Response('not found', {status:404})
   const types:Record<string,string> = {'.mp4':'video/mp4','.m4v':'video/mp4','.webm':'video/webm','.mov':'video/quicktime','.mkv':'video/x-matroska'}

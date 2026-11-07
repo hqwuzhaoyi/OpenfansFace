@@ -164,7 +164,7 @@ export default function Integration() {
       const data = await api<{ removed: UndoItem[] }>('/api/plan/queue', { method: 'DELETE', body: JSON.stringify({ vids }) })
       setUndoResult(data.removed); await load()
       toast.success(`已将 ${data.removed.length} 个退回待确认，文件未删除`, toastOptions)
-      if (goBack && data.removed[0]?.return_href) router.push(data.removed[0].return_href)
+      if (goBack && data.removed[0]?.return_href) router.push('/review?vid='+encodeURIComponent(data.removed[0].vid))
     } catch (cause) { toast.error((cause as Error).message, toastOptions) }
     finally { writing.current = false; setBusy(false) }
   }
@@ -191,10 +191,10 @@ export default function Integration() {
     finally { writing.current = false; setBusy(false) }
   }
 
-  return <div className="archive-workbench">
+  return <main className="archive-workbench">
     {error && <div role="alert" className={`archive-notice archive-warning`}>{error}<Button size="sm" variant="ghost" disabled={loading || busy} onClick={() => load()}>重新加载</Button></div>}
     {result && <div className="archive-notice" role="status"><div className="flex items-start justify-between gap-3"><details open={!!result.errors?.length} className="min-w-0 flex-1"><summary>{result.moved ? `已处理 ${result.moved} 个视频，Peach 账本已同步${result.staged ? `；${result.staged} 个重复源文件已暂存` : ''}。` : '本轮未完成归档，相关任务仍在待归档中。'}</summary>{!!result.errors?.length && <ul className="archive-warning">{result.errors.map((message, i) => <li key={i}>{message}</li>)}</ul>}<p>剩余 {plan?.n ?? result.remaining} 项，失败或未选中的任务继续保留。</p>{result.moved > 0 && <Button size="sm" variant="ghost" onClick={() => setView(true)}>查看归档后的位置<ArrowRight size={14} /></Button>}</details><button aria-label="关闭归档结果" className="archive-iconButton" onClick={() => setResult(null)}><X size={15} /></button></div></div>}
-    {!!undoResult.length && !history && <div className="archive-notice" role="status"><div className="flex justify-between gap-3"><p>已将 {undoResult.length} 个视频退回待确认，文件没有移动或删除。</p><button aria-label="关闭退回结果" className="archive-iconButton" onClick={() => setUndoResult([])}><X size={15} /></button></div><div className="archive-noticeLinks">{Array.from(new Map(undoResult.map(r => [r.return_href, r])).values()).map((r, i) => <Link key={r.return_href || i} href={r.return_href || '/clusters'}>回到{sourceLabel[r.source || 'legacy'] || '原确认入口'}</Link>)}</div></div>}
+    {!!undoResult.length && !history && <div className="archive-notice" role="status"><div className="flex justify-between gap-3"><p>已将 {undoResult.length} 个视频退回待确认，文件没有移动或删除。</p><button aria-label="关闭退回结果" className="archive-iconButton" onClick={() => setUndoResult([])}><X size={15} /></button></div><div className="archive-noticeLinks">{Array.from(new Map(undoResult.map(r => [r.return_href, r])).values()).map((r, i) => <Link key={r.return_href || i} href={'/review?vid='+encodeURIComponent(r.vid)}>回到{sourceLabel[r.source || 'legacy'] || '原确认入口'}</Link>)}</div></div>}
     <div className="archive-split" data-hidden={listHidden} data-mobile-detail={mobileDetail}>
       <section className="archive-list" aria-label={history ? '归档记录列表' : '待归档波次列表'} aria-busy={loading}>
         <header className="archive-listHeading"><h1>{history ? '已归档' : '待归档'}<span className="archive-count">{history ? items.length : `${waves.length} 波 · ${rows.length} 个`}</span></h1><div className="archive-iconActions"><button className="archive-iconButton" aria-label={history ? '返回待归档' : '查看已归档记录'} title={history ? '返回待归档' : '已归档记录'} disabled={busy} onClick={() => setView(!history)}>{history ? <Archive size={17} /> : <History size={17} />}</button><button className="archive-iconButton" aria-label="刷新归档预览" title="刷新" disabled={busy || loading} onClick={() => load()}><RefreshCw size={16} className={loading ? 'animate-spin motion-reduce:animate-none' : ''} /></button></div></header>
@@ -232,7 +232,7 @@ export default function Integration() {
             <div className="archive-person"><span className="archive-avatar">{current.creator.slice(0, 1)}</span><div><small>已确认人物</small><strong>{current.creator}<ShieldCheck size={14} className="archive-good" /></strong></div><span>{history ? '归档已完成' : '可跨波次勾选归档'}</span></div>
             <div className={`archive-reason ${pending && pending.status !== 'ok' ? 'archive-warning' : 'archive-good'}`}>{pending && pending.status !== 'ok' ? <CircleAlert size={16} /> : <CheckCheck size={16} />}<span>{pending?.reason || '已完成文件移动与 Peach 账本更新。'}</span></div>
             {pending && <div className="archive-detailsActions">{conflicts.some(r => r.vid === pending.vid) && <Button variant="outline" size="sm" disabled={disabled} onClick={() => setResolving([pending])}>{pending.resolution ? '更改处理方式' : '选择同名文件处理方式'}</Button>}<Button variant="ghost" size="sm" disabled={disabled} onClick={() => setUndoRequest({ vids: [pending.vid], goBack: true })}><Undo2 size={14} />退回待确认，重新选人</Button></div>}
-            <div className="archive-metadata"><span>{waveTime((pending || archived)?.at || '')} {history ? '归档记录' : '加入队列'}</span>{pending?.return_href && <Link href={pending.return_href} className="underline underline-offset-4">查看归名来源</Link>}</div>
+            {(pending || archived)?.note && <p className="archive-reason">备注：{(pending || archived)?.note}</p>}<div className="archive-metadata"><span>{waveTime((pending || archived)?.at || '')} {history ? '归档记录' : '加入队列'}</span>{pending?.return_href && <Link href={'/review?vid='+encodeURIComponent(pending.vid)} className="underline underline-offset-4">查看归名来源</Link>}</div>
           </> : <div className="archive-empty"><CircleCheck size={28} /><p>{loading ? '正在读取归档计划…' : '从左侧选择视频查看详情'}</p></div>}
         </div>
       </section>
@@ -256,5 +256,5 @@ export default function Integration() {
       if (!data) { toast.warning('选择已保存，预览刷新失败，请点刷新后继续。', toastOptions); return }
       toast.success('处理方式已保存，所有仍在队列中的勾选已保留。点击归档才会移动文件。', toastOptions)
     }} />}
-  </div>
+  </main>
 }

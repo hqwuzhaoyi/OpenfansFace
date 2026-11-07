@@ -1,0 +1,5 @@
+/* Shared workbench tokens are now defined globally in app/globals.css. */
+.pw,
+.pw-modal {
+  font-family: var(--wb-font);
+}

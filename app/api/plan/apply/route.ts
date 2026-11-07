@@ -7,13 +7,15 @@ import { buildPlan } from '@/lib/review-plan'
 import { saveQueue, writeJson } from '@/lib/jsonio'
 import { validateVids, ReviewError, type ArchivedItem } from '@/lib/review-logic'
 import { MANIFESTS_D, STAGE } from '@/lib/env'
-import { identicalFiles, moveExclusive } from '@/lib/archive-files'
+import { identicalFiles, moveExclusiveAsync } from '@/lib/archive-files'
 import { toWin } from '@/lib/paths'
 import { peachExec } from '@/lib/peach'
 import { invalidateIntegrationCache } from '@/lib/integration'
+import { startArchiveJob } from '@/lib/runtime-jobs'
 
 export async function POST(req: NextRequest) {
   let release: (()=>void) | undefined
+  let progress: ReturnType<typeof startArchiveJob> | undefined
   try {
     const body = await req.json(), vids = validateVids(body.vids)
     release = acquireReviewLock()
@@ -21,13 +23,17 @@ export async function POST(req: NextRequest) {
     if (body.version !== plan.version) throw new ReviewError('待归档内容或文件状态已变化，请刷新预览后再执行', 409)
     const ids = new Set(vids), selected = plan.rows.filter(r=>ids.has(r.vid))
     if (selected.length !== vids.length || selected.some(r=>r.status!=='ok')) throw new ReviewError('只能归档检查通过的视频，请刷新并处理异常项', 409)
+    progress = startArchiveJob(selected.length)
     fs.mkdirSync(MANIFESTS_D, { recursive: true })
     const mf = path.join(MANIFESTS_D, `apply-${Date.now()}-${randomUUID().slice(0,8)}.json`)
     const manifest: any = { at: new Date().toISOString(), status: 'moving', moves: [], ledger: [], errors: [] }
     const stageBatch = path.join(STAGE, 'archive-duplicates', randomUUID())
     writeJson(mf, manifest)
     const completed: ArchivedItem[] = []
+    let processed = 0
     for (const item of selected) {
+      progress.update({stage: item.operation==='stage-duplicate'?'校验重复文件':'移动文件', current:item.name, done:processed, total:selected.length, unit:'个文件'})
+      await new Promise<void>(resolve=>setImmediate(resolve))
       const src = item.src!, dst = item.dst!
       try {
         const source = fs.statSync(src)
@@ -41,14 +47,16 @@ export async function POST(req: NextRequest) {
           if (checkedSource.size !== item.size || checkedSource.mtimeMs !== item.mtime || checkedTarget.size !== item.dst_size || checkedTarget.mtimeMs !== item.dst_mtime) throw new Error('校验后文件状态已变化，请重新核对')
         } else if (fs.existsSync(dst)) throw new Error('目标文件已出现，请核对冲突')
         const actualDst = duplicate ? path.join(stageBatch, randomUUID(), path.basename(src)) : dst
-        moveExclusive(src, actualDst)
+        await moveExclusiveAsync(src, actualDst)
         manifest.moves.push({ src, dst: actualDst, canonical_dst: dst, operation: item.operation, win_src: toWin(src), original_vid: item.vid, win_dst: toWin(actualDst) })
         manifest.ledger.push({ from: toWin(src), to: toWin(actualDst), creator: item.creator, canonical: duplicate ? toWin(dst) : undefined })
         completed.push({ ...item, dst, win_dst: toWin(dst), manifest: mf, ...(duplicate ? {staged_path: actualDst} : {}) })
         writeJson(mf, manifest)
       } catch (e: any) { manifest.errors.push(`${item.name}: ${e.message}`) }
+      processed++; progress.update({done:processed, failed:manifest.errors.length})
     }
     if (completed.length) {
+      progress.update({stage:'同步 Peach 账本',current:undefined,done:0,total:completed.length,unit:'条记录'})
       manifest.status = 'updating_ledger'; writeJson(mf, manifest)
       const payload = Buffer.from(JSON.stringify(manifest.ledger)).toString('base64')
       const script = `import json,sqlite3,base64,datetime
@@ -87,16 +95,19 @@ finally: con.close()
       try { updated = JSON.parse(result.out).updated } catch {}
       if (result.code !== 0 || updated !== completed.length) {
         // Ledger transaction did not commit: return files to their original paths and keep every task pending.
+        progress.update({stage:'恢复文件',done:null,total:null,unit:''})
         manifest.errors.push('Peach 账本更新失败，本轮文件正在恢复原位置')
         for (const mv of [...manifest.moves].reverse()) {
-          try { moveExclusive(mv.dst, mv.src); mv.restored = true }
+          try { await moveExclusiveAsync(mv.dst, mv.src); mv.restored = true }
           catch (e:any) { manifest.errors.push(`恢复失败 ${path.basename(mv.src)}: ${e.message}`) }
         }
         manifest.status = manifest.moves.every((m:any)=>m.restored) ? 'rolled_back' : 'recovery_needed'
         manifest.ledger_error = result.err
         writeJson(mf, manifest)
+        progress.finish(manifest.errors.join("；"))
         return NextResponse.json({ ok: false, moved: 0, errors: manifest.errors, manifest: mf, remaining: queuedWithOrigin().length })
       }
+      progress.update({done:updated,total:updated})
       manifest.ledger_remapped = updated
       const history = new Map(loadArchive().map(v=>[v.vid,v]))
       completed.forEach(v=>history.set(v.vid,v))
@@ -106,7 +117,8 @@ finally: con.close()
     }
     manifest.status = 'complete'; writeJson(mf, manifest)
     invalidateIntegrationCache()
+    progress.finish(manifest.errors.length?manifest.errors.join("；"):undefined)
     return NextResponse.json({ ok: !manifest.errors.length, moved: completed.length, staged: completed.filter(v=>v.staged_path).length, ledger: manifest.ledger_remapped || 0, errors: manifest.errors, manifest: mf, remaining: queuedWithOrigin().length })
-  } catch (e:any) { return NextResponse.json({ error: e.message }, { status: e.status || 500 }) }
+  } catch (e:any) { progress?.finish(e.message); return NextResponse.json({ error: e.message }, { status: e.status || 500 }) }
   finally { release?.() }
 }

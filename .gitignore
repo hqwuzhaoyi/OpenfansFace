@@ -57,6 +57,8 @@ __pycache__/
 /thumbs/
 /manifests/
 /media/
+# Project-local evidence, build snapshots and preview artifacts.
+/.local/
 report.json
 clusters.json
 claims-detail*.json
@@ -64,6 +66,12 @@ integration-queue.json
 archive-history.json
 review-decisions.json
 people-manual.json
+person-rejections.json
+**/external-profiles/manual-links.json
+**/external-profiles/reviewed-links.json
+person-renames.json
+video-path-overrides.json
+person-operations/
 video-health*.json
 template-overrides.json
 *.mp4
@@ -72,3 +80,8 @@ template-overrides.json
 *.webm
 *.npy
 *.npz
+
+people-deleted.json
+
+# macOS archive metadata
+._*

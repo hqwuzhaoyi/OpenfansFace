@@ -7,6 +7,13 @@ import { mergeReviewedCreatorProfiles } from '../lib/creator-directory-reference
 const p = (id, handle, name, description = '') => ({ id, handle, name, description, followers: null, synced_at: null })
 const search = (profiles, query) => addFuzzyCreatorProfiles(profiles, query)
 
+test('an explicit manual search can use one Chinese character without loosening automatic matching',()=>{
+  const profiles=[p('1','cat_day','小猫日常')]
+  assert.deepEqual(search(profiles,'猫'),[])
+  const results=addFuzzyCreatorProfiles(profiles,'猫',[],true)
+  assert.equal(results.length,1);assert.equal(results[0].basis,'name-contains')
+})
+
 test('query expansion finds embedded accounts and removes only explicit folder decorations', () => {
   const profiles = [p('1', 'sample_01', '小安')]
   for (const query of ['小安@sample_01', 'sample_01小安', '#sample_01-14192581523534213', 'https://x.com/sample_01', 'https://onlyfans.com/sample_01']) {

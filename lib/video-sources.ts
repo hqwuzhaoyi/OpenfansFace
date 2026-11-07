@@ -2,10 +2,11 @@ import fs from 'fs'
 import Database from 'better-sqlite3'
 import { BASE, MEDIA2 } from './env'
 import { chooseSource } from './source-resolution'
+import { readJson } from './jsonio'
 
 export function readVideoSources(): Map<string,string> {
   const db=new Database(`${BASE}/faces.db`,{readonly:true,fileMustExist:true})
-  try{return new Map((db.prepare('SELECT vid,path FROM videos').all() as {vid:string;path:string}[]).map(r=>[r.vid,r.path]))}
+  try{return new Map([...(db.prepare('SELECT vid,path FROM videos').all() as {vid:string;path:string}[]).map(r=>[r.vid,r.path] as const),...Object.entries(readJson<Record<string,string>>(`${BASE}/video-path-overrides.json`,{}))])}
   finally{db.close()}
 }
 export function isMediaFile(path:string):boolean {

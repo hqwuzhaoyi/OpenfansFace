@@ -23,22 +23,33 @@ def load_clusters():
 
 
 def rel(vid):
-    w = vid.split('\\', 1)[1].replace('\\', '/')
-    if 'media/pikpak/' in w:
-        w = w.split('media/pikpak/', 1)[1]
-    return w
+    value = (vid or '').replace('\\', '/')
+    return value.split('/pikpak/', 1)[1] if '/pikpak/' in value else value.lstrip('/')
+
+
+def canonical_name(name):
+    try:
+        with open(f'{BASE}/person-renames.json') as source:
+            renames = json.load(source)
+    except FileNotFoundError:
+        return name
+    seen = set()
+    while isinstance(renames.get(name), str) and name not in seen:
+        seen.add(name)
+        name = renames[name]
+    return name
 
 
 def identity_of(p):
     if p[0] == 'creators' and len(p) >= 3:
-        return p[1]
+        return canonical_name(p[1])
     if p[0] == 'share':
         if len(p) >= 3 and p[1] == '收藏':
-            return p[2]
+            return canonical_name(p[2])
         if len(p) >= 2:
-            return p[1]
+            return canonical_name(p[1])
     if p[0] == 'My Telegram' and len(p) >= 3 and p[1].startswith('#'):
-        return p[1].split()[0]
+        return canonical_name(p[1].split()[0])
     return None
 
 
@@ -57,13 +68,14 @@ def _picked_index(name):
 
 
 def identity_groups(name):
+    name = canonical_name(name)
     import sqlite3
     con = sqlite3.connect(f'{BASE}/faces.db')
-    rows = con.execute("""SELECT f.emb, f.thumb, f.ts, f.vid, v.duration FROM faces f
+    rows = con.execute("""SELECT f.emb, f.thumb, f.ts, f.vid, v.duration, v.path FROM faces f
                           JOIN videos v ON v.vid=f.vid
                           WHERE v.status='done' ORDER BY f.id""").fetchall()
     con.close()
-    idxs = [i for i, r in enumerate(rows) if identity_of(rel(r[3]).split('/')) == name]
+    idxs = [i for i, r in enumerate(rows) if identity_of(rel(r[5] or r[3]).split('/')) == canonical_name(name)]
     if not idxs:
         return {'name': name, 'groups': [], 'picked': None, 'note': '该身份没有文件夹脸（纯认领）'}
     E = np.stack([np.frombuffer(rows[i][0], np.float32) for i in idxs])
@@ -88,7 +100,7 @@ def identity_groups(name):
 
 
 def identity_pick(payload):
-    name = payload.get('name')
+    name = canonical_name(payload.get('name'))
     groups = payload.get('groups')
     if not name or groups is None:
         return {'error': 'name/groups required'}

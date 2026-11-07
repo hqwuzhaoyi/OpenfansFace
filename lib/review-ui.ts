@@ -9,4 +9,4 @@ export function videoGroups(videos: ReviewVideo[]) {
   for (const v of videos) { const dir = directoryOf(v.path || v.vid); groups.set(dir, [...(groups.get(dir) || []), v]) }
   return [...groups.entries()].sort((a, b) => b[1].length - a[1].length)
 }
-export const sourceLabel: Record<string, string> = { all: '全部待分类', cluster: '相似视频组', person: '人物页确认', approval: '识别待确认', legacy: '旧队列' }
+export const sourceLabel: Record<string, string> = { review: '人工确认', all: '全部待分类', watermark: '提取水印', cluster: '相似视频组', person: '人物页确认', approval: '识别待确认', legacy: '旧队列' }

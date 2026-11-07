@@ -1,0 +1,6 @@
+FROM face-watermarks:v1
+COPY maintenance/processing-requirements.txt /opt/processing-requirements.txt
+RUN pip install --no-cache-dir -r /opt/processing-requirements.txt
+COPY maintenance/*.py /opt/
+ENV FACE_ADMIN_URL=http://127.0.0.1:8919 INSIGHTFACE_HOME=/root/.insightface WATERMARK_CPU_THREADS=1 OMP_NUM_THREADS=1
+CMD ["python3", "/opt/processing_worker.py"]

@@ -7,6 +7,8 @@ import { readJson, loadQueue, saveQueue, loadDecisions, saveDecisions, loadOverr
 export { loadQueue, saveQueue, loadDecisions, saveDecisions, loadOverride, saveOverride }
 import { copyPeachLedger } from "./peach"
 import Database from "better-sqlite3"
+import { canonicalPersonFields } from './person-names'
+import { invalidatePersonStats } from './person-library-stats'
 
 const cache: { ledgerTs: number; walkTs: number; integrated?: Record<string, any> } = {
   ledgerTs: 0, walkTs: 0,
@@ -105,10 +107,10 @@ export function stagingStats() {
 
 export interface Report { stats: any; identities: any[] }
 export function loadReport(): Report {
-  return readJson<Report>(path.join(BASE, "report.json"), { stats: {}, identities: [] })
+  return canonicalPersonFields(readJson<Report>(path.join(BASE, "report.json"), { stats: {}, identities: [] }))
 }
 export function loadClaims(): any[] {
-  return readJson<any[]>(path.join(BASE, "claims-detail.json"), [])
+  return canonicalPersonFields(readJson<any[]>(path.join(BASE, "claims-detail.json"), []))
 }
 export function loadClusters(): any[] {
   return readJson<any[]>(path.join(BASE, "clusters.json"), [])
@@ -138,4 +140,4 @@ export async function peachPersons() {
   return { links, aliases }
 }
 
-export function invalidateIntegrationCache() { cache.ledgerTs = 0; cache.walkTs = 0; cache.integrated = undefined; walkGeneration++; pendingWalk=undefined; pendingLedger=undefined }
+export function invalidateIntegrationCache() { cache.ledgerTs = 0; cache.walkTs = 0; cache.integrated = undefined; walkGeneration++; pendingWalk=undefined; pendingLedger=undefined;invalidatePersonStats() }

@@ -4,9 +4,10 @@ import { BASE } from './env'
 import { readJson, writeJson, loadQueue, loadDecisions } from './jsonio'
 import { ReviewError, type ArchivedItem, type QueueItem } from './review-logic'
 import { loadClusters, loadReport } from './integration'
+import { canonicalPersonFields } from './person-names'
 
 export const ARCHIVE_F = path.join(BASE, 'archive-history.json')
-export const loadArchive = () => readJson<ArchivedItem[]>(ARCHIVE_F, [])
+export const loadArchive = () => canonicalPersonFields(readJson<ArchivedItem[]>(ARCHIVE_F, []))
 export const saveArchive = (items: ArchivedItem[]) => writeJson(ARCHIVE_F, items)
 
 /** Shared across workers and production/shadow instances. Never silently discard a live lock. */
@@ -19,7 +20,7 @@ export function acquireReviewLock() {
     throw e
   }
   fs.writeFileSync(fd, JSON.stringify({ pid: process.pid, at: new Date().toISOString() }))
-  return () => { fs.closeSync(fd); fs.rmSync(lock, { force: true }) }
+  return (keep = false) => { fs.closeSync(fd); if(!keep)fs.rmSync(lock, { force: true }) }
 }
 export function queuedWithOrigin(): QueueItem[] {
   const byVideo = new Map<string, string>()

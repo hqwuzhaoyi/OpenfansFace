@@ -1,6 +1,7 @@
 import fs from "fs"
 import { randomUUID } from "crypto"
 import { QUEUE_F, DECISIONS_F, OVR_F } from "./env"
+import { canonicalPersonFields } from './person-names'
 
 export function readJson<T = any>(p: string, fallback: T): T {
   try { return JSON.parse(fs.readFileSync(/*turbopackIgnore: true*/ p, "utf8")) as T } catch { return fallback }
@@ -12,7 +13,7 @@ export function writeJson(p: string, data: any) {
     fs.renameSync(/*turbopackIgnore: true*/ tmp, /*turbopackIgnore: true*/ p)
   } finally { fs.rmSync(/*turbopackIgnore: true*/ tmp, { force: true }) }
 }
-export const loadQueue = () => readJson<any[]>(QUEUE_F, [])
+export const loadQueue = () => canonicalPersonFields(readJson<any[]>(QUEUE_F, []))
 export const saveQueue = (q: any[]) => writeJson(QUEUE_F, q)
 export const loadDecisions = () => readJson<{ approved: string[]; rejected: string[] }>(DECISIONS_F, { approved: [], rejected: [] })
 export const saveDecisions = (d: any) => writeJson(DECISIONS_F, d)

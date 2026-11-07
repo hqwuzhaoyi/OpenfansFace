@@ -27,9 +27,9 @@ export async function copyPeachLedger(dest: string): Promise<void> {
 }
 
 /** Run python inside peach, return demultiplexed stdout. python3 -c argv（不经 stdin，杜绝空输入静默 rc0）。 */
-export async function peachExec(script: string, timeoutMs = 600000): Promise<{ out: string; code: number; err: string }> {
+export async function peachExec(script: string, timeoutMs = 600000, args: string[] = []): Promise<{ out: string; code: number; err: string }> {
   const c = docker().getContainer(process.env.PEACH_CONTAINER || "peach")
-  const exec = await c.exec({ Cmd: ["python3", "-c", script], AttachStdout: true, AttachStderr: true })
+  const exec = await c.exec({ Cmd: ["python3", "-c", script, ...args], AttachStdout: true, AttachStderr: true })
   const outChunks: Buffer[] = []
   const errChunks: Buffer[] = []
   const stdout = new (await import("stream")).PassThrough()

@@ -1,4 +1,6 @@
 import { rememberPerson } from '@/lib/people-catalog'
+import { canonicalPersonName } from '@/lib/person-names'
+import { isStagedPath } from '@/lib/person-file-paths'
 import { healthScope } from '@/lib/video-health'
 import { creatorFolder } from '@/lib/source-resolution'
 import { MEDIA2 } from '@/lib/env'
@@ -21,10 +23,11 @@ export async function POST(req: NextRequest) {
     const decisions = loadDecisions()
     if (approve) {
       const p=videoSource(vid,readVideoSources())
+      if(p&&isStagedPath(p))throw new ReviewError('暂存区中的视频不能重新归名',409)
       if(p&&healthScope()(vid,p))throw new ReviewError('视频体检已连续确认异常，请到回收站查看记录',409)
       if(p&&creatorFolder(p,MEDIA2)!==null)throw new ReviewError('creators 内的视频已归类，不需要再次审批归档；请刷新列表',409)
       if(!p||!isMediaFile(p))throw new ReviewError('原视频无法读取，请刷新列表并核对路径',409)
-      const target = validateCreator(creator ?? claim.name)
+      const target = canonicalPersonName(validateCreator(creator ?? claim.name))
       const result = enqueueItems(queuedWithOrigin(), target, [vid], origin('approval', vid))
       rememberPerson(target,videoInfo().get(vid)?.thumb)
       saveQueue(result.queue)

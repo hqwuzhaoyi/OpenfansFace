@@ -8,7 +8,7 @@ import numpy as np
 
 BASE = os.environ.get('FACES_BASE', '/data/base')
 MIN_TPL = 5
-_cache = {'C': None, 'names': [], 'reps': [], 'tpln': [], 'at': 0.0}
+_cache = {'C': None, 'names': [], 'reps': [], 'tpln': [], 'at': 0.0, 'report_stamp': None}
 _lock = threading.Lock()
 
 
@@ -18,6 +18,7 @@ def _sq(s):
 
 def _build():
     t0 = time.time()
+    report_stamp = os.stat(f'{BASE}/report.json').st_mtime_ns
     rep = json.load(open(f'{BASE}/report.json'))
     db = sqlite3.connect(f'{BASE}/faces.db')
     cents, names, reps, tpln = [], [], [], []
@@ -49,14 +50,26 @@ def _build():
     _cache['reps'] = reps
     _cache['tpln'] = tpln
     _cache['at'] = time.time()
+    _cache['report_stamp'] = report_stamp
     print(f'[suggest] registry: {len(names)} identities in {time.time()-t0:.1f}s', flush=True)
 
 
 def _registry():
     with _lock:
-        if _cache['C'] is None or time.time() - _cache['at'] > 600:
+        if _cache['C'] is None or time.time() - _cache['at'] > 600 or _cache['report_stamp'] != os.stat(f'{BASE}/report.json').st_mtime_ns:
             _build()
-        return _cache['C'], _cache['names'], _cache['reps'], _cache['tpln']
+        try:
+            with open(f'{BASE}/person-renames.json') as source:
+                renames = json.load(source)
+        except FileNotFoundError:
+            renames = {}
+        names = []
+        for name in _cache['names']:
+            seen = set()
+            while isinstance(renames.get(name), str) and name not in seen:
+                seen.add(name); name = renames[name]
+            names.append(name)
+        return _cache['C'], names, _cache['reps'], _cache['tpln']
 
 
 def suggest(cid, topk=12):

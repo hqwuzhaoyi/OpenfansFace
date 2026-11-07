@@ -5,6 +5,7 @@ import { reviewClusters } from './cluster-review'
 import { loadClusters } from './integration'
 import { resolvedVids } from './review-store'
 import { healthScope } from './video-health'
+import { isStagedPath } from './person-file-paths'
 
 /** Eligibility follows the current file location, never its historical video ID. */
 export function reviewScope(sources=readVideoSources()) {
@@ -13,7 +14,7 @@ export function reviewScope(sources=readVideoSources()) {
   const source=(vid:string)=>{if(!paths.has(vid))paths.set(vid,videoSource(vid,sources));return paths.get(vid)!}
   const organized=(vid:string)=>{const p=source(vid);return !!p&&creatorFolder(p,MEDIA2)!==null}
   const eligible=(vid:string)=>{
-    if(!eligibility.has(vid)){const p=source(vid);eligibility.set(vid,!!p&&!organized(vid)&&isMediaFile(p)&&!hidden(vid,p))}
+    if(!eligibility.has(vid)){const p=source(vid);eligibility.set(vid,!!p&&!organized(vid)&&!isStagedPath(p)&&isMediaFile(p)&&!hidden(vid,p))}
     return eligibility.get(vid)!
   }
   return {sources,source,organized,eligible,hidden:(vid:string)=>{const p=source(vid);return !!p&&hidden(vid,p)}}

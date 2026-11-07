@@ -48,3 +48,19 @@ export function moveExclusive(src: string, dst: string): void {
     fs.unlinkSync(src)
   } catch (e) { fs.unlinkSync(dst); throw e }
 }
+
+/** Same guarantees as moveExclusive, without blocking the web server during a copy. */
+export async function moveExclusiveAsync(src:string,dst:string):Promise<void> {
+  await fs.promises.mkdir(path.dirname(dst),{recursive:true})
+  const before=await fs.promises.stat(src)
+  if(!before.isFile())throw new Error('原路径不是文件')
+  try{await fs.promises.link(src,dst)}catch(error){
+    if(!['EXDEV','EPERM','EOPNOTSUPP','ENOTSUP'].includes((error as NodeJS.ErrnoException).code||''))throw error
+    await fs.promises.copyFile(src,dst,fs.constants.COPYFILE_EXCL)
+  }
+  try{
+    const after=await fs.promises.stat(src)
+    if(after.ino!==before.ino||after.size!==before.size||after.mtimeMs!==before.mtimeMs)throw new Error('移动期间原文件发生变化')
+    await fs.promises.unlink(src)
+  }catch(error){await fs.promises.unlink(dst);throw error}
+}

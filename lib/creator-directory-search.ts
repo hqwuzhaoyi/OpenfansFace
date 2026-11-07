@@ -10,7 +10,7 @@ const accountWord = /^[a-z0-9_]+$/i
 const nameBoundary = /[^a-z0-9_.-]/i
 
 /** Query expansion is for discovery only; it never rewrites an account or naming rule. */
-export function creatorSearchTerms(input: string): string[] {
+export function creatorSearchTerms(input: string, manual = false): string[] {
   const normalized = input.normalize('NFKC').trim().replace(/^#+/, '').replace(/-\d{12,}$/, '')
   // A complete profile URL is one account query, not a source of generic URL fragments.
   const url = normalized.match(/^(?:https?:\/\/)?(?:www\.)?(?:x\.com|twitter\.com|onlyfans\.com|fansly\.com|instagram\.com)\/([a-z0-9_]{1,64})\/?$/i)
@@ -18,7 +18,7 @@ export function creatorSearchTerms(input: string): string[] {
   const raw = url ? [url[1]] : [normalized,
     ...normalized.split(/[\s()（）\[\]【】|｜,，、;；@#]+/u),
     ...(normalized.match(/[a-z][a-z0-9_.-]*|[\p{Script=Han}]{2,}/giu) || [])]
-  return [...new Set(raw.map(fold))].filter(term => term.length >= 2 && term.length <= 100 &&
+  return [...new Set(raw.map(fold))].filter(term => term.length >= (manual&&/\p{Script=Han}/u.test(term)?1:2) && term.length <= 100 &&
     !/^\d+$/.test(term) && !/^\d+[pvg](?:\d+[pvg])*$/i.test(term) && !stopWords.has(term)).slice(0, 16)
 }
 
@@ -58,8 +58,8 @@ function oneEdit(a: string, b: string): boolean {
 }
 
 /** Rank fuzzy candidates after exact matches. Return all candidates so the caller can count before capping. */
-export function addFuzzyCreatorProfiles(profiles: CreatorProfile[], query: string, exact: CreatorMatch[] = []): CreatorMatch[] {
-  const terms = creatorSearchTerms(query), preserved = new Set(exact.map(m => m.profile.id))
+export function addFuzzyCreatorProfiles(profiles: CreatorProfile[], query: string, exact: CreatorMatch[] = [], manual = false): CreatorMatch[] {
+  const terms = creatorSearchTerms(query,manual), preserved = new Set(exact.map(m => m.profile.id))
   const additional: CreatorMatch[] = []
   for (const profile of profiles) {
     if (preserved.has(profile.id)) continue
@@ -73,7 +73,7 @@ export function addFuzzyCreatorProfiles(profiles: CreatorProfile[], query: strin
       if (term === idx.handle) offer('unverified-handle', 100, `查询词「${term}」与完整账号一致，原平台待核对`)
       if (compact && compact === idx.compactName) offer('normalized-name', 96, `统一繁简、字形和装饰字符后，「${term}」与昵称「${profile.name}」一致，待核对`)
       if (idx.mentions.has(term) && term.length >= 4) offer('profile-mention', 88, `简介中的账号或平台链接提及「${term}」；可能是关联账号、推广或来源，待核对`)
-      if ((han && term.length >= 2 && idx.name.includes(term)) || (latin && term.length >= 3 && containsWord(idx.name, term))) {
+      if ((han && term.length >= (manual?1:2) && idx.name.includes(term)) || (latin && term.length >= 3 && containsWord(idx.name, term))) {
         offer('name-contains', term.length >= 3 ? 82 : 65, `昵称「${profile.name}」包含「${term}」，可能重名，待核对`)
       }
       if (latin && term.length >= 4 && accountWord.test(term) && (idx.handle.startsWith(term) || (term.length >= 6 && idx.handle.includes(term)))) {

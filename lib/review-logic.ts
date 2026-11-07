@@ -1,9 +1,10 @@
-export type ReviewSource = 'cluster' | 'person' | 'approval' | 'all' | 'legacy'
+export type ReviewSource = 'cluster' | 'person' | 'approval' | 'all' | 'watermark' | 'review' | 'legacy'
 export type ArchiveResolution = { kind: 'rename'; name: string } | { kind: 'stage-duplicate' }
 export interface QueueItem {
   vid: string; creator: string; at: string
   source?: ReviewSource; source_id?: string; return_href?: string; batch_id?: string
   resolution?: ArchiveResolution
+  note?: string
 }
 export interface Decisions { approved: string[]; rejected: string[] }
 export interface ArchivedItem extends QueueItem { dst: string; win_dst: string; manifest: string; staged_path?: string }
@@ -23,7 +24,7 @@ export function validateVids(value: unknown): string[] {
 }
 export function origin(source: ReviewSource, sourceId: string): Pick<QueueItem, 'source' | 'source_id' | 'return_href'> {
   if (source === 'cluster' && !/^p\d+$/.test(sourceId)) throw new ReviewError('相似组编号无效')
-  return { source, source_id: sourceId, return_href: source === 'all' ? '/unclassified' : source === 'approval' ? `/approvals${sourceId ? `?vid=${encodeURIComponent(sourceId)}` : ''}`
+  return { source, source_id: sourceId, return_href: source === 'review' ? '/review' : source === 'watermark' ? '/watermarks' : source === 'all' ? '/unclassified' : source === 'approval' ? `/approvals${sourceId ? `?vid=${encodeURIComponent(sourceId)}` : ''}`
     : source === 'person' ? `/persons/${encodeURIComponent(sourceId)}`
     : source === 'cluster' ? `/clusters?cid=${encodeURIComponent(sourceId)}` : '/clusters' }
 }
@@ -32,7 +33,7 @@ export function enqueueItems(queue: QueueItem[], creator: string, vids: string[]
   const conflicts = vids.filter(v => existing.has(v) && existing.get(v)!.creator !== creator)
   if (conflicts.length) throw new ReviewError(`${conflicts.length} 个视频已归给其他人物，请先到待归档撤销`, 409)
   const batch_id = globalThis.crypto.randomUUID()
-  const added = vids.filter(v => !existing.has(v)).map(vid => ({ vid, creator, at: new Date().toISOString(), batch_id, ...provenance }))
+  const added: QueueItem[] = vids.filter(v => !existing.has(v)).map(vid => ({ vid, creator, at: new Date().toISOString(), batch_id, ...provenance }))
   return { queue: [...queue, ...added], added }
 }
 export function undoItems(queue: QueueItem[], decisions: Decisions, vids: string[]) {

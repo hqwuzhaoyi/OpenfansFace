@@ -21,6 +21,9 @@ function savedDirectory(): Directory | null {
   } catch { return null }
 }
 
+/** Read local profile details for saved links without making management depend on an upstream request. */
+export function cachedCreatorProfiles() { return savedDirectory()?.profiles || [] }
+
 async function updateDirectory(saved: Directory | null): Promise<Directory> {
   try {
     const response = await fetch(CREATOR_DIRECTORY_DATA, { cache: 'no-store', signal: AbortSignal.timeout(10_000) })
