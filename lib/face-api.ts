@@ -11,7 +11,7 @@ export async function api<T=any>(path:string,opts?:RequestInit):Promise<T> {
     try{
       const headers=new Headers(opts?.headers);if(!headers.has('Content-Type'))headers.set('Content-Type','application/json')
       const res=await fetch(path,{...opts,headers})
-      if(!res.ok){const message=await res.json().catch(()=>({}));throw new Error(message.error||`请求失败（${res.status}）`)}
+      if(!res.ok){const message=await res.json().catch(()=>({}));throw Object.assign(new Error(message.error||`请求失败（${res.status}）`),{status:res.status,code:message.code,resultUnknown:res.status>=500})}
       return await res.json() as T
     }catch(error){
       if(opts?.signal?.aborted||(error as Error)?.name==='AbortError')throw error

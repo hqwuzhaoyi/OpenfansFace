@@ -23,6 +23,7 @@ mod person_move;
 mod person_registration;
 mod person_rename;
 mod review;
+mod review_sessions;
 mod shared_metadata;
 mod staging;
 mod store;

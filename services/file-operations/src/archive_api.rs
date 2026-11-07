@@ -26,6 +26,9 @@ pub fn execute(engine: &mut Engine, command: &str, mut body: Value) -> Result<Va
     if !body.is_object() {
         return Err(Error::new(400, "invalid_request", "操作请求格式无效"));
     }
+    if ["review-page", "review-status"].contains(&command) {
+        return crate::review_sessions::execute(engine, command, body);
+    }
     if command == "archive-preview" {
         return archive::preview(&engine.config);
     }
@@ -51,6 +54,9 @@ pub fn execute(engine: &mut Engine, command: &str, mut body: Value) -> Result<Va
         "archive-apply" => "archive",
         "archive-resolve" => "archive-resolve",
         "queue-confirm" => "queue-confirm",
+        "review-note" => "review-note",
+        "review-defer" => "review-defer",
+        "review-restore" => "review-restore",
         "queue-undo" => "queue-undo",
         "claim-decide" => "claim-decide",
         _ => return Err(Error::new(400, "invalid_request", "未知人工确认操作")),

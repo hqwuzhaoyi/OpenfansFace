@@ -85,6 +85,9 @@ pub fn vids(value: &Value) -> Result<Vec<String>> {
     Ok(out)
 }
 pub fn creator(config: &Config, value: &Value) -> Result<String> {
+    creator_with_aliases(value, &read(config, "person-renames.json", json!({}))?.1)
+}
+pub fn creator_with_aliases(value: &Value, aliases: &Value) -> Result<String> {
     let name = value
         .as_str()
         .map(str::trim)
@@ -101,7 +104,6 @@ pub fn creator(config: &Config, value: &Value) -> Result<String> {
                 "请输入有效人物名，不能包含路径分隔符",
             )
         })?;
-    let (_, aliases) = read(config, "person-renames.json", json!({}))?;
     let mut name = name.to_owned();
     let mut seen = BTreeSet::new();
     while let Some(next) = aliases[&name].as_str() {
@@ -326,13 +328,14 @@ pub fn prepare(
     {
         return Err(Error::conflict("部分视频已归档，请刷新后检查完成记录"));
     }
-    let tasks_path = config.base.join("processing/processing.db");
-    let tasks = if action == "queue-confirm" && body["source"] == "review" && tasks_path.exists() {
-        db::rows(
-            &db::open(&tasks_path)?,
-            "SELECT * FROM tasks ORDER BY vid",
-            [],
-        )?
+    let tasks = if action == "queue-confirm" && body["source"] == "review" {
+        crate::review_sessions::validate(config, body)?
+            .into_iter()
+            .map(|mut task| {
+                task["data"] = json!(serde_json::to_string(&task["data"]).unwrap());
+                task
+            })
+            .collect()
     } else {
         vec![]
     };
@@ -356,6 +359,7 @@ pub fn prepare(
         true
     };
     if undo {
+        crate::review_sessions::validate_undo(config, body)?;
         let mut removed = queue
             .iter()
             .filter(|r| ids.iter().any(|id| r["vid"] == *id))
@@ -476,7 +480,13 @@ pub fn prepare(
                 let task = task.ok_or_else(|| Error::conflict("视频尚未就绪或状态已变化"))?;
                 let data = task_data(task)?;
                 let manual = number(&task["manual"]).unwrap_or(0) != 0;
-                if task["stage"] != "review" && !manual {
+                if task["stage"] != "review"
+                    && !manual
+                    && !(data["ready"] == true
+                        && (task["stage"] == "face"
+                            || task["stage"] == "face_queued"
+                            || task["stage"] == "retry" && task["retry_stage"] == "face"))
+                {
                     return Err(Error::conflict("视频尚未就绪或状态已变化"));
                 }
                 if let Some(scope) = body.get("review_group").filter(|s| !s.is_null())
@@ -598,7 +608,9 @@ pub fn plan(config: &Config, request: crate::model::Request) -> Result<crate::mo
     let at = body["at"]
         .as_str()
         .ok_or_else(|| Error::new(400, "invalid_request", "缺少持久化操作时间"))?;
-    let prepared = if request.action == "archive-resolve" {
+    let prepared = if request.action.starts_with("review-") {
+        prepare_edit(config, &request.action, body)?
+    } else if request.action == "archive-resolve" {
         crate::archive_resolution::prepare(config, body)?
     } else if request.action == "queue-rule" {
         prepare_rule(config, body)?
@@ -639,7 +651,9 @@ pub fn revalidate(config: &Config, plan: &crate::model::Plan) -> Result<()> {
         .payload
         .as_ref()
         .ok_or_else(|| Error::conflict("人工确认内容缺失"))?;
-    let prepared = if plan.action == "archive-resolve" {
+    let prepared = if plan.action.starts_with("review-") {
+        prepare_edit(config, &plan.action, body)?
+    } else if plan.action == "archive-resolve" {
         crate::archive_resolution::prepare(config, body)?
     } else if plan.action == "queue-rule" {
         prepare_rule(config, body)?
@@ -908,4 +922,45 @@ fn prepare_restore(config: &Config, body: &Value) -> Result<Prepared> {
     out.settings_after =
         vec![json!({"key":"discovery_requested","value":serde_json::to_string(&timestamp(at)?)?})];
     Ok(out)
+}
+
+/// Explicit human task fields only; analysis data, leases and stage remain worker-owned.
+fn prepare_edit(config: &Config, action: &str, body: &Value) -> Result<Prepared> {
+    crate::review_sessions::validate(config, body)?;
+    let ids = vids(&body["vids"])?;
+    if action == "review-note"
+        && body["note"]
+            .as_str()
+            .is_none_or(|s| s.chars().count() > 1000)
+    {
+        return Err(Error::new(400, "invalid_request", "备注最多 1000 字"));
+    }
+    let conn = db::open(&config.base.join("processing/processing.db"))?;
+    let mut before = vec![];
+    let mut after = vec![];
+    for id in &ids {
+        let row = db::rows(&conn, "SELECT * FROM tasks WHERE vid=?", [id])?
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::conflict("视频已移出核对范围"))?;
+        let mut next = row.clone();
+        if action == "review-note" {
+            next["note"] = body["note"].clone()
+        } else {
+            next["deferred"] = integer(if action == "review-defer" { 1 } else { 0 })
+        }
+        before.push(row);
+        after.push(next);
+    }
+    Ok(Prepared {
+        documents: vec![],
+        jobs: before,
+        job_updates: after,
+        settings_before: vec![],
+        settings_after: vec![],
+        guards: json!({}),
+        result: json!({"ok":true,"vids":ids}),
+        optional_rule: None,
+        optional_restore: None,
+    })
 }

@@ -11,7 +11,11 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{collections::BTreeSet, fs, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::Path,
+};
 
 const BUSINESS: &[(&str, bool)] = &[
     ("person-renames.json", false),
@@ -66,15 +70,15 @@ fn names(value: &Value) -> Result<Vec<String>> {
 fn canonical(config: &Config, name: &str) -> Result<String> {
     review::creator(config, &json!(name))
 }
-fn relevant(
-    config: &Config,
+fn relevant_using(
     row: &Value,
     people: &BTreeSet<String>,
     vids: &BTreeSet<String>,
+    canonical: impl Fn(&str) -> Result<String>,
 ) -> Result<bool> {
     for key in ["creator", "person", "name"] {
         if let Some(name) = row[key].as_str()
-            && people.contains(&canonical(config, name)?)
+            && people.contains(&canonical(name)?)
         {
             return Ok(true);
         }
@@ -112,103 +116,165 @@ fn file_guard_from(
     }
 }
 /// #18 calls this under its admission gate. Analysis ranks, stages and retries excluded.
-pub fn material_state(config: &Config, scope: &Value) -> Result<Value> {
-    if !scope.is_object() {
-        return Err(bad("缺少核对范围"));
-    }
-    let raw_people = names(&scope["people"])?;
-    let vids: BTreeSet<_> = names(&scope["vids"])?.into_iter().collect();
-    let keys: BTreeSet<_> = names(&scope["watermark_keys"])?.into_iter().collect();
-    let people: BTreeSet<_> = raw_people
-        .iter()
-        .map(|s| canonical(config, s))
-        .collect::<Result<_>>()?;
-    let sources = review::sources(config)?;
-    let mut material = json!({"names":raw_people.iter().map(|s|Ok(json!([s,canonical(config,s)?]))).collect::<Result<Vec<_>>>()?,"files":vids.iter().map(|id|file_guard_from(config,id,&sources)).collect::<Result<Vec<_>>>()?});
-    for (name, array) in BUSINESS {
-        if [
-            "person-renames.json",
-            "video-path-overrides.json",
-            "people-manual.json",
-        ]
-        .contains(name)
-        {
-            continue;
-        }
-        let value = read(config, name, *array)?;
-        if name.starts_with("external-profiles/")
-            && !value.as_object().unwrap().is_empty()
-            && !value["links"].is_array()
-        {
-            return Err(Error::new(
-                503,
-                "metadata_contract",
-                "账号核对资料无法读取，请恢复后重新核对",
-            ));
-        }
-        let selected = if *array {
-            json!(
-                value
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .filter(|r| r["vid"].as_str().is_some_and(|id| vids.contains(id)))
-                    .cloned()
-                    .collect::<Vec<_>>()
-            )
-        } else if name.starts_with("external-profiles/") {
-            json!(
-                value["links"]
-                    .as_array()
-                    .unwrap_or(&vec![])
-                    .iter()
-                    .filter_map(|r| match relevant(config, r, &people, &vids) {
-                        Ok(true) => Some(Ok(r.clone())),
-                        Ok(false) => None,
-                        Err(e) => Some(Err(e)),
-                    })
-                    .collect::<Result<Vec<_>>>()?
-            )
-        } else if *name == "review-decisions.json" {
-            json!({"approved":value["approved"].as_array().unwrap_or(&vec![]).iter().filter(|v|v.as_str().is_some_and(|id|vids.contains(id))).collect::<Vec<_>>(),"rejected":value["rejected"].as_array().unwrap_or(&vec![]).iter().filter(|v|v.as_str().is_some_and(|id|vids.contains(id))).collect::<Vec<_>>()})
-        } else {
-            let mut out = serde_json::Map::new();
-            for (k, v) in value.as_object().unwrap() {
-                let keep = if *name == "watermarks/mappings.json" {
-                    keys.contains(k) || relevant(config, v, &people, &vids)?
-                } else if *name == "person-rejections.json" {
-                    v["vid"].as_str().is_some_and(|id| vids.contains(id))
-                        && relevant(config, v, &people, &vids)?
-                } else {
-                    people.contains(&canonical(config, k)?)
-                };
-                if keep {
-                    out.insert(k.clone(), v.clone());
-                }
+/// Request-local reader: snapshot batches reuse source indexes and business inputs,
+/// while each admission constructs a fresh reader. No process-wide material cache.
+pub struct MaterialReader {
+    sources: BTreeMap<String, String>,
+    aliases: Value,
+    documents: BTreeMap<&'static str, Value>,
+    arrays: BTreeMap<&'static str, BTreeMap<String, Vec<(usize, Value)>>>,
+    manual: Option<BTreeMap<String, Value>>,
+}
+impl MaterialReader {
+    pub fn new(config: &Config) -> Result<Self> {
+        let mut documents = BTreeMap::new();
+        let mut arrays = BTreeMap::new();
+        for (name, array) in BUSINESS {
+            if [
+                "person-renames.json",
+                "video-path-overrides.json",
+                "people-manual.json",
+            ]
+            .contains(name)
+            {
+                continue;
             }
-            Value::Object(out)
-        };
-        material[*name] = selected;
-    }
-    let task_path = config.base.join("processing/processing.db");
-    if task_path.exists() {
-        let conn = db::open(&task_path)?;
-        let columns = db::columns(&conn, "tasks")?;
-        let selected: Vec<_> = ["vid", "manual", "deferred", "note"]
-            .into_iter()
-            .filter(|key| columns.iter().any(|c| c == key))
-            .collect();
-        let mut tasks = vec![];
-        for vid in &vids {
-            tasks.extend(db::rows(
-                &conn,
-                &format!("SELECT {} FROM tasks WHERE vid=?", selected.join(",")),
-                [vid],
-            )?);
+            let value = read(config, name, *array)?;
+            if *array {
+                let mut index: BTreeMap<String, Vec<(usize, Value)>> = BTreeMap::new();
+                for (position, row) in value.as_array().unwrap().iter().enumerate() {
+                    if let Some(vid) = row["vid"].as_str() {
+                        index
+                            .entry(vid.into())
+                            .or_default()
+                            .push((position, row.clone()));
+                    }
+                }
+                arrays.insert(*name, index);
+            }
+            documents.insert(*name, value);
         }
-        material["manual_tasks"] = json!(tasks);
+        let path = config.base.join("processing/processing.db");
+        let manual = if path.exists() {
+            let conn = db::open(&path)?;
+            let columns = db::columns(&conn, "tasks")?;
+            let selected: Vec<_> = ["vid", "manual", "deferred", "note"]
+                .into_iter()
+                .filter(|key| columns.iter().any(|c| c == key))
+                .collect();
+            Some(
+                db::rows(
+                    &conn,
+                    &format!("SELECT {} FROM tasks ORDER BY vid", selected.join(",")),
+                    [],
+                )?
+                .into_iter()
+                .filter_map(|row| row["vid"].as_str().map(|vid| (vid.to_owned(), row.clone())))
+                .collect(),
+            )
+        } else {
+            None
+        };
+        Ok(Self {
+            sources: review::sources(config)?,
+            aliases: read(config, "person-renames.json", false)?,
+            documents,
+            arrays,
+            manual,
+        })
     }
-    Ok(json!({"version":model::hash(&material),"scope":scope,"material":material}))
+    fn canonical(&self, name: &str) -> Result<String> {
+        review::creator_with_aliases(&json!(name), &self.aliases)
+    }
+    pub fn state(&self, config: &Config, scope: &Value) -> Result<Value> {
+        if !scope.is_object() {
+            return Err(bad("缺少核对范围"));
+        }
+        let raw_people = names(&scope["people"])?;
+        let vids: BTreeSet<_> = names(&scope["vids"])?.into_iter().collect();
+        let keys: BTreeSet<_> = names(&scope["watermark_keys"])?.into_iter().collect();
+        let people: BTreeSet<_> = raw_people
+            .iter()
+            .map(|s| self.canonical(s))
+            .collect::<Result<_>>()?;
+        let mut material = json!({"names":raw_people.iter().map(|s|Ok(json!([s,canonical(config,s)?]))).collect::<Result<Vec<_>>>()?,"files":vids.iter().map(|id|file_guard_from(config,id,&self.sources)).collect::<Result<Vec<_>>>()?});
+        for (name, array) in BUSINESS {
+            if [
+                "person-renames.json",
+                "video-path-overrides.json",
+                "people-manual.json",
+            ]
+            .contains(name)
+            {
+                continue;
+            }
+            let value = &self.documents[name];
+            if name.starts_with("external-profiles/")
+                && !value.as_object().unwrap().is_empty()
+                && !value["links"].is_array()
+            {
+                return Err(Error::new(
+                    503,
+                    "metadata_contract",
+                    "账号核对资料无法读取，请恢复后重新核对",
+                ));
+            }
+            let selected = if *array {
+                let mut selected = vids
+                    .iter()
+                    .flat_map(|vid| self.arrays[name].get(vid).into_iter().flatten())
+                    .collect::<Vec<_>>();
+                selected.sort_by_key(|(index, _)| *index);
+                json!(selected.into_iter().map(|(_, row)| row).collect::<Vec<_>>())
+            } else if name.starts_with("external-profiles/") {
+                json!(
+                    value["links"]
+                        .as_array()
+                        .unwrap_or(&vec![])
+                        .iter()
+                        .filter_map(|r| {
+                            match relevant_using(r, &people, &vids, |n| self.canonical(n)) {
+                                Ok(true) => Some(Ok(r.clone())),
+                                Ok(false) => None,
+                                Err(e) => Some(Err(e)),
+                            }
+                        })
+                        .collect::<Result<Vec<_>>>()?
+                )
+            } else if *name == "review-decisions.json" {
+                json!({"approved":value["approved"].as_array().unwrap_or(&vec![]).iter().filter(|v|v.as_str().is_some_and(|id|vids.contains(id))).collect::<Vec<_>>(),"rejected":value["rejected"].as_array().unwrap_or(&vec![]).iter().filter(|v|v.as_str().is_some_and(|id|vids.contains(id))).collect::<Vec<_>>()})
+            } else {
+                let mut out = serde_json::Map::new();
+                for (k, v) in value.as_object().unwrap() {
+                    let keep = if *name == "watermarks/mappings.json" {
+                        keys.contains(k)
+                            || relevant_using(v, &people, &vids, |n| self.canonical(n))?
+                    } else if *name == "person-rejections.json" {
+                        v["vid"].as_str().is_some_and(|id| vids.contains(id))
+                            && relevant_using(v, &people, &vids, |n| self.canonical(n))?
+                    } else {
+                        people.contains(&self.canonical(k)?)
+                    };
+                    if keep {
+                        out.insert(k.clone(), v.clone());
+                    }
+                }
+                Value::Object(out)
+            };
+            material[*name] = selected;
+        }
+        if let Some(tasks) = &self.manual {
+            material["manual_tasks"] = json!(
+                vids.iter()
+                    .filter_map(|vid| tasks.get(vid))
+                    .collect::<Vec<_>>()
+            );
+        }
+        Ok(json!({"version":model::hash(&material),"scope":scope,"material":material}))
+    }
+}
+pub fn material_state(config: &Config, scope: &Value) -> Result<Value> {
+    MaterialReader::new(config)?.state(config, scope)
 }
 pub fn check_state(config: &Config, scope: &Value, version: &str) -> Result<Value> {
     let state = material_state(config, scope)?;

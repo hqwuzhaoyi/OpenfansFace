@@ -8,7 +8,7 @@ export function nativeArchiveEnabled():boolean {
 }
 export async function nativeArchive(command:string,body:unknown={}):Promise<unknown>{
   const result=await request({command,body})
-  if(command!=='archive-preview')invalidateIntegrationCache()
+  if(!['archive-preview','review-page','review-status'].includes(command))invalidateIntegrationCache()
   return result
 }
 export async function nativeArchiveProgress(id:string|null):Promise<unknown>{return request(null,id||'')}

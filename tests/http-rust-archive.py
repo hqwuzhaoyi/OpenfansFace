@@ -178,9 +178,20 @@ class Fixture:
             }
             for vid in ids
         }
+        # #18 requires server-delivered evidence. Persist the exact envelope for retries.
+        cache = getattr(self, "review_evidence", {})
+        key = extra.get("operation_id") or str(uuid.uuid4())
+        if key not in cache:
+            page = self.call("review-page")
+            delivered = []
+            for index in range((page["total"] + page["limit"] - 1) // page["limit"]):
+                delivered += (page if index == 0 else self.call("review-page", {"session": page["session"], "page": str(index)}))["rows"]
+            cache[key] = {"review_session": page["session"], "review_tokens": {t["vid"]: t["review_token"] for t in delivered}}
+            self.review_evidence = cache
         return self.call(
             "queue-confirm",
             {
+                **cache[key],
                 "creator": "Momoyih",
                 "vids": ids,
                 "source": "review",

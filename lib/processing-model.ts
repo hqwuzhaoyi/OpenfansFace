@@ -4,6 +4,7 @@ export interface IdentityCandidate {
   evidence: { name: string; source: string; confirmed?: boolean; score?: number; support?: number; detail: string; thumb?: string; timestamp?: number; key?: string }[]
 }
 export interface ProcessingTask {
+  review_token?: string; review_blocked?: string
   vid: string; path: string; name: string; size: number; mtime_ns: string; duration?: number
   stage: ProcessingStage; retry_stage: string; text_attempts: number; face_attempts: number
   next_retry: number; priority: number; is_new: number; batch_id: string; created_at: number; updated_at: number

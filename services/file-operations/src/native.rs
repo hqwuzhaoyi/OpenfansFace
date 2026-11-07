@@ -13,6 +13,9 @@ fn review_action(action: &str) -> bool {
     [
         "archive-resolve",
         "queue-confirm",
+        "review-note",
+        "review-defer",
+        "review-restore",
         "queue-undo",
         "claim-decide",
         "queue-rule",
