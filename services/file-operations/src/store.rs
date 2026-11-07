@@ -30,7 +30,7 @@ impl Store {
             .map_err(|_| Error::new(503, "writer_busy", "另一个 Rust 执行器正在使用此状态目录"))?;
         let conn = Connection::open(config.state_db())?;
         let schema: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if schema > 2 {
+        if schema > 3 {
             return Err(Error::new(
                 503,
                 "schema_version",
@@ -51,7 +51,7 @@ impl Store {
             operation_id TEXT NOT NULL REFERENCES operations(id), revision INTEGER NOT NULL,
             phase TEXT NOT NULL, evidence TEXT NOT NULL, at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY(operation_id,revision)
-          ); PRAGMA user_version=2;")?;
+          ); PRAGMA user_version=3;")?;
         let stat = identity(&ownership.metadata()?);
         let identity = serde_json::to_string(&json!({"dev":stat["dev"],"ino":stat["ino"]}))?;
         conn.execute("INSERT OR IGNORE INTO authority VALUES(1,?)", [&identity])?;
@@ -98,6 +98,51 @@ impl Store {
                     r.get(0)
                 })?;
         Ok(raw.map(|v| serde_json::from_str(&v)).transpose()?)
+    }
+    pub fn latest_file_step(&self, id: &str, index: usize) -> Result<Option<Value>> {
+        let raw:Option<String>=self.db.query_row("SELECT evidence FROM steps WHERE operation_id=? AND json_extract(evidence,'$.file_index')=? ORDER BY revision DESC LIMIT 1",params![id,index as i64],|r|r.get(0)).optional()?;
+        Ok(raw.map(|s| serde_json::from_str(&s)).transpose()?)
+    }
+    pub fn latest_step(&self, id: &str, phase: &str) -> Result<Option<Value>> {
+        let raw:Option<String>=self.db.query_row("SELECT evidence FROM steps WHERE operation_id=? AND phase=? ORDER BY revision DESC LIMIT 1",params![id,phase],|r|r.get(0)).optional()?;
+        Ok(raw.map(|s| serde_json::from_str(&s)).transpose()?)
+    }
+    pub fn file_evidence(&self, id: &str, index: usize) -> Result<crate::files::MoveEvidence> {
+        let raw:Option<String>=self.db.query_row("SELECT evidence FROM steps WHERE operation_id=? AND json_extract(evidence,'$.file_index')=? AND json_type(evidence,'$.move_evidence')='object' ORDER BY revision DESC LIMIT 1",params![id,index as i64],|r|r.get(0)).optional()?;
+        if let Some(raw) = raw {
+            let value: Value = serde_json::from_str(&raw)?;
+            return Ok(serde_json::from_value(value["move_evidence"].clone())?);
+        }
+        let admitted = self.evidence(id)?;
+        if let Some(evidence) = admitted
+            .and_then(|v| v["files"].get(index).map(|f| f["move_evidence"].clone()))
+            .filter(|v| !v.is_null())
+        {
+            return Ok(serde_json::from_value(evidence)?);
+        }
+        Ok(crate::files::MoveEvidence::default())
+    }
+
+    pub fn directory_evidence(
+        &self,
+        id: &str,
+        path: &str,
+    ) -> Result<Option<crate::files::DirectoryProof>> {
+        let raw:Option<String>=self.db.query_row("SELECT evidence FROM steps WHERE operation_id=? AND json_extract(evidence,'$.directory.path')=? ORDER BY revision DESC LIMIT 1",params![id,path],|r|r.get(0)).optional()?;
+        raw.map(|s| {
+            let v: Value = serde_json::from_str(&s)?;
+            Ok(serde_json::from_value(v["directory"].clone())?)
+        })
+        .transpose()
+    }
+    pub fn failures(&self, id: &str) -> Result<Vec<Value>> {
+        let mut query=self.db.prepare("SELECT evidence FROM steps WHERE operation_id=? AND phase='file_failed' ORDER BY revision")?;
+        let raw = query
+            .query_map([id], |r| r.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        raw.into_iter()
+            .map(|s| Ok(serde_json::from_str(&s)?))
+            .collect()
     }
     pub fn recovery_ids(&self) -> Result<Vec<String>> {
         let mut query = self.db.prepare("SELECT id FROM operations WHERE status IN ('accepted','running','recovery_needed','rolling_back') ORDER BY created_at,id")?;
@@ -225,7 +270,35 @@ pub fn status(path: &Path, id: &str) -> Result<Value> {
         }
         return Err(Error::new(404, "not_found", "找不到操作记录"));
     };
-    let mut result = json!({"id":id,"status":record.status,"phase":record.phase,"revision":record.revision,"io_state":if ["complete","rolled_back","failed","cancelled","not_started"].contains(&record.status.as_str()){"idle"}else if record.status=="recovery_needed"{"unknown"}else{"running"},"current_file":record.plan.file().src,"completed":if record.status=="complete"{1}else{0},"total":1,"failed":if record.error.is_some(){1}else{0}});
+    let total = record.plan.files.len();
+    let done:i64=db.query_row("SELECT COUNT(DISTINCT COALESCE(json_extract(evidence,'$.file_index'),0)) FROM steps WHERE operation_id=? AND phase='source_removed'",[id],|r|r.get(0))?;
+    let failures: i64 = db.query_row(
+        "SELECT COUNT(*) FROM steps WHERE operation_id=? AND phase='file_failed'",
+        [id],
+        |r| r.get(0),
+    )?;
+    let current:Option<String>=db.query_row("SELECT json_extract(evidence,'$.src') FROM steps WHERE operation_id=? AND json_type(evidence,'$.file_index')='integer' ORDER BY revision DESC LIMIT 1",[id],|r|r.get(0)).optional()?.flatten();
+    let mut result = json!({"id":id,"status":record.status,"phase":record.phase,"revision":record.revision,"io_state":if ["complete","rolled_back","failed","cancelled","not_started"].contains(&record.status.as_str()){"idle"}else if record.status=="recovery_needed"{"unknown"}else{"running"},"current_file":current.or_else(||record.plan.files.first().map(|f|f.src.clone())),"completed":if record.status=="rolled_back"{0}else{done},"total":total,"failed":if record.error.is_some(){failures.max(1)}else{failures}});
+    let mut latest = std::collections::HashMap::<usize, (String, Value)>::new();
+    let mut query=db.prepare("SELECT phase,evidence FROM steps WHERE operation_id=? AND (json_type(evidence,'$.file_index')='integer' OR phase IN ('destination_publish_intent','destination_published','source_remove_intent','source_removed')) ORDER BY revision")?;
+    for row in query.query_map([id], |r| {
+        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+    })? {
+        let (phase, raw) = row?;
+        let evidence: Value = serde_json::from_str(&raw)?;
+        let index = evidence["file_index"].as_u64().unwrap_or(0) as usize;
+        latest.insert(index, (phase, evidence));
+    }
+    let items:Vec<Value>=record.plan.files.iter().enumerate().map(|(index,file)|{
+        let step=latest.get(&index);let phase=step.map(|s|s.0.as_str()).unwrap_or("not_started");
+        let state=if phase=="file_failed"{"failed"}else if record.status=="complete"{"complete"}else if record.status=="rolled_back"{"rolled_back"}else if record.status=="recovery_needed" && step.is_some(){"recovery_needed"}else if phase=="source_removed"{"moved_pending_commit"}else if step.is_some(){"moving"}else{"not_started"};
+        let mut item=json!({"file_index":index,"src":file.src,"dst":file.dst,"vids":file.vids,"status":state,"phase":phase});
+        if let Some((_,evidence))=step && let Some(error)=evidence.get("error"){item["error"]=error.clone();}
+        item
+    }).collect();
+    result["files"] = json!(items);
+    result["processed"] = json!(done);
+    result["committed"] = json!(if record.status == "complete" { done } else { 0 });
     if let Some(value) = record.result {
         result["result"] = value;
     }

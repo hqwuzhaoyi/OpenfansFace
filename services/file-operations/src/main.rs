@@ -1,11 +1,14 @@
 mod config;
+mod creator_delta;
 mod db;
+mod delta;
 mod engine;
 mod fault;
 mod files;
 mod ledger;
 mod metadata;
 mod model;
+mod native;
 mod permissions;
 mod store;
 
@@ -131,7 +134,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             get(|| async { Json(json!({"ok":true,"service":"face-file-operations"})) }),
         )
         .route("/v1/person-files", get(status).post(post))
-        .layer(DefaultBodyLimit::max(64 * 1024))
+        .layer(DefaultBodyLimit::max(8 * 1024 * 1024))
         .with_state(app);
     let listener = tokio::net::TcpListener::bind(&config.bind).await?;
     eprintln!("face-file-operations listening on {}", config.bind);
