@@ -7,6 +7,7 @@ parser.add_argument('--url',default='http://127.0.0.1:18961')
 parser.add_argument('--root',type=Path,required=True)
 parser.add_argument('--backend',choices=['legacy','rust'],default='legacy')
 parser.add_argument('--seed',action='store_true')
+parser.add_argument('--native-ledger',action='store_true',help='seed with observed Peach composite keys and foreign keys')
 parser.add_argument('--sample',type=Path,default=Path('/tmp/face-admin-fixture.mp4'))
 args=parser.parse_args();root=args.root.resolve()
 assert root.parent==Path('/tmp').resolve() and root.name.startswith('face-admin-person-fileops-'), 'fixture root required'
@@ -14,6 +15,16 @@ parsed=urllib.parse.urlparse(args.url)
 assert parsed.hostname in ('127.0.0.1','localhost') and parsed.port not in (None,80,443,8919), 'isolated loopback port required'
 if args.seed:
  subprocess.run([sys.executable,str(Path(__file__).with_name('http-person-file-operations.py')),str(root),'--seed','--sample',str(args.sample)],check=True)
+ if args.native_ledger:
+  with sqlite3.connect(root/'ledger.db') as db:
+   assets=db.execute('SELECT id,path,disposal FROM asset').fetchall()
+   entities=db.execute('SELECT * FROM entity').fetchall()
+   links=db.execute('SELECT asset_id,entity_id,role,source,confidence,metadata_json,first_seen_at,last_seen_at FROM asset_entity').fetchall()
+   db.executescript('DROP TABLE asset_entity;DROP TABLE entity_alias;DROP TABLE entity;DROP TABLE asset;')
+   db.executescript((Path(__file__).parent/'fixtures/peach-contract-schema.sql').read_text())
+   db.executemany("INSERT INTO asset(id,location,path,disposal) VALUES(?,'fixture',?,?)",assets)
+   db.executemany('INSERT INTO entity(id,kind,canonical_name,normalized_name,metadata_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?)',entities)
+   db.executemany('INSERT INTO asset_entity VALUES(?,?,?,?,?,?,?,?)',links)
  raise SystemExit
 assert (root/'.fileops-fixture').read_text()=='person file operations'
 base=root/'base';creators=root/'media/pikpak/creators';ledger=root/'ledger.db'

@@ -85,3 +85,6 @@ people-deleted.json
 
 # macOS archive metadata
 ._*
+
+# Native file-operation build artifacts
+/services/file-operations/target/

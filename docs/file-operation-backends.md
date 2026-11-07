@@ -18,6 +18,8 @@ The Rust adapter calls `POST <FILE_OPERATIONS_RUST_URL>/v1/person-files` with th
 
 The Rust provider must also validate or atomically create the same ownership record for direct requests. It must acquire **the same** `FACES_BASE/.review-write.lock` with exclusive creation before mutations, and retain it on unknown/recovery-needed outcomes. Its process PID is not proof of lock ownership across containers; no implementation may delete a lock merely because a PID looks absent. The gateway must not hold this lock while calling Rust, since the provider owns it for the actual transaction. Legacy writers continue acquiring it themselves.
 
+Ticket #2 implements this contract in [`services/file-operations`](../services/file-operations/README.md) for registered single-video renames, using native Rust filesystem and SQLite operations. Its durable operation store, per-database receipts, ownership and conservative recovery handoff are documented there. The original apply waiter remains compatible; Rust execution continues independently of an HTTP disconnect. Automatic reconciliation is the next ticket.
+
 Cutover must drain or reconcile in-flight operations before changing ownership configuration. A restart or dispatch-flag change cannot transfer an existing operation ID to a new provider. Final single-writer retirement may absorb these compatibility records only after their outstanding receipts remain queryable.
 
 ## Shared writer inventory at the accepted baseline
