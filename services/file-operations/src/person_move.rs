@@ -14,6 +14,7 @@ use std::{
     collections::BTreeSet,
     path::{Component, Path},
 };
+use unicode_normalization::UnicodeNormalization;
 
 pub fn validate(request: &Request) -> Result<()> {
     crate::model::validate_id(&request.id)?;
@@ -61,6 +62,9 @@ pub fn validate(request: &Request) -> Result<()> {
     Ok(())
 }
 fn subfolder(value: &str) -> Result<()> {
+    if value.len() > 2048 {
+        return Err(Error::new(400, "invalid_request", "子文件夹路径过长"));
+    }
     if value.is_empty() {
         return Ok(());
     }
@@ -160,7 +164,7 @@ pub fn plan(config: &Config, request: Request) -> Result<Plan> {
         if dst == selected.path {
             return Err(Error::new(400, "invalid_request", "源文件与目标路径相同"));
         }
-        if !targets.insert(dst.to_lowercase()) {
+        if !targets.insert(dst.nfc().collect::<String>().to_lowercase()) {
             return Err(
                 Error::new(409, "target_exists", "选中文件在目标目录中同名，请先改名").at(&dst),
             );
@@ -208,11 +212,6 @@ pub fn plan(config: &Config, request: Request) -> Result<Plan> {
             }
         }
     }
-    let next_entity_id: i64 = db::open(&config.ledger)?.query_row(
-        "SELECT COALESCE(MAX(id),0)+1 FROM entity",
-        [],
-        |r| r.get(0),
-    )?;
     let execution = ExecutionIntent {
         scopes,
         failure_policy: FailurePolicy::Rollback,
@@ -221,7 +220,7 @@ pub fn plan(config: &Config, request: Request) -> Result<Plan> {
             jobs: config.base.join("processing/processing.db").exists(),
             ledger: true,
         },
-        data: json!({"timestamp":timestamp,"affected_thumbs":thumbs,"next_entity_id":next_entity_id.to_string()}),
+        data: json!({"timestamp":timestamp,"affected_thumbs":thumbs}),
         result: json!({"ok":true,"id":request.id,"person":person,"staged":false}),
     };
     let mut plan = Plan {

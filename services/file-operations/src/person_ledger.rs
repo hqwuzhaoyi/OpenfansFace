@@ -1,7 +1,7 @@
 //! Native Peach selected-file path/creator changes, preserving all unrelated roles and fields.
 use crate::{
     config::Config,
-    db,
+    db, ledger,
     metadata::win,
     model::{Error, Plan, Result},
 };
@@ -44,7 +44,7 @@ fn new_row(connection: &Connection, table: &str, fields: Value) -> Result<Value>
     }
     Ok(Value::Object(row))
 }
-pub fn snapshot(config: &Config, plan: &Plan) -> Result<db::Delta> {
+pub fn snapshot(config: &Config, plan: &Plan) -> Result<ledger::Delta> {
     let mut connection = db::open(&config.ledger)?;
     let tx = connection.transaction()?;
     let mut assets = vec![];
@@ -71,7 +71,7 @@ pub fn snapshot(config: &Config, plan: &Plan) -> Result<db::Delta> {
     for row in source.iter().chain(&target) {
         entities.insert(id(row)?, row.clone());
     }
-    let mut entity_scope: Vec<Value> = entities.values().map(|r| key(r, &["id"])).collect();
+    let entity_scope: Vec<Value> = entities.values().map(|r| key(r, &["id"])).collect();
     for file in &plan.files {
         let old = win(config, &file.src);
         let new = win(config, &file.dst);
@@ -131,33 +131,33 @@ pub fn snapshot(config: &Config, plan: &Plan) -> Result<db::Delta> {
             next_assets.push(next);
         }
     }
-    let mut next_entities = entities.clone();
+    let next_entities = entities.clone();
     let changed_owner =
         plan.action == "move-files" && plan.person != plan.target_person && !assets.is_empty();
     let target_id = if changed_owner {
-        if let Some(row) = target.first() {
-            Some(id(row)?)
-        } else {
-            let next_id: i64 = plan.execution.as_ref().unwrap().data["next_entity_id"]
-                .as_str()
-                .and_then(|s| s.parse().ok())
-                .ok_or_else(|| Error::conflict("缺少目标人物预留编号"))?;
-            if !db::rows(&tx, "SELECT id FROM entity WHERE id=?", [next_id])?.is_empty() {
-                return Err(Error::conflict("目标人物预留编号已被占用，请重新预览"));
-            }
-            let timestamp = &plan.execution.as_ref().unwrap().data["timestamp"];
-            let row = new_row(
-                &tx,
-                "entity",
-                json!({"id":integer(next_id),"kind":"creator","canonical_name":plan.target_person,"normalized_name":plan.target_person.to_lowercase(),"metadata_json":"{}","created_at":timestamp,"updated_at":timestamp}),
-            )?;
-            entity_scope.push(json!({"id":integer(next_id)}));
-            next_entities.insert(next_id, row);
-            Some(next_id)
-        }
+        target.first().map(id).transpose()?
     } else {
         None
     };
+    let mut creators = vec![];
+    if changed_owner && target_id.is_none() {
+        let timestamp = &plan.execution.as_ref().unwrap().data["timestamp"];
+        let mut pending_links = vec![];
+        for asset in &assets {
+            let mut row = new_row(
+                &tx,
+                "asset_entity",
+                json!({"asset_id":asset["id"],"entity_id":null,"role":"creator","source":"face-persons","confidence":1.0,"metadata_json":"{}","first_seen_at":timestamp,"last_seen_at":timestamp}),
+            )?;
+            row.as_object_mut().unwrap().remove("entity_id");
+            pending_links.push(row);
+        }
+        creators.push(ledger::CreatorIntent {
+            canonical_name: plan.target_person.clone(),
+            normalized_name: plan.target_person.to_lowercase(),
+            links: pending_links,
+        });
+    }
     let source_id = source.first().map(id).transpose()?;
     for link in &links {
         if changed_owner
@@ -232,30 +232,33 @@ pub fn snapshot(config: &Config, plan: &Plan) -> Result<db::Delta> {
             .cloned()
             .collect(),
     });
-    Ok(db::Delta {
-        tables: vec![
-            db::TableDelta {
-                table: db::Table::Entity,
-                key_columns: vec!["id".into()],
-                scope: entity_scope,
-                before: entities.into_values().collect(),
-                after: next_entities.into_values().collect(),
-            },
-            db::TableDelta {
-                table: db::Table::Asset,
-                key_columns: vec!["id".into()],
-                scope: asset_scope,
-                before: assets,
-                after: next_assets,
-            },
-            db::TableDelta {
-                table: db::Table::AssetEntity,
-                key_columns: link_keys.iter().map(|s| (*s).into()).collect(),
-                scope: link_scope,
-                before: links,
-                after: next_links,
-            },
-        ],
-        guards,
+    Ok(ledger::Delta {
+        changes: db::Delta {
+            tables: vec![
+                db::TableDelta {
+                    table: db::Table::Entity,
+                    key_columns: vec!["id".into()],
+                    scope: entity_scope,
+                    before: entities.into_values().collect(),
+                    after: next_entities.into_values().collect(),
+                },
+                db::TableDelta {
+                    table: db::Table::Asset,
+                    key_columns: vec!["id".into()],
+                    scope: asset_scope,
+                    before: assets,
+                    after: next_assets,
+                },
+                db::TableDelta {
+                    table: db::Table::AssetEntity,
+                    key_columns: link_keys.iter().map(|s| (*s).into()).collect(),
+                    scope: link_scope,
+                    before: links,
+                    after: next_links,
+                },
+            ],
+            guards,
+        },
+        creators,
     })
 }

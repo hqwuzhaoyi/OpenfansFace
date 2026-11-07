@@ -222,6 +222,7 @@ fn delta(table: db::Table, before: Vec<Value>, after: Vec<Value>, plan: &Plan) -
 }
 pub fn snapshot(config: &Config, plan: &Plan) -> Result<Snapshot> {
     let mut documents = vec![];
+    let mut document_bytes = 0usize;
     for name in DOCUMENTS {
         let array = [
             "claims-detail.json",
@@ -238,6 +239,16 @@ pub fn snapshot(config: &Config, plan: &Plan) -> Result<Snapshot> {
         } else {
             Some(serde_json::to_string_pretty(&next)?)
         };
+        document_bytes = document_bytes
+            .saturating_add(before.as_ref().map_or(0, String::len))
+            .saturating_add(after.as_ref().map_or(0, String::len));
+        if document_bytes > 64 * 1024 * 1024 {
+            return Err(crate::model::Error::new(
+                413,
+                "snapshot_limit",
+                "操作元数据快照超过 64 MiB 安全限制",
+            ));
+        }
         documents.push(Document {
             name: (*name).into(),
             before,
