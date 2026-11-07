@@ -3,7 +3,7 @@
 纯 stdlib http.server：同一主机内 Next 容器经 CALIBRATOR_URL=http://127.0.0.1:8921 反代。
 通过 FACES_BASE 配置容器内的人脸数据与管线目录。
 """
-import json, os, subprocess, threading, time
+import json, os
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
@@ -20,6 +20,8 @@ OVR = f'{BASE}/template-overrides.json'
 PYBIN = os.environ.get('CAL_PYBIN', 'python3')  # sidecar 自带 numpy 的 python
 
 REBUILD = {'running': False, 'done_at': None, 'ok': None, 'msg': ''}
+from sidecar.native_metadata import Rebuilder, MetadataError
+_NATIVE_REBUILD = Rebuilder(BASE, PYBIN, REBUILD)
 
 
 def load_clusters():
@@ -92,32 +94,7 @@ def identity_groups(name):
 
 
 def identity_pick(payload):
-    name = payload.get('name')
-    groups = payload.get('groups')
-    if not name or groups is None:
-        return {'error': 'name/groups required'}
-    cur = _load_override()
-    cur[name] = {'groups': groups, 'at': time.strftime('%F %T')}
-    with open(OVR, 'w') as f:
-        json.dump(cur, f, ensure_ascii=False, indent=1)
-    if REBUILD['running']:
-        return {'queued': True, 'running': True}
-    REBUILD.update(running=True, ok=None, msg='starting', done_at=None)
-
-    def run():
-        try:
-            r = subprocess.run([PYBIN, f'{BASE}/identify_faces.py'],
-                               capture_output=True, text=True, timeout=900, cwd=BASE)
-            REBUILD['ok'] = r.returncode == 0
-            REBUILD['msg'] = ((r.stdout or '') + (r.stderr or ''))[-500:]
-        except Exception as e:
-            REBUILD['ok'] = False
-            REBUILD['msg'] = str(e)
-        REBUILD['running'] = False
-        REBUILD['done_at'] = time.strftime('%T')
-
-    threading.Thread(target=run, daemon=True).start()
-    return {'started': True}
+    return _NATIVE_REBUILD.pick(payload)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -160,6 +137,8 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             self._send(200, dict(identity_pick(payload), _cal_ok=True))
+        except MetadataError as error:
+            self._send(error.status, {'error': str(error), 'operation_id': error.operation_id})
         except Exception as e:
             self._send(500, {'error': str(e)})
 

@@ -51,7 +51,7 @@ docker build -t face-admin-next .
 
 运行镜像时挂载自己的数据目录、媒体目录及需要的 Docker socket，配置上述环境变量，并将容器端口 3000 映射到所需端口。旧记录中的绝对缩略图路径需要在容器内同样可访问。
 
-可选校准镜像使用 `docker build -t face-calibrator sidecar/` 构建。Python 侧依赖 NumPy；通过 `FACES_BASE` 指定管线目录，并在该目录提供 `identify_faces.py`、`tplgroups.py` 和 `sidecar/sidecar-suggest.py` 等辅助脚本及识别数据。不同部署须核对容器内路径。
+可选校准镜像使用 `docker build -t face-calibrator sidecar/` 构建。Python 侧依赖 NumPy；通过 `FACES_BASE` 指定管线目录，并在该目录提供 `identify_faces.py`、`tplgroups.py` 和 `sidecar/sidecar-suggest.py` 等辅助脚本及识别数据。不同部署须核对容器内路径。 模板保存现通过 Rust 协调器，校准容器也须配置 `FILE_OPERATIONS_RUST_URL` 和匹配的 `FILE_OPERATIONS_RUST_TOKEN`；输入目录只读挂载，计算输出写入独立临时 `F_OUT` 后经版本校验发布。未配置协调器时保存返回错误，不回退到 Python 直接写入。详见 [共享资料协议](docs/shared-metadata-coordination.md)。
 
 ## 自动分析与人工确认
 
