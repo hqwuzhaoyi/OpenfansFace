@@ -402,6 +402,23 @@ impl Engine {
             }
         }
         let failures = self.store.failures(&plan.id)?;
+        // A crash after the durable pre-effect failure must not turn an all-or-
+        // nothing move into an archive-style partial commit on startup.
+        let failed_rollback = plan
+            .execution
+            .as_ref()
+            .is_some_and(|e| e.failure_policy == FailurePolicy::Rollback)
+            && !failures.is_empty();
+        let persisted_cause = if failed_rollback {
+            failures
+                .first()
+                .map(|f| serde_json::from_value::<Error>(f["error"].clone()))
+                .transpose()?
+        } else {
+            None
+        };
+        let cause = persisted_cause.as_ref().unwrap_or(cause);
+        let rollback = rollback || failed_rollback;
         for (index, file) in plan.files.iter().enumerate() {
             if failures.iter().any(|f| f["file_index"] == index) {
                 continue;
@@ -650,14 +667,17 @@ impl Engine {
                         Ok(p) => p,
                         Err(error) => {
                             if started.is_null()
-                                && plan.execution.as_ref().is_some_and(|e| {
-                                    e.failure_policy == FailurePolicy::ContinueUnchanged
-                                })
+                                && let Some(execution) = &plan.execution
                             {
+                                // prepare_move / pin are read-only, and no before-effect
+                                // file intent exists. This proves only this file untouched;
+                                // separately journaled directory effects still need cleanup.
                                 let failure = json!({"file_index":index,"src":file.src,"dst":file.dst,"error":error,"unchanged":true});
                                 self.checkpoint(id, "file_failed", failure.clone())?;
                                 failures.push(failure);
-                                continue;
+                                if execution.failure_policy == FailurePolicy::ContinueUnchanged {
+                                    continue;
+                                }
                             }
                             return Err(error);
                         }
@@ -1119,6 +1139,78 @@ mod shared_tests {
             engine.store.get(&plan.id).unwrap().unwrap().status,
             "rolled_back"
         );
+    }
+    fn assert_pre_effect_second_failure_rolls_back(external_source_change: bool, restart: bool) {
+        let (config, mut plan, domain) = fixture(2);
+        let owned_dir = config.creators().join("乙/owned-new");
+        plan.files[0].dst = owned_dir.join("0.mp4").display().to_string();
+        plan.directories = vec![owned_dir.display().to_string()];
+        plan.version = String::new();
+        plan.version = hash(&plan);
+        let (mut engine, gate) = admitted(&config, &plan, &domain);
+        let external = if external_source_change {
+            &plan.files[1].src
+        } else {
+            &plan.files[1].dst
+        };
+        fs::write(external, b"external late bytes").unwrap();
+        let error = engine.execute(&plan, &domain).unwrap_err();
+        assert!(!Path::new(&plan.files[0].src).exists());
+        let failures = engine.store.failures(&plan.id).unwrap();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0]["file_index"], 1);
+        assert_eq!(failures[0]["unchanged"], true);
+        if restart {
+            drop(engine);
+            drop(gate);
+            engine = Engine::new(config.clone()).unwrap();
+        } else {
+            assert!(
+                engine
+                    .reconcile(&plan, &domain, true, &error)
+                    .unwrap()
+                    .is_none()
+            );
+            gate.release().unwrap();
+        }
+        assert_eq!(
+            engine.store.get(&plan.id).unwrap().unwrap().status,
+            "rolled_back"
+        );
+        assert_eq!(
+            fs::read_to_string(&plan.files[0].src).unwrap(),
+            "isolated bytes 0"
+        );
+        assert!(!Path::new(&plan.files[0].dst).exists());
+        assert!(!owned_dir.exists());
+        assert_eq!(fs::read(external).unwrap(), b"external late bytes");
+        if !external_source_change {
+            assert_eq!(
+                fs::read_to_string(&plan.files[1].src).unwrap(),
+                "isolated bytes 1"
+            );
+        }
+        assert!(!config.base.join("fixture.json").exists());
+        assert!(!config.base.join(".review-write.lock").exists());
+        assert!(
+            engine
+                .store
+                .latest_step(&plan.id, "commit_scope")
+                .unwrap()
+                .is_none()
+        );
+    }
+    #[test]
+    fn late_second_target_preserves_external_bytes_and_cleans_owned_directory() {
+        assert_pre_effect_second_failure_rolls_back(false, false);
+    }
+    #[test]
+    fn changed_second_source_does_not_block_first_file_compensation() {
+        assert_pre_effect_second_failure_rolls_back(true, false);
+    }
+    #[test]
+    fn restart_after_pre_effect_failure_keeps_rollback_policy() {
+        assert_pre_effect_second_failure_rolls_back(false, true);
     }
     #[test]
     fn restart_after_second_publication_preserves_file_indexes() {
