@@ -110,6 +110,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             for Work { envelope, reply } in queue {
                 let result = match envelope.mode.as_str() {
                     "preview" => engine.preview(envelope.request),
+                    "reconcile" => engine.reconcile_request(envelope.request, envelope.version),
                     "apply" => match envelope.version {
                         Some(version) => engine.apply(envelope.request, version),
                         None => Err(Error::new(400, "invalid_request", "缺少预览版本")),

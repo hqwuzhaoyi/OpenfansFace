@@ -140,11 +140,14 @@ try:
     injected_errno = os.environ.get('NFS_FIXTURE_ERRNO', 'ESTALE')
     fault('destination_publish_intent', 'io_error', errno=injected_errno)
     code, error = apply(plan)
-    assert code == 503 and error['code'] == 'recovery_required' and ('Stale' if injected_errno == 'ESTALE' else 'Input/output' if injected_errno == 'EIO' else 'timed out') in error['error'], error
+    assert code == 503 and error['code'] == 'storage_unavailable' and error['step'] == 'destination_publish_intent' and ('Stale' if injected_errno == 'ESTALE' else 'Input/output' if injected_errno == 'EIO' else 'timed out') in error['error'], error
     assert source.read_bytes() == payload and not target.exists()
-    assert call(route='/v1/person-files?id=' + plan['id'])[1]['status'] == 'recovery_needed'
-    assert (base / '.review-write.lock').exists()
-    print(f'PASS injected {injected_errno} after admission -> recovery_needed with original bytes and retained gate', flush=True)
+    state = call(route='/v1/person-files?id=' + plan['id'])[1]
+    assert state['status'] == 'rolled_back' and state['failure']['step'] == 'destination_publish_intent', state
+    assert not (base / '.review-write.lock').exists()
+    with sqlite3.connect(root / 'ledger.db') as db:
+        assert db.execute('SELECT state FROM _face_admin_person_ops WHERE id=?', (plan['id'],)).fetchone()[0] == 'cancelled'
+    print(f'PASS injected {injected_errno} after admission -> proven rolled_back with original bytes and released gate', flush=True)
     print(json.dumps({'root': str(root), 'process_uid': os.geteuid(), 'process_gid': os.getegid(), 'server_uid': source.stat().st_uid, 'server_gid': source.stat().st_gid, 'checks': 'passed'}), flush=True)
 finally:
     process.send_signal(signal.SIGINT)

@@ -9,7 +9,7 @@ import type { PersonFileRequest, PersonFilePlan, PersonFileResult } from './pers
 
 export interface PersonFileOperationStatus {
   id:string; backend:FileOperationBackendName; status:string
-  result?:PersonFileResult; error?:string
+  result?:PersonFileResult; error?:string; revision?:number; phase?:string; io_state?:string
 }
 interface PersonFileBackend {
   preview(request:PersonFileRequest):Promise<PersonFilePlan>
@@ -40,7 +40,10 @@ async function rustRequest<T>(body:unknown,id?:string):Promise<T>{
   catch{throw new FileOperationRoutingError('文件操作后端连接中断，结果尚未确认；请查询原操作回执，不要重复提交',503)}
   const data=await response.json().catch(()=>null)
   if(response.status===202)throw new FileOperationRoutingError('操作已受理但尚未完成，请查询原操作回执',503)
-  if(!response.ok)throw new FileOperationRoutingError(data?.error||'文件操作后端拒绝请求',response.status)
+  if(!response.ok){
+    const error=new FileOperationRoutingError([data?.error||'文件操作后端拒绝请求',data?.step,data?.path].filter(value=>typeof value==='string'&&value).join(' · '),response.status)
+    throw Object.assign(error,{code:data?.code,path:data?.path,step:data?.step})
+  }
   if(!data||typeof data!=='object')throw new FileOperationRoutingError('文件操作后端未返回可核对的回执',502)
   return data as T
 }
@@ -48,7 +51,7 @@ const rust:PersonFileBackend={
   async preview(request){
     const plan=await rustRequest<PersonFilePlan>({mode:'preview',request})
     if(plan.id!==request.id||plan.request?.id!==request.id||plan.action!==request.action||typeof plan.version!=='string')throw new FileOperationRoutingError('预览回执与请求不匹配',502)
-    return plan
+    return {...plan,backend:'rust' as const}
   },
   async apply(request,version){
     const result=await rustRequest<PersonFileResult>({mode:'apply',request,version})
@@ -59,6 +62,7 @@ const rust:PersonFileBackend={
   async status(id){
     const status=await rustRequest<PersonFileOperationStatus>(null,id)
     if(status.id!==id||typeof status.status!=='string')throw new FileOperationRoutingError('查询结果与操作编号不匹配',502)
+    if(status.status==='complete'||status.status==='rolled_back')invalidateIntegrationCache()
     return {...status,backend:'rust'}
   },
 }
@@ -85,4 +89,14 @@ export function personFileOperationStatus(id:string){
   if(!owner)throw new FileOperationRoutingError('找不到此操作',404)
   // Result lookup follows persisted ownership even after configuration changes; it never executes.
   return backends[owner.backend].status(id)
+}
+
+export async function reconcilePersonFileOperation(request:PersonFileRequest,version:string){
+  validateFileOperationId(request.id)
+  const owner=fileOperationOwner(BASE,request.id!)
+  if(owner?.backend!=='rust'||owner.action!==request.action)throw new FileOperationRoutingError('此操作没有 Rust 执行记录',409)
+  const status=await rustRequest<PersonFileOperationStatus>({mode:'reconcile',request,version})
+  if(status.id!==request.id)throw new FileOperationRoutingError('核对回执编号不匹配',502)
+  if(status.status==='complete'||status.status==='rolled_back')invalidateIntegrationCache()
+  return {...status,backend:'rust' as const}
 }

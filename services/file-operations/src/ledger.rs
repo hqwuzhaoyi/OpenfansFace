@@ -112,3 +112,88 @@ pub fn apply(config: &Config, plan: &Plan) -> Result<Value> {
     tx.commit()?;
     Ok(evidence)
 }
+
+/// Query the transaction receipt and compare the full scoped state before choosing a direction.
+pub fn inspect(config: &Config, plan: &Plan) -> Result<String> {
+    let mut db = db::open(&config.ledger)?;
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    inspect_db(&tx, config, plan)
+}
+fn inspect_db(db: &Connection, config: &Config, plan: &Plan) -> Result<String> {
+    let exists: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='_face_admin_person_ops')",
+        [],
+        |r| r.get(0),
+    )?;
+    let receipt: Option<(String, String, String)> = if exists {
+        db.query_row(
+            "SELECT signature,state,data FROM _face_admin_person_ops WHERE id=?",
+            [&plan.id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?
+    } else {
+        None
+    };
+    let Some((signature, state, data)) = receipt else {
+        if hash(&snapshot_db(db, config, plan)?) != plan.ledger_version {
+            return Err(Error::conflict("未提交账本已被外部修改"));
+        }
+        return Ok("absent".into());
+    };
+    if signature != plan.version {
+        return Err(Error::conflict("账本回执范围不匹配"));
+    }
+    let evidence: Value = serde_json::from_str(&data)?;
+    if state == "committed" {
+        if hash(&evidence["before"]) != plan.ledger_version {
+            return Err(Error::conflict("账本原始证据不匹配"));
+        }
+        let mut reverse = plan.clone();
+        let file = &mut reverse.files[0];
+        std::mem::swap(&mut file.src, &mut file.dst);
+        let actual = snapshot_db(db, config, &reverse)?;
+        if actual["assets"] != evidence["after_assets"]
+            || actual["links"] != evidence["before"]["links"]
+            || actual["entities"] != evidence["before"]["entities"]
+        {
+            return Err(Error::conflict("已提交账本被外部修改，保留恢复状态"));
+        }
+    } else if ["prepared", "cancelled"].contains(&state.as_str()) {
+        if hash(&evidence) != plan.ledger_version
+            || hash(&snapshot_db(db, config, plan)?) != plan.ledger_version
+        {
+            return Err(Error::conflict("账本准备记录与实际状态不一致"));
+        }
+    } else {
+        return Err(Error::conflict("账本事务结果未知"));
+    }
+    Ok(state)
+}
+/// Fence the reserved transaction before compensation. Never undo an unknown or committed ledger.
+pub fn cancel(config: &Config, plan: &Plan) -> Result<()> {
+    let mut db = db::open(&config.ledger)?;
+    let tx = db.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let state = inspect_db(&tx, config, plan)?;
+    if state == "committed" {
+        return Err(Error::conflict("账本已经提交，不能按未提交补偿"));
+    }
+    if state == "cancelled" {
+        return Ok(());
+    }
+    tx.execute_batch("CREATE TABLE IF NOT EXISTS _face_admin_person_ops (id TEXT PRIMARY KEY, signature TEXT NOT NULL, state TEXT NOT NULL, data TEXT NOT NULL)")?;
+    if state == "absent" {
+        tx.execute(
+            "INSERT INTO _face_admin_person_ops VALUES(?,?,'cancelled',?)",
+            params![
+                plan.id,
+                plan.version,
+                serde_json::to_string(&snapshot_db(&tx, config, plan)?)?
+            ],
+        )?;
+    } else {
+        tx.execute("UPDATE _face_admin_person_ops SET state='cancelled' WHERE id=? AND signature=? AND state='prepared'",params![plan.id,plan.version])?;
+    }
+    tx.commit()?;
+    Ok(())
+}

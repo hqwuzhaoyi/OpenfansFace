@@ -6,6 +6,7 @@ export interface PersonFileRequest {
 }
 export interface PersonFileMove {vids:string[];src:string;dst:string;size:number;version:string;renamed?:boolean}
 export interface PersonFilePlan {
+  backend?:'rust'|'legacy'
   id:string;request:PersonFileRequest;version:string;action:PersonFileAction
   person:string;target_person:string;files:PersonFileMove[];total_bytes:number
   source_directory?:string;target_directory?:string;directories:string[]

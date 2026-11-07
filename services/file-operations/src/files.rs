@@ -1,7 +1,7 @@
 //! All media mutations use pinned directory descriptors and atomic no-replace link publication.
 use crate::{
     config::Config,
-    model::{Error, Result, hash},
+    model::{Error, Plan, Result, hash},
 };
 use rustix::fs::{AtFlags, Mode, OFlags, linkat, open, openat, unlinkat};
 use serde_json::json;
@@ -136,6 +136,105 @@ impl PinnedMove {
             src: src.into(),
             dst: dst.into(),
         })
+    }
+    /// Reopen only an exact accepted inode, under no-follow directory descriptors.
+    /// The original source fingerprint is also used for a published destination.
+    pub fn recover(config: &Config, plan: &Plan) -> Result<Self> {
+        let src = &plan.file().src;
+        let dst = &plan.file().dst;
+        let root = config.creators().join(&plan.person);
+        if !Path::new(src).starts_with(root) || Path::new(src).parent() != Path::new(dst).parent() {
+            return Err(Error::conflict("恢复路径超出原范围"));
+        }
+        let parent: File = directory(Path::new(src).parent().unwrap())?.into();
+        let mut source = None;
+        for path in [src, dst] {
+            match openat(
+                &parent,
+                Path::new(path).file_name().unwrap(),
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            ) {
+                Ok(fd) => {
+                    let file: File = fd.into();
+                    if !file.metadata()?.is_file()
+                        || fingerprint(src, &file.metadata()?) != plan.file().version
+                    {
+                        return Err(Error::conflict("恢复路径已被外部替换，保留冲突依据").at(path));
+                    }
+                    source = Some(file);
+                }
+                Err(rustix::io::Errno::NOENT) => (),
+                Err(e) => return Err(Error::from(e).at(path)),
+            }
+        }
+        let pinned = Self {
+            parent,
+            source: source.ok_or_else(|| Error::conflict("源文件与目标文件均不存在"))?,
+            src: src.clone(),
+            dst: dst.clone(),
+        };
+        pinned.position(&plan.file().version)?;
+        Ok(pinned)
+    }
+    pub fn position(&self, expected: &str) -> Result<(bool, bool)> {
+        let current_parent: File = directory(Path::new(&self.src).parent().unwrap())?.into();
+        if identity(&current_parent.metadata()?)["ino"] != identity(&self.parent.metadata()?)["ino"]
+            || current_parent.metadata()?.dev() != self.parent.metadata()?.dev()
+        {
+            return Err(Error::conflict("恢复目录已被替换"));
+        }
+        let mut present = [false, false];
+        for (index, path) in [&self.src, &self.dst].iter().enumerate() {
+            match openat(
+                &self.parent,
+                Path::new(path).file_name().unwrap(),
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            ) {
+                Ok(fd) => {
+                    let file: File = fd.into();
+                    if fingerprint(&self.src, &file.metadata()?) != expected
+                        || !file.metadata()?.is_file()
+                    {
+                        return Err(Error::conflict("文件身份发生外部变化，不能继续恢复").at(*path));
+                    }
+                    present[index] = true;
+                }
+                Err(rustix::io::Errno::NOENT) => (),
+                Err(e) => return Err(Error::from(e).at(*path)),
+            }
+        }
+        if !present[0] && !present[1] {
+            return Err(Error::conflict("源文件与目标文件均不存在"));
+        }
+        Ok((present[0], present[1]))
+    }
+    pub fn compensate(&self, config: &Config, expected: &str) -> Result<()> {
+        let (source, target) = self.position(expected)?;
+        if !source {
+            linkat(
+                &self.parent,
+                Path::new(&self.dst).file_name().unwrap(),
+                &self.parent,
+                Path::new(&self.src).file_name().unwrap(),
+                AtFlags::empty(),
+            )?;
+            self.parent.sync_all()?;
+        }
+        crate::fault::checkpoint(config, "compensation_source_published")?;
+        self.position(expected)?;
+        if target {
+            crate::fault::checkpoint(config, "compensation_destination_remove_intent")?;
+            unlinkat(
+                &self.parent,
+                Path::new(&self.dst).file_name().unwrap(),
+                AtFlags::empty(),
+            )?;
+            self.parent.sync_all()?;
+            crate::fault::checkpoint(config, "compensation_destination_removed")?;
+        }
+        Ok(())
     }
     pub fn stat(&self) -> Result<fs::Metadata> {
         Ok(self.source.metadata()?)
@@ -287,13 +386,40 @@ impl WriteGate {
         // From this point, failed durability keeps the marker; never infer its ownership by PID.
         file.write_all(
             serde_json::to_string(
-                &json!({"backend":"rust","operation":id,"pid":std::process::id()}),
+                &json!({"backend":"rust","operation":id,"pid":std::process::id(),"authority":config.state_dir(),"token":uuid::Uuid::new_v4().to_string()}),
             )?
             .as_bytes(),
         )?;
         file.sync_all()?;
         sync_parent(&path)?;
         Ok(Self { file, path })
+    }
+    pub fn evidence(&self) -> Result<serde_json::Value> {
+        Ok(
+            json!({"identity":identity(&self.file.metadata()?),"marker":serde_json::from_str::<serde_json::Value>(&fs::read_to_string(&self.path)?)?}),
+        )
+    }
+    /// Caller must hold the process-lifetime executor flock. PID/TTL never confer authority.
+    pub fn recover(config: &Config, id: &str, evidence: &serde_json::Value) -> Result<Self> {
+        let path = config.base.join(".review-write.lock");
+        let file: File = open(
+            &path,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?
+        .into();
+        let gate = Self { file, path };
+        let actual = gate.evidence()?;
+        if actual["marker"]["backend"] != "rust"
+            || actual["marker"]["operation"] != id
+            || actual["marker"]["authority"] != json!(config.state_dir())
+        {
+            return Err(Error::conflict("共享写锁不属于此执行权威，不能接管"));
+        }
+        if *evidence != actual {
+            return Err(Error::conflict("共享写锁已被替换，不能接管"));
+        }
+        Ok(gate)
     }
     pub fn release(self) -> Result<()> {
         let actual = fs::symlink_metadata(&self.path)?;

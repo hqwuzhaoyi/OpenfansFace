@@ -400,3 +400,143 @@ pub fn apply_document(config: &Config, item: &Document) -> Result<()> {
     }
     Ok(())
 }
+
+/// Native receipts are transaction-local evidence, never merely an engine phase label.
+/// Return true only when this domain is committed and its exact after-image still exists.
+pub fn inspect_domain(config: &Config, plan: &Plan, before: &Snapshot, jobs: bool) -> Result<bool> {
+    let path = config.base.join(if jobs {
+        "processing/processing.db"
+    } else {
+        "faces.db"
+    });
+    let expected = if jobs { &before.jobs } else { &before.videos };
+    if !path.exists() && jobs && expected.is_empty() {
+        return Ok(false);
+    }
+    let db = db::open(&path)?;
+    inspect_rows(
+        &db,
+        config,
+        plan,
+        expected,
+        if jobs { "tasks" } else { "videos" },
+    )
+}
+fn inspect_rows(
+    db: &rusqlite::Connection,
+    config: &Config,
+    plan: &Plan,
+    before: &[Value],
+    table: &str,
+) -> Result<bool> {
+    let receipt = db::receipt(db, &plan.id, &plan.version)?;
+    let current = db::rows(db, &format!("SELECT * FROM {table} ORDER BY vid"), [])?
+        .into_iter()
+        .filter(|row| affected(config, row, plan) || before.iter().any(|r| r["vid"] == row["vid"]))
+        .collect::<Vec<_>>();
+    let expected = match &receipt {
+        Some(r) => {
+            if r["before"] != json!(before) {
+                return Err(Error::conflict("本地事务原始证据不匹配"));
+            }
+            if r["state"] == "rolled_back" {
+                &r["before"]
+            } else {
+                &r["after"]
+            }
+        }
+        None => &json!(before),
+    };
+    if current
+        != *expected
+            .as_array()
+            .ok_or_else(|| Error::conflict("本地回执格式无效"))?
+    {
+        return Err(Error::conflict(format!(
+            "{table} 已被外部修改，不能自动恢复"
+        )));
+    }
+    Ok(receipt.is_some_and(|r| r["state"] != "rolled_back"))
+}
+pub fn inspect_documents(config: &Config, before: &Snapshot) -> Result<()> {
+    for item in &before.documents {
+        let (raw, _) = document(config, &item.name)?;
+        if raw != item.before && raw != item.after {
+            return Err(Error::conflict("JSON 记录被外部修改，不能恢复").at(config
+                .base
+                .join(&item.name)
+                .display()
+                .to_string()));
+        }
+    }
+    Ok(())
+}
+pub fn compensate_domain(
+    config: &Config,
+    plan: &Plan,
+    before: &Snapshot,
+    jobs: bool,
+) -> Result<()> {
+    let path = config.base.join(if jobs {
+        "processing/processing.db"
+    } else {
+        "faces.db"
+    });
+    let original = if jobs { &before.jobs } else { &before.videos };
+    if !path.exists() && jobs && original.is_empty() {
+        return Ok(());
+    }
+    let table = if jobs { "tasks" } else { "videos" };
+    let mut db = db::open(&path)?;
+    let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    if !inspect_rows(&tx, config, plan, original, table)? {
+        return Ok(());
+    }
+    let mut receipt = db::receipt(&tx, &plan.id, &plan.version)?.unwrap();
+    for row in original {
+        let fields = row
+            .as_object()
+            .unwrap()
+            .keys()
+            .filter(|k| k.as_str() != "vid")
+            .collect::<Vec<_>>();
+        let assignments = fields
+            .iter()
+            .map(|k| format!("\"{}\"=?", k.replace('"', "\"\"")))
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut args = fields
+            .iter()
+            .map(|k| db::sql_value(&row[*k]))
+            .collect::<Result<Vec<_>>>()?;
+        args.push(db::sql_value(&row["vid"])?);
+        tx.execute(
+            &format!("UPDATE {table} SET {assignments} WHERE vid=?"),
+            rusqlite::params_from_iter(args),
+        )?;
+    }
+    receipt["state"] = json!("rolled_back");
+    tx.execute(
+        "UPDATE _face_admin_rust_commits SET data=? WHERE id=? AND signature=?",
+        params![serde_json::to_string(&receipt)?, plan.id, plan.version],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+pub fn compensate_document(config: &Config, item: &Document) -> Result<()> {
+    let path = config.base.join(&item.name);
+    let (raw, _) = document(config, &item.name)?;
+    if raw == item.before {
+        return Ok(());
+    }
+    if raw != item.after {
+        return Err(Error::conflict("JSON 补偿遇到外部修改").at(path.display().to_string()));
+    }
+    if let Some(raw) = &item.before {
+        files::atomic_write(&path, raw.as_bytes())?;
+    } else {
+        fs::remove_file(&path)?;
+        files::sync_parent(&path)?;
+    }
+    Ok(())
+}
