@@ -310,7 +310,7 @@ impl Engine {
         // Final receipt may be durable while marker removal was interrupted. Only this
         // authority's exact admitted gate may be removed. Legacy/foreign markers survive.
         let gate_path = self.config.base.join(".review-write.lock");
-        if let Ok(Some(raw)) = files::read_optional(&gate_path)
+        if let Ok(Some(raw)) = crate::control::read(&gate_path, crate::control::MARKER_LIMIT)
             && let Ok(marker) = serde_json::from_str::<Value>(&raw)
             && let Some(id) = marker["operation"].as_str()
             && let Some(record) = self.store.get(id)?
