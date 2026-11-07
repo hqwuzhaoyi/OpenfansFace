@@ -26,7 +26,7 @@ impl Store {
         crate::control::verify_path(&ownership, &path)?;
         let conn = Connection::open(config.state_db())?;
         let schema: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if schema > 3 {
+        if schema > 4 {
             return Err(Error::new(
                 503,
                 "schema_version",
@@ -47,7 +47,7 @@ impl Store {
             operation_id TEXT NOT NULL REFERENCES operations(id), revision INTEGER NOT NULL,
             phase TEXT NOT NULL, evidence TEXT NOT NULL, at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY(operation_id,revision)
-          ); PRAGMA user_version=3;")?;
+          ); PRAGMA user_version=4;")?;
         let stat = identity(&ownership.metadata()?);
         let identity = serde_json::to_string(&json!({"dev":stat["dev"],"ino":stat["ino"]}))?;
         conn.execute("INSERT OR IGNORE INTO authority VALUES(1,?)", [&identity])?;
@@ -267,6 +267,9 @@ pub fn status(path: &Path, id: &str) -> Result<Value> {
         return Err(Error::new(404, "not_found", "找不到操作记录"));
     };
     let total = record.plan.files.len();
+    if crate::staging_delete::action(&record.plan.action) {
+        return crate::staging_delete::status(&db, &record);
+    }
     let done:i64=db.query_row("SELECT COUNT(DISTINCT COALESCE(json_extract(evidence,'$.file_index'),0)) FROM steps WHERE operation_id=? AND phase='source_removed'",[id],|r|r.get(0))?;
     let failures: i64 = db.query_row(
         "SELECT COUNT(*) FROM steps WHERE operation_id=? AND phase='file_failed'",

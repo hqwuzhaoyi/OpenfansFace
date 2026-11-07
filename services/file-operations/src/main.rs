@@ -18,6 +18,9 @@ mod permissions;
 mod person_delete;
 mod person_directory;
 mod person_ledger;
+mod person_merge;
+mod person_merge_ledger;
+mod person_merge_metadata;
 mod person_metadata;
 mod person_move;
 mod person_registration;
@@ -25,6 +28,7 @@ mod person_rename;
 mod review;
 mod shared_metadata;
 mod staging;
+mod staging_delete;
 mod store;
 mod video_health;
 
@@ -48,7 +52,7 @@ use std::{
 use tokio::sync::{Semaphore, oneshot};
 
 enum Command {
-    Files(Envelope),
+    Files(Box<Envelope>),
     Metadata { command: String, body: Value },
     Archive { command: String, body: Value },
 }
@@ -60,7 +64,9 @@ struct Work {
 struct App {
     config: Config,
     worker: mpsc::SyncSender<Work>,
-    reads: Arc<Semaphore>,
+    // Local journal reads must remain available while media/NFS reads are stalled.
+    status_reads: Arc<Semaphore>,
+    media_reads: Arc<Semaphore>,
 }
 fn authorize(config: &Config, headers: &HeaderMap) -> Result<()> {
     if let Some(token) = &config.token
@@ -101,7 +107,7 @@ async fn post(
     let (reply, wait) = oneshot::channel();
     app.worker
         .try_send(Work {
-            command: Command::Files(envelope),
+            command: Command::Files(Box::new(envelope)),
             reply,
         })
         .map_err(|_| {
@@ -128,7 +134,7 @@ async fn status(
         .ok_or_else(|| Error::new(400, "invalid_request", "缺少操作编号"))?;
     model::validate_id(&id)?;
     let permit = app
-        .reads
+        .status_reads
         .clone()
         .acquire_owned()
         .await
@@ -154,16 +160,32 @@ async fn staging_list(
         .transpose()
         .map_err(|_| Error::new(400, "invalid_request", "分页位置无效"))?
         .unwrap_or(0);
-    let permit = app
-        .reads
-        .clone()
-        .acquire_owned()
-        .await
-        .map_err(|_| Error::new(503, "unavailable", "读取服务不可用"))?;
+    let permit = if query.contains_key("id") {
+        app.status_reads
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::new(503, "unavailable", "读取服务不可用"))?
+    } else {
+        app.media_reads
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Error::new(503, "reader_busy", "媒体目录读取繁忙，请稍后重试"))?
+    };
     Ok(Json(
         tokio::task::spawn_blocking(move || {
+            // A disconnected HTTP waiter cannot cancel a blocking syscall. Keep the
+            // permit here until the real read returns; never admit replacement work early.
             let _permit = permit;
-            staging::list(&app.config, offset)
+            if let Some(id) = query.get("id") {
+                return staging_delete::historical_status(&app.config, id);
+            }
+            media_listing_checkpoint(&app.config, offset)?;
+            staging::list(
+                &app.config,
+                offset,
+                query.get("q").map(String::as_str).unwrap_or(""),
+            )
         })
         .await
         .map_err(|_| Error::new(503, "unavailable", "暂存列表读取失败"))??,
@@ -184,6 +206,27 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     serve()
 }
 
+/// Slow-media test hook, only reachable with Config's full marked-fixture guard.
+/// The per-request marker proves admission happened inside the bounded blocking lane.
+fn media_listing_checkpoint(config: &Config, offset: usize) -> Result<()> {
+    let Some(root) = &config.fixture else {
+        return Ok(());
+    };
+    let Some(raw) = control::read(&root.join("rust-fault.json"), control::MARKER_LIMIT)? else {
+        return Ok(());
+    };
+    let fault: Value = serde_json::from_str(&raw)?;
+    if fault["phase"] != "media_listing" {
+        return Ok(());
+    }
+    if fault["mode"] == "pause" {
+        files::atomic_write(
+            &root.join(format!("media-read-{offset}.started")),
+            b"admitted",
+        )?;
+    }
+    fault::checkpoint(config, "media_listing")
+}
 #[tokio::main]
 async fn serve() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
@@ -214,6 +257,19 @@ async fn serve() -> std::result::Result<(), Box<dyn std::error::Error>> {
                     Command::Files(envelope) => match envelope.mode.as_str() {
                         "preview" => engine.preview(envelope.request),
                         "reconcile" => engine.reconcile_request(envelope.request, envelope.version),
+                        "apply"
+                            if staging_delete::action(&envelope.request.action)
+                                && envelope.confirmation.as_deref()
+                                    != Some(staging_delete::confirmation(
+                                        &envelope.request.action,
+                                    )) =>
+                        {
+                            Err(Error::new(
+                                400,
+                                "confirmation_required",
+                                "请输入完整确认文字：永久删除或清空回收站",
+                            ))
+                        }
                         "apply" => match envelope.version {
                             Some(version) => engine.apply(envelope.request, version),
                             None => Err(Error::new(400, "invalid_request", "缺少预览版本")),
@@ -237,7 +293,8 @@ async fn serve() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let app = App {
         config: config.clone(),
         worker,
-        reads: Arc::new(Semaphore::new(4)),
+        status_reads: Arc::new(Semaphore::new(4)),
+        media_reads: Arc::new(Semaphore::new(4)),
     };
     let router = Router::new()
         .route(
@@ -308,7 +365,7 @@ async fn archive_status(
 ) -> Result<Json<Value>> {
     authorize(&app.config, &headers)?;
     let permit = app
-        .reads
+        .status_reads
         .clone()
         .acquire_owned()
         .await
@@ -367,7 +424,7 @@ async fn health_summary(
 ) -> Result<Json<Value>> {
     authorize(&app.config, &headers)?;
     let permit = app
-        .reads
+        .media_reads
         .clone()
         .acquire_owned()
         .await
