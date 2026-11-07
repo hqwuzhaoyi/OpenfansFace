@@ -658,7 +658,19 @@ impl Engine {
                     let pinned = if let Some(execution) = &plan.execution
                         && started.is_null()
                     {
-                        files::prepare_move(&self.config, &execution.scopes[index], file)
+                        if plan.action == "archive"
+                            && execution.data["rows"][index]["operation"] == "stage-duplicate"
+                        {
+                            self.checkpoint(
+                                id,
+                                "duplicate_verification_intent",
+                                json!({"index":index,"src":file.src}),
+                            )?;
+                        }
+                        crate::archive::verify_duplicate(&self.config, plan, index, true)
+                            .and_then(|_| {
+                                files::prepare_move(&self.config, &execution.scopes[index], file)
+                            })
                             .and_then(|_| self.pin(plan, index))
                     } else {
                         self.pin(plan, index)
@@ -690,9 +702,12 @@ impl Engine {
                     )?;
                     if !pinned.position(&file.version)?.1 {
                         if plan.execution.is_some() {
-                            pinned.publish_recoverable(&file.version, &mut |phase, proof| {
-                                self.file_checkpoint(plan, index, phase, proof)
-                            })?;
+                            let config = self.config.clone();
+                            pinned.publish_recoverable(
+                                &config,
+                                &file.version,
+                                &mut |phase, proof| self.file_checkpoint(plan, index, phase, proof),
+                            )?;
                         } else {
                             pinned.publish(&file.version)?;
                         }
@@ -703,6 +718,7 @@ impl Engine {
                         &format!("destination_published_unrecorded:{index}"),
                     )?;
                     self.file_checkpoint(plan, index, "destination_published", &pinned.evidence)?;
+                    crate::archive::verify_duplicate(&self.config, plan, index, false)?;
                     self.file_checkpoint(plan, index, "source_remove_intent", &pinned.evidence)?;
                     if pinned.position(&file.version)?.0 {
                         pinned.remove_source(&file.version)?;
@@ -752,6 +768,9 @@ impl Engine {
         }
         let (domain, successful) = self.commit_scope(plan, accepted)?;
         let snapshot = &domain.metadata;
+        for &index in &successful {
+            crate::archive::verify_duplicate(&self.config, plan, index, false)?;
+        }
         if plan.execution.is_some() {
             self.checkpoint(
                 id,
@@ -811,6 +830,9 @@ impl Engine {
         let evidence = if self.ledger_state(plan, &domain)? == "committed" {
             json!({"reconciled":true})
         } else {
+            for &index in &successful {
+                crate::archive::verify_duplicate(&self.config, plan, index, false)?;
+            }
             self.ledger_apply(plan, &domain)?
         };
         crate::fault::checkpoint(&self.config, "ledger_committed_unrecorded")?;

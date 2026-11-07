@@ -1,6 +1,7 @@
 mod archive;
 mod archive_api;
 mod archive_ledger;
+mod archive_resolution;
 mod config;
 mod creator_delta;
 mod db;

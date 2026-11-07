@@ -144,6 +144,7 @@ pub struct Plan {
 pub enum ScopeRoot {
     Person(String),
     Unorganized,
+    Staging,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MoveScope {

@@ -598,7 +598,9 @@ pub fn plan(config: &Config, request: crate::model::Request) -> Result<crate::mo
     let at = body["at"]
         .as_str()
         .ok_or_else(|| Error::new(400, "invalid_request", "缺少持久化操作时间"))?;
-    let prepared = if request.action == "queue-rule" {
+    let prepared = if request.action == "archive-resolve" {
+        crate::archive_resolution::prepare(config, body)?
+    } else if request.action == "queue-rule" {
         prepare_rule(config, body)?
     } else if request.action == "queue-restore" {
         prepare_restore(config, body)?
@@ -637,7 +639,9 @@ pub fn revalidate(config: &Config, plan: &crate::model::Plan) -> Result<()> {
         .payload
         .as_ref()
         .ok_or_else(|| Error::conflict("人工确认内容缺失"))?;
-    let prepared = if plan.action == "queue-rule" {
+    let prepared = if plan.action == "archive-resolve" {
+        crate::archive_resolution::prepare(config, body)?
+    } else if plan.action == "queue-rule" {
         prepare_rule(config, body)?
     } else if plan.action == "queue-restore" {
         prepare_restore(config, body)?

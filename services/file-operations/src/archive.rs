@@ -1,4 +1,4 @@
-//! Ordinary pending-queue archive. Duplicate resolution is deliberately a separate action.
+//! Pending-queue archive, including confirmed keep-both and verified duplicate staging.
 use crate::native::DomainSnapshot;
 use crate::{
     archive_ledger,
@@ -18,6 +18,9 @@ use std::{
 
 pub fn preview(config: &Config) -> Result<Value> {
     let (_, queue) = review::read(config, "integration-queue.json", json!([]))?;
+    preview_queue(config, &queue)
+}
+pub fn preview_queue(config: &Config, queue: &Value) -> Result<Value> {
     let sources = review::sources(config)?;
     let videos = db::rows(
         &db::open(&config.base.join("faces.db"))?,
@@ -131,33 +134,57 @@ pub fn preview(config: &Config) -> Result<Value> {
                 row["status"] = json!("corrupt");
                 return Err(Error::conflict("视频体检连续确认异常，请查看回收站记录"));
             }
-            let dst = config.creators().join(&creator).join(&name);
-            row["dst"] = json!(dst.to_string_lossy());
-            row["original_dst"] = row["dst"].clone();
+            let original = config.creators().join(&creator).join(&name);
+            let mut dst = original.clone();
+            row["original_dst"] = json!(original.to_string_lossy());
+            row["suggested_name"] = json!(crate::archive_resolution::alternate_name(&name, vid));
             row["size"] = json!(stat.len());
             row["size_gb"] = json!((stat.len() as f64 / 1073741824.0 * 100.0).round() / 100.0);
             row["mtime"] = json!(files::mtime_ns(&stat).parse::<i128>().unwrap_or(0) / 1_000_000);
             row["file_version"] = json!(files::fingerprint(src, &stat));
-            if item.get("resolution").is_some_and(|r| !r.is_null()) {
-                return Err(Error::new(
-                    409,
-                    "resolution_required",
-                    "该任务已有冲突处理选择，请使用重复处理流程",
-                ));
+            if let Ok(target) = files::regular_stat(&original.to_string_lossy()) {
+                row["original_size"] = json!(target.len());
             }
+            match item["resolution"]["kind"].as_str() {
+                Some("rename") => {
+                    let filename = item["resolution"]["name"]
+                        .as_str()
+                        .ok_or_else(|| Error::conflict("保留文件名无效"))?;
+                    crate::archive_resolution::validate_name(filename, &name)?;
+                    dst = config.creators().join(&creator).join(filename);
+                    row["reason"] = json!("已选择保留两份，将按新文件名归档");
+                }
+                Some("stage-duplicate") | None => (),
+                _ => return Err(Error::conflict("冲突处理选择无效")),
+            }
+            row["dst"] = json!(dst.to_string_lossy());
             if dst.symlink_metadata().is_ok() {
                 let target = std::fs::symlink_metadata(&dst)?;
                 row["dst_size"] = json!(target.len());
                 row["dst_mtime"] =
                     json!(files::mtime_ns(&target).parse::<i128>().unwrap_or(0) / 1_000_000);
-                row["status"] = json!(if target.is_file() && target.len() == stat.len() {
+                row["status"] = json!(if target.is_file()
+                    && !target.file_type().is_symlink()
+                    && target.len() == stat.len()
+                {
                     "duplicate"
                 } else {
                     "conflict"
                 });
-                return Err(Error::conflict("目标存在同名文件，需先处理冲突"));
+                if row["status"] == "duplicate" && item["resolution"]["kind"] == "stage-duplicate" {
+                    let target = files::regular_stat(&dst.to_string_lossy())?;
+                    row["canonical_version"] =
+                        json!(files::fingerprint(&dst.to_string_lossy(), &target));
+                    row["operation"] = json!("stage-duplicate");
+                    row["status"] = json!("ok");
+                    row["reason"] = json!("执行时完整校验内容，完全一致才把源文件移入暂存");
+                } else {
+                    return Err(Error::conflict("目标存在同名文件，需先处理冲突"));
+                }
+            } else if item["resolution"]["kind"] == "stage-duplicate" {
+                return Err(Error::conflict("目标文件已变化，无法暂存重复件"));
             }
-            if !targets.insert(dst.clone()) {
+            if row["operation"] != "stage-duplicate" && !targets.insert(dst.clone()) {
                 row["status"] = json!("dupe-target");
                 return Err(Error::conflict("队列里另一个视频也将使用此目标文件名"));
             }
@@ -198,7 +225,7 @@ pub fn preview(config: &Config) -> Result<Value> {
                 rusqlite::params![creator, creator.to_lowercase()],
             )?;
             let mut links = vec![];
-            for asset in &src_assets {
+            for asset in src_assets.iter().chain(&dst_assets) {
                 links.extend(db::rows(
                     &ledger,
                     "SELECT * FROM asset_entity WHERE asset_id=? ORDER BY entity_id,role,source",
@@ -216,7 +243,14 @@ pub fn preview(config: &Config) -> Result<Value> {
             row["record_version"] = json!(hash(
                 &json!({"videos":scoped_videos,"destination_videos":destination_videos,"jobs":scoped_jobs,"source_assets":src_assets,"destination_assets":dst_assets,"entities":creators,"links":links,"documents":documents})
             ));
-            permissions::require_move_permissions(Path::new(src), &dst)?;
+            let actual = if row["operation"] == "stage-duplicate" {
+                config
+                    .media
+                    .join("pikpak/.face-cleanup-staging/archive-duplicates/pending")
+            } else {
+                dst
+            };
+            permissions::require_move_permissions(Path::new(src), &actual)?;
             Ok(())
         })();
         if let Err(error) = checked {
@@ -284,18 +318,33 @@ pub fn plan(config: &Config, request: Request) -> Result<Plan> {
             vids.push(vid)
         }
         moves.push(FileMove {
-            vids,
+            vids: vids.clone(),
             src: src.into(),
-            dst: row["dst"].as_str().unwrap().into(),
+            dst: if row["operation"] == "stage-duplicate" {
+                config
+                    .media
+                    .join("pikpak/.face-cleanup-staging/archive-duplicates")
+                    .join(&request.id)
+                    .join(&hash(&json!(vids))[..16])
+                    .join(Path::new(src).file_name().unwrap())
+                    .to_string_lossy()
+                    .to_string()
+            } else {
+                row["dst"].as_str().unwrap().into()
+            },
             size: row["size"].as_u64().unwrap(),
             version: row["file_version"].as_str().unwrap().into(),
         });
         scopes.push(MoveScope {
             source: ScopeRoot::Unorganized,
-            destination: ScopeRoot::Person(row["creator"].as_str().unwrap().into()),
+            destination: if row["operation"] == "stage-duplicate" {
+                ScopeRoot::Staging
+            } else {
+                ScopeRoot::Person(row["creator"].as_str().unwrap().into())
+            },
         });
     }
-    let ledger = archive_ledger::prepare(config, &rows, at, &request.id)?;
+    let ledger = archive_ledger::prepare(config, &ledger_rows(&rows, &moves), at, &request.id)?;
     for (database, table) in [
         (config.base.join("faces.db"), "videos"),
         (config.base.join("processing/processing.db"), "tasks"),
@@ -354,6 +403,7 @@ pub fn plan(config: &Config, request: Request) -> Result<Plan> {
         ("integration-queue.json", json!([])),
         ("archive-history.json", json!([])),
         ("video-path-overrides.json", json!({})),
+        ("staging-origins.json", json!({})),
         ("report.json", json!({})),
         ("claims-detail.json", json!([])),
         ("clusters.json", json!([])),
@@ -449,7 +499,7 @@ pub fn revalidate(config: &Config, plan: &Plan) -> Result<()> {
     }
     let ledger = archive_ledger::prepare(
         config,
-        intent.data["rows"].as_array().unwrap(),
+        &ledger_rows(intent.data["rows"].as_array().unwrap(), &plan.files),
         intent.data["at"].as_str().unwrap(),
         &plan.id,
     )?;
@@ -545,6 +595,7 @@ pub fn snapshot(config: &Config, plan: &Plan, successful: &[usize]) -> Result<Do
             "integration-queue.json",
             "archive-history.json",
             "video-path-overrides.json",
+            "staging-origins.json",
         ]
         .contains(&doc.name.as_str())
         {
@@ -560,13 +611,24 @@ pub fn snapshot(config: &Config, plan: &Plan, successful: &[usize]) -> Result<Do
             for &i in successful {
                 let mut row = data["rows"][i].clone();
                 row["manifest"] = json!(format!("rust:{}", plan.id));
-                row["win_dst"] = json!(metadata::win(config, &plan.files[i].dst));
+                row["win_dst"] = json!(metadata::win(config, row["dst"].as_str().unwrap()));
+                if row["operation"] == "stage-duplicate" {
+                    row["staged_path"] = json!(plan.files[i].dst);
+                }
                 row["operation_id"] = json!(plan.id);
                 value
                     .as_array_mut()
                     .unwrap()
                     .retain(|r| r["vid"] != row["vid"]);
                 value.as_array_mut().unwrap().push(row)
+            }
+        }
+        if doc.name == "staging-origins.json" {
+            for &i in successful {
+                if data["rows"][i]["operation"] == "stage-duplicate" {
+                    let f = &plan.files[i];
+                    value[&f.dst] = json!({"operation":plan.id,"action":"stage-duplicate","original_path":f.src,"person":"","vids":f.vids,"source":"native-receipt"});
+                }
             }
         }
         if doc.name == "video-path-overrides.json" {
@@ -657,7 +719,15 @@ pub fn result(plan: &Plan, successful: &[usize], failures: &[Value]) -> Value {
     result["id"] = json!(plan.id);
     result["moved"] = json!(successful.len());
     result["ledger"] = json!(successful.len());
-    result["staged"] = json!(0);
+    result["staged"] = json!(
+        successful
+            .iter()
+            .filter(
+                |&&i| plan.execution.as_ref().unwrap().data["rows"][i]["operation"]
+                    == "stage-duplicate"
+            )
+            .count()
+    );
     result["remaining"] = json!(
         plan.execution.as_ref().unwrap().data["queue_count"]
             .as_u64()
@@ -723,4 +793,39 @@ fn related(value: &Value, vid: &str, src: &str, win: &str, out: &mut Vec<Value>)
         }
         _ => {}
     }
+}
+
+fn ledger_rows(rows: &[Value], files: &[FileMove]) -> Vec<Value> {
+    rows.iter()
+        .zip(files)
+        .map(|(row, file)| {
+            let mut value = row.clone();
+            if row["operation"] == "stage-duplicate" {
+                value["canonical"] = row["dst"].clone();
+            }
+            value["dst"] = json!(file.dst);
+            value
+        })
+        .collect()
+}
+
+pub fn verify_duplicate(config: &Config, plan: &Plan, index: usize, compare: bool) -> Result<()> {
+    if plan.action != "archive" {
+        return Ok(());
+    }
+    let row = &plan.execution.as_ref().unwrap().data["rows"][index];
+    if row["operation"] != "stage-duplicate" {
+        return Ok(());
+    }
+    let target = row["dst"].as_str().unwrap();
+    let version = row["canonical_version"].as_str().unwrap();
+    if compare {
+        crate::fault::checkpoint(config, "duplicate_verification_started")?;
+        files::identical_files(config, &plan.files[index], target, version)?;
+        crate::fault::checkpoint(config, "duplicate_verified")?;
+        crate::fault::checkpoint(config, &format!("duplicate_verified:{index}"))?;
+    } else if files::fingerprint(target, &files::regular_stat(target)?) != version {
+        return Err(Error::conflict("重复件目标文件已变化，请重新核对").at(target));
+    }
+    Ok(())
 }
