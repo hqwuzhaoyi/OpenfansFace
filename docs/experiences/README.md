@@ -64,3 +64,5 @@
 ## 归档与人物合并可靠性
 
 - [2026-11-07 修复与上线回执](../../.local/experiences/archive-reliability-release-20261107/verification.json)：提交 `3da3e24` 修复 Peach 人物名大小写冲突，增加归档／合并目录权限预检、事务回执与实时进度。NAS 的 6,638 个管理目录中更新 6,637 个访问／默认 ACL，仅授予服务 UID 1000 所需权限，保留已有文件、属主及其他主体有效权限；备份位于 NAS `/root/face-media-acl-20261107-release`。17 项单元测试、2 项 ACL 测试、隔离 HTTP 与合并回归、浏览器键盘／窄屏／减少动态效果及播放验证通过。已部署 `face-admin-next:archive-reliability-20261107`，切换时人工记录校验一致，worker 未重启；线上当时 76 项待归档均通过预览，未替用户执行真实归档或合并。源码清单、镜像比对、构建日志和回滚容器名保存在同目录。
+
+- [2026-11-07 人物预览误过期修复](../../.local/experiences/person-preview-version-release-20261107/live-version-verification.json)：提交 `f1d2310` 将人物操作的数据库版本限定到实际会改写的视频索引和任务，修复无关后台分析更新导致合并确认失效的问题。6 项版本保护场景及原有批量合并／删除回归通过；已部署 `face-admin-next:person-preview-version-20261107`。线上同一合并请求连续 8 次预览版本一致，期间观测到 0 次后台任务表变化；11 个源文件均在，目标未产生文件，未执行真实合并。发布回执、构建日志、诊断与回滚容器位置位于同目录。
