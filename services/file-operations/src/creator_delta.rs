@@ -357,6 +357,10 @@ pub fn apply(conn: &Connection, changes: &Delta, creators: &[CreatorIntent]) -> 
         if entity["kind"] != "creator"
             || entity["canonical_name"] != creator.canonical_name
             || entity["normalized_name"] != creator.normalized_name
+            || creator
+                .metadata_json
+                .as_ref()
+                .is_some_and(|metadata| entity["metadata_json"] != *metadata)
         {
             return Err(conflict("新建人物记录与接受的意图不一致"));
         }

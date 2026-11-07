@@ -108,6 +108,7 @@ fn reject_unknown(conn: &Connection, id: &Value) -> Result<()> {
         if ["asset_entity", "entity_alias"].contains(&name) {
             continue;
         }
+        let mut groups = BTreeMap::<i64, Vec<Value>>::new();
         for fk in db::rows(
             conn,
             &format!("PRAGMA foreign_key_list({})", quote(name)),
@@ -116,24 +117,36 @@ fn reject_unknown(conn: &Connection, id: &Value) -> Result<()> {
             if fk["table"]
                 .as_str()
                 .is_some_and(|s| s.eq_ignore_ascii_case("entity"))
-                && (fk["to"].is_null() || fk["to"] == "id")
             {
-                let column = fk["from"]
-                    .as_str()
-                    .ok_or_else(|| Error::conflict("Peach 外键字段无效"))?;
-                if !db::rows(
-                    conn,
-                    &format!(
-                        "SELECT 1 AS occupied FROM {} WHERE {}=? LIMIT 1",
-                        quote(name),
-                        quote(column)
-                    ),
-                    [db::sql_value(id)?],
-                )?
-                .is_empty()
-                {
-                    return Err(Error::conflict("Peach 还有需核对的人物关联").at(name));
-                }
+                groups.entry(db::integer(&fk["id"])?).or_default().push(fk);
+            }
+        }
+        for (_, mut group) in groups {
+            group.sort_by_key(|fk| db::integer(&fk["seq"]).unwrap_or(-1));
+            let predicates = group
+                .iter()
+                .map(|fk| {
+                    let parent = fk["to"].as_str().unwrap_or("id");
+                    let child = fk["from"]
+                        .as_str()
+                        .ok_or_else(|| Error::conflict("Peach 外键字段无效"))?;
+                    Ok(format!("p.{} = c.{}", quote(parent), quote(child)))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            // Keep the parent operand on the left: SQLite applies its affinity
+            // and collation to foreign-key comparisons, including composite keys.
+            if !db::rows(
+                conn,
+                &format!(
+                    "SELECT 1 AS occupied FROM {} AS c JOIN entity AS p ON {} WHERE p.id=? LIMIT 1",
+                    quote(name),
+                    predicates.join(" AND ")
+                ),
+                [db::sql_value(id)?],
+            )?
+            .is_empty()
+            {
+                return Err(Error::conflict("Peach 还有需核对的人物关联").at(name));
             }
         }
     }
