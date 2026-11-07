@@ -54,6 +54,9 @@ fn owner_transform(value: &Value, plan: &Plan) -> Value {
     }
 }
 fn updated(config: &Config, name: &str, value: &Value, plan: &Plan) -> Value {
+    if plan.action == "delete-person" {
+        return crate::person_delete::updated(config, name, value, plan);
+    }
     if name.starts_with("external-profiles/") {
         if plan.action != "rename-person" {
             return value.clone();
@@ -221,7 +224,7 @@ fn selected_rows(
     table: &str,
     plan: &Plan,
 ) -> Result<Vec<Value>> {
-    if plan.action == "rename-person" {
+    if ["rename-person", "delete-person"].contains(&plan.action.as_str()) {
         let rows = crate::delta::local_identity(
             connection,
             if table == "videos" {
@@ -249,11 +252,8 @@ fn selected_rows(
             &identity_prefixes(config, plan),
             &crate::person_rename::names(plan),
         )?;
-        let target = config
-            .creators()
-            .join(&plan.target_person)
-            .display()
-            .to_string();
+        let (_, target) = crate::person_directory::roots(config, plan);
+        let target = target.display().to_string();
         let prefixes = [
             format!("{target}/"),
             format!("{}\\", metadata::win(config, &target)),
@@ -343,7 +343,7 @@ fn delta(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    let guard = if plan.action == "rename-person" {
+    let guard = if ["rename-person", "delete-person"].contains(&plan.action.as_str()) {
         db::Guard::LocalIdentity {
             table,
             vids,
@@ -429,7 +429,7 @@ pub fn snapshot(config: &Config, plan: &Plan) -> Result<Snapshot> {
                         json!(Path::new(&file.dst).parent().unwrap().to_string_lossy());
                 }
             }
-            if plan.action == "rename-person" && next == *row {
+            if ["rename-person", "delete-person"].contains(&plan.action.as_str()) && next == *row {
                 next = metadata::transform(config, row, plan);
                 if next["path"] != row["path"] {
                     let path = Path::new(next["path"].as_str().unwrap()).to_owned();
@@ -478,16 +478,18 @@ pub fn snapshot(config: &Config, plan: &Plan) -> Result<Snapshot> {
                     plan
                 ))?);
             }
-            if plan.action == "rename-person" {
+            if ["rename-person", "delete-person"].contains(&plan.action.as_str()) {
                 let data: Value = serde_json::from_str(
                     row["data"]
                         .as_str()
                         .ok_or_else(|| crate::model::Error::conflict("任务数据无效"))?,
                 )?;
-                let changed = crate::person_rename::transform(
-                    &metadata::transform(config, &data, plan),
-                    plan,
-                );
+                let mapped = metadata::transform(config, &data, plan);
+                let changed = if plan.action == "delete-person" {
+                    crate::person_delete::transform(&mapped, plan)
+                } else {
+                    crate::person_rename::transform(&mapped, plan)
+                };
                 next["data"] = json!(serde_json::to_string(&changed)?);
                 if next["path"] == row["path"] {
                     next["path"] = json!(metadata::mapped(
@@ -497,7 +499,9 @@ pub fn snapshot(config: &Config, plan: &Plan) -> Result<Snapshot> {
                     ));
                     let path = Path::new(next["path"].as_str().unwrap()).to_owned();
                     next["name"] = json!(path.file_name().unwrap().to_string_lossy());
-                    if ["face", "text"].contains(&row["stage"].as_str().unwrap_or("")) {
+                    if next["path"] != row["path"] && plan.action == "delete-person" {
+                        next["stage"] = json!("excluded");
+                    } else if ["face", "text"].contains(&row["stage"].as_str().unwrap_or("")) {
                         next["stage"] = json!("queued");
                     }
                 }
@@ -519,10 +523,10 @@ pub fn snapshot(config: &Config, plan: &Plan) -> Result<Snapshot> {
 }
 
 fn identity_prefixes(config: &Config, plan: &Plan) -> Vec<String> {
-    [
-        config.creators().join(&plan.person),
-        config.creators().join(&plan.target_person),
-    ]
+    {
+        let (source, target) = crate::person_directory::roots(config, plan);
+        [source, target]
+    }
     .iter()
     .flat_map(|p| {
         [
