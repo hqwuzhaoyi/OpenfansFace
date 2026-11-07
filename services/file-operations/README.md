@@ -281,3 +281,11 @@ concurrent confirmation, scoped versions, 5000-ID requests, duplicate submits,
 never-started fences, and process exits at multi-file/transaction/optional-child
 boundaries. The service's fixture PATH excludes external executables. These
 checks do not authorize or perform production media changes.
+
+### Control-file read guards
+
+Control JSON reads walk parent directories without following symlinks, open the final entry with `O_NOFOLLOW | O_NONBLOCK`, and require a regular file before reading. Reads use bounded `pread` from the held descriptor; device/inode, length and modification/change timestamps must remain stable, and the pathname must still name that descriptor. FIFOs, symlinks, replaced files and oversize input produce explicit errors with the affected path. Only an absent path is treated as optional. This prevents special-file stalls; it does not claim that regular-file storage I/O has a cancellable deadline.
+
+Gate evidence reads the already held read/write descriptor rather than reopening `.review-write.lock`. Startup recovery and routing markers are bounded to 1 MiB. Metadata and legacy JSON documents default to 256 MiB per file; `FILE_OPERATIONS_CONTROL_MAX_BYTES` accepts a positive byte count when a known valid larger document requires it. Limits are checked against file size before allocation and against bytes read if the file grows. No content is truncated or silently skipped. The executor lock also opens nonblocking/no-follow, must be regular and must retain its directory-entry identity before authority checks. Rejected/replaced gate entries remain in place and uncertain operations retain recovery protection.
+
+`python3 tests/http-rust-control-files.py` exercises actual FIFO/symlink/oversize metadata and markers, prompt startup/recovery behavior, and a 2 MiB legacy document through normal execution and restart. Rust control tests additionally replace an already-held gate with a FIFO, symlink and byte-identical new regular inode, verify that evidence/release reject all replacements without deleting them, and check exact byte-limit boundaries.

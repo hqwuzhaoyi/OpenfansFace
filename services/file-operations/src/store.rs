@@ -8,7 +8,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use rustix::fs::{FlockOperation, flock};
 use serde_json::{Value, json};
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     path::Path,
 };
 
@@ -20,14 +20,10 @@ impl Store {
     pub fn start(config: &Config) -> Result<Self> {
         fs::create_dir_all(config.state_dir())?;
         let path = config.state_dir().join("executor.lock");
-        let ownership = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)?;
+        let ownership = crate::control::open_executor(&path)?;
         flock(&ownership, FlockOperation::NonBlockingLockExclusive)
             .map_err(|_| Error::new(503, "writer_busy", "另一个 Rust 执行器正在使用此状态目录"))?;
+        crate::control::verify_path(&ownership, &path)?;
         let conn = Connection::open(config.state_db())?;
         let schema: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if schema > 3 {
