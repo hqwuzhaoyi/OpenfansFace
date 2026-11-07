@@ -1,0 +1,40 @@
+{
+  "change": "L1 mandatory fail-closed legacy_reference_compatibility release gate",
+  "implementation_base": "bd0787c",
+  "real_data_gate": "unresolved",
+  "existing_supplied_audit": {
+    "assigned_legacy_caches": 189,
+    "direct_metadata_compatible": 179,
+    "unproven_pre_rust_archived_inputs": 10,
+    "affected_current_reference_names": 1,
+    "alternative_scalar_eligible_face_rows": 8,
+    "numerical_reference_effect": "unknown; no vector inspection authorized",
+    "new_production_inspection_in_this_change": false
+  },
+  "verification": {
+    "scalar_diagnostic_tests": 5,
+    "controller_regression_tests": 24,
+    "rust_tests": 72,
+    "actual_http": "Native rename and forced-copy origin metadata proofs pass under CLOSED admission; analysis-state remains refused; existing references.npz bytes unchanged",
+    "strict_cache_regression": "Genuine native processing publication, forced archive copy, chained rename, unrelated proof stability, cache tamper and replaced inode guards pass",
+    "blocked_cases": [
+      "ten old path-only cache inputs despite complete historical manifest",
+      "missing named gate",
+      "two-file rename parity substituted for compatibility evidence",
+      "hashed passed flag with failed or unknown audit",
+      "changed frozen inputs",
+      "malformed cache/JSON/SQLite",
+      "symlink cache inventory",
+      "pending native recovery"
+    ],
+    "read_policy": "stdlib only; whitelisted scalar NPY members; query-only read-only SQLite source IDs/paths; no embedding/image/model loading or media-content reads",
+    "public_diagnostics": "aggregate counts, reasons and hashed identifiers; private paths/names omitted",
+    "controller_rehearsal": "18-stage actual isolated Docker rehearsal passed with a specifically named simulated legacy gate; cached native image/schema and simulated protocol peers retain prior limitations",
+    "native_query_scope": "Only file-move fields, source identity, per-file move proof and successful indexes are fetched; full plan/domain/face-BLOB snapshots are not returned to the diagnostic",
+    "file_operation_regression": "Actual native file operation suite including durable crash checkpoints passed after movement-proof SQL projection"
+  },
+  "automatic_adoption_or_rescan": false,
+  "production_service_changes": false,
+  "production_reference_writes": false,
+  "release_or_gpu_acceptance_claimed": false
+}

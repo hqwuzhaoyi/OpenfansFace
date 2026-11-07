@@ -139,6 +139,12 @@
       "passed": false,
       "path": "/PRIVATE/evidence/writer_retirement.json",
       "sha256": "FREEZE_EVIDENCE_DIGEST"
+    },
+    "legacy_reference_compatibility": {
+      "passed": false,
+      "path": "/PRIVATE/evidence/legacy_reference_compatibility.json",
+      "sha256": "FREEZE_EVIDENCE_DIGEST",
+      "status": "unresolved"
     }
   },
   "probes": [
@@ -238,5 +244,6 @@
     "timer": "face-video-health.timer",
     "service": "face-video-health.service"
   },
-  "legacy_terminal_acknowledgements": {}
+  "legacy_terminal_acknowledgements": {},
+  "media_root": "/PRIVATE/media"
 }

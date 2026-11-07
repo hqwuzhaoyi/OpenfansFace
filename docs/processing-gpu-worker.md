@@ -143,3 +143,12 @@ binary. It opens a delivered review session, publishes a changed suggestion
 through the actual worker/native flow, checks frozen rows/data/group and pending
 updates, then confirms using the original delivered token. Refresh and receipt
 replay keep batch completion at one.
+
+Before first candidate enablement, the release controller additionally requires
+`legacy_reference_compatibility`: a fresh bounded scalar-only audit of assigned
+legacy NPZ inputs matching frozen reviewed evidence. Unproven pre-Rust moves
+remain blockers; old history paths do not establish native provenance. The audit
+preserves `references.npz`, reads no vectors/images/models and never triggers a
+rescan. See `docs/native-release.md` for the diagnostic and failure semantics.
+Closed native admission already prevents standalone candidate discovery from
+passing `analysis-state` and replacing references before the release gate opens.

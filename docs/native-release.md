@@ -297,3 +297,60 @@ failure. Marker and ownership-record FIFO/symlink/oversize/corruption cases are
 bounded and preserve foreign objects. The actual Docker controller rehearsal
 was rerun with the repaired prepared-inode publication protocol; its simulated
 peer/GPU boundaries above still apply.
+
+## Legacy reference compatibility gate
+
+`legacy_reference_compatibility` is mandatory and separate from rename/path
+parity. The observed pre-Rust audit has 189 assigned legacy caches: 179 direct
+metadata matches and 10 unproven archived inputs. One current reference name is
+affected, but it also has eight scalar-eligible face rows. Numerical survival is
+unknown; these counts neither prove template loss nor establish compatibility.
+The gate remains unresolved until a separately reviewed migration disposition
+supplies adequate evidence. Old `complete` manifests/history cannot become native
+inode/digest proof, and no automatic adoption or rescan is authorized.
+
+Run the bounded diagnostic using explicit local paths or `FACES_BASE` and
+`MEDIA2_ROOT`; `FILE_OPERATIONS_RUST_URL` and its token are optional for checking
+already completed native moves:
+
+```sh
+python3 maintenance/legacy_reference_audit.py --base /PRIVATE/base --media-root /PRIVATE/media
+```
+
+It opens only `version.npy`, `path.npy`, `size.npy`, `mtime_ns.npy` and optional
+`model_hashes.npy` in assigned legacy caches. It does not import NumPy/models,
+open embedding/image members, read media bytes or rebuild references. SQLite is
+read-only/query-only and selects only source IDs/paths. Unreadable/malformed
+inputs, observed drift, unavailable required native proof and exceeded bounds
+are explicit failed/unknown results, never zero omissions. Output is aggregates,
+rejection reasons and hashed identifiers, with an input version; actual private
+paths/names are not printed. Existing `references.npz` is only stat'ed and remains
+unchanged. A read-only SQLite failure is a blocker, not permission to reopen it
+for writes or ignore missing WAL state.
+
+Save and review the diagnostic JSON privately, then reference its exact hash in
+the named manifest evidence entry. A `passed:true` wrapper is insufficient:
+`fence-peers`, `replace`/`rollback` and `open` require a complete passed diagnostic,
+rerun the current scalar audit, require zero unresolved/unknown inputs and match
+its input version/counts to the frozen evidence. Failure occurs before the first
+service pause/stop/replacement/open operation. The separate two-file rename
+comparison cannot satisfy this gate. A changed source set requires a new audit;
+the controller never changes worker state or reference artifacts to make it pass.
+
+The native `/v1/reference-origin` read supports the audit under closed write
+admission. It reuses the strict completed per-file movement-chain validator,
+checks bounded native history and current identity, and reads no cache/media
+content. Its SQL projects only file-move fields, source identities, movement
+proofs and successful indexes; it never fetches complete historical domain
+snapshots that can contain face BLOB values. Its `metadata_only:true` result is a diagnostic, **not** cache adoption
+or feature acceptance; the worker's existing NPZ hash/model/vector checks remain
+unchanged. Pending or recovery records and a held shared gate refuse proof.
+Candidates still start paused with native admission closed; startup discovery's
+`analysis-state` call is rejected before reference construction until the
+controller passes the fresh gate and opens admission. This change does not pause
+or otherwise alter the currently running production worker.
+
+Only a strictly marked isolated controller rehearsal may use a named simulated
+passed legacy gate. Such evidence is rejected outside the existing fixture
+path/container/network ownership guard. Passing this metadata gate does not
+replace numerical/model acceptance or clear the unresolved real-data/GPU gates.
