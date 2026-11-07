@@ -13,6 +13,7 @@ mod metadata;
 mod model;
 mod native;
 mod permissions;
+mod person_delete;
 mod person_directory;
 mod person_ledger;
 mod person_metadata;

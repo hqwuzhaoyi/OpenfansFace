@@ -88,17 +88,27 @@ pub fn intent(plan: &Plan) -> Result<Option<Inventory>> {
 pub fn roots(config: &Config, plan: &Plan) -> (PathBuf, PathBuf) {
     (
         config.creators().join(&plan.person),
-        config.creators().join(&plan.target_person),
+        if plan.action == "delete-person" {
+            crate::staging::root(config)
+                .join("person-deletions")
+                .join(&plan.id)
+                .join(&plan.person)
+        } else {
+            config.creators().join(&plan.target_person)
+        },
     )
 }
 pub fn approved(config: &Config, plan: &Plan, path: &str) -> bool {
-    if plan.action != "rename-person" {
+    if !["rename-person", "delete-person"].contains(&plan.action.as_str()) {
         return false;
     }
     let (_, target) = roots(config, plan);
     intent(plan).ok().flatten().is_some_and(|i| {
-        i.directories
-            .iter()
-            .any(|d| d.dst == path && Path::new(path).starts_with(&target))
+        i.directories.iter().any(|d| {
+            (d.dst == path && Path::new(path).starts_with(&target))
+                || (plan.action == "delete-person"
+                    && Path::new(&d.dst).starts_with(path)
+                    && Path::new(path).starts_with(crate::staging::root(config)))
+        })
     })
 }

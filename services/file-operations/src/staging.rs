@@ -364,7 +364,7 @@ pub fn snapshot(config: &Config, plan: &Plan, successful: &[usize]) -> Result<Do
     if successful.iter().copied().ne(0..plan.files.len()) {
         return Err(Error::conflict("暂存操作必须提交完整范围"));
     }
-    let deleting = plan.action == "delete-files";
+    let deleting = ["delete-files", "delete-person"].contains(&plan.action.as_str());
     let mut domain_plan = plan.clone();
     if !deleting && !plan.target_person.is_empty() {
         domain_plan.action = "move-files".into();
