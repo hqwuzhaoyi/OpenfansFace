@@ -1,8 +1,12 @@
 import type { LibraryPerson } from './person-library-model'
 export type PersonSort='recent'|'name-asc'|'name-desc'|'videos-desc'|'videos-asc'|'bytes-desc'|'bytes-asc'
-export function sortedLibraryPeople(people:LibraryPerson[],query:string,sort:PersonSort):LibraryPerson[]{
+export function matchesPersonQuery(person:{name:string;aliases?:string[]},query:string){
   const words=query.trim().normalize('NFKC').toLowerCase().split(/\s+/).filter(Boolean)
-  const filtered=people.filter(person=>{const text=[person.name,...(person.aliases||[])].join(' ').normalize('NFKC').toLowerCase();return words.every(word=>text.includes(word))})
+  const text=[person.name,...(person.aliases||[])].join(' ').normalize('NFKC').toLowerCase()
+  return words.every(word=>text.includes(word))
+}
+export function sortedLibraryPeople(people:LibraryPerson[],query:string,sort:PersonSort):LibraryPerson[]{
+  const filtered=people.filter(person=>matchesPersonQuery(person,query))
   return filtered.sort((a,b)=>{
     let order=0
     if(sort.startsWith('videos')||sort.startsWith('bytes')){

@@ -1,22 +1,29 @@
 'use client'
-import { useState } from 'react'
-import { Search, Check } from 'lucide-react'
+import { useRef, useState } from 'react'
+import { Check, Eye, Plus, X, ArrowLeft } from 'lucide-react'
+import { matchesPersonQuery } from '@/lib/person-list-model'
 import { PersonReference } from './person-reference'
 import { WorkspaceSearch } from '@/components/workbench/controls'
+import { WorkspaceButton as Button, WorkspaceInput, WorkspaceField, WorkspaceMessage } from '@/components/workbench/inner'
 
-export interface PersonChoice { name: string; rep_thumb: string | null; sim?: number; recent_at?:string }
-export function PersonPicker({ people, suggestions = [], value, onChange, disabled, loading=false,error='',onRetry,compact=false }: {compact?:boolean; people: PersonChoice[]; suggestions?: PersonChoice[]; value: string; onChange: (s: string) => void; disabled?: boolean; loading?:boolean;error?:string;onRetry?:()=>void }) {
-  const [q,setQ]=useState(''),[expanded,setExpanded]=useState(false)
-  const recent=people.filter(p=>p.recent_at).slice(0,4)
-  const combined=[...new Map([...recent,...suggestions,...people].map(p=>[p.name,p])).values()].slice(0,12)
-  const choices=q?people.filter(v=>v.name.toLowerCase().includes(q.toLowerCase())):expanded?people:combined
-  return <div className="space-y-3">
-    <div data-keyboard-hide><p className="text-sm font-medium">选择归给谁</p>{!compact&&<p className="mt-1 text-xs text-muted-foreground">点人物只选名字；点击“看对照”可以播放她的已知视频。最后再批量确认。</p>}</div>
-    <WorkspaceSearch value={q} onChange={setQ} label="搜索全部人物" disabled={disabled}/>
-    <label className="block space-y-1 text-xs text-muted-foreground"><span>选中人物，或输入新名字</span><input value={value} disabled={disabled} onChange={e=>onChange(e.target.value)} placeholder="人物名" aria-label="归名人物" enterKeyHint="done" autoCorrect="off" autoCapitalize="none" onKeyDown={e=>{if(e.key==='Enter'){e.preventDefault();e.currentTarget.blur()}}} className="h-8 w-full rounded-[8px] border bg-background px-2.5 text-xs text-foreground outline-none focus-visible:ring-2 focus-visible:ring-ring max-md:min-h-11 max-md:text-base"/></label>
-    {!q&&suggestions.length>0&&!expanded&&<p className="text-xs text-muted-foreground">最近使用的人物会排在前面；系统推荐仅供参考。</p>}
-    <div className={`grid grid-cols-2 gap-2 lg:max-h-64 lg:overflow-y-auto lg:overscroll-contain ${compact?'':'sm:grid-cols-3'}`}>{choices.map(p=><div key={p.name} className={`min-w-0 overflow-hidden rounded-[8px] border ${value===p.name?'border-[var(--wb-success)]/50 bg-[var(--wb-success-soft)]':'bg-background'}`}><button type="button" disabled={disabled} onClick={()=>{onChange(p.name);if(matchMedia('(pointer:coarse)').matches&&document.activeElement instanceof HTMLElement)document.activeElement.blur()}} className="flex min-h-16 w-full items-center gap-2 p-2 text-left" aria-label={`选择人物 ${p.name}`} aria-pressed={value===p.name}>{p.rep_thumb?<img data-private-media draggable={false} src={p.rep_thumb} alt="" loading="lazy" className="h-10 w-10 shrink-0 rounded-full object-cover"/>:<span className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-muted text-xs">{p.name.slice(0,2)}</span>}<span className="min-w-0 flex-1 break-all text-xs font-medium">{p.name}{p.recent_at&&<span className="mt-1 block text-[10px] font-normal text-muted-foreground">最近使用</span>}</span>{value===p.name&&<Check className="h-4 w-4 shrink-0 text-[var(--wb-success)]"/>}</button><div className="border-t p-1"><PersonReference name={p.name} compact/></div></div>)}{!choices.length&&<div className="col-span-full space-y-2 p-2 text-xs text-muted-foreground"><p role={error?'alert':'status'}>{loading?'加载人物…':error?'人物加载失败，可重试或直接输入名字':'没有匹配的人物，也可以直接输入名字'}</p>{error&&onRetry&&<button type="button" onClick={onRetry} className="min-h-8 rounded-[8px] border px-3 max-md:min-h-11">重新加载人物</button>}</div>}</div>
-    {!q&&<button type="button" onClick={()=>setExpanded(v=>!v)} className="min-h-8 text-xs text-muted-foreground underline underline-offset-4 max-md:min-h-11">{expanded?'收起全列表':'查看全部人物'}</button>}
-
-  </div>
+export interface PersonChoice { name: string; rep_thumb: string | null; aliases?:string[];sim?: number; recent_at?:string }
+export function PersonPicker({people,suggestions=[],value,onChange,disabled,loading=false,error='',onRetry,onReference,search,onSearchChange}:{search?:string;onSearchChange?:(value:string)=>void;compact?:boolean;people:PersonChoice[];suggestions?:PersonChoice[];value:string;onChange:(value:string)=>void;disabled?:boolean;loading?:boolean;error?:string;onRetry?:()=>void;onReference?:(name:string)=>void}){
+  const [localQuery,setLocalQuery]=useState(''),[creating,setCreating]=useState(false),previous=useRef(value),newInput=useRef<HTMLInputElement>(null)
+  const query=search??localQuery,setQuery=onSearchChange??setLocalQuery
+  const combined=[...new Map([...people.filter(p=>p.recent_at),...suggestions,...people].map(p=>[p.name,p])).values()]
+  const choices=combined.filter(p=>matchesPersonQuery(p,query))
+  const startCreate=()=>{previous.current=value;setCreating(true);onChange(query.trim());requestAnimationFrame(()=>newInput.current?.focus())}
+  const cancelCreate=()=>{onChange(previous.current);setCreating(false)}
+  return <section className="ws-person-picker" aria-label="归名人物选择">
+    <div className="ws-person-choice"><strong>{creating?'新人物':value||'选择人物'}</strong>{value&&!creating&&<Button variant="ghost" size="icon" aria-label="清空归名人物" title="清空人物" disabled={disabled} onClick={()=>onChange('')}><X size={14}/></Button>}{!creating&&<Button variant="ghost" disabled={disabled} onClick={startCreate}><Plus size={14}/>新建人物</Button>}</div>
+    {creating?<div className="ws-create-person"><WorkspaceField label="新人物名称"><WorkspaceInput ref={newInput} value={value} disabled={disabled} maxLength={120} aria-label="归名人物" autoComplete="off" autoCorrect="off" autoCapitalize="none" onChange={e=>onChange(e.target.value)}/></WorkspaceField><Button variant="ghost" disabled={disabled} onClick={cancelCreate}><ArrowLeft size={14}/>返回人物列表</Button></div>:<>
+      <WorkspaceSearch value={query} onChange={setQuery} label="搜索全部人物" placeholder="搜索人物或别名…" disabled={disabled}/>
+      {error&&<WorkspaceMessage error>{error}{onRetry&&<Button variant="outline" disabled={disabled||loading} onClick={onRetry}>重试</Button>}</WorkspaceMessage>}
+      <div className="ws-person-options" role="group" aria-label="可选人物" aria-busy={loading}>{loading&&!people.length?<WorkspaceMessage>读取人物…</WorkspaceMessage>:choices.map(person=><div key={person.name} className="ws-person-option" data-selected={value===person.name}>
+        <Button variant="ghost" className="ws-person-select" disabled={disabled} onClick={()=>onChange(person.name)} aria-label={`选择人物 ${person.name}`} aria-pressed={value===person.name}>{person.rep_thumb?<img data-private-media draggable={false} src={person.rep_thumb} alt="" loading="lazy"/>:<span className="ws-person-initial">{person.name.slice(0,1)}</span>}<span className="ws-person-name">{person.name}</span>{value===person.name&&<Check size={14}/>}</Button>
+        {onReference?<Button variant="ghost" size="icon" disabled={disabled} aria-label={`看 ${person.name} 的对照视频`} title="查看对照视频" onClick={()=>onReference(person.name)}><Eye size={14}/></Button>:<PersonReference name={person.name} compact/>}
+      </div>)}</div>
+      {!loading&&!error&&!choices.length&&<WorkspaceMessage>没有匹配的人物。<Button variant="ghost" disabled={disabled} onClick={startCreate}>新建人物</Button></WorkspaceMessage>}
+    </>}
+  </section>
 }

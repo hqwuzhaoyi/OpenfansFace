@@ -2,6 +2,7 @@
 import Link from 'next/link'
 import { ArrowRight, Check, Undo2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
+import { WorkspaceButton,WorkspaceCard } from '@/components/workbench/inner'
 
 export function ReviewFlow({ step = 1 }: { step?: 1 | 2 | 3 }) {
   return <div className="space-y-2 rounded-xl border bg-card p-3 sm:p-4">
@@ -12,5 +13,5 @@ export function ReviewFlow({ step = 1 }: { step?: 1 | 2 | 3 }) {
   </div>
 }
 export function QueueReceipt({ count, creator, onUndo, busy = false }: { count: number; creator: string; onUndo: () => void; busy?: boolean }) {
-  return <div role="status" className="flex flex-wrap items-center gap-3 rounded-[12px] border border-[var(--wb-success)]/25 bg-[var(--wb-success-soft)] p-3"><div className="min-w-0 flex-1"><p className="text-sm font-medium text-[var(--wb-success)]">已确认 {count} 个视频属于 {creator}，已加入待归档</p><p className="mt-1 text-xs text-muted-foreground">文件仍在原处。下一步：去待归档检查目标路径，再执行归档。</p></div><Button variant="ghost" size="sm" onClick={onUndo} disabled={busy}><Undo2 className="h-3.5 w-3.5" />撤销这次</Button><Button asChild size="sm"><Link href="/integration">查看待归档<ArrowRight className="h-3.5 w-3.5" /></Link></Button></div>
+  return <WorkspaceCard className="ws-result" role="status"><Check size={17}/><div className="min-w-0 flex-1"><strong>已确认 {count} 个视频属于 {creator}</strong><span>已加入待归档，文件暂未移动。</span></div><WorkspaceButton variant="ghost" onClick={onUndo} disabled={busy}><Undo2 size={14}/>撤销这次</WorkspaceButton><Button asChild size="sm"><Link href="/integration">查看待归档<ArrowRight size={14}/></Link></Button></WorkspaceCard>
 }

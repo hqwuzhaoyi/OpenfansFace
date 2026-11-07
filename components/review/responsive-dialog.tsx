@@ -4,7 +4,7 @@ import { DialogContent } from '@/components/ui/dialog'
 import { cn } from '@/lib/utils'
 
 /** Keep an iPhone sheet inside the visual viewport when Safari opens its keyboard. */
-export function ResponsiveDialogContent({open,className,...props}:React.ComponentProps<typeof DialogContent>&{open:boolean}) {
+export function ResponsiveDialogContent({open,className,onEscapeKeyDown,...props}:React.ComponentProps<typeof DialogContent>&{open:boolean}) {
   const [node,setNode]=useState<HTMLDivElement|null>(null)
   useEffect(()=>{
     if(!open||!node)return
@@ -33,5 +33,5 @@ export function ResponsiveDialogContent({open,className,...props}:React.Componen
     schedule()
     return()=>{cancelAnimationFrame(frame);cancelAnimationFrame(scrollFrame);viewport?.removeEventListener('resize',schedule);viewport?.removeEventListener('scroll',schedule);window.removeEventListener('resize',schedule);document.removeEventListener('focusin',schedule);document.removeEventListener('focusout',schedule)}
   },[open,node])
-  return <DialogContent {...props} ref={setNode} className={cn('mobile-review-sheet top-0 left-0 translate-x-0 translate-y-0 lg:top-1/2 lg:left-1/2 lg:-translate-x-1/2 lg:-translate-y-1/2',className)}/>
+  return <DialogContent {...props} onEscapeKeyDown={event=>{if(event.isComposing||event.keyCode===229||(event.target instanceof HTMLInputElement&&event.target.type==='search'&&!!event.target.value&&!!event.target.closest('[data-slot=input-group]'))){event.preventDefault();return}onEscapeKeyDown?.(event)}} ref={setNode} className={cn('mobile-review-sheet top-0 left-0 translate-x-0 translate-y-0 lg:top-1/2 lg:left-1/2 lg:-translate-x-1/2 lg:-translate-y-1/2',className)}/>
 }

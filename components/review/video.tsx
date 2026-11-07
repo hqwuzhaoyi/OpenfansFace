@@ -1,4 +1,5 @@
 'use client'
+import { WorkspacePath } from '@/components/workbench/inner'
 import { PrivateVideo } from '@/components/private-media'
 import { useRef, useState } from 'react'
 import Link from 'next/link'
@@ -11,24 +12,7 @@ import { Dialog, DialogDescription, DialogHeader, DialogTitle } from '@/componen
 import { Button } from '@/components/ui/button'
 import { fileName, type ReviewVideo } from '@/lib/review-ui'
 
-export function PathText({ value, label = '原路径' }: { value: string; label?: string }) {
-  const copy = async () => {
-    try {
-      if (navigator.clipboard?.writeText) await navigator.clipboard.writeText(value)
-      else {
-        const previous=document.activeElement
-        const input = document.createElement('textarea'); input.value = value; input.readOnly=true; input.tabIndex=-1; input.setAttribute('inputmode','none')
-        input.style.position = 'fixed'; input.style.opacity = '0'; document.body.appendChild(input)
-        input.select(); const ok = document.execCommand('copy'); input.remove(); if(previous instanceof HTMLElement)previous.focus({preventScroll:true}); if (!ok) throw new Error()
-      }
-      toast.success('路径已复制')
-    } catch { toast.error('复制失败，可以直接选择路径文字复制') }
-  }
-  return <div className="min-w-0 text-xs text-muted-foreground">
-    <div className="mb-1 flex items-center gap-2"><span>{label}</span><button type="button" className="inline-flex min-h-7 items-center gap-1 rounded px-1 text-muted-foreground hover:text-foreground" onClick={copy} aria-label={`复制${label}`}><Copy className="h-3 w-3" />复制</button></div>
-    <p className="break-all font-mono leading-relaxed text-foreground/65">{value}</p>
-  </div>
-}
+export function PathText({value,label='原路径'}:{value:string;label?:string}){return <WorkspacePath value={value} label={label}/>}
 export function VideoThumbnail({ video, onPlay, className }: { video: ReviewVideo; onPlay: (v: ReviewVideo) => void; className?:string }) {
   return <button type="button" className={cn("video-thumb group relative aspect-video w-28 shrink-0 overflow-hidden rounded-lg border bg-muted sm:w-36",className)} onClick={() => onPlay(video)} aria-label={`播放 ${video.name || fileName(video.vid)}`}>
     {video.thumb && <img data-private-media draggable={false} src={video.thumb} alt="" loading="lazy" className="h-full w-full object-cover" />}
