@@ -215,6 +215,17 @@ fn validate_delta(delta: &Delta) -> Result<()> {
     }) {
         return Err(Error::conflict("账本事务包含错误的存储表"));
     }
+    if delta.changes.guards.iter().any(|guard| {
+        !matches!(
+            guard,
+            db::Guard::AssetPath { .. }
+                | db::Guard::CreatorName { .. }
+                | db::Guard::CreatorCanonical { .. }
+                | db::Guard::AssetLinks { .. }
+        )
+    }) {
+        return Err(Error::conflict("账本事务不能包含其他存储域的查询保护"));
+    }
     Ok(())
 }
 pub fn inspect_delta(config: &Config, plan: &Plan, delta: &Delta) -> Result<String> {
@@ -319,4 +330,34 @@ pub fn cancel_delta(config: &Config, plan: &Plan, delta: &Delta) -> Result<()> {
     }
     tx.commit()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod guard_domain_tests {
+    use super::*;
+    #[test]
+    fn peach_transactions_reject_local_file_guards() {
+        let mut delta = Delta {
+            changes: db::Delta {
+                tables: vec![],
+                guards: vec![db::Guard::AssetPath {
+                    path: "a".into(),
+                    before: vec![],
+                    after: vec![],
+                }],
+            },
+            creators: vec![],
+        };
+        validate_delta(&delta).unwrap();
+        for table in [db::Table::Videos, db::Table::Tasks, db::Table::Settings] {
+            delta.changes.guards = vec![db::Guard::LocalFiles {
+                table,
+                vids: vec![],
+                paths: vec![],
+                before: vec![],
+                after: vec![],
+            }];
+            assert!(validate_delta(&delta).is_err());
+        }
+    }
 }

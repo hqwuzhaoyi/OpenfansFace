@@ -596,6 +596,18 @@ fn validate_delta_domain(delta: &db::Delta, jobs: bool) -> Result<()> {
     }) {
         return Err(Error::conflict("本地事务包含错误的存储表"));
     }
+    let expected = if jobs {
+        db::Table::Tasks
+    } else {
+        db::Table::Videos
+    };
+    if delta
+        .guards
+        .iter()
+        .any(|guard| !matches!(guard, db::Guard::LocalFiles { table, .. } if *table == expected))
+    {
+        return Err(Error::conflict("本地事务包含其他存储域的查询保护"));
+    }
     Ok(())
 }
 fn apply_delta_domain(
@@ -668,4 +680,66 @@ fn compensate_delta_domain(
     )?;
     tx.commit()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod guard_domain_tests {
+    use super::*;
+    fn local(table: db::Table) -> db::Guard {
+        db::Guard::LocalFiles {
+            table,
+            vids: vec![],
+            paths: vec![],
+            before: vec![],
+            after: vec![],
+        }
+    }
+    #[test]
+    fn local_transactions_reject_guards_for_other_stores() {
+        for jobs in [false, true] {
+            let expected = if jobs {
+                db::Table::Tasks
+            } else {
+                db::Table::Videos
+            };
+            let other = if jobs {
+                db::Table::Videos
+            } else {
+                db::Table::Tasks
+            };
+            let mut delta = db::Delta {
+                tables: vec![],
+                guards: vec![local(expected)],
+            };
+            validate_delta_domain(&delta, jobs).unwrap();
+            for guard in [
+                local(other),
+                local(db::Table::Settings),
+                db::Guard::AssetPath {
+                    path: "a".into(),
+                    before: vec![],
+                    after: vec![],
+                },
+                db::Guard::CreatorName {
+                    canonical: "a".into(),
+                    normalized: "a".into(),
+                    before: vec![],
+                    after: vec![],
+                },
+                db::Guard::CreatorCanonical {
+                    canonical: "a".into(),
+                    before: vec![],
+                    after: vec![],
+                },
+                db::Guard::AssetLinks {
+                    asset_id: json!({"$integer":"1"}),
+                    before: vec![],
+                    after: vec![],
+                },
+            ] {
+                delta.guards = vec![guard];
+                assert!(validate_delta_domain(&delta, jobs).is_err());
+            }
+        }
+    }
 }
