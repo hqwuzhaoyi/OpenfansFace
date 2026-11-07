@@ -184,3 +184,55 @@ writes, and legacy serialization. Existing native HTTP and recovery suites still
 The shared tests run only in newly marked isolated `/tmp` fixtures; copy tests exercise the
 same primitive directly. Production NFS multi-file/cross-device deployment remains unproven
 until the feature and deployment acceptance runs complete.
+
+### Native confirmation and ordinary archive (#5)
+
+`POST /v1/archive` accepts `{command,body}` on the existing bounded writer queue.
+Commands are `queue-confirm`, `queue-undo`, `claim-decide`, `archive-preview`,
+`archive-apply`, and `archive-reconcile`. `GET /v1/archive?id=<UUID>` returns the
+legacy `{job,result?}` presentation; omitting the ID selects the latest archive.
+Next's existing queue/claims/plan endpoints are transport adapters when the
+explicit Rust feature switch is enabled. There is no execution fallback after a
+native request fails. The duplicate-resolution endpoint remains ticket #6.
+
+Confirmation preserves review file fingerprints, group/deferred checks, common
+account evidence, notes, source links and stable IDs. Confirmation and undo have
+zero media files and no Peach transaction. Optional account-rule persistence and
+processing-state restoration use deterministic, separately journaled zero-file
+follow-ups on the **same Engine**. The mandatory human decision first records an
+honest warning. Only a proven follow-up commit clears it; known failures remain
+warnings, and replay never repeats a committed follow-up. Both optional commands
+verify their exact intent against the completed parent receipt.
+
+Ordinary archive versions include source fingerprints and affected index/task,
+metadata and Peach records. Unrelated task/entity changes do not expire them.
+Native preflight requires exactly one active source asset, an unoccupied target,
+and unambiguous canonical/lowercase-normalized creator lookup. Missing creators
+are allocated inside the Peach transaction, using actual schema defaults and
+constraints. Existing IDs, all existing link roles/sources and audit text survive.
+
+Archive uses the common runner's `ContinueUnchanged` policy. Proven untouched
+file failures remain queued; the persisted successful index set determines one
+aggregate local/Peach commit. A failed ledger transaction compensates that whole
+successful subset. A confirmed ledger commit is recovered forward, including a
+lost final reply. Results include the final file locations, actual failed files,
+and `manifest: "rust:<operation-id>"` referring to the durable operation journal.
+The deprecated filesystem-manifest rollback endpoint is not a native undo API.
+
+Run on marked isolated fixtures only:
+
+```sh
+cargo test --manifest-path services/file-operations/Cargo.toml --locked
+cargo clippy --manifest-path services/file-operations/Cargo.toml --locked --all-targets -- -D warnings
+cargo build --manifest-path services/file-operations/Cargo.toml --locked
+python3 tests/http-rust-archive.py --port 18981
+python3 tests/http-rust-archive-gateway.py --port 18981
+```
+
+The gateway harness additionally uses reserved Next port 18980. The native suite
+uses real bytes, the observed Peach schema and the processing schema. It covers
+partial commits, actual SQLite and permission failures, late target races,
+concurrent confirmation, scoped versions, 5000-ID requests, duplicate submits,
+never-started fences, and process exits at multi-file/transaction/optional-child
+boundaries. The service's fixture PATH excludes external executables. These
+checks do not authorize or perform production media changes.

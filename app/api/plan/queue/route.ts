@@ -1,3 +1,4 @@
+import { nativeArchiveEnabled, nativeArchive } from '@/lib/archive-native-backend'
 import { matchesReviewSelection } from '@/lib/processing-model'
 import { rememberPerson } from '@/lib/people-catalog'
 import { canonicalPersonName } from '@/lib/person-names'
@@ -16,6 +17,8 @@ import { acquireReviewLock, queuedWithOrigin, loadDecisions, loadArchive, videoI
 import { enqueueItems, undoItems, origin, validateCreator, validateVids, ReviewError, type ReviewSource } from '@/lib/review-logic'
 
 export async function POST(req: NextRequest) {
+  try {if(nativeArchiveEnabled())return NextResponse.json(await nativeArchive('queue-confirm',await req.json()),{headers:{'Cache-Control':'no-store'}})}
+  catch(error:any){return NextResponse.json({error:error.message,code:error.code,path:error.path,step:error.step},{status:error.status||500})}
   let release: (() => void) | undefined
   try {
     const body = await req.json()
@@ -69,6 +72,8 @@ export async function POST(req: NextRequest) {
   finally { release?.() }
 }
 export async function DELETE(req: NextRequest) {
+  try {if(nativeArchiveEnabled())return NextResponse.json(await nativeArchive('queue-undo',await req.json()),{headers:{'Cache-Control':'no-store'}})}
+  catch(error:any){return NextResponse.json({error:error.message,code:error.code,path:error.path,step:error.step},{status:error.status||500})}
   let release: (() => void) | undefined
   try {
     const vids = validateVids((await req.json()).vids)
