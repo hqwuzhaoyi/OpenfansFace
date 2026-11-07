@@ -15,7 +15,7 @@ try:
     env = {
         **f.env,
         "PATH": os.environ["PATH"],
-        "FILE_OPERATIONS_BACKEND": "rust",
+        "FILE_OPERATIONS_BACKEND": "legacy",  # retired selector cannot revive old writes
         "FILE_OPERATIONS_ENABLE_RUST": "1",
         "FILE_OPERATIONS_RUST_URL": f.url,
         "NEXT_TELEMETRY_DISABLED": "1",
@@ -81,6 +81,18 @@ try:
     assert result["ok"] and result["moved"] == 1, result
     progress = call("/api/plan/progress?id=" + op)
     assert progress["result"] == result
+    legacy_id = str(native.uuid.uuid4())
+    legacy_job = {**progress['job'], 'id':legacy_id, 'started_at':1, 'updated_at':2, 'finished_at':2}
+    legacy_result = {'ok':True,'moved':1,'remaining':0,'errors':[]}
+    native.write(f.base/'jobs/archive.json',legacy_job)
+    native.write(f.base/'archive-runs'/f'{legacy_id}.json',{'job':legacy_job,'result':legacy_result})
+    assert call('/api/plan/progress')['job']['id']==op
+    assert call('/api/plan/progress?id='+legacy_id)['result']==legacy_result
+    assert any(j['id']==op for j in call('/api/home/tasks')['jobs'])
+    for route in ('/api/plan/rollback','/api/watermarks'):
+        request=urllib.request.Request(base+route,data=b'{}',headers={'Content-Type':'application/json'})
+        try:urllib.request.urlopen(request);raise AssertionError('retired writer accepted')
+        except urllib.error.HTTPError as error:assert error.code==410,error.read()
     # Follow the job's actual navigation target through Next, not a mirrored string assertion.
     with urllib.request.urlopen(base + progress["job"]["href"], timeout=30) as page:
         assert page.status == 200

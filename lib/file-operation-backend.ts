@@ -2,9 +2,8 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { BASE } from './env'
-import { previewPersonFiles, applyPersonFiles } from './person-file-operations'
 import { invalidateIntegrationCache } from './integration'
-import { claimFileOperation, fileOperationOwner, selectedPersonFileBackend, validateFileOperationId, FileOperationRoutingError, type FileOperationBackendName } from './file-operation-routing'
+import { fileOperationOwner, selectedPersonFileBackend, validateFileOperationId, FileOperationRoutingError, type FileOperationBackendName } from './file-operation-routing'
 import type { PersonFileRequest, PersonFilePlan, PersonFileResult } from './person-file-model'
 
 export interface PersonFileOperationStatus {
@@ -17,8 +16,8 @@ interface PersonFileBackend {
   status(id:string):Promise<PersonFileOperationStatus>
 }
 const legacy:PersonFileBackend={
-  preview:previewPersonFiles,
-  apply:applyPersonFiles,
+  async preview(){throw new FileOperationRoutingError('旧执行器已退役，请重新预览',410)},
+  async apply(){throw new FileOperationRoutingError('旧执行器已退役，请核对历史回执',410)},
   async status(id){
     try{
       const operation=JSON.parse(fs.readFileSync(path.join(BASE,'person-operations',id,'operation.json'),'utf8'))
@@ -71,7 +70,8 @@ function dispatch(request:PersonFileRequest):PersonFileBackend {
   if(!request||typeof request!=='object'||typeof request.action!=='string')throw new FileOperationRoutingError('缺少操作请求',400)
   validateFileOperationId(request.id)
   const backend=selectedPersonFileBackend(request.action)
-  claimFileOperation(BASE,request.id,request.action,backend)
+  const owner=fileOperationOwner(BASE,request.id)
+  if(owner && (owner.backend!==backend||owner.action!==request.action))throw new FileOperationRoutingError('旧操作不能转交新执行器，请重新预览')
   return backends[backend]
 }
 export function previewPersonFileOperation(request:PersonFileRequest){

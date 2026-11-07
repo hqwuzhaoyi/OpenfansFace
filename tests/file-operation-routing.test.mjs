@@ -7,9 +7,9 @@ import {randomUUID} from 'node:crypto'
 import {claimFileOperation,fileOperationOwner,selectedPersonFileBackend} from '../lib/file-operation-routing.ts'
 
 function fixture(t){const base=fs.mkdtempSync(path.join(os.tmpdir(),'face-routing-test-'));t.after(()=>fs.rmSync(base,{recursive:true,force:true}));return base}
-test('provider selection defaults to legacy and Rust opt-in selects migrated rename and move capabilities',()=>{
- assert.equal(selectedPersonFileBackend('rename-file',{}),'legacy')
- assert.throws(()=>selectedPersonFileBackend('rename-file',{FILE_OPERATIONS_BACKEND:'rust'}),{status:503})
+test('all migrated writes use native authority regardless of old configuration',()=>{
+ assert.equal(selectedPersonFileBackend('rename-file',{}),'rust')
+ assert.equal(selectedPersonFileBackend('rename-file',{FILE_OPERATIONS_BACKEND:'legacy'}),'rust')
  const enabled={FILE_OPERATIONS_BACKEND:'rust',FILE_OPERATIONS_ENABLE_RUST:'1'}
  assert.equal(selectedPersonFileBackend('rename-file',enabled),'rust')
  assert.equal(selectedPersonFileBackend('move-files',enabled),'rust')
@@ -18,7 +18,7 @@ test('provider selection defaults to legacy and Rust opt-in selects migrated ren
  assert.equal(selectedPersonFileBackend('rename-person',enabled),'rust')
  assert.equal(selectedPersonFileBackend('delete-person',enabled),'rust')
  assert.equal(selectedPersonFileBackend('merge-person',enabled),'rust')
- assert.throws(()=>selectedPersonFileBackend('rename-file',{FILE_OPERATIONS_BACKEND:'typo'}),{status:503})
+ assert.throws(()=>selectedPersonFileBackend('unknown',{}),{status:400})
 })
 test('one operation ID has one immutable backend and action',t=>{
  const base=fixture(t),id=randomUUID()

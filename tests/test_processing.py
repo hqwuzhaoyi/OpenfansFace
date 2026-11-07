@@ -8,7 +8,8 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'maintenance'))
-from processing_store import connect, set_setting, reconcile, claim, fail, recover, finish
+from processing_fixture import finish
+from processing_store import connect, set_setting, reconcile, claim, fail, recover
 from processing_logic import candidates_from_text, can_skip_face, folder_hints, resolve_candidates
 from processing_worker import discover, process_one as worker_process_one
 
@@ -28,6 +29,7 @@ class ProcessingTests(unittest.TestCase):
         self.root = Path(self.temp.name) / 'media'; self.root.mkdir()
         self.file = self.root / 'one.mp4'; self.file.write_bytes(b'fixture-video')
         self.item = dict(vid='one', path=str(self.file), name=self.file.name, size=self.file.stat().st_size, mtime_ns=str(self.file.stat().st_mtime_ns))
+        (self.base / '.processing-fixture').write_text('isolated processing fixture')
         self.db = connect(self.base)
         import numpy as np
         np.savez(self.base / 'processing/references.npz', input_version='a'*64)

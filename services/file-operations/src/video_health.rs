@@ -985,7 +985,7 @@ pub fn summary(config: &Config) -> Result<Value> {
 }
 
 fn dispatch(
-    worker: &std::sync::mpsc::SyncSender<crate::Work>,
+    worker: &crate::admission::AcceptedPublisher,
     command: &str,
     body: Value,
 ) -> Result<Value> {
@@ -1009,11 +1009,7 @@ fn configured(key: &str, default: u64, max: u64) -> u64 {
         .unwrap_or(default)
         .min(max)
 }
-fn scheduled(
-    config: Config,
-    worker: std::sync::mpsc::SyncSender<crate::Work>,
-    stop: Arc<AtomicBool>,
-) {
+fn scheduled(config: Config, worker: crate::admission::Worker, stop: Arc<AtomicBool>) {
     let budget = configured("VIDEO_HEALTH_BUDGET", 300, 1000) as usize;
     let seconds = configured("VIDEO_HEALTH_SECONDS", 1200, 1200);
     let mut next = report(&config)
@@ -1031,8 +1027,15 @@ fn scheduled(
             std::thread::sleep(Duration::from_millis(200));
             continue;
         }
+        let cycle = match worker.begin_publisher() {
+            Ok(cycle) => cycle,
+            Err(_) => {
+                next = clock(&config) + 60;
+                continue;
+            }
+        };
         let run_id = uuid::Uuid::new_v4().to_string();
-        if let Err(error) = dispatch(&worker, "health-start", json!({"run_id":run_id})) {
+        if let Err(error) = dispatch(&cycle, "health-start", json!({"run_id":run_id})) {
             eprintln!("health start: {}", error.error);
             next = clock(&config) + 60;
             continue;
@@ -1041,10 +1044,10 @@ fn scheduled(
             Ok(result) => json!({"run_id":run_id,"result":result}),
             Err(error) => json!({"run_id":run_id,"error":error.error}),
         };
-        if let Err(error) = dispatch(&worker, "health-finish", body) {
+        if let Err(error) = dispatch(&cycle, "health-finish", body) {
             eprintln!("health publish: {}", error.error);
             let _ = dispatch(
-                &worker,
+                &cycle,
                 "health-finish",
                 json!({"run_id":run_id,"error":format!("发布前资料变化或发布失败：{}",error.error)}),
             );
@@ -1054,7 +1057,7 @@ fn scheduled(
 }
 pub fn spawn(
     config: Config,
-    worker: std::sync::mpsc::SyncSender<crate::Work>,
+    worker: crate::admission::Worker,
     stop: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
@@ -1102,6 +1105,7 @@ mod tests {
             ledger: root.join("ledger.db"),
             bind: "127.0.0.1:0".into(),
             token: None,
+            parity_root: None,
             fixture: Some(root),
         };
         let db = rusqlite::Connection::open(config.base.join("faces.db")).unwrap();

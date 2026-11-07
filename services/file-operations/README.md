@@ -18,7 +18,24 @@ FILE_OPERATIONS_BIND=127.0.0.1:8930 \
 services/file-operations/target/debug/face-file-operations
 ```
 
-Next selects this service using `FILE_OPERATIONS_BACKEND=rust`, `FILE_OPERATIONS_ENABLE_RUST=1` and `FILE_OPERATIONS_RUST_URL=http://127.0.0.1:8930`. `FILE_OPERATIONS_RUST_TOKEN` must match in both processes when configured. Non-loopback binding requires a nonempty token. Default routing remains legacy. No production cutover is performed by building or testing this crate.
+Next routes migrated writes exclusively to `FILE_OPERATIONS_RUST_URL=http://127.0.0.1:8930`. `FILE_OPERATIONS_RUST_TOKEN` must match in both processes when configured. Non-loopback binding requires a nonempty token. Legacy configuration flags cannot revive the retired writer. No production cutover is performed by building or testing this crate.
+
+## Release controls
+
+See [native release and compatible rollback](../../docs/native-release.md) and the
+versioned manifests under `deployment/`. `FILE_OPERATIONS_ADMISSION=closed`
+starts closed; closure persists until an authenticated explicit open.
+`GET /v1/readiness` separates operational `ready` from `drained`, reports schema,
+authority, pending commands, admitted background publishers and unresolved work.
+`POST /v1/admission` accepts `{accepting:false}` or an explicitly checked reopen.
+An already admitted health scan completes publication after closure.
+
+`FILE_OPERATIONS_PARITY_ROOT` requires marked disposable SQLite backups and a
+new independent state directory. It permits previews only, never startup
+recovery, business publication or apply, and cannot be promoted to a writer.
+Use the snapshot helper in `maintenance/release_control.py`; never point immutable
+SQLite handles at a live WAL database. Production release remains gated on the
+external WSL GPU and final joint acceptance; this crate build is not deployment.
 
 ## HTTP contract
 
@@ -32,7 +49,7 @@ Preview and admission bind immutable request hashes and exact plan versions. Reu
 
 ## Ownership, steps and recovery handoff
 
-`FACES_BASE/file-operations-rust/operations.sqlite3` is a local WAL database with `synchronous=FULL` and schema `user_version=3` (upgrades v1/v2 in place). A newer schema refuses an older writer. `operations` stores request hash, full immutable plan, admission evidence, state, revision, result/error and timestamps. `steps` stores intent and confirmation at each external side-effect boundary. SQLite integers in before/after evidence use `{"$integer":"..."}` and blobs use `{"$blob":[...]}` to avoid lossy JavaScript numeric conversion.
+`FACES_BASE/file-operations-rust/operations.sqlite3` is a local WAL database with `synchronous=FULL` and schema `user_version=9` (retains historical rows; v8 added native analysis publication, v9 protects persistent admission closure). A newer schema refuses an older writer. `operations` stores request hash, full immutable plan, admission evidence, state, revision, result/error and timestamps. `steps` stores intent and confirmation at each external side-effect boundary. SQLite integers in before/after evidence use `{"$integer":"..."}` and blobs use `{"$blob":[...]}` to avoid lossy JavaScript numeric conversion.
 
 The process holds an exclusive advisory lock on `file-operations-rust/executor.lock`. Schema v2 binds that authority to the persistent lock inode/device and rejects a replaced lock; this file must never be unlinked as a way to restart. The gate contains its state-directory authority and a random token; exact marker bytes/identity are persisted in `gates` before preflight, then included in admission evidence. A crash before that proof is durable leaves the marker for manual investigation; marker contents alone never prove ownership. Restart may recover this gate only while holding the original lifetime authority. A v1/foreign/replaced gate without verifiable ownership stays blocked. Direct requests also claim the same immutable `file-operation-routing/<id>.json` used by Next. Apply exclusively creates the shared `.review-write.lock` before revalidation/admission. The gate is removed only after successful completion or a known pre-admission validation failure, and only if its device/inode still identify the owned marker. No PID expiry or TTL steals either lock. SIGINT/SIGTERM drain the worker; abrupt termination leaves durable evidence and the shared marker.
 

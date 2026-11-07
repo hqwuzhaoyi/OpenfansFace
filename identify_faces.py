@@ -3,7 +3,7 @@ from collections import defaultdict, Counter
 
 BASE = os.environ.get('FACES_BASE', '/data/base')
 OUT = os.environ.get('F_OUT', BASE)     # 输出重定向（dry-run 用），默认与 BASE 相同
-if os.environ.get('FILE_OPERATIONS_BACKEND') == 'rust' and os.path.realpath(OUT) == os.path.realpath(BASE):
+if os.path.realpath(OUT) == os.path.realpath(BASE):
     raise RuntimeError('Rust owns analysis publication; use calibrator with an isolated F_OUT')
 from tplgroups import mutual_groups
 

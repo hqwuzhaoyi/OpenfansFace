@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { BASE } from './env'
 import { invalidateIntegrationCache } from './integration'
 import { rustRequest, personFileOperationStatus } from './file-operation-backend'
-import { claimFileOperation, fileOperationOwner, selectedPersonFileBackend, validateFileOperationId, FileOperationRoutingError } from './file-operation-routing'
+import { fileOperationOwner, selectedPersonFileBackend, validateFileOperationId, FileOperationRoutingError } from './file-operation-routing'
 import type { PersonFileMove, PersonFileResult } from './person-file-model'
 export interface StagedFile {vid:string;path:string;name:string;size:number;version:string;origin:null|{original_path:string|null;person?:string;operation?:string;action?:string;source:string}}
 export interface StagingList {files:number;matched:number;gb:number;bytes:number;path:string;rows:StagedFile[];offset:number;next_offset:number|null}
@@ -25,7 +25,7 @@ export async function stagingOperation(mode:unknown,input:RestoreRequest|DeleteR
   if(mode==='reconcile'){
     const owner=fileOperationOwner(BASE,request.id)
     if(owner?.backend!=='rust'||owner.action!==request.action)throw new FileOperationRoutingError('找不到此暂存操作',404)
-  }else{enabled();claimFileOperation(BASE,request.id,request.action,'rust')}
+  }else{enabled();const owner=fileOperationOwner(BASE,request.id);if(owner&&(owner.backend!=='rust'||owner.action!==request.action))throw new FileOperationRoutingError('旧操作请核对原回执并重新预览')}
   if(mode!=='preview'&&typeof version!=='string')throw new FileOperationRoutingError('请先核对预览范围',400)
   if(mode==='apply'&&request.action!=='restore-files'&&confirmation!==(request.action==='clear-staging'?'清空回收站':'永久删除'))throw new FileOperationRoutingError('请输入完整确认文字',400)
   const result=await rustRequest<RestorePlan|DeletePlan|PersonFileResult|DeleteResult|{id:string;status:string}>({mode,request,...(mode!=='preview'?{version}:{}),...(mode==='apply'&&request.action!=='restore-files'?{confirmation}:{})})

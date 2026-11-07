@@ -1,3 +1,4 @@
+mod admission;
 mod archive;
 mod archive_api;
 mod archive_ledger;
@@ -67,7 +68,7 @@ struct Work {
 #[derive(Clone)]
 struct App {
     config: Config,
-    worker: mpsc::SyncSender<Work>,
+    worker: admission::Worker,
     // Local journal reads must remain available while media/NFS reads are stalled.
     status_reads: Arc<Semaphore>,
     media_reads: Arc<Semaphore>,
@@ -109,18 +110,10 @@ async fn post(
         ));
     }
     let (reply, wait) = oneshot::channel();
-    app.worker
-        .try_send(Work {
-            command: Command::Files(Box::new(envelope)),
-            reply,
-        })
-        .map_err(|_| {
-            Error::new(
-                503,
-                "writer_busy",
-                "执行队列已满或执行器不可用，请稍后查询原编号",
-            )
-        })?;
+    app.worker.try_send(Work {
+        command: Command::Files(Box::new(envelope)),
+        reply,
+    })?;
     // The dedicated worker owns execution. Dropping this receiver never aborts admitted work.
     Ok(Json(wait.await.map_err(|_| {
         Error::new(503, "outcome_unknown", "执行器连接中断，请按操作编号查询")
@@ -235,18 +228,22 @@ fn media_listing_checkpoint(config: &Config, offset: usize) -> Result<()> {
 async fn serve() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
     let mut engine = Engine::new(config.clone())?;
-    match video_health::needs_recovery(&config) {
-        Ok(true) => {
-            if let Err(error) =
-                shared_metadata::execute(&mut engine, "health-interrupted", json!({}))
-            {
-                eprintln!("health recovery: {}", error.error);
+    if config.parity_root.is_none() {
+        match video_health::needs_recovery(&config) {
+            Ok(true) => {
+                if let Err(error) =
+                    shared_metadata::execute(&mut engine, "health-interrupted", json!({}))
+                {
+                    eprintln!("health recovery: {}", error.error);
+                }
             }
+            Err(error) => eprintln!("health state unavailable: {}", error.error),
+            Ok(false) => (),
         }
-        Err(error) => eprintln!("health state unavailable: {}", error.error),
-        Ok(false) => (),
     }
-    let (worker, queue) = mpsc::sync_channel::<Work>(32);
+    let (sender, queue) = mpsc::sync_channel::<Work>(32);
+    let worker = admission::Worker::new(config.clone(), sender)?;
+    let completion = worker.completion();
     let executor = thread::Builder::new()
         .name("file-operation-executor".into())
         .spawn(move || {
@@ -282,11 +279,14 @@ async fn serve() -> std::result::Result<(), Box<dyn std::error::Error>> {
                         _ => Err(Error::new(400, "invalid_request", "操作模式无效")),
                     },
                 };
+                completion.complete();
                 let _ = reply.send(result);
             }
         })?;
     let health_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let health = if std::env::var("VIDEO_HEALTH_ENABLED").as_deref() == Ok("1") {
+    let health = if config.parity_root.is_none()
+        && std::env::var("VIDEO_HEALTH_ENABLED").as_deref() == Ok("1")
+    {
         Some(video_health::spawn(
             config.clone(),
             worker.clone(),
@@ -306,6 +306,8 @@ async fn serve() -> std::result::Result<(), Box<dyn std::error::Error>> {
             "/health",
             get(|| async { Json(json!({"ok":true,"service":"face-file-operations"})) }),
         )
+        .route("/v1/readiness", get(readiness))
+        .route("/v1/admission", axum::routing::post(admission_control))
         .route("/v1/person-files", get(status).post(post))
         .route("/v1/person-batch", get(batch_status).post(batch_post))
         .route("/v1/archive", get(archive_status).post(archive_post))
@@ -351,15 +353,13 @@ async fn archive_post(
         .ok_or_else(|| Error::new(400, "invalid_request", "缺少命令"))?
         .to_owned();
     let (reply, wait) = oneshot::channel();
-    app.worker
-        .try_send(Work {
-            command: Command::Archive {
-                command,
-                body: payload["body"].clone(),
-            },
-            reply,
-        })
-        .map_err(|_| Error::new(503, "writer_busy", "执行队列已满"))?;
+    app.worker.try_send(Work {
+        command: Command::Archive {
+            command,
+            body: payload["body"].clone(),
+        },
+        reply,
+    })?;
     Ok(Json(wait.await.map_err(|_| {
         Error::new(503, "outcome_unknown", "执行连接中断")
     })??))
@@ -409,15 +409,13 @@ async fn metadata_post(
         return Err(Error::new(400, "invalid_request", "请使用视频体检报告入口"));
     }
     let (reply, wait) = oneshot::channel();
-    app.worker
-        .try_send(Work {
-            command: Command::Metadata {
-                command,
-                body: payload["body"].clone(),
-            },
-            reply,
-        })
-        .map_err(|_| Error::new(503, "writer_busy", "执行队列已满"))?;
+    app.worker.try_send(Work {
+        command: Command::Metadata {
+            command,
+            body: payload["body"].clone(),
+        },
+        reply,
+    })?;
     Ok(Json(wait.await.map_err(|_| {
         Error::new(503, "outcome_unknown", "执行连接中断")
     })??))
@@ -430,12 +428,10 @@ async fn batch_post(
 ) -> Result<Json<Value>> {
     authorize(&app.config, &headers)?;
     let (reply, wait) = oneshot::channel();
-    app.worker
-        .try_send(Work {
-            command: Command::Batch(body),
-            reply,
-        })
-        .map_err(|_| Error::new(503, "writer_busy", "执行队列已满"))?;
+    app.worker.try_send(Work {
+        command: Command::Batch(body),
+        reply,
+    })?;
     Ok(Json(wait.await.map_err(|_| {
         Error::new(503, "outcome_unknown", "执行器连接中断，请查询原批次")
     })??))
@@ -502,16 +498,38 @@ async fn health_report(
 ) -> Result<Json<Value>> {
     authorize(&app.config, &headers)?;
     let (reply, wait) = oneshot::channel();
-    app.worker
-        .try_send(Work {
-            command: Command::Metadata {
-                command: "health-report".into(),
-                body,
-            },
-            reply,
-        })
-        .map_err(|_| Error::new(503, "writer_busy", "执行队列已满"))?;
+    app.worker.try_send(Work {
+        command: Command::Metadata {
+            command: "health-report".into(),
+            body,
+        },
+        reply,
+    })?;
     Ok(Json(wait.await.map_err(|_| {
         Error::new(503, "outcome_unknown", "报告回执未知，请查询原操作编号")
     })??))
+}
+
+async fn readiness(State(app): State<App>, headers: HeaderMap) -> Result<Json<Value>> {
+    authorize(&app.config, &headers)?;
+    Ok(Json(
+        tokio::task::spawn_blocking(move || app.worker.readiness())
+            .await
+            .map_err(|_| Error::new(503, "unavailable", "准入状态读取失败"))??,
+    ))
+}
+async fn admission_control(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>> {
+    authorize(&app.config, &headers)?;
+    let accepting = body["accepting"]
+        .as_bool()
+        .ok_or_else(|| Error::new(400, "invalid_request", "缺少 accepting 布尔值"))?;
+    Ok(Json(
+        tokio::task::spawn_blocking(move || app.worker.set_accepting(accepting))
+            .await
+            .map_err(|_| Error::new(503, "unavailable", "准入控制失败"))??,
+    ))
 }

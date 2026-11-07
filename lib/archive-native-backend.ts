@@ -1,17 +1,32 @@
+import fs from 'node:fs'
+import path from 'node:path'
+import { BASE } from './env'
+import { validateFileOperationId } from './file-operation-routing'
+import type { ArchiveRun } from './archive-run-model'
 import { invalidateIntegrationCache } from './integration'
 /** Thin transport only. Rust owns queue, metadata, media and Peach mutations. */
-export function nativeArchiveEnabled():boolean {
-  const selected=process.env.FILE_OPERATIONS_BACKEND||'legacy'
-  if(!['legacy','rust'].includes(selected))throw Object.assign(new Error('文件操作后端配置无效'),{status:503})
-  if(selected==='rust'&&process.env.FILE_OPERATIONS_ENABLE_RUST!=='1')throw Object.assign(new Error('Rust 文件操作尚未启用'),{status:503})
-  return selected==='rust'
-}
+export function nativeArchiveEnabled():true { return true }
 export async function nativeArchive(command:string,body:unknown={}):Promise<unknown>{
   const result=await request({command,body})
   if(!['archive-preview','review-page','review-status'].includes(command))invalidateIntegrationCache()
   return result
 }
-export async function nativeArchiveProgress(id:string|null):Promise<unknown>{return request(null,id||'')}
+function legacyProgress(id:string|null):Pick<ArchiveRun,'job'|'result'>|null {
+  if(!id){
+    try { id=JSON.parse(fs.readFileSync(path.join(BASE,'jobs/archive.json'),'utf8')).id }
+    catch(error){if((error as NodeJS.ErrnoException).code==='ENOENT')return null;throw error}
+  }
+  validateFileOperationId(id)
+  try { const run=JSON.parse(fs.readFileSync(path.join(BASE,'archive-runs',id+'.json'),'utf8')) as ArchiveRun;return {job:run.job,result:run.result} }
+  catch(error){if((error as NodeJS.ErrnoException).code==='ENOENT')return null;throw error}
+}
+export async function nativeArchiveProgress(id:string|null):Promise<Pick<ArchiveRun,'job'|'result'>|{job:null}> {
+  const old=legacyProgress(id)
+  if(id&&old)return old // Receipt read only; never dispatch an old ID to an executor.
+  const current=await request(null,id||'') as Pick<ArchiveRun,'job'|'result'>|{job:null}
+  if(old&&(!current.job||Number(old.job.started_at)>Number(current.job.started_at)))return old
+  return current
+}
 async function request(payload:unknown,id?:string):Promise<unknown>{
   const configured=process.env.FILE_OPERATIONS_RUST_URL
   if(!configured)throw Object.assign(new Error('Rust 文件操作服务地址未配置'),{status:503})

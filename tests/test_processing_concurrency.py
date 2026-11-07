@@ -7,7 +7,8 @@ import threading
 import unittest
 from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'maintenance'))
-from processing_store import connect, reconcile, set_setting, claim, finish, fail, recover, release_task
+from processing_fixture import finish
+from processing_store import connect, reconcile, set_setting, claim, fail, recover, release_task
 
 from task_progress import stage_progress
 
@@ -16,6 +17,7 @@ class ConcurrencyTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.base = Path(self.temp.name)
+        (self.base / '.processing-fixture').write_text('isolated processing fixture')
         self.db = connect(self.base)
         items = [dict(vid=str(i),path=str(self.base/f'{i}.mp4'),name=f'{i}.mp4',size=10,mtime_ns='1') for i in range(8)]
         with self.db:

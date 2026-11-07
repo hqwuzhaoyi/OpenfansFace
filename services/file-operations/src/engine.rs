@@ -19,8 +19,10 @@ impl Engine {
     pub fn new(config: Config) -> Result<Self> {
         let store = Store::start(&config)?;
         let mut engine = Self { config, store };
-        engine.recover_startup()?;
-        crate::person_batch::recover(&mut engine)?;
+        if engine.config.parity_root.is_none() {
+            engine.recover_startup()?;
+            crate::person_batch::recover(&mut engine)?;
+        }
         Ok(engine)
     }
     pub fn preview(&mut self, request: Request) -> Result<Value> {
@@ -139,6 +141,7 @@ impl Engine {
         Ok(plan)
     }
     pub fn apply(&mut self, request: Request, version: String) -> Result<Value> {
+        self.config.require_writer()?;
         crate::person_batch::reject_child(&self.store, &request.id)?;
         validate(&request)?;
         files::claim_owner_for(&self.config, &request.id, &request.action)?;
@@ -307,6 +310,7 @@ impl Engine {
         request: Request,
         version: Option<String>,
     ) -> Result<Value> {
+        self.config.require_writer()?;
         crate::person_batch::reject_child(&self.store, &request.id)?;
         validate(&request)?;
         files::claim_owner_for(&self.config, &request.id, &request.action)?;
@@ -1141,6 +1145,7 @@ mod shared_tests {
             ledger: root.join("ledger.db"),
             bind: "127.0.0.1:0".into(),
             token: None,
+            parity_root: None,
             fixture: Some(root.clone()),
         };
         fs::create_dir_all(config.creators().join("甲")).unwrap();

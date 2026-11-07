@@ -1,6 +1,6 @@
 import fs from 'node:fs'
 import path from 'node:path'
-import { alternateName } from './archive-files'
+import { alternateName } from './archive-paths'
 import { ReviewError } from './review-logic'
 const normalize=(name:string)=>name.normalize('NFC').toLowerCase()
 

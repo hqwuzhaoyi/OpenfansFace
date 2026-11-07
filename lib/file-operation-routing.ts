@@ -11,12 +11,9 @@ export function validateFileOperationId(value:unknown):asserts value is string {
   if(typeof value!=='string'||!/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(value))throw new FileOperationRoutingError('操作编号无效',400)
 }
 
-/** Migrated file capabilities opt into the same Rust authority; other actions retain their owner. */
-export function selectedPersonFileBackend(action:string,env:NodeJS.ProcessEnv=process.env):FileOperationBackendName {
-  const selected=env.FILE_OPERATIONS_BACKEND||'legacy'
-  if(selected!=='legacy'&&selected!=='rust')throw new FileOperationRoutingError('文件操作后端配置无效',503)
-  if(!['rename-file','move-files','delete-files','restore-files','delete-staged','clear-staging','rename-person','merge-person','delete-person'].includes(action)||selected==='legacy')return 'legacy'
-  if(env.FILE_OPERATIONS_ENABLE_RUST!=='1')throw new FileOperationRoutingError('Rust 文件操作尚未启用',503)
+/** The legacy writer is retired; configuration cannot revive it. */
+export function selectedPersonFileBackend(action:string,_env:NodeJS.ProcessEnv=process.env):'rust' {
+  if(!['rename-file','move-files','delete-files','restore-files','delete-staged','clear-staging','rename-person','merge-person','delete-person'].includes(action))throw new FileOperationRoutingError('不支持的文件操作',400)
   return 'rust'
 }
 function ownerPath(base:string,id:string){validateFileOperationId(id);return path.join(base,'file-operation-routing',id+'.json')}
