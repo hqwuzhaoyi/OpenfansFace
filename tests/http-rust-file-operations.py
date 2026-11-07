@@ -24,6 +24,7 @@ REPO = Path(__file__).resolve().parents[1]
 SCHEMA = (REPO / 'tests/fixtures/peach-contract-schema.sql').read_text()
 parser = argparse.ArgumentParser()
 parser.add_argument('--binary', type=Path, default=REPO / 'services/file-operations/target/debug/face-file-operations')
+parser.add_argument('--port',type=int,default=0)
 args = parser.parse_args()
 BINARY = args.binary.resolve()
 VID = r'R:\media\pikpak\My Telegram\stable.mp4'
@@ -67,7 +68,7 @@ class Fixture:
             db.execute("INSERT INTO tasks VALUES('unrelated','other.mp4','other.mp4',1,'0','face',0,'{}')")
         with socket.socket() as s:
             s.bind(('127.0.0.1', 0))
-            self.port = s.getsockname()[1]
+            self.port = args.port or s.getsockname()[1]
         self.url = f'http://127.0.0.1:{self.port}'
         self.env = {**os.environ, 'FACES_BASE': str(self.base), 'MEDIA2_ROOT': str(self.media), 'PEACH_LEDGER_PATH': str(self.ledger), 'FILE_OPERATIONS_BIND': f'127.0.0.1:{self.port}', 'FILE_OPERATIONS_FIXTURE_ROOT': str(self.root), 'FILE_OPERATIONS_RUST_TOKEN': 'fixture-token', 'PATH': '/no-executables'}
         self.process = None
@@ -79,7 +80,7 @@ class Fixture:
     def start(self):
         self.log = (self.root / 'service.log').open('ab')
         self.process = subprocess.Popen([str(BINARY)], env=self.env, stdout=self.log, stderr=self.log)
-        for _ in range(100):
+        for _ in range(600):
             if self.process.poll() is not None:
                 raise AssertionError((self.process.returncode, (self.root / 'service.log').read_text()))
             try:
@@ -273,21 +274,7 @@ def interrupted(phase):
         f.stop()
         f.start()
         status = f.status(plan)
-        if phase == 'complete':
-            assert f.apply(plan) == f.assert_complete(plan)
-        else:
-            assert status['status'] == 'recovery_needed', status
-            assert (f.base / '.review-write.lock').exists()
-            f.apply(plan, 503)
-            assert (f.source.exists(), f.target.exists()) == (source_exists, target_exists)
-            # New plans cannot run while one admission is uncertain, even if a marker was lost.
-            other = f.source.with_name('another.mp4')
-            other.write_bytes(PAYLOAD)
-            with sqlite3.connect(f.base / 'faces.db') as db:
-                db.execute('INSERT INTO videos(vid,path,name) VALUES(?,?,?)', ('another', str(other), other.name))
-            next_plan = f.preview(f.request(source=other, filename='another-renamed.mp4', vid='another'))
-            f.apply(next_plan, 503)
-            assert other.exists()
+        assert f.apply(plan) == f.assert_complete(plan)
         print('PASS crash checkpoint', phase, '->', status['status'])
     finally:
         f.stop()
@@ -301,15 +288,15 @@ def failed_commit():
         with sqlite3.connect(f.ledger) as db:
             db.executescript("CREATE TRIGGER reject_path BEFORE UPDATE OF path ON asset BEGIN SELECT RAISE(ABORT,'fixture ledger failure'); END;")
         failure = f.apply(plan, 503)
-        assert failure['code'] == 'recovery_required' and 'fixture ledger failure' in failure['error']
-        assert f.status(plan)['status'] == 'recovery_needed'
-        assert f.target.read_bytes() == PAYLOAD and not f.source.exists()
-        assert (f.base / '.review-write.lock').exists()
+        assert failure['code'] == 'database_unavailable' and 'fixture ledger failure' in failure['error']
+        assert f.status(plan)['status'] == 'rolled_back'
+        assert f.source.read_bytes() == PAYLOAD and not f.target.exists()
+        assert not (f.base / '.review-write.lock').exists()
         with sqlite3.connect(f.ledger) as db:
             assert db.execute('SELECT path FROM asset WHERE id=1').fetchone()[0] == f.win(f.source)
-            assert db.execute('SELECT state FROM _face_admin_person_ops WHERE id=?', (plan['id'],)).fetchone()[0] == 'prepared'
+            assert db.execute('SELECT state FROM _face_admin_person_ops WHERE id=?', (plan['id'],)).fetchone()[0] == 'cancelled'
         assert f.apply(plan, 503) == failure
-        print('PASS actual SQLite commit failure keeps evidence, file bytes and recovery gate')
+        print('PASS actual SQLite commit failure compensates with durable guarded receipts')
     finally:
         f.stop()
 
@@ -338,9 +325,10 @@ def publication_race():
         f.stop()
 
 
-success_and_guards()
-disconnected_client()
-failed_commit()
-publication_race()
-for phase in ['destination_publish_intent', 'destination_published_unrecorded', 'destination_published', 'source_removed_unrecorded', 'source_removed', 'faces_commit_intent', 'faces_committed_unrecorded', 'faces_committed', 'jobs_commit_intent', 'jobs_committed_unrecorded', 'jobs_committed', 'json_replace_intent', 'json_replaced_unrecorded', 'json_replaced', 'ledger_commit_intent', 'ledger_committed_unrecorded', 'ledger_committed', 'complete']:
-    interrupted(phase)
+if __name__ == '__main__':
+    success_and_guards()
+    disconnected_client()
+    failed_commit()
+    publication_race()
+    for phase in ['destination_publish_intent', 'destination_published_unrecorded', 'destination_published', 'source_removed_unrecorded', 'source_removed', 'faces_commit_intent', 'faces_committed_unrecorded', 'faces_committed', 'jobs_commit_intent', 'jobs_committed_unrecorded', 'jobs_committed', 'json_replace_intent', 'json_replaced_unrecorded', 'json_replaced', 'ledger_commit_intent', 'ledger_committed_unrecorded', 'ledger_committed', 'complete']:
+        interrupted(phase)

@@ -23,6 +23,10 @@ pub fn checkpoint(config: &Config, phase: &str) -> Result<()> {
             format!("隔离夹具故障：{phase}"),
         )),
         Some("pause") => {
+            crate::files::atomic_write(
+                &root.join("rust-fault-reached.json"),
+                serde_json::to_string(&serde_json::json!({"phase":phase}))?.as_bytes(),
+            )?;
             std::thread::sleep(std::time::Duration::from_millis(
                 value["milliseconds"].as_u64().unwrap_or(500).min(10_000),
             ));

@@ -1,7 +1,7 @@
 use crate::{
     config::Config,
     db,
-    files::sync_parent,
+    files::{identity, sync_parent},
     model::{Error, Plan, Result, hash},
 };
 use rusqlite::{Connection, OptionalExtension, params};
@@ -30,7 +30,7 @@ impl Store {
             .map_err(|_| Error::new(503, "writer_busy", "另一个 Rust 执行器正在使用此状态目录"))?;
         let conn = Connection::open(config.state_db())?;
         let schema: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
-        if schema > 1 {
+        if schema > 2 {
             return Err(Error::new(
                 503,
                 "schema_version",
@@ -44,13 +44,31 @@ impl Store {
             evidence TEXT, result TEXT, error TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
           );
+          CREATE TABLE IF NOT EXISTS authority (singleton INTEGER PRIMARY KEY CHECK(singleton=1), identity TEXT NOT NULL);
+          CREATE TABLE IF NOT EXISTS gates (id TEXT PRIMARY KEY, evidence TEXT NOT NULL);
+          CREATE TABLE IF NOT EXISTS fences (id TEXT PRIMARY KEY, request_hash TEXT NOT NULL, version TEXT);
           CREATE TABLE IF NOT EXISTS steps (
             operation_id TEXT NOT NULL REFERENCES operations(id), revision INTEGER NOT NULL,
             phase TEXT NOT NULL, evidence TEXT NOT NULL, at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY(operation_id,revision)
-          ); PRAGMA user_version=1;")?;
+          ); PRAGMA user_version=2;")?;
+        let stat = identity(&ownership.metadata()?);
+        let identity = serde_json::to_string(&json!({"dev":stat["dev"],"ino":stat["ino"]}))?;
+        conn.execute("INSERT OR IGNORE INTO authority VALUES(1,?)", [&identity])?;
+        let original: String = conn.query_row(
+            "SELECT identity FROM authority WHERE singleton=1",
+            [],
+            |r| r.get(0),
+        )?;
+        if original != identity {
+            return Err(Error::new(
+                503,
+                "writer_authority_changed",
+                "执行权威锁文件已被替换，拒绝恢复写入",
+            ));
+        }
         sync_parent(&config.state_db())?;
-        // Ticket #3 reconciles these records. Never auto-replay or discard an old marker here.
+        // Reconciliation runs only after the process-lifetime lock has been acquired.
         let error = serde_json::to_string(&Error::new(
             503,
             "recovery_required",
@@ -62,9 +80,69 @@ impl Store {
             _ownership: ownership,
         })
     }
+    pub fn remember_gate(&self, id: &str, evidence: &Value) -> Result<()> {
+        self.db.execute("INSERT INTO gates(id,evidence) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET evidence=excluded.evidence",params![id,serde_json::to_string(evidence)?])?;
+        Ok(())
+    }
+    pub fn gate_evidence(&self, id: &str) -> Result<Option<Value>> {
+        let raw: Option<String> = self
+            .db
+            .query_row("SELECT evidence FROM gates WHERE id=?", [id], |r| r.get(0))
+            .optional()?;
+        Ok(raw.map(|v| serde_json::from_str(&v)).transpose()?)
+    }
+    pub fn evidence(&self, id: &str) -> Result<Option<Value>> {
+        let raw: Option<String> =
+            self.db
+                .query_row("SELECT evidence FROM operations WHERE id=?", [id], |r| {
+                    r.get(0)
+                })?;
+        Ok(raw.map(|v| serde_json::from_str(&v)).transpose()?)
+    }
+    pub fn recovery_ids(&self) -> Result<Vec<String>> {
+        let mut query = self.db.prepare("SELECT id FROM operations WHERE status IN ('accepted','running','recovery_needed','rolling_back') ORDER BY created_at,id")?;
+        Ok(query
+            .query_map([], |r| r.get(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+    pub fn fenced(&self, id: &str) -> Result<bool> {
+        Ok(self.db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM fences WHERE id=?)",
+            [id],
+            |r| r.get(0),
+        )?)
+    }
+    pub fn fence(&mut self, request: &crate::model::Request, version: Option<&str>) -> Result<()> {
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let existing: Option<(String, Option<String>)> = tx
+            .query_row(
+                "SELECT request_hash,version FROM fences WHERE id=?",
+                [&request.id],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if let Some((signature, stored_version)) = existing
+            && (signature != hash(request) || stored_version.as_deref() != version)
+        {
+            return Err(Error::conflict("已停止受理的编号不能更换范围"));
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO fences(id,request_hash,version) VALUES(?,?,?)",
+            params![request.id, hash(request), version],
+        )?;
+        tx.execute("UPDATE operations SET status='cancelled',phase='cancelled',revision=revision+1 WHERE id=? AND status='not_started'", [&request.id])?;
+        tx.commit()?;
+        Ok(())
+    }
+    pub fn rolled_back(&mut self, id: &str, cause: &Error) -> Result<()> {
+        self.db.execute("UPDATE operations SET status='rolled_back',phase='rolled_back',error=?,revision=revision+1,updated_at=CURRENT_TIMESTAMP WHERE id=?", params![serde_json::to_string(cause)?,id])?;
+        Ok(())
+    }
     pub fn blocked(&self) -> Result<bool> {
         Ok(self.db.query_row(
-            "SELECT EXISTS(SELECT 1 FROM operations WHERE status='recovery_needed')",
+            "SELECT EXISTS(SELECT 1 FROM operations WHERE status IN ('recovery_needed','rolling_back'))",
             [],
             |r| r.get(0),
         )?)
@@ -90,7 +168,7 @@ impl Store {
         Ok(())
     }
     pub fn complete(&mut self, plan: &Plan, result: &Value) -> Result<()> {
-        self.db.execute("UPDATE operations SET status='complete',phase='complete',result=?,revision=revision+1,updated_at=CURRENT_TIMESTAMP WHERE id=?",params![serde_json::to_string(result)?,plan.id])?;
+        self.db.execute("UPDATE operations SET status='complete',phase='complete',error=NULL,result=?,revision=revision+1,updated_at=CURRENT_TIMESTAMP WHERE id=?",params![serde_json::to_string(result)?,plan.id])?;
         Ok(())
     }
     pub fn fail(&mut self, id: &str, error: &Error, recovery: bool) -> Result<()> {
@@ -136,9 +214,18 @@ fn record(db: &Connection, id: &str) -> Result<Option<Record>> {
 pub fn status(path: &Path, id: &str) -> Result<Value> {
     let db = db::open(path)?;
     let Some(record) = record(&db, id)? else {
+        if db.query_row(
+            "SELECT EXISTS(SELECT 1 FROM fences WHERE id=?)",
+            [id],
+            |r| r.get::<_, bool>(0),
+        )? {
+            return Ok(
+                json!({"id":id,"status":"cancelled","phase":"cancelled","revision":0,"completed":0,"total":0,"failed":0}),
+            );
+        }
         return Err(Error::new(404, "not_found", "找不到操作记录"));
     };
-    let mut result = json!({"id":id,"status":record.status,"phase":record.phase,"revision":record.revision,"current_file":record.plan.file().src,"completed":if record.status=="complete"{1}else{0},"total":1,"failed":if record.error.is_some(){1}else{0}});
+    let mut result = json!({"id":id,"status":record.status,"phase":record.phase,"revision":record.revision,"io_state":if ["complete","rolled_back","failed","cancelled","not_started"].contains(&record.status.as_str()){"idle"}else if record.status=="recovery_needed"{"unknown"}else{"running"},"current_file":record.plan.file().src,"completed":if record.status=="complete"{1}else{0},"total":1,"failed":if record.error.is_some(){1}else{0}});
     if let Some(value) = record.result {
         result["result"] = value;
     }

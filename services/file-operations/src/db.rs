@@ -48,3 +48,45 @@ pub fn receipt_table(db: &Connection) -> Result<()> {
     db.execute_batch("CREATE TABLE IF NOT EXISTS _face_admin_rust_commits (id TEXT PRIMARY KEY, signature TEXT NOT NULL, data TEXT NOT NULL)")?;
     Ok(())
 }
+
+pub fn receipt(db: &Connection, id: &str, signature: &str) -> Result<Option<Value>> {
+    use rusqlite::OptionalExtension;
+    let exists: bool = db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='_face_admin_rust_commits')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !exists {
+        return Ok(None);
+    }
+    let row: Option<(String, String)> = db
+        .query_row(
+            "SELECT signature,data FROM _face_admin_rust_commits WHERE id=?",
+            [id],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    row.map(|(stored, data)| {
+        if stored != signature {
+            return Err(Error::conflict("数据库回执范围不匹配"));
+        }
+        Ok(serde_json::from_str(&data)?)
+    })
+    .transpose()
+}
+pub fn sql_value(value: &Value) -> Result<rusqlite::types::Value> {
+    use rusqlite::types::Value as Sql;
+    Ok(match value {
+        Value::Null => Sql::Null,
+        Value::String(s) => Sql::Text(s.clone()),
+        Value::Number(n) => Sql::Real(
+            n.as_f64()
+                .ok_or_else(|| Error::conflict("无效数据库数字"))?,
+        ),
+        Value::Object(o) if o.contains_key("$integer") => Sql::Integer(integer(value)?),
+        Value::Object(o) if o.contains_key("$blob") => {
+            Sql::Blob(serde_json::from_value(value["$blob"].clone())?)
+        }
+        _ => return Err(Error::conflict("无效数据库值")),
+    })
+}
