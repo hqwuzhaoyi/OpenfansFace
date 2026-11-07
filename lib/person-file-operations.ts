@@ -17,6 +17,7 @@ import { metadataFiles, remappedPath, transformPersonData, updatedMetadata } fro
 import { personLedger } from './person-file-ledger'
 import { mergedDirectoryPaths } from './person-merge-paths'
 import { personVideoExtension } from './person-library-stats'
+import { requireMovePermissions, requireWritableDirectory } from './file-permissions'
 import type { PersonFileRequest, PersonFilePlan, PersonFileMove, PersonFileResult } from './person-file-model'
 
 const operationsRoot=path.join(BASE,'person-operations')
@@ -135,6 +136,10 @@ export async function previewPersonFiles(body:PersonFileRequest):Promise<PersonF
       files.push({src,dst,vids,size:fs.statSync(/*turbopackIgnore: true*/ src).size,version})
     }
   }
+  for(const file of files)requireMovePermissions(file.src,file.dst)
+  for(const directory of directories)requireWritableDirectory(path.dirname(directory),'源目录')
+  if(targetRoot)requireWritableDirectory(targetRoot,'目标目录')
+  for(const directory of directoryTargets||[])requireWritableDirectory(directory.dst,'目标目录')
   const plan:PersonFilePlan={id,request,version:'',action:body.action,person,target_person:target,files,total_bytes:files.reduce((sum,file)=>sum+file.size,0),directories,
     ...(['rename-person','merge-person','delete-person'].includes(body.action)?{source_directory:sourceRoot,target_directory:targetRoot}:{}),...(directoryTargets?{directory_targets:directoryTargets}:{}),ledger_version:'',metadata_version:''}
   if(['merge-person','delete-person'].includes(plan.action)){

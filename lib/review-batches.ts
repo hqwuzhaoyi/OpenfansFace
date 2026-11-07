@@ -14,7 +14,7 @@ export function groupBatches<T extends BatchRow>(rows: T[]) {
   const time=(s:string)=>Date.parse(s.includes('T')?s:s.replace(' ','T')+'Z')||0
   return [...map.values()].sort((a,b)=>time(b.at)-time(a.at))
 }
-export const statusTitle:Record<string,string>={empty:'源文件为空',corrupt:'视频体检异常',organized:'已归类（creators）','not-file':'记录指向文件夹',ok:'可以归档',missing:'找不到原文件',conflict:'目标同名冲突',duplicate:'目标文件需核对',already:'已在目标目录',invalid:'人物名需更正','dupe-target':'队列目标文件名重复'}
+export const statusTitle:Record<string,string>={permission:'目录权限不足',empty:'源文件为空',corrupt:'视频体检异常',organized:'已归类（creators）','not-file':'记录指向文件夹',ok:'可以归档',missing:'找不到原文件',conflict:'目标同名冲突',duplicate:'目标文件需核对',already:'已在目标目录',invalid:'人物名需更正','dupe-target':'队列目标文件名重复'}
 export function selectedProblems(rows: {status:string;name:string}[]) {
   return rows.filter(r=>r.status!=='ok').map(r=>({name:r.name,reason:statusTitle[r.status]||'需要核对文件'}))
 }

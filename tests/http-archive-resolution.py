@@ -65,9 +65,9 @@ print('PASS equal byte size with different content is never removed or moved')
 create('rollback-duplicate',canonical=False);resolve(['rollback-duplicate'],'stage-duplicate')
 r=apply(['rollback-duplicate']);assert r['moved']==0 and r['errors'],r
 assert srcfile('rollback-duplicate').read_bytes()==dstfile('rollback-duplicate').read_bytes()==b'source-video'
-manifest=json.loads(Path(r['manifest'].replace('/fixture-base',str(base),1)).read_text());assert manifest['status']=='rolled_back'
+manifest=json.loads(Path(r['manifest'].replace('/fixture-base',str(base),1)).read_text());assert manifest['status']=='failed'
 assert row('rollback-duplicate')['status']=='ok'
-print('PASS failed canonical ledger validation restores staged source and leaves task pending')
+print('PASS failed canonical ledger preflight leaves source untouched and task pending')
 
 create('changed-target');resolve(['changed-target'],'stage-duplicate');p=plan()
 dstfile('changed-target').write_bytes(b'source-video');s=dstfile('changed-target').stat();os.utime(dstfile('changed-target'),(s.st_atime,s.st_mtime+10))

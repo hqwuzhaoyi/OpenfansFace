@@ -132,3 +132,16 @@ Motion 用于选择数量更新、确认步骤切换及操作提示的进入/退
 成功后保留结果弹窗，重新读取目标视频数量；点击“查看合并后的视频”关闭弹窗并进入目标人物的视频区。视频播放在执行前停止，避免继续读取已搬移的来源路径。
 
 人物列表的账号按钮直接显示手动关联状态：绿色链条图标与账号数量，灰色断链图标表示未关联；悬停提示和无障碍名称保留完整状态。`libraryPeople()` 一次读取本地关联记录，按当前人物名归一并以账号 ID 去重，不请求外部资料站；姓名候选和文字线索不计入。读取失败返回未知状态，不当作零条。关联或解除成功后刷新人物列表，保留当前勾选和查看对象。
+
+
+## 归档可靠性与目录权限（2026-11-07）
+
+归档与人物文件操作在预览／执行前检查源文件可读、源目录可移出、目标或最近的现存祖先目录可写。权限错误保留完整路径，不再展示为可执行。该检查不能代替执行时校验，外部权限变更仍可能导致操作失败。
+
+归档使用 `operation_id` 绑定预览版本和所选视频；`GET /api/plan/progress?id=...` 查询对应阶段及最终回执。回执保存在 `FACES_BASE/archive-runs/`，最新进度仍写入 `jobs/archive.json`。页面提交当帧反馈，底栏显示真实阶段和数量；断线后查询回执，重复提交不会重复移动。复制或同步没有可测量的字节进度时不估算百分比。
+
+Peach 归档在移动前核对源／目标账本，按 `canonical_name` 或小写 `normalized_name` 复用人物，歧义时停止。`_face_admin_archive_ops` 保存预留和提交状态；响应丢失后先查询事务状态，取消状态阻止迟到提交。只有确认账本未提交才回退文件；账本状态未知、本地提交失败或回退不完整时保留恢复写锁，不允许盲目重试。
+
+NAS 的 `/mnt/mnt2/media` 使用 `root_squash,anonuid=1000,anongid=1000`。媒体服务目录由 `maintenance/media-directory-permissions.py` 配置 UID 1000 的访问和默认 ACL，范围仅为 `pikpak/creators`、`pikpak/My Telegram`、`pikpak/.face-cleanup-staging` 的目录；已有文件、属主和其他主体的有效权限保持不变。工具默认只读，`--apply --backup <媒体树外的新目录>` 才写入，原 ACL 可通过 `setfacl --restore=<backup>/before.acl` 回退。外部工具显式 chmod 或替换 ACL 仍可能破坏继承，应在导入端保持同一服务身份。
+
+`tests/archive-ledger.test.mjs`、`tests/file-permissions.test.mjs`、`tests/http-archive-reliability.py` 和 `tests/test_media_directory_permissions.py` 覆盖名称规范化、事务回执、迟到请求、权限拦截及 ACL 有效权限保留。HTTP 测试仅使用明确标记的隔离夹具与专用端口。

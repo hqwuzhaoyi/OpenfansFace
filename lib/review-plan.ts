@@ -2,7 +2,8 @@ import fs from 'fs'
 import path from 'path'
 import { createHash } from 'crypto'
 import { creatorFolder } from './source-resolution'
-import { MEDIA2 } from './env'
+import { MEDIA2, STAGE } from './env'
+import { requireMovePermissions } from './file-permissions'
 import { CREATORS } from './env'
 import { readVideoSources, videoSource } from './video-sources'
 import { queuedWithOrigin, videoInfo } from './review-store'
@@ -60,6 +61,10 @@ export function buildPlan(queue = queuedWithOrigin()) {
       } else if (targets.has(row.dst)) { row.status = 'dupe-target'; row.reason = '队列里另一个视频也将使用此目标文件名' }
       if (item.resolution?.kind === 'stage-duplicate' && row.operation !== 'stage-duplicate') { row.status = 'conflict'; row.reason = '目标文件已变化，无法暂存重复件，请重新选择处理方式' }
       targets.add(row.dst)
+      if(row.status==='ok'){
+        try{requireMovePermissions(src,row.operation==='stage-duplicate'?path.join(STAGE,'archive-duplicates','pending'):row.dst)}
+        catch(e){row.status='permission';row.reason=(e as Error).message}
+      }
     } catch { row.status = 'missing'; row.reason = '暂时无法读取文件，请刷新后重试' }
     return row
   })

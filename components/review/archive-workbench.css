@@ -202,3 +202,17 @@
   .archive-waveVideoMain>button>small { display:none; }
   .archive-waveVideo .archive-rowActions { margin-left:50px; }
 }
+
+.archive-run { display:flex; align-items:center; justify-content:space-between; gap:16px; width:100%; min-width:0; }
+.archive-runBody { flex:1; min-width:0; }
+.archive-currentFile { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.archive-progress { margin-top:8px; height:3px; }
+.archive-progress [data-slot=progress-indicator] { transition:transform 180ms var(--ease-out-ui); }
+.archive-progress[data-unknown=true] [data-slot=progress-indicator] { transform:none!important; opacity:.3; }
+.archive-actionbar[data-instant=true] [data-slot=progress-indicator] { transition:none; }
+.archive-confirmDialog { animation-duration:160ms; }
+.archive-confirmDialog[data-instant=true] { animation:none!important; }
+@media(prefers-reduced-motion:reduce) { .archive-progress [data-slot=progress-indicator] { transition:none; } }
+@media(max-width:700px) { .archive-run { align-items:stretch; flex-direction:column; gap:8px; } .archive-run .archive-actionButtons { flex-wrap:wrap; } }
+
+body:has(.archive-confirmDialog[data-instant=true]) [data-slot=alert-dialog-overlay] { animation:none!important; }
