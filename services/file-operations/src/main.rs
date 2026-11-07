@@ -15,6 +15,7 @@ mod metadata;
 mod model;
 mod native;
 mod permissions;
+mod person_batch;
 mod person_delete;
 mod person_directory;
 mod person_ledger;
@@ -52,6 +53,7 @@ use tokio::sync::{Semaphore, oneshot};
 
 enum Command {
     Files(Box<Envelope>),
+    Batch(Value),
     Metadata { command: String, body: Value },
     Archive { command: String, body: Value },
 }
@@ -207,6 +209,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .spawn(move || {
             for Work { command, reply } in queue {
                 let result = match command {
+                    Command::Batch(body) => person_batch::execute(&mut engine, body),
                     Command::Archive { command, body } => {
                         archive_api::execute(&mut engine, &command, body)
                     }
@@ -251,6 +254,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
             get(|| async { Json(json!({"ok":true,"service":"face-file-operations"})) }),
         )
         .route("/v1/person-files", get(status).post(post))
+        .route("/v1/person-batch", get(batch_status).post(batch_post))
         .route("/v1/archive", get(archive_status).post(archive_post))
         .route("/v1/staging", get(staging_list))
         .route("/v1/metadata", axum::routing::post(metadata_post))
@@ -356,4 +360,47 @@ async fn metadata_post(
     Ok(Json(wait.await.map_err(|_| {
         Error::new(503, "outcome_unknown", "执行连接中断")
     })??))
+}
+
+async fn batch_post(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>> {
+    authorize(&app.config, &headers)?;
+    let (reply, wait) = oneshot::channel();
+    app.worker
+        .try_send(Work {
+            command: Command::Batch(body),
+            reply,
+        })
+        .map_err(|_| Error::new(503, "writer_busy", "执行队列已满"))?;
+    Ok(Json(wait.await.map_err(|_| {
+        Error::new(503, "outcome_unknown", "执行器连接中断，请查询原批次")
+    })??))
+}
+async fn batch_status(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<Value>> {
+    authorize(&app.config, &headers)?;
+    let id = query
+        .get("id")
+        .cloned()
+        .ok_or_else(|| Error::new(400, "invalid_request", "缺少批次编号"))?;
+    let permit = app
+        .status_reads
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| Error::new(503, "unavailable", "读取服务不可用"))?;
+    Ok(Json(
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            person_batch::progress(&app.config, &id)
+        })
+        .await
+        .map_err(|_| Error::new(503, "unavailable", "批次状态读取失败"))??,
+    ))
 }
