@@ -7,6 +7,7 @@ COPY services/file-operations/src ./src
 RUN cargo build --release --locked --bins
 
 FROM ${RUNTIME_IMAGE} AS runtime
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg util-linux && rm -rf /var/lib/apt/lists/*
 COPY --from=build /build/target/release/face-file-operations /usr/local/bin/face-file-operations
 COPY --from=build /build/target/release/storage-probe /usr/local/bin/storage-probe
 USER 1000:1000

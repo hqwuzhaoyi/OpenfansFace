@@ -239,19 +239,9 @@ fn group(task: &Value, data: &Value) -> String {
     bucket.into()
 }
 pub fn health_hidden(config: &Config, vid: &str, path: &str, stat: &fs::Metadata) -> Result<bool> {
-    let (_, report) = read(config, "video-health.json", json!({}))?;
-    let record = &report["records"][vid];
-    let fresh: bool = rusqlite::Connection::open_in_memory()?.query_row(
-        "SELECT COALESCE(julianday('now')-julianday(?) BETWEEN 0 AND 7,0)",
-        [report["last_success_at"].as_str()],
-        |r| r.get(0),
-    )?;
-    Ok(fresh
-        && record["hidden"] == true
-        && record["path"] == path
-        && record["size"].as_u64() == Some(stat.len())
-        && record["mtime_ns"].as_str() == Some(files::mtime_ns(stat).as_str()))
+    crate::video_health::effective_hidden(config, vid, path, stat)
 }
+
 pub fn timestamp(at: &str) -> Result<f64> {
     Ok(rusqlite::Connection::open_in_memory()?.query_row(
         "SELECT unixepoch(?, 'subsec')",

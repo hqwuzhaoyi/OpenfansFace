@@ -147,6 +147,7 @@ name = "face-file-operations"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "libc",
  "rusqlite",
  "rustix",
  "serde",

@@ -31,6 +31,7 @@ mod shared_metadata;
 mod staging;
 mod staging_delete;
 mod store;
+mod video_health;
 
 use crate::{
     config::Config,
@@ -91,6 +92,20 @@ async fn post(
             format!("操作请求无效：{}", e.body_text()),
         )
     })?;
+    if envelope.request.action == "metadata-write"
+        && envelope
+            .request
+            .payload
+            .as_ref()
+            .and_then(|v| v["command"].as_str())
+            .is_some_and(|c| c.starts_with("health-"))
+    {
+        return Err(Error::new(
+            400,
+            "invalid_request",
+            "体检发布只允许后台调度器执行",
+        ));
+    }
     let (reply, wait) = oneshot::channel();
     app.worker
         .try_send(Work {
@@ -178,6 +193,21 @@ async fn staging_list(
         .map_err(|_| Error::new(503, "unavailable", "暂存列表读取失败"))??,
     ))
 }
+fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    let args: Vec<_> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("--health-observe") {
+        let result = video_health::helper(std::path::Path::new(
+            args.get(2).ok_or("missing observation input")?,
+        ));
+        if let Err(e) = result {
+            eprintln!("{}", e.error);
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+    serve()
+}
+
 /// Slow-media test hook, only reachable with Config's full marked-fixture guard.
 /// The per-request marker proves admission happened inside the bounded blocking lane.
 fn media_listing_checkpoint(config: &Config, offset: usize) -> Result<()> {
@@ -200,9 +230,20 @@ fn media_listing_checkpoint(config: &Config, offset: usize) -> Result<()> {
     fault::checkpoint(config, "media_listing")
 }
 #[tokio::main]
-async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
+async fn serve() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
     let mut engine = Engine::new(config.clone())?;
+    match video_health::needs_recovery(&config) {
+        Ok(true) => {
+            if let Err(error) =
+                shared_metadata::execute(&mut engine, "health-interrupted", json!({}))
+            {
+                eprintln!("health recovery: {}", error.error);
+            }
+        }
+        Err(error) => eprintln!("health state unavailable: {}", error.error),
+        Ok(false) => (),
+    }
     let (worker, queue) = mpsc::sync_channel::<Work>(32);
     let executor = thread::Builder::new()
         .name("file-operation-executor".into())
@@ -242,6 +283,16 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                 let _ = reply.send(result);
             }
         })?;
+    let health_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let health = if std::env::var("VIDEO_HEALTH_ENABLED").as_deref() == Ok("1") {
+        Some(video_health::spawn(
+            config.clone(),
+            worker.clone(),
+            health_stop.clone(),
+        ))
+    } else {
+        None
+    };
     let app = App {
         config: config.clone(),
         worker,
@@ -257,6 +308,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .route("/v1/person-batch", get(batch_status).post(batch_post))
         .route("/v1/archive", get(archive_status).post(archive_post))
         .route("/v1/staging", get(staging_list))
+        .route("/v1/video-health", get(health_summary).post(health_report))
         .route("/v1/metadata", axum::routing::post(metadata_post))
         .layer(DefaultBodyLimit::max(8 * 1024 * 1024))
         .with_state(app);
@@ -265,6 +317,10 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     axum::serve(listener, router)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
+    health_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    if let Some(health) = health {
+        health.join().map_err(|_| "health worker panicked")?;
+    }
     executor.join().map_err(|_| "execution worker panicked")?;
     Ok(())
 }
@@ -347,6 +403,9 @@ async fn metadata_post(
         .as_str()
         .ok_or_else(|| Error::new(400, "invalid_request", "缺少命令"))?
         .to_owned();
+    if command.starts_with("health-") {
+        return Err(Error::new(400, "invalid_request", "请使用视频体检报告入口"));
+    }
     let (reply, wait) = oneshot::channel();
     app.worker
         .try_send(Work {
@@ -403,4 +462,54 @@ async fn batch_status(
         .await
         .map_err(|_| Error::new(503, "unavailable", "批次状态读取失败"))??,
     ))
+}
+
+async fn health_summary(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<Value>> {
+    authorize(&app.config, &headers)?;
+    let permit = app
+        .media_reads
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| Error::new(503, "unavailable", "读取服务不可用"))?;
+    Ok(Json(
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            if let Some(vid) = query.get("vid") {
+                video_health::playback_guard(
+                    &app.config,
+                    vid,
+                    query.get("path").map(String::as_str),
+                )
+            } else {
+                video_health::summary(&app.config)
+            }
+        })
+        .await
+        .map_err(|_| Error::new(503, "unavailable", "体检记录读取失败"))??,
+    ))
+}
+async fn health_report(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>> {
+    authorize(&app.config, &headers)?;
+    let (reply, wait) = oneshot::channel();
+    app.worker
+        .try_send(Work {
+            command: Command::Metadata {
+                command: "health-report".into(),
+                body,
+            },
+            reply,
+        })
+        .map_err(|_| Error::new(503, "writer_busy", "执行队列已满"))?;
+    Ok(Json(wait.await.map_err(|_| {
+        Error::new(503, "outcome_unknown", "报告回执未知，请查询原操作编号")
+    })??))
 }

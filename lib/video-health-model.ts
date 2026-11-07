@@ -1,5 +1,5 @@
 export interface VideoHealthRecord {
-  vid: string; path: string | null; status: string; size?: number | null; mtime_ns?: string | null
+  vid: string; path: string | null; fingerprint?: string | null; restorations?: [string,string][]; status: string; size?: number | null; mtime_ns?: string | null
   hidden?: boolean; consecutive?: number; detail?: string; codec?: string; in_review?: boolean
   first_failure_at?: string; last_checked_at?: string; last_probed_at?: string
 }
