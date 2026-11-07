@@ -43,7 +43,7 @@ export default function ProcessingDashboard(){
    else if(signature(next)!==signature(current.current))setPending(true)
  }catch(e:any){if(request===sequence.current)setError(e.message)}},[apply,canApply,version])
  useEffect(()=>{let stop=false,timer:ReturnType<typeof setTimeout>;const run=async()=>{await load();if(!stop)timer=setTimeout(run,5000)};void run();return()=>{stop=true;sequence.current++;clearTimeout(timer)}},[load])
- const open=(id:string)=>{origin.current=document.activeElement as HTMLElement;setInstant(!!document.activeElement?.matches(':focus-visible')||matchMedia('(prefers-reduced-motion: reduce)').matches);if(id==='settings')setDraft(data?.settings.requested||1);setDetail(id)}
+ const open=(id:string)=>{origin.current=document.activeElement as HTMLElement;setInstant(!!document.activeElement?.matches(':focus-visible')||matchMedia('(prefers-reduced-motion: reduce)').matches);if(id==='settings')setDraft(Math.min(data?.settings.requested||1,data?.settings.maximum||1));setDetail(id)}
  const act=async(action:'pause'|'resume'|'retry',batch?:string)=>{setBusy(true);try{
    if(action==='retry'){const result=await api<{retried:number}>('/api/processing/dashboard',{method:'POST',body:JSON.stringify({action,batch})});toast.success(`${result.retried} 个异常任务已重新排队`)}
    else{await api('/api/processing',{method:'POST',body:JSON.stringify({action})});toast.success(action==='pause'?'已暂停接单，在途任务继续完成':'已恢复自动分析')}

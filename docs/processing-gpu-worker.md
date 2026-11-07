@@ -122,3 +122,10 @@ claiming. A native read outage returns the attempt's model retry budget and wait
 Legacy standalone watermark worker entrypoints/shared-result writes fail closed
 when Rust ownership is configured. Central cutover must also drain and retire any
 pre-upgrade process that loaded older code before enabling the new authority.
+
+Joint review regression runs with `PROCESSING_REVIEW_JOINT=1` in
+`tests/http-processing-native-worker.py` against the combined #18/schema8 native
+binary. It opens a delivered review session, publishes a changed suggestion
+through the actual worker/native flow, checks frozen rows/data/group and pending
+updates, then confirms using the original delivered token. Refresh and receipt
+replay keep batch completion at one.
