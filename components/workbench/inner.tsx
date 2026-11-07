@@ -3,7 +3,7 @@
 // Thin compositions of the existing BEUI controls and ReUI/Radix primitives.
 import { useEffect, useRef, useState, type ComponentProps, type ReactNode } from 'react'
 import { Collapsible } from 'radix-ui'
-import { ChevronDown, Copy, AlertCircle } from 'lucide-react'
+import { ChevronDown, Copy, Check, AlertCircle } from 'lucide-react'
 import { workspaceToast as toast } from '@/components/workbench/feedback'
 import { Button as BeuiButton } from '@/components/beui/motion/button/base'
 import { Card } from '@/components/beui/motion/card'
@@ -37,7 +37,7 @@ export function WorkspaceSection({title,count,defaultOpen=true,children}:{title:
 export function WorkspaceField({label,children}:{label:string;children:ReactNode}){return <label className="ws-field-label"><span>{label}</span>{children}</label>}
 export function WorkspaceMessage({children,error=false}:{children:ReactNode;error?:boolean}){return <p className={`ws-inline-message ${error?'ws-inline-error':''}`} role={error?'alert':'status'}>{error&&<AlertCircle size={14}/>}<span>{children}</span></p>}
 
-export function WorkspacePath({value,label='完整路径'}:{value:string;label?:string}){
+export function WorkspacePath({value,label='完整路径',compact=false}:{value:string;label?:string;compact?:boolean}){
   const [copied,setCopied]=useState(false),timer=useRef<ReturnType<typeof setTimeout>|null>(null)
   useEffect(()=>()=>{if(timer.current)clearTimeout(timer.current)},[])
   useEffect(()=>setCopied(false),[value])
@@ -48,7 +48,7 @@ export function WorkspacePath({value,label='完整路径'}:{value:string;label?:
       setCopied(true);if(timer.current)clearTimeout(timer.current);timer.current=setTimeout(()=>setCopied(false),1800)
     }catch{toast.error('复制失败，可直接选择路径文字复制')}
   }
-  return <div className="ws-path"><div><span>{label}</span><WorkspaceButton variant="ghost" size="icon" aria-label={`复制${label}`} title={copied?'已复制':'复制路径'} onClick={copy}><Copy size={13}/></WorkspaceButton><span role="status">{copied?'已复制':''}</span></div><code>{value}</code></div>
+  return <div className={`ws-path ${compact?'ws-path-compact':''}`}><div><span>{label}</span><WorkspaceButton variant="ghost" size="icon" aria-label={`复制${label}`} title={copied?'已复制':'复制路径'} onClick={copy}>{copied?<Check size={13}/>:<Copy size={13}/>}</WorkspaceButton><span role="status">{copied?'已复制':''}</span></div><code title={value}>{value}</code></div>
 }
 
 const mediaPositions=new Map<string,number>()
