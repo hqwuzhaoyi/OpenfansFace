@@ -60,7 +60,7 @@ pub fn mapped(config: &Config, value: &str, plan: &Plan) -> String {
     if plan.action == "merge-person" {
         return crate::person_merge::mapped(config, value, plan);
     }
-    if plan.action == "rename-person" {
+    if ["rename-person", "delete-person"].contains(&plan.action.as_str()) {
         return crate::person_rename::mapped(config, value, plan);
     }
     value.into()
@@ -177,6 +177,7 @@ fn updated(config: &Config, name: &str, value: &Value, plan: &Plan) -> Value {
 fn is_array(name: &str) -> bool {
     [
         "claims-detail.json",
+        "promoted.json",
         "clusters.json",
         "integration-queue.json",
         "archive-history.json",

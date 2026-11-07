@@ -200,7 +200,36 @@ def identity_conflicts():
         print('PASS normalized source entity reused in place')
     finally:x.stop()
 
+def ambiguous_cleanup():
+    for errno in ('EIO', 'ESTALE', 'ETIMEDOUT'):
+        x = RenameFixture()
+        try:
+            plan = x.preview(x.rename_request())
+            x.fault('mutation:source_directory_remove', 'mutation_error_after', errno=errno)
+            error = x.apply(plan, 503)
+            assert error['mutation_outcome'] == 'unknown' and error['step'] == 'source_directory_remove', error
+            target = x.media / 'pikpak/creators' / plan['target_person']
+            assert {str(p.relative_to(target)):p.read_bytes() for p in target.rglob('*') if p.is_file()} == x.contents
+            with sqlite3.connect(x.ledger) as db:
+                assert db.execute('SELECT canonical_name FROM entity WHERE id=1').fetchone()[0] == '新甲'
+            with sqlite3.connect(x.base/'file-operations-rust/operations.sqlite3') as db:
+                attempts = db.execute("SELECT COUNT(*) FROM steps WHERE operation_id=? AND phase='filesystem_mutation_intent'", (plan['id'],)).fetchone()[0]
+            (x.root/'rust-fault.json').unlink()
+            x.stop(); x.start()
+            for _ in range(2):
+                state = x.call({'mode':'reconcile', 'request':plan['request'], 'version':plan['version']})
+                assert state['status'] == 'recovery_needed' and state['io_state'] == 'unknown', state
+                assert (x.base/'.review-write.lock').exists()
+                x.apply(plan, 503)
+            with sqlite3.connect(x.base/'file-operations-rust/operations.sqlite3') as db:
+                assert attempts == db.execute("SELECT COUNT(*) FROM steps WHERE operation_id=? AND phase='filesystem_mutation_intent'", (plan['id'],)).fetchone()[0]
+                assert db.execute("SELECT COUNT(*) FROM steps WHERE operation_id=? AND phase='source_directory_cleanup_warning'", (plan['id'],)).fetchone()[0] == 0
+            print('PASS committed directory cleanup ambiguity stays protected across restart', errno)
+        finally:
+            x.stop()
+
+
 if __name__=='__main__':
-    success();guards();rollback();empty();hardlinks();cleanup_warning();identity_conflicts()
+    success();guards();rollback();empty();hardlinks();cleanup_warning();identity_conflicts();ambiguous_cleanup()
     for phase in ('directory_published','source_removed:1','faces_committed_unrecorded','jobs_committed_unrecorded','ledger_committed_unrecorded','source_directory_cleanup_intent','source_directory_removed_unrecorded','final_receipt_intent'):crash(phase)
     crash('jobs_committed_unrecorded',True)

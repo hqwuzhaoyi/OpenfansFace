@@ -18,6 +18,8 @@ pub struct Error {
     pub path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub step: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mutation_outcome: Option<Box<str>>,
 }
 impl Error {
     pub fn new(status: u16, code: &str, message: impl Into<String>) -> Self {
@@ -27,6 +29,7 @@ impl Error {
             error: message.into(),
             path: None,
             step: None,
+            mutation_outcome: None,
         }
     }
     pub fn at(mut self, path: impl Into<String>) -> Self {
@@ -36,6 +39,25 @@ impl Error {
     pub fn during(mut self, step: impl Into<String>) -> Self {
         self.step = Some(step.into());
         self
+    }
+    pub fn ambiguous_mutation(mut self) -> Self {
+        self.mutation_outcome = Some("unknown".into());
+        self
+    }
+    pub fn mutation(e: std::io::Error) -> Self {
+        let ambiguous = [
+            rustix::io::Errno::IO,
+            rustix::io::Errno::STALE,
+            rustix::io::Errno::TIMEDOUT,
+        ]
+        .iter()
+        .any(|errno| e.raw_os_error() == Some(errno.raw_os_error()));
+        let error = Self::from(e);
+        if ambiguous {
+            error.ambiguous_mutation()
+        } else {
+            error
+        }
     }
     pub fn conflict(message: impl Into<String>) -> Self {
         Self::new(409, "stale_preview", message)
@@ -196,4 +218,41 @@ pub fn validate_id(id: &str) -> Result<()> {
 }
 pub fn final_result(plan: &Plan) -> Value {
     json!({"ok":true,"id":plan.id,"person":plan.person,"changed":plan.files.len(),"staged":false})
+}
+
+#[cfg(test)]
+mod mutation_tests {
+    use super::*;
+    #[test]
+    fn only_actual_ambiguous_write_errors_have_unknown_outcome() {
+        for errno in [
+            rustix::io::Errno::IO,
+            rustix::io::Errno::STALE,
+            rustix::io::Errno::TIMEDOUT,
+        ] {
+            assert!(Error::from(errno).mutation_outcome.is_none());
+            let error = Error::mutation(std::io::Error::from_raw_os_error(errno.raw_os_error()));
+            assert_eq!(error.mutation_outcome.as_deref(), Some("unknown"));
+            let restored: Error =
+                serde_json::from_value(serde_json::to_value(error).unwrap()).unwrap();
+            assert_eq!(restored.mutation_outcome.as_deref(), Some("unknown"));
+        }
+        for errno in [
+            rustix::io::Errno::ACCESS,
+            rustix::io::Errno::PERM,
+            rustix::io::Errno::EXIST,
+            rustix::io::Errno::NOENT,
+        ] {
+            assert!(
+                Error::mutation(std::io::Error::from_raw_os_error(errno.raw_os_error()))
+                    .mutation_outcome
+                    .is_none()
+            );
+        }
+        let old: Error = serde_json::from_value(
+            json!({"code":"storage_unavailable","error":"old receipt","status":503,"path":null}),
+        )
+        .unwrap();
+        assert!(old.mutation_outcome.is_none());
+    }
 }

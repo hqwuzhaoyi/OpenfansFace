@@ -45,7 +45,7 @@ fn new_row(connection: &Connection, table: &str, fields: Value) -> Result<Value>
     Ok(Value::Object(row))
 }
 pub fn snapshot(config: &Config, plan: &Plan) -> Result<ledger::Delta> {
-    if plan.action == "rename-person" {
+    if ["rename-person", "delete-person"].contains(&plan.action.as_str()) {
         return rename_snapshot(config, plan);
     }
     let mut connection = db::open(&config.ledger)?;
@@ -288,36 +288,24 @@ fn rename_snapshot(config: &Config, plan: &Plan) -> Result<ledger::Delta> {
     if source.len() > 1 {
         return Err(Error::conflict("Peach 来源人物记录不唯一"));
     }
-    if !target.is_empty() {
+    let deleting = plan.action == "delete-person";
+    if !deleting && !target.is_empty() {
         return Err(Error::conflict("Peach 已有同名人物，不能直接覆盖或合并"));
     }
     let after_entities = source
         .iter()
         .map(|r| {
             let mut next = r.clone();
-            next["canonical_name"] = json!(plan.target_person);
-            next["normalized_name"] = json!(plan.target_person.to_lowercase());
+            if !deleting {
+                next["canonical_name"] = json!(plan.target_person);
+                next["normalized_name"] = json!(plan.target_person.to_lowercase());
+            }
             next
         })
         .collect::<Vec<_>>();
-    let old = format!(
-        "{}\\",
-        win(
-            config,
-            &config.creators().join(&plan.person).display().to_string()
-        )
-    );
-    let new = format!(
-        "{}\\",
-        win(
-            config,
-            &config
-                .creators()
-                .join(&plan.target_person)
-                .display()
-                .to_string()
-        )
-    );
+    let (source_root, target_root) = crate::person_directory::roots(config, plan);
+    let old = format!("{}\\", win(config, &source_root.display().to_string()));
+    let new = format!("{}\\", win(config, &target_root.display().to_string()));
     let assets = db::rows(
         &tx,
         "SELECT * FROM asset WHERE substr(path,1,length(?))=? ORDER BY id",
@@ -355,12 +343,12 @@ fn rename_snapshot(config: &Config, plan: &Plan) -> Result<ledger::Delta> {
             canonical: plan.person.clone(),
             normalized: plan.person.to_lowercase(),
             before: source.clone(),
-            after: vec![],
+            after: if deleting { source.clone() } else { vec![] },
         },
         db::Guard::CreatorName {
             canonical: plan.target_person.clone(),
             normalized: plan.target_person.to_lowercase(),
-            before: vec![],
+            before: if deleting { source.clone() } else { vec![] },
             after: after_entities.clone(),
         },
         db::Guard::AssetPrefix {

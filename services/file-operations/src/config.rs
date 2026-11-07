@@ -57,7 +57,11 @@ impl Config {
                 || config.base != root.join("base")
                 || config.media != root.join("media")
                 || config.ledger != root.join("ledger.db")
-                || std::fs::read_to_string(root.join(".fileops-fixture"))?
+                || crate::control::read(
+                    &root.join(".fileops-fixture"),
+                    crate::control::MARKER_LIMIT,
+                )?
+                .unwrap_or_default()
                     != "person file operations"
                 || !address.ip().is_loopback())
         {
