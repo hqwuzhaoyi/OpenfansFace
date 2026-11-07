@@ -29,6 +29,7 @@ mod person_move;
 mod person_registration;
 mod person_rename;
 mod processing_result;
+mod reference_relocation;
 mod review;
 mod review_sessions;
 mod shared_metadata;

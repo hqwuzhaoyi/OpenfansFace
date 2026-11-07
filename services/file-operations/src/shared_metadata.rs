@@ -322,6 +322,13 @@ pub fn analysis_state(config: &Config) -> Result<Value> {
         "assigned_feature_caches".into(),
         crate::processing_result::assigned_reference_inputs(config)?,
     );
+    // Completed relocation receipts authorize cache origin bridges. Pending worker
+    // progress is deliberately absent from the reference input version.
+    let journal = db::open(&config.state_db())?;
+    input.insert("reference_relocations".into(), json!(table_digest(&journal,
+        "SELECT id,plan,evidence FROM operations WHERE status='complete' AND json_array_length(plan,'$.files')>0 ORDER BY rowid")?));
+    input.insert("reference_relocation_steps".into(), json!(table_digest(&journal,
+        "SELECT s.operation_id,s.revision,s.phase,s.evidence FROM steps s JOIN operations o ON o.id=s.operation_id WHERE o.status='complete' AND json_array_length(o.plan,'$.files')>0 AND (s.phase='commit_scope' OR json_type(s.evidence,'$.move_evidence')='object') ORDER BY s.operation_id,s.revision")?));
     Ok(json!({"version":model::hash(&input)}))
 }
 fn table_digest(conn: &rusqlite::Connection, sql: &str) -> Result<String> {
@@ -777,7 +784,14 @@ pub fn execute(engine: &mut Engine, command: &str, mut body: Value) -> Result<Va
     if command == "processing-result" {
         return crate::processing_result::execute(engine, body);
     }
-    if ["state", "check-state", "analysis-state"].contains(&command) {
+    if [
+        "state",
+        "check-state",
+        "analysis-state",
+        "reference-relocation",
+    ]
+    .contains(&command)
+    {
         if engine.store.blocked()? {
             return Err(Error::new(
                 503,
@@ -798,6 +812,7 @@ pub fn execute(engine: &mut Engine, command: &str, mut body: Value) -> Result<Va
         };
         check_gate()?;
         let result = match command {
+            "reference-relocation" => crate::reference_relocation::verify(engine, &body),
             "state" => material_state(&engine.config, &body["scope"]),
             "check-state" => check_state(&engine.config, &body["scope"], string(&body, "version")?),
             _ => analysis_state(&engine.config),

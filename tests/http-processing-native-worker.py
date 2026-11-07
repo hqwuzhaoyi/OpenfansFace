@@ -80,9 +80,16 @@ try:
         confirmed=x.call({'command':'queue-confirm','body':{'creator':'甲','vids':[vid],'source':'review','fingerprints':{vid:{'path':str(file),'size':file.stat().st_size,'mtime_ns':str(file.stat().st_mtime_ns)}},'review_group':{'key':'none','deferred':False},**confirmation_scope}},'/v1/archive')
         assert build_references(x.base,x.media)['people']==1
         preview=x.call({'command':'archive-preview','body':{}},'/v1/archive')
+        if os.environ.get('PROCESSING_COPY_RELOCATION')=='1':f.write(x.root/'rust-fault.json',{'force_copy':True})
         result=x.call({'command':'archive-apply','body':{'vids':[vid],'version':preview['version'],'operation_id':str(uuid.uuid4())}},'/v1/archive')
         destination=Path(json.loads((x.base/'video-path-overrides.json').read_text())[vid])
         assert destination!=file and destination.is_file(),result
+        assert build_references(x.base,x.media)['people']==1
+        # A second native move must bridge through the now-absent intermediate path.
+        request=x.request(destination,filename='renamed-reference.mp4',vid=vid)
+        plan=x.call({'mode':'preview','request':request})
+        x.call({'mode':'apply','request':request,'version':plan['version']})
+        destination=destination.with_name('renamed-reference.mp4')
         assert build_references(x.base,x.media)['people']==1
         old=destination.stat();replacement=destination.with_suffix('.replacement');replacement.write_bytes(destination.read_bytes());os.utime(replacement,ns=(old.st_atime_ns,old.st_mtime_ns));os.replace(replacement,destination)
         assert build_references(x.base,x.media)['people']==0

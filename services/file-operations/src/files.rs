@@ -1157,6 +1157,15 @@ pub fn remove_source_directory(
 /// Verify a committed destination after source-directory cleanup removed its parent.
 /// This retains the same inode/content evidence as PinnedMove::position, including EXDEV copies.
 pub fn inspect_committed_destination(file: &FileMove, evidence: &MoveEvidence) -> Result<()> {
+    inspect_destination(file, evidence, true)
+}
+/// A completed receipt already verified copied bytes. Reference-cache reuse keeps
+/// its existing identity/fingerprint contract without rehashing multi-GB media.
+/// This is never an execution/recovery verifier.
+pub fn inspect_reference_destination(file: &FileMove, evidence: &MoveEvidence) -> Result<()> {
+    inspect_destination(file, evidence, false)
+}
+fn inspect_destination(file: &FileMove, evidence: &MoveEvidence, verify_bytes: bool) -> Result<()> {
     let parent: File = directory(Path::new(&file.dst).parent().unwrap())?.into();
     if !same_inode(&identity(&parent.metadata()?), &evidence.destination_parent) {
         return Err(Error::conflict("目标父目录已被替换").at(&file.dst));
@@ -1170,10 +1179,18 @@ pub fn inspect_committed_destination(file: &FileMove, evidence: &MoveEvidence) -
     .into();
     if !opened.metadata()?.is_file()
         || !(fingerprint(&file.src, &opened.metadata()?) == file.version
-            || evidence
-                .copy
-                .as_ref()
-                .is_some_and(|p| PinnedMove::proof_matches(&mut opened, p).unwrap_or(false)))
+            || evidence.copy.as_ref().is_some_and(|p| {
+                if verify_bytes {
+                    PinnedMove::proof_matches(&mut opened, p).unwrap_or(false)
+                } else {
+                    p.digest
+                        .as_ref()
+                        .is_some_and(|d| d.len() == 64 && d.bytes().all(|c| c.is_ascii_hexdigit()))
+                        && opened
+                            .metadata()
+                            .is_ok_and(|stat| identity(&stat) == p.identity)
+                }
+            }))
     {
         return Err(Error::conflict("已提交文件身份已变化").at(&file.dst));
     }

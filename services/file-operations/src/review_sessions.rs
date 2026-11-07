@@ -39,7 +39,7 @@ pub fn available(t: &Value) -> bool {
         || (t["data"]["ready"] == true
             && (t["stage"] == "face"
                 || t["stage"] == "face_queued"
-                || t["stage"] == "retry" && t["retry_stage"] == "face"))
+                || (t["stage"] == "retry" || t["stage"] == "error") && t["retry_stage"] == "face"))
 }
 fn public(mut t: Value) -> Result<Value> {
     for v in t.as_object_mut().unwrap().values_mut() {
@@ -416,10 +416,11 @@ pub fn validate(config: &Config, body: &Value) -> Result<Vec<Value>> {
             .iter()
             .find(|t| t["vid"] == vid)
             .ok_or_else(changed)?;
-        if t["stage"] == "error" && review::number(&t["manual"]).unwrap_or(0) == 0
-            || ["path", "size", "mtime_ns"]
-                .iter()
-                .any(|key| t[*key] != e["task"][*key])
+        // Worker stages (including exhausted inference retries) do not change
+        // already delivered human evidence. Material and disposition guards do.
+        if ["path", "size", "mtime_ns"]
+            .iter()
+            .any(|key| t[*key] != e["task"][*key])
             || text_evidence(t) != e["text"]
             || health.state(config, t)? != e["health"]
             || dispositions.get(&vid).cloned().unwrap_or(Value::Null) != e["disposition"]

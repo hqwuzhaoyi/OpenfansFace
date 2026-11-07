@@ -44,7 +44,7 @@ export default function Review() {
   const [drafts,setDrafts]=useState<Record<string,{creator:string;watermarkKey:string}>>({}),[notes,setNotes]=useState<Record<string,string>>({}),[submitError,setSubmitError]=useState('')
   const [pickerSearch,setPickerSearch]=useState<Record<string,string>>({})
   const [reference,setReference]=useState<{name:string;returnTo:'video'|'selection';scroll:number}|null>(null)
-  const [people,setPeople]=useState<PersonChoice[]>([]),[peopleError,setPeopleError]=useState(''),[receipt,setReceipt]=useState<{vids:string[];creator:string}|null>(null)
+  const [people,setPeople]=useState<PersonChoice[]>([]),[peopleError,setPeopleError]=useState(''),[receipt,setReceipt]=useState<{vids:string[];creator:string;session:string}|null>(null)
   const pendingMutations=useRef(new Map<string,string>())
   const mutate=async<T=any>(path:string,body:Record<string,unknown>,method='POST'):Promise<T>=>{const key=JSON.stringify([path,method,body]),id=pendingMutations.current.get(key)||crypto.randomUUID();pendingMutations.current.set(key,id);try{const result=await api<T>(path,{method,body:JSON.stringify({...body,operation_id:id})});pendingMutations.current.delete(key);return result}catch(error:any){if(!error.resultUnknown)pendingMutations.current.delete(key);else error.message+=`（操作 ${id}，重试将查询同一回执）`;throw error}}
   const refreshFocus=useRef<HTMLElement|null>(null)
@@ -145,13 +145,13 @@ export default function Review() {
     catch(e:any){setSubmitError(e.message);if(/核对已过期|核对会话|本次核对已过期/.test(e.message))setSessionExpired(true);toast.error(e.message);return false}finally{setBusy(false)}
   }
   const confirm=async()=>{
-    if(!chosen.length||!creator.trim()||busy||sessionExpired||chosen.some(t=>blockedIds.has(t.vid)))return
+    if(!session.current||!chosen.length||!creator.trim()||busy||sessionExpired||chosen.some(t=>blockedIds.has(t.vid)))return
     setBusy(true);setSubmitError('')
-    const vids=chosen.map(t=>t.vid),name=creator.trim()
-    try{const result=await mutate<{vids?:string[];rule_warning?:string}>('/api/plan/queue',{vids,creator:name,review_tokens:evidenceTokens(vids),review_session:session.current,source:'review',source_id:activeGroup,review_group:{key:activeGroup,deferred:view==='deferred'},watermark_key:watermarkKey||undefined,fingerprints:Object.fromEntries(chosen.map(t=>[t.vid,{path:t.path,size:t.size,mtime_ns:t.mtime_ns}]))});const completed=result.vids||vids;setReceipt({vids:completed,creator:name});removeCompleted(completed);setDrafts(current=>({...current,[scope]:{creator:'',watermarkKey:''}}));setPreviewOpen(false);setDetailMode('video');setLinkFocus('');await load({preservePosition:true});await loadPeople();result.rule_warning?toast.warning(result.rule_warning):toast.success('已加入待归档')}
+    const vids=chosen.map(t=>t.vid),name=creator.trim(),confirmationSession=session.current
+    try{const result=await mutate<{vids?:string[];rule_warning?:string}>('/api/plan/queue',{vids,creator:name,review_tokens:evidenceTokens(vids),review_session:confirmationSession,source:'review',source_id:activeGroup,review_group:{key:activeGroup,deferred:view==='deferred'},watermark_key:watermarkKey||undefined,fingerprints:Object.fromEntries(chosen.map(t=>[t.vid,{path:t.path,size:t.size,mtime_ns:t.mtime_ns}]))});const completed=result.vids||vids;setReceipt({vids:completed,creator:name,session:confirmationSession});removeCompleted(completed);setDrafts(current=>({...current,[scope]:{creator:'',watermarkKey:''}}));setPreviewOpen(false);setDetailMode('video');setLinkFocus('');await load({preservePosition:true});await loadPeople();result.rule_warning?toast.warning(result.rule_warning):toast.success('已加入待归档')}
     catch(e:any){setSubmitError(e.message);if(/核对已过期|核对会话|本次核对已过期/.test(e.message))setSessionExpired(true);toast.error(e.message)}finally{setBusy(false)}
   }
-  const undo=async()=>{if(!receipt)return;setBusy(true);try{const result=await mutate<{warning?:string}>('/api/plan/queue',{vids:receipt.vids,review_session:session.current},'DELETE');setReceipt(null);await load({preservePosition:true});result.warning?toast.warning(result.warning):toast.success('已撤销本次归名')}catch(e:any){toast.error(e.message)}finally{setBusy(false)}}
+  const undo=async()=>{if(!receipt)return;setBusy(true);try{const result=await mutate<{warning?:string}>('/api/plan/queue',{vids:receipt.vids,review_session:receipt.session},'DELETE');setReceipt(null);await load({preservePosition:true});result.warning?toast.warning(result.warning):toast.success('已撤销本次归名')}catch(e:any){toast.error(e.message)}finally{setBusy(false)}}
   const openReference=(name:string)=>{setReference({name,returnTo:detailMode,scroll:document.querySelector('.ws-detail-content')?.scrollTop||0});requestAnimationFrame(()=>selectionHeading.current?.focus())}
   const backReference=()=>{const previous=reference;setReference(null);if(previous)requestAnimationFrame(()=>{const area=document.querySelector('.ws-detail-content');if(area)area.scrollTop=previous.scroll;const trigger=[...document.querySelectorAll<HTMLButtonElement>('.ws-detail-content button')].find(b=>b.getAttribute('aria-label')===`看 ${previous.name} 的对照视频`);trigger?.focus({preventScroll:true})})}
   const detail=<>
