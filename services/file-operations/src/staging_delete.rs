@@ -497,6 +497,7 @@ pub fn plan(config: &Config, request: Request) -> Result<Plan> {
     let mut seen = BTreeSet::new();
     let mut docs = BTreeMap::new();
     let mut total = 0u64;
+    let mut snapshot_bytes = 0usize;
     for chosen in selected {
         if !seen.insert(chosen.path.clone()) {
             return Err(Error::conflict("重复选择暂存文件"));
@@ -524,6 +525,16 @@ pub fn plan(config: &Config, request: Request) -> Result<Plan> {
             origin: staging::origin(config, &file.src, &origins)?,
             domain: domain(config, &file, &request.id, &mut docs)?,
         };
+        snapshot_bytes = snapshot_bytes
+            .saturating_add(serde_json::to_vec(&item)?.len())
+            .saturating_add(serde_json::to_vec(&file)?.len());
+        if snapshot_bytes > 64 * 1024 * 1024 {
+            return Err(Error::new(
+                413,
+                "scope_too_large",
+                "删除恢复材料超过 64 MiB，请分批处理",
+            ));
+        }
         items.push(item);
         files.push(file);
     }
