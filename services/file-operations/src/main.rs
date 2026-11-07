@@ -18,6 +18,7 @@ mod person_metadata;
 mod person_move;
 mod person_registration;
 mod review;
+mod staging;
 mod store;
 
 use crate::{
@@ -119,6 +120,33 @@ async fn status(
     .map_err(|_| Error::new(503, "unavailable", "状态读取失败"))??;
     Ok(Json(value))
 }
+async fn staging_list(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Query(query): Query<HashMap<String, String>>,
+) -> Result<Json<Value>> {
+    authorize(&app.config, &headers)?;
+    let offset = query
+        .get("offset")
+        .map(|s| s.parse::<usize>())
+        .transpose()
+        .map_err(|_| Error::new(400, "invalid_request", "分页位置无效"))?
+        .unwrap_or(0);
+    let permit = app
+        .reads
+        .clone()
+        .acquire_owned()
+        .await
+        .map_err(|_| Error::new(503, "unavailable", "读取服务不可用"))?;
+    Ok(Json(
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            staging::list(&app.config, offset)
+        })
+        .await
+        .map_err(|_| Error::new(503, "unavailable", "暂存列表读取失败"))??,
+    ))
+}
 #[tokio::main]
 async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
@@ -157,6 +185,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         )
         .route("/v1/person-files", get(status).post(post))
         .route("/v1/archive", get(archive_status).post(archive_post))
+        .route("/v1/staging", get(staging_list))
         .layer(DefaultBodyLimit::max(8 * 1024 * 1024))
         .with_state(app);
     let listener = tokio::net::TcpListener::bind(&config.bind).await?;

@@ -75,9 +75,10 @@ pub fn require_move_permissions(src: &Path, dst: &Path) -> Result<()> {
             .ok_or_else(|| Error::new(400, "invalid_request", "目标目录无效"))?,
         "destination_directory",
     )?;
+    // Do not wait for a writer if an external actor replaces a regular file with a FIFO.
     let source = open(
         src,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )
     .map_err(|e| failure(e, src, "source_read"))?;

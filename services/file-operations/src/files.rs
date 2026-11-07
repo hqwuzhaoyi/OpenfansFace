@@ -109,6 +109,7 @@ fn root(config: &Config, scope: &ScopeRoot) -> Result<std::path::PathBuf> {
             Ok(config.creators().join(person))
         }
         ScopeRoot::Unorganized => Ok(config.media.join("pikpak")),
+        ScopeRoot::Staging => Ok(config.media.join("pikpak/.face-cleanup-staging")),
     }
 }
 fn scoped(config: &Config, scope: &MoveScope, file: &FileMove) -> Result<()> {
@@ -163,7 +164,7 @@ pub fn check_move(config: &Config, scope: &MoveScope, file: &FileMove) -> Result
     let source: File = openat(
         &parent,
         Path::new(&file.src).file_name().unwrap(),
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )?
     .into();
@@ -222,7 +223,7 @@ impl PinnedMove {
             match openat(
                 dir,
                 Path::new(path).file_name().unwrap(),
-                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::empty(),
             ) {
                 Ok(fd) => {
@@ -327,7 +328,7 @@ impl PinnedMove {
             match openat(
                 dir,
                 Path::new(path).file_name().unwrap(),
-                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::empty(),
             ) {
                 Ok(fd) => {
@@ -354,7 +355,7 @@ impl PinnedMove {
                 match openat(
                     parent,
                     proof.temp.as_str(),
-                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                     Mode::empty(),
                 ) {
                     Ok(fd) => {
@@ -384,7 +385,7 @@ impl PinnedMove {
         let current: File = openat(
             &self.parent,
             Path::new(&self.src).file_name().unwrap(),
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         )?
         .into();
@@ -507,7 +508,7 @@ impl PinnedMove {
             let mut input: File = openat(
                 from_parent,
                 Path::new(from).file_name().unwrap(),
-                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::empty(),
             )?
             .into();
@@ -546,7 +547,7 @@ impl PinnedMove {
         let mut output: File = openat(
             to_parent,
             proof.temp.as_str(),
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         )?
         .into();
@@ -624,7 +625,7 @@ impl PinnedMove {
                 match openat(
                     parent,
                     proof.temp.as_str(),
-                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                     Mode::empty(),
                 ) {
                     Ok(fd) => {
@@ -756,7 +757,7 @@ impl WriteGate {
         let path = config.base.join(".review-write.lock");
         let file: File = open(
             &path,
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         )?
         .into();
