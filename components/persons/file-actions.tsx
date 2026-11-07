@@ -10,13 +10,13 @@ import { WorkbenchDialogContent as DialogContent, WorkbenchButton as Button, Wor
 export interface FileActionSelection {action:PersonFileAction;files:PersonVideo[];resumePlan?:PersonFilePlan}
 export const FILE_OPERATION_STORAGE_KEY='person-file-operation-v1'
 const labels:Record<PersonFileAction,string>={'rename-file':'重命名文件','move-files':'移动视频','delete-files':'删除视频','rename-person':'人物重命名','merge-person':'合并人物','delete-person':'删除人物'}
-export function FileActionDialog({selection,person,people,theme,onClose,onSaved,onBusyChange,onSubmitted,onForget}:{selection:FileActionSelection;person:string;people:LibraryPerson[];theme:'light'|'dark';onClose:()=>void;onSaved:(result:PersonFileResult)=>Promise<void>;onBusyChange:(busy:boolean)=>void;onSubmitted:(plan:PersonFilePlan)=>void;onForget:()=>void}) {
+export function FileActionDialog({selection,person,people,theme,onClose,onSaved,onRolledBack,onBusyChange,onSubmitted,onForget}:{selection:FileActionSelection;person:string;people:LibraryPerson[];theme:'light'|'dark';onClose:()=>void;onSaved:(result:PersonFileResult)=>Promise<void>;onRolledBack:()=>Promise<void>;onBusyChange:(busy:boolean)=>void;onSubmitted:(plan:PersonFilePlan)=>void;onForget:()=>void}) {
   const [name,setName]=useState(selection.action==='rename-person'?person:selection.files[0]?.name||'')
   const [target,setTarget]=useState(''),[folder,setFolder]=useState(''),[plan,setPlan]=useState<PersonFilePlan|null>(selection.resumePlan||null),[error,setError]=useState(''),[busy,setBusy]=useState(false)
   const [targetQuery,setTargetQuery]=useState('')
   const [submitted,setSubmitted]=useState(!!selection.resumePlan),[status,setStatus]=useState(''),[phase,setPhase]=useState(''),[checking,setChecking]=useState(false)
-  const revision=useRef(-1),finished=useRef(false),alive=useRef(true),saved=useRef(onSaved)
-  saved.current=onSaved
+  const revision=useRef(-1),finished=useRef(false),alive=useRef(true),saved=useRef(onSaved),rolledBack=useRef(onRolledBack)
+  saved.current=onSaved;rolledBack.current=onRolledBack
   useEffect(()=>{alive.current=true;return()=>{alive.current=false}},[])
   type Receipt={id:string;status:string;revision?:number;phase?:string;result?:PersonFileResult;error?:string;failure?:{path?:string;step?:string}}
   async function receive(receipt:Receipt){
@@ -26,7 +26,8 @@ export function FileActionDialog({selection,person,people,theme,onClose,onSaved,
     if(detail||receipt.status!=='not_started')setError(detail)
     if(['complete','rolled_back','cancelled','failed'].includes(receipt.status)){
       finished.current=true;updateBusy(false)
-      if(receipt.result?.ok)await saved.current(receipt.result)
+      if(receipt.status==='rolled_back')await rolledBack.current()
+      else if(receipt.result?.ok)await saved.current(receipt.result)
     }
   }
   useEffect(()=>{
@@ -91,7 +92,7 @@ export function FileActionDialog({selection,person,people,theme,onClose,onSaved,
       <div className="pw-move-preview">{!plan.files.length&&<p>没有需要搬动的文件，将更新人物资料与归属记录。</p>}{plan.files.map(file=><div key={file.src}><span>原路径</span><code>{file.src}</code><span>新路径{file.renamed?' · 已调整以保留两份':''}</span><code>{file.dst}</code></div>)}</div>
       {error&&<p role="alert" className="pw-error">{error}</p>}
       {submitted?<>
-        <p role="status" aria-live="polite">{status==='complete'?'文件与记录已同步':status==='rolled_back'?'操作已回退，原文件与记录已恢复':status==='cancelled'?'未开始执行，迟到提交已阻止':status==='recovery_needed'?'需要核对恢复，写入已暂停':status==='not_started'?'提交尚未受理，可核对并停止此次提交':status==='failed'?'操作未完成，请核对错误依据':phaseText}</p>
+        <p role="status" aria-live="polite">{status==='complete'?'文件与记录已同步':status==='rolled_back'?'本次已执行的变更已回退':status==='cancelled'?'未开始执行，迟到提交已阻止':status==='recovery_needed'?'需要核对恢复，写入已暂停':status==='not_started'?'提交尚未受理，可核对并停止此次提交':status==='failed'?'操作未完成，请核对错误依据':phaseText}</p>
         <p className="pw-player-path">操作编号：{plan.id}</p>
         {!terminal&&<p>关闭窗口只停止等待，文件操作会继续。刷新后可按此编号查看结果。</p>}
         <div className="pw-modal-actions">
