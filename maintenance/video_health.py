@@ -119,6 +119,8 @@ def inventory(base):
     return sources, review, archived, ids
 
 def run(base, root, expected_source, budget=300, fixture=False, now=None, seconds=1200):
+    if os.environ.get('FILE_OPERATIONS_BACKEND')=='rust' or (base/'file-operations-rust/operations.sqlite3').exists():
+        raise RuntimeError('Native Rust owns video health; legacy publication is disabled')
     now=now or dt.datetime.now(UTC)
     deadline=time.monotonic()+seconds
     target=base/'video-health.json'; previous=read_json(target,{'schema':1,'records':{}})
@@ -178,6 +180,8 @@ def run(base, root, expected_source, budget=300, fixture=False, now=None, second
     return summary
 
 if __name__=='__main__':
+    if os.environ.get('FILE_OPERATIONS_BACKEND')=='rust' or (Path(os.environ.get('FACES_BASE','/data/base'))/'file-operations-rust/operations.sqlite3').exists():
+        raise SystemExit('Native Rust owns video health. Disable the legacy timer; use VIDEO_HEALTH_ENABLED=1 on the Rust service.')
     parser=argparse.ArgumentParser();parser.add_argument('--base',type=Path,default=Path(os.environ.get('FACES_BASE','/data/base')))
     parser.add_argument('--root',type=Path,default=Path(os.environ.get('MEDIA2_ROOT','/mnt/media2')));parser.add_argument('--budget',type=int,default=300)
     parser.add_argument('--expected-source',default=os.environ.get('MEDIA_NFS_SOURCE',''));parser.add_argument('--fixture',action='store_true')

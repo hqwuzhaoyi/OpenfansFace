@@ -1,3 +1,8 @@
+import fs from 'node:fs'
+import { BASE } from '@/lib/env'
+import { randomUUID } from 'node:crypto'
+import { nativeMetadataEnabled } from '@/lib/shared-metadata-backend'
+import { rustRequest } from '@/lib/file-operation-backend'
 import { NextRequest, NextResponse } from 'next/server'
 import { readVideoSources, videoSource } from '@/lib/video-sources'
 import { acquireReviewLock, loadArchive } from '@/lib/review-store'
@@ -9,6 +14,8 @@ export async function POST(req:NextRequest) {
   let release:(()=>void)|undefined
   try {
     const body=await req.json(),[vid]=validateVids([body.vid])
+    if(nativeMetadataEnabled())return NextResponse.json(await rustRequest({...body,operation_id:body.operation_id||randomUUID()},undefined,'v1/video-health'))
+    if(fs.existsSync(`${BASE}/file-operations-rust/operations.sqlite3`))return NextResponse.json({error:'视频体检已由 Rust 接管，请恢复后端配置'},{status:503})
     const sources=readVideoSources(),archive=loadArchive()
     if(!sources.has(vid)&&!archive.some(v=>v.vid===vid))throw new ReviewError('视频记录不存在',404)
     for(const item of archive)sources.set(item.vid,item.win_dst)

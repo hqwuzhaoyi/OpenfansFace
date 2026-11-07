@@ -338,6 +338,14 @@ fn prepare(config: &Config, body: &Value, id: &str) -> Result<Prepared> {
             .ok_or_else(|| bad("资料版本无效"))?;
         check_state(config, &body["scope"], version)?;
     }
+    if command.starts_with("health-") {
+        let (documents, guards, result) = crate::video_health::prepare(config, command, body, at)?;
+        return Ok(Prepared {
+            documents,
+            guards,
+            result,
+        });
+    }
     let mut out = Prepared {
         documents: vec![],
         guards: json!({}),
@@ -734,6 +742,9 @@ pub fn execute(engine: &mut Engine, command: &str, mut body: Value) -> Result<Va
             [],
             |r| r.get::<_, String>(0)
         )?);
+        if command.starts_with("health-") {
+            body["at"] = json!(crate::video_health::timestamp(&engine.config)?);
+        }
         serde_json::from_value(engine.preview(Request {
             id,
             action: "metadata-write".into(),
