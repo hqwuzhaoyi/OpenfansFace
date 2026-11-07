@@ -69,8 +69,8 @@ def reap(pid, seconds=3):
 
 
 class Service:
-    def __init__(self, binary, schema, media=None, sample=None, expected_source=None):
-        self.root = Path(tempfile.mkdtemp(prefix='face-admin-person-fileops-health-linux-', dir='/tmp')).resolve()
+    def __init__(self, binary, schema, media=None, sample=None, expected_source=None, state_parent=None):
+        self.root = Path(tempfile.mkdtemp(prefix='face-admin-person-fileops-health-linux-', dir=str(state_parent or Path('/tmp')))).resolve()
         (self.root / '.fileops-fixture').write_text('person file operations')
         self.base = self.root / 'base'
         self.base.mkdir()
@@ -258,7 +258,7 @@ def tree_evidence(root):
     return evidence
 
 
-def nfs_readonly(binary, schema, media, sample, expected_source):
+def nfs_readonly(binary, schema, media, sample, expected_source, state_parent=None):
     media = media.resolve(strict=True)
     assert '.face-admin-rust-fixtures' in media.parts, 'use only a marked isolated NFS subtree'
     assert (media / '.rust-nfs-fixture').read_text() == 'rust nfs acceptance\n'
@@ -268,7 +268,7 @@ def nfs_readonly(binary, schema, media, sample, expected_source):
     assert len(mount) == 3 and mount[0] in ('nfs', 'nfs4') and mount[1] == expected_source, mount
     assert 'ro' in mount[2].split(','), 'bind the isolated subtree read-only for this rehearsal'
     before = tree_evidence(media)
-    service = Service(binary, schema, media=media, sample=sample, expected_source=expected_source)
+    service = Service(binary, schema, media=media, sample=sample, expected_source=expected_source, state_parent=state_parent)
     try:
         service.launch()
         service.ready()
@@ -292,6 +292,7 @@ def main():
     parser.add_argument('--nfs-media', type=Path)
     parser.add_argument('--sample', type=Path)
     parser.add_argument('--expected-source')
+    parser.add_argument('--state-parent', type=Path, help='NFS mode only: existing local task subdirectory under /tmp')
     args = parser.parse_args()
     assert sys.platform == 'linux', 'Linux /proc and PDEATHSIG are required'
     assert args.binary.is_file() and os.access(args.binary, os.X_OK)
@@ -302,12 +303,14 @@ def main():
     signal.signal(signal.SIGALRM, timed_out)
     signal.signal(signal.SIGTERM, timed_out)
     signal.alarm(90)
+    if args.state_parent:
+        assert args.mode == 'nfs' and args.state_parent.is_absolute() and args.state_parent.resolve(strict=True) == args.state_parent and args.state_parent.is_relative_to(Path('/tmp')), 'state-parent must be an existing canonical local /tmp directory in NFS mode'
     if args.mode == 'processes':
         group_timeout(args.binary.resolve(), args.schema.resolve())
         helper_parent_death(args.binary.resolve(), args.schema.resolve())
     else:
         assert args.nfs_media and args.expected_source, 'NFS mode requires explicit media and expected source'
-        nfs_readonly(args.binary.resolve(), args.schema.resolve(), args.nfs_media, args.sample, args.expected_source)
+        nfs_readonly(args.binary.resolve(), args.schema.resolve(), args.nfs_media, args.sample, args.expected_source, args.state_parent)
     signal.alarm(0)
 
 if __name__ == '__main__':
