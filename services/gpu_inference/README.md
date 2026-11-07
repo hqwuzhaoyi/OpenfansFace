@@ -24,7 +24,7 @@ python -m services.gpu_inference.server \
 
 Variables are operator-provided paths/values, not business paths or credentials to commit. Token file must be mode 0600 and hold 32–256 non-whitespace ASCII characters. No token is generated into source, shown on the CLI, or logged. Default listener is loopback port 8921. A remote deployment needs a private authenticated tunnel or TLS ingress and access restriction; changing `--host` does not establish those protections. The VM client refuses ordinary remote plaintext HTTP unless an operator explicitly permits a private numeric IP. Redirects and environment proxies are disabled to avoid forwarding credentials elsewhere.
 
-`requirements-observed.txt` records package versions observed in the existing environment. It is not a resolved lockfile or authorization to install into that environment. Existing CPU and GPU ORT distributions overlap; create and validate a clean isolated environment with only the GPU distribution before release. Verify model/package provenance and applicable licenses separately. No model weights are included.
+`requirements-observed.txt` records the original environment. The deploy directory now contains a complete hash lock, clean-environment validator and isolated builder; see [deploy/README.md](deploy/README.md). Neither file authorizes installing into the existing environment. Existing CPU and GPU ORT distributions overlap; create and validate a clean isolated environment with only the GPU distribution before release. Verify model/package provenance and applicable licenses separately. No model weights are included.
 
 The GPU service must run as a restricted principal/container with no business DB credentials, media mount, home-directory access or archive write permission. Mount only the model and runtime dependencies read-only, supply a secret read-only, permit a bounded private temporary directory for the startup profile, and expose only the selected private transport. **This code does not establish OS isolation by itself.** Running it as the existing unrestricted scanning user is not the final deployment boundary.
 
@@ -60,7 +60,7 @@ The VM continues any final score threshold, face alignment, recognition, vector 
 
 ## Bounds, health and errors
 
-Hard limits: 1.5 MB encoded raster bytes, 2.01 MB request body, dimensions <=1280 in each axis, <=1280² pixels, <=256 detections, response <=300 KB. Dimensions are inspected before raster decode and verified against actual decoded dimensions. Multi-frame images are rejected. Eight connection handlers and an eight-connection listen backlog are the HTTP ceiling; headers plus body upload have a five-second wall-clock bound, with idle socket timeouts as well.
+Hard limits: 1.5 MB encoded raster bytes, 2.01 MB request body, width <=1280, height <=4096, <=1280×4096 pixels, <=256 detections, response <=300 KB. Dimensions are inspected before raster decode and verified against actual decoded dimensions. Multi-frame images are rejected. Eight connection handlers and an eight-connection listen backlog are the HTTP ceiling; headers plus body upload have a five-second wall-clock bound, with idle socket timeouts as well.
 
 The inference lane has concurrency **one**, with zero or one waiting slot. This is a conservative implementation ceiling, not a measured production recommendation. Duplicate in-flight requests return `request_in_progress`; complete identical requests replay a cached result. The cache is bounded to 64 records and 60 seconds by default, has no image bytes after completion, and is volatile. A restarted process may recompute a request. Business exactly-once counting is always the VM's responsibility.
 
@@ -70,6 +70,7 @@ Authenticated endpoints:
 
 - `GET /health/live`: process liveness and service instance.
 - `GET /health/ready`: model/provider proof, resource counters, running/queued/capacity, `model_ready`, `busy`, `accepting`, startup/runtime fault. HTTP 503 when not accepting, even if the model itself is ready.
+- `POST /v1/drain`: `{}` stops new computations and reports whether existing queued/running work has drained. Readiness exposes `draining`/`drained` and managed release identity; draining does not cancel a kernel or resume automatically.
 - `POST /v1/cancel`: `{request_id,attempt_id}` returns `cancel_requested` and `execution_finished`. It does not interrupt an already running ORT call or free its slot early. A cancelled cached result is not returned as successful.
 
 Errors are structured `{error:{code,retryable}}`. Typical statuses: 400 malformed input, 401 auth, 408 expired request/upload, 409 changed version/idempotency/attempt or cancelled result, 413 size bound, 429 queue full, 503 unavailable/resource busy/model failure, 504 response deadline. Busy errors include `Retry-After: 2`; the VM queue chooses bounded retry/backoff. The client performs **no retries**, and a transport timeout does not prove remote execution stopped. There is no automatic CPU fallback. A deliberate CPU policy needs separate measurement and visible provenance.

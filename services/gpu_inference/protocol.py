@@ -18,8 +18,10 @@ SCHEMA = 1
 MAX_IMAGE_BYTES = 1_500_000
 MAX_BODY_BYTES = 2_010_000
 MAX_RESPONSE_BYTES = 300_000
-MAX_DIMENSION = 1280
-MAX_PIXELS = 1280 * 1280
+MAX_WIDTH = 1280
+MAX_HEIGHT = 4096
+MAX_DIMENSION = MAX_HEIGHT
+MAX_PIXELS = MAX_WIDTH * MAX_HEIGHT
 MAX_FACES = 256
 MAX_DEADLINE_MS = 120_000
 TOKEN_RE = re.compile(r'[A-Za-z0-9_.:-]{1,128}\Z')
@@ -170,7 +172,7 @@ class Request:
         frame = obj['frame']
         fields(frame, 'index timestamp_ms sha256 width height data_base64')
         integer(frame['index'], 0, 10_000); integer(frame['timestamp_ms'])
-        integer(frame['width'], 1, MAX_DIMENSION); integer(frame['height'], 1, MAX_DIMENSION)
+        integer(frame['width'], 1, MAX_WIDTH); integer(frame['height'], 1, MAX_HEIGHT)
         if frame['width'] * frame['height'] > MAX_PIXELS:
             raise ProtocolError('image_too_large', 413)
         sha(frame['sha256'])

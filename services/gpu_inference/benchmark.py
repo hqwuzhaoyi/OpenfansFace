@@ -43,6 +43,8 @@ def main():
     parser.add_argument('--model-sha256', required=True)
     parser.add_argument('--size', type=int, choices=(160, 640), default=640)
     parser.add_argument('--cpu-only', action='store_true')
+    parser.add_argument('--fixture', help='Explicit marked anonymous JPEG fixture; never business media')
+    parser.add_argument('--fixture-sha256')
     parser.add_argument('--neighbor-port', type=int, action='append', required=True,
                         help='Existing loopback /health listener; repeat for every coexisting service')
     args = parser.parse_args()
@@ -121,16 +123,25 @@ def main():
         frames = [np.zeros((args.size,args.size,3),np.uint8),
                   np.broadcast_to(np.linspace(0,255,args.size,dtype=np.uint8)[None,:,None],(args.size,args.size,3)).copy(),
                   np.random.default_rng(19).integers(0,256,(args.size,args.size,3),dtype=np.uint8)]
+        fixture_bytes = None
+        if args.fixture:
+            import pathlib
+            fixture_bytes=pathlib.Path(args.fixture).read_bytes()
+            if not args.fixture_sha256 or hashlib.sha256(fixture_bytes).hexdigest()!=args.fixture_sha256:
+                raise ProtocolError('fixture_hash_mismatch')
+            fixture_frame=cv2.imdecode(np.frombuffer(fixture_bytes,np.uint8),cv2.IMREAD_COLOR | cv2.IMREAD_IGNORE_ORIENTATION)
+            if fixture_frame is None:raise ProtocolError('invalid_fixture')
+            frames.append(fixture_frame)
         wire_frames = []
         for index, frame in enumerate(frames):
             ok, encoded = cv2.imencode('.png',frame)
             if not ok: raise RuntimeError('fixture_encode_failed')
-            data=encoded.tobytes()
+            data=fixture_bytes if fixture_bytes is not None and index==len(frames)-1 else encoded.tobytes()
             wire_frames.append(Request(str(uuid.uuid4()),Binding('isolated-task','isolated-video','isolated-batch',
                  'isolated-attempt','isolated-lease','isolated-generation',now_ms()+90_000,
                  Fingerprint(len(data),'0',hashlib.sha256(data).hexdigest()),'a'*64,'synthetic-detector-v1'),
                  args.model_sha256,model.preprocess_version,now_ms()+60_000,index,index*1000,
-                 hashlib.sha256(data).hexdigest(),args.size,args.size,data))
+                 hashlib.sha256(data).hexdigest(),int(frame.shape[1]),int(frame.shape[0]),data))
         broker=Broker(model,policy,waiting=0)
         server=Server(('127.0.0.1',0),broker,secrets.token_urlsafe(32))
         thread=threading.Thread(target=server.serve_forever,kwargs={'poll_interval':.01},daemon=True);thread.start()
@@ -147,7 +158,9 @@ def main():
             if len(boxes):agreement=agreement and cpu_points is not None and bool(np.allclose(points,cpu_points,rtol=1e-4,atol=1e-3))
             rows.append({'fixture':index,'image_bytes':len(req.image),'cpu_detector_ms':round(cpu_ms,3),
                          'gpu_http_ms':round(http_ms,3),'gpu_timing':result.timing,'face_count':len(boxes),
-                         'detector_output_agrees':agreement})
+                         'detector_output_agrees':agreement,
+                         'bbox_max_abs_difference':float(np.abs(boxes-cpu_boxes).max()) if boxes.size and boxes.shape==cpu_boxes.shape else None,
+                         'keypoints_max_abs_difference':float(np.abs(points-cpu_points).max()) if points.size and cpu_points is not None and points.shape==cpu_points.shape else None})
         summary.update(status='completed',samples=rows,limitations=[
             'No positive-face fixtures or recognition/candidate consistency proof',
             'CPU baseline is same WSL host, not production VM',

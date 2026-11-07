@@ -40,6 +40,8 @@ class Broker:
         self.running = 0
         self.fault = None
         self.closed = False
+        self.draining = False
+        self.release = {'managed': False}
         self.thread = threading.Thread(target=self._run, name='gpu-single-lane', daemon=True)
         self.thread.start()
 
@@ -62,8 +64,10 @@ class Broker:
                     'execution': self.model.execution if self.model else None,
                     'running': self.running, 'queued': self.inflight - self.running,
                     'capacity': self.capacity, 'concurrency': 1, 'resources': resource,
+                    'release': self.release, 'draining': self.draining,
+                    'drained': self.draining and self.inflight == 0,
                     'busy': resource['busy'] or self.inflight >= self.capacity,
-                    'accepting': ready and not resource['busy'] and self.inflight < self.capacity,
+                    'accepting': ready and not self.draining and not resource['busy'] and self.inflight < self.capacity,
                     'fault': self.fault}
 
     def submit(self, request):
@@ -76,6 +80,8 @@ class Broker:
                 if not previous.done.is_set():
                     raise ProtocolError('request_in_progress', 409, True)
                 return previous
+            if self.draining:
+                raise ProtocolError('service_draining', 503, True)
             if self.closed or self.model is None or self.fault:
                 raise ProtocolError('model_not_ready', 503, True)
             if request.model_sha256 != self.model.model_sha256 or request.preprocess_version != self.model.preprocess_version:
@@ -89,6 +95,12 @@ class Broker:
             self.inflight += 1
             self.queue.put_nowait(job)
             return job
+
+    def begin_drain(self):
+        with self.lock:
+            self.draining = True
+            return {'draining': True, 'drained': self.inflight == 0,
+                    'running': self.running, 'queued': self.inflight - self.running}
 
     def cancel(self, request_id, attempt_id):
         with self.lock:

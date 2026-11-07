@@ -7,6 +7,8 @@ import socket
 import struct
 import sys
 import threading
+import tempfile
+import shutil
 import time
 import unittest
 import uuid
@@ -81,6 +83,16 @@ class ContractTests(unittest.TestCase):
                         replace(first, binding=replace(first.binding, attempt_id='attempt-2')),
                         replace(first, binding=replace(first.binding, material_version='b'*64))]:
             self.assertNotEqual(first.request_hash, changed.request_hash)
+
+    def test_portrait_retains_original_raster_with_bounded_height(self):
+        image=png(1080,1920)
+        portrait=request(width=1080,height=1920,image=image,image_sha256=hashlib.sha256(image).hexdigest())
+        self.assertEqual(Request.parse(portrait.wire()),portrait)
+        tall=png(1280,4096)
+        bound=request(width=1280,height=4096,image=tall,image_sha256=hashlib.sha256(tall).hexdigest())
+        self.assertEqual(Request.parse(bound.wire()).height,4096)
+        for width,height in [(1281,4096),(1280,4097)]:
+            with self.assertRaises(ProtocolError):Request.parse(replace(bound,width=width,height=height).wire())
 
     def test_strict_json_and_bad_fields(self):
         for data in [b'{"x":1,"x":2}', b'{"x":NaN}', b'[]', b'\xff']:
@@ -170,6 +182,18 @@ class BrokerTests(unittest.TestCase):
         with self.assertRaisesRegex(ProtocolError, 'model_not_ready'): self.broker.wait(second)
         self.assertEqual(self.model.calls, 1)
         self.assertFalse(self.broker.health()['model_ready'])
+
+    def test_drain_refuses_new_work_but_completes_owned_jobs(self):
+        self.model.release.clear()
+        first=self.broker.submit(request());self.assertTrue(self.model.entered.wait(1))
+        second=self.broker.submit(request())
+        state=self.broker.begin_drain()
+        self.assertFalse(state['drained'])
+        with self.assertRaisesRegex(ProtocolError,'service_draining'):self.broker.submit(request())
+        self.model.release.set();self.broker.wait(first);self.broker.wait(second)
+        health=self.broker.health()
+        self.assertTrue(health['drained']);self.assertFalse(health['accepting'])
+        self.assertEqual(self.model.calls,2)
 
     def test_current_binding_gate_rejects_manual_change_new_lease_or_expiry(self):
         req = request(); response = self.broker.wait(self.broker.submit(req)); result = Result.parse(response, req)
@@ -262,6 +286,14 @@ class HTTPTests(unittest.TestCase):
         self.assertTrue(result['execution_finished'])
         with self.assertRaisesRegex(ProtocolError,'cancelled'): self.client.detect(req)
 
+    def test_drain_state_and_release_survive_http(self):
+        state=self.client.drain()
+        self.assertTrue(state['drained'])
+        health=self.client.ready()
+        self.assertTrue(health['draining'])
+        self.assertEqual(health['release'],{'managed':False})
+        with self.assertRaisesRegex(ProtocolError,'service_draining'):self.client.detect(request())
+
     def test_busy_status_survives_http(self):
         self.resources.busy=True
         health=self.client.ready()
@@ -270,6 +302,46 @@ class HTTPTests(unittest.TestCase):
         self.assertFalse(health['accepting'])
         with self.assertRaises(ProtocolError) as failure:self.client.detect(request())
         self.assertEqual((failure.exception.code,failure.exception.status),('resource_busy',503))
+
+
+class ReleaseTests(unittest.TestCase):
+    def test_manifest_rejects_changed_code_lock_and_policy(self):
+        from services.gpu_inference.release import create_manifest,verify_manifest
+        package=pathlib.Path(__file__).resolve().parents[1]/'services/gpu_inference'
+        with tempfile.TemporaryDirectory(prefix='isolated-gpu-release-') as folder:
+            copied=pathlib.Path(folder)/'package';shutil.copytree(package,copied)
+            manifest=create_manifest('isolated-release','a'*40,HASH,copied)
+            path=pathlib.Path(folder)/'release.json';path.write_bytes(canonical(manifest))
+            self.assertEqual(verify_manifest(path,copied)['revision'],'a'*40)
+            changed={**manifest,'admission':{**manifest['admission'],'min_free_mib':1}}
+            path.write_bytes(canonical(changed))
+            with self.assertRaisesRegex(ValueError,'release_manifest_mismatch'):verify_manifest(path,copied)
+            path.write_bytes(canonical(manifest))
+            with (copied/'model.py').open('a') as out:out.write('\n# changed\n')
+            with self.assertRaisesRegex(ValueError,'release_manifest_mismatch'):verify_manifest(path,copied)
+
+    def test_release_health_requires_expected_instance_code_and_cuda_proof(self):
+        from services.gpu_inference.release import create_manifest,health_release
+        from services.gpu_inference.deploy.control import verify_release_health
+        manifest=create_manifest('isolated-release','a'*40,HASH)
+        manifest['manifest_sha256']='b'*64
+        health={'release':health_release(manifest),'model_ready':True,'execution':dict(FakeDetector.execution)}
+        verify_release_health(health,manifest)
+        changed={**health,'release':{**health['release'],'revision':'c'*40}}
+        with self.assertRaisesRegex(RuntimeError,'remote_release_mismatch'):verify_release_health(changed,manifest)
+        changed={**health,'execution':{**health['execution'],'providers':['CPUExecutionProvider']}}
+        with self.assertRaisesRegex(RuntimeError,'remote_model_readiness_mismatch'):verify_release_health(changed,manifest)
+
+    def test_lock_has_only_gpu_runtime_and_pinned_versions(self):
+        from services.gpu_inference.environment import lock_versions,LOCK
+        versions=lock_versions()
+        self.assertNotIn('onnxruntime',versions)
+        self.assertEqual(versions['onnxruntime-gpu'],'1.23.2')
+        text=LOCK.read_text()
+        for block in text.split('\n'):
+            if block and not block.startswith(('#',' ')):
+                self.assertRegex(block,r'^[a-zA-Z0-9_.-]+==[^ ]+ \\$')
+        self.assertEqual(len(versions),31)
 
 
 if __name__=='__main__':
