@@ -281,3 +281,41 @@ concurrent confirmation, scoped versions, 5000-ID requests, duplicate submits,
 never-started fences, and process exits at multi-file/transaction/optional-child
 boundaries. The service's fixture PATH excludes external executables. These
 checks do not authorize or perform production media changes.
+
+### Ambiguous native filesystem responses
+
+Media mutation boundaries (link publication, source unlink, copy creation/write/
+publication, compensation, directory creation/publication/removal and their sync)
+now durably record `filesystem_mutation_intent` before the call and
+`filesystem_mutation_resolved` only after success or a known failure. At these
+boundaries EIO, ESTALE and ETIMEDOUT carry `mutation_outcome: "unknown"`; the same
+errno from a read/preflight, an injected pre-effect checkpoint, or an HTTP waiter
+timeout does not by itself classify a write as ambiguous.
+
+An unresolved marker or unknown mutation outcome prevents automatic execution,
+compensation, new writes and gate release. Status remains `recovery_needed` /
+`io_state: "unknown"` across repeated reconcile requests and process restarts.
+This includes a crash between the syscall and its outcome journal: even a source
+that still exists with an absent destination cannot prove the server will not
+complete a delayed RPC. Known completed receipts and ordinary rollback retain
+their existing recovery behavior. These markers do not retrospectively certify
+older operations recorded before this change; deployment still requires draining
+or explicitly settling existing operations.
+
+**Recovery limit:** the service has no protocol that fences already-submitted NAS
+RPCs or proves remote quiescence, and deliberately provides no automatic “clear
+unknown” endpoint. Restarting the process, waiting for a timeout, or observing
+stable paths is insufficient. An administrator must establish storage/client
+quiescence outside the service, retain the operation evidence, verify actual file
+identities and all store receipts, and perform an audited repair before releasing
+protection. This change does not claim that local fixture tests prove NFS server
+cancellation or durability.
+
+`python3 tests/http-rust-mutation-uncertainty.py` uses only the existing marked
+`/tmp` fixture guard. It injects EIO/ESTALE/ETIMEDOUT after actual publication and
+source removal, models delayed publication/removal released by the fixture
+harness after a response and restart, and checks unchanged mutation attempt counts,
+protected repeated reconcile/retry, no false rollback, and held gates. It also
+checks an unresolved syscall journal on restart, ordinary pre-effect rollback,
+and disconnected HTTP waiter completion. No shared NFS mount or network is
+interrupted.
