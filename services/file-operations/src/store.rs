@@ -104,23 +104,10 @@ impl Store {
         Ok(raw.map(|s| serde_json::from_str(&s)).transpose()?)
     }
     pub fn latest_step(&self, id: &str, phase: &str) -> Result<Option<Value>> {
-        let raw:Option<String>=self.db.query_row("SELECT evidence FROM steps WHERE operation_id=? AND phase=? ORDER BY revision DESC LIMIT 1",params![id,phase],|r|r.get(0)).optional()?;
-        Ok(raw.map(|s| serde_json::from_str(&s)).transpose()?)
+        read_latest_step(&self.db, id, phase)
     }
     pub fn file_evidence(&self, id: &str, index: usize) -> Result<crate::files::MoveEvidence> {
-        let raw:Option<String>=self.db.query_row("SELECT evidence FROM steps WHERE operation_id=? AND json_extract(evidence,'$.file_index')=? AND json_type(evidence,'$.move_evidence')='object' ORDER BY revision DESC LIMIT 1",params![id,index as i64],|r|r.get(0)).optional()?;
-        if let Some(raw) = raw {
-            let value: Value = serde_json::from_str(&raw)?;
-            return Ok(serde_json::from_value(value["move_evidence"].clone())?);
-        }
-        let admitted = self.evidence(id)?;
-        if let Some(evidence) = admitted
-            .and_then(|v| v["files"].get(index).map(|f| f["move_evidence"].clone()))
-            .filter(|v| !v.is_null())
-        {
-            return Ok(serde_json::from_value(evidence)?);
-        }
-        Ok(crate::files::MoveEvidence::default())
+        read_file_evidence(&self.db, id, index)
     }
 
     pub fn directory_evidence(
@@ -310,4 +297,37 @@ pub fn status(path: &Path, id: &str) -> Result<Value> {
         result["failure"] = json!(value);
     }
     Ok(result)
+}
+
+pub fn read_latest_step(db: &Connection, id: &str, phase: &str) -> Result<Option<Value>> {
+    let raw:Option<String>=db.query_row("SELECT evidence FROM steps WHERE operation_id=? AND phase=? ORDER BY revision DESC LIMIT 1",params![id,phase],|r|r.get(0)).optional()?;
+    Ok(raw.map(|s| serde_json::from_str(&s)).transpose()?)
+}
+
+pub fn read_file_evidence(
+    db: &Connection,
+    id: &str,
+    index: usize,
+) -> Result<crate::files::MoveEvidence> {
+    // Project only the movement proof, never full domain/face snapshot evidence.
+    let raw:Option<String>=db.query_row("SELECT json_extract(evidence,'$.move_evidence') FROM steps WHERE operation_id=? AND json_extract(evidence,'$.file_index')=? AND json_type(evidence,'$.move_evidence')='object' ORDER BY revision DESC LIMIT 1",params![id,index as i64],|r|r.get(0)).optional()?;
+    if let Some(raw) = raw {
+        return Ok(serde_json::from_str(&raw)?);
+    }
+    let raw: Option<String> = db.query_row(
+        "SELECT json_extract(evidence,'$.files[' || ?2 || '].move_evidence') FROM operations WHERE id=?1", params![id,index as i64], |r| r.get(0))?;
+    Ok(raw
+        .map(|s| serde_json::from_str(&s))
+        .transpose()?
+        .unwrap_or_default())
+}
+
+pub fn read_committed_file(db: &Connection, id: &str, index: usize) -> Result<bool> {
+    let raw: Option<Option<String>> = db.query_row(
+        "SELECT json_extract(evidence,'$.successful_file_indexes') FROM steps WHERE operation_id=? AND phase='commit_scope' ORDER BY revision DESC LIMIT 1", [id], |r| r.get(0)).optional()?;
+    match raw {
+        None => Ok(true), // Legacy single-file operations have no subset step.
+        Some(Some(raw)) => Ok(serde_json::from_str::<Vec<usize>>(&raw)?.contains(&index)),
+        Some(None) => Err(Error::conflict("持久化提交范围无效")),
+    }
 }

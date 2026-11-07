@@ -25,7 +25,7 @@ TRANSIENT_SNAPSHOT_EXCLUSIONS = {'processing/tmp'}  # worker scratch frames, nev
 ROLES = ('native', 'worker', 'calibrator', 'web')
 # GPU runs on a different WSL host under systemd; this controller never pretends it is local Docker.
 GATES = ('isolated_contracts', 'full_peach_schema', 'nfs_identity_permissions',
-         'real_readonly_parity', 'gpu_full_640_coexistence', 'worker_native_joint',
+         'real_readonly_parity', 'legacy_reference_compatibility', 'gpu_full_640_coexistence', 'worker_native_joint',
          'review_continuity', 'accepted_ui_baseline', 'writer_retirement')
 
 
@@ -172,12 +172,40 @@ def validate(manifest, release=False):
             try: proof=json.loads(path.read_text())
             except (ValueError,UnicodeError): proof={}
             if isinstance(proof,dict) and proof.get('simulated') is True and not rehearsal: fail('simulated gate evidence is forbidden outside marked rehearsal')
+            if gate=='legacy_reference_compatibility': legacy_reference_gate(manifest,proof,rehearsal)
         if manifest.get('native_max_schema', 0) < manifest['native_schema']:
             fail('candidate would downgrade native state')
         if manifest.get('single_native_writer') is not True:
             fail('release and rollback must retain one native writer')
         if manifest.get('workers_start_paused') is not True or manifest.get('native_starts_closed') is not True:
             fail('candidate must start with workers paused and native admission closed')
+
+
+def legacy_reference_gate(manifest, proof, rehearsal=False):
+    """A frozen flag cannot overrule a current failed/unknown scalar audit."""
+    name='legacy_reference_compatibility'
+    if not isinstance(proof,dict) or proof.get('audit_schema')!=1 or proof.get('complete') is not True or proof.get('status')!='passed' or proof.get('metadata_only') is not True:
+        fail('release gate unresolved: '+name)
+    if proof.get('simulated') is True:
+        if not rehearsal or proof.get('gate')!=name or not rehearsal_guard(manifest):
+            fail('simulated legacy reference gate requires a marked isolated rehearsal')
+        return proof
+    counts=proof.get('counts')
+    if not isinstance(counts,dict) or counts.get('unresolved')!=0 or counts.get('unknown')!=0 or not isinstance(proof.get('input_version'),str):
+        fail('release gate incomplete: '+name)
+    import importlib.util
+    spec=importlib.util.spec_from_file_location('legacy_reference_audit',Path(__file__).with_name('legacy_reference_audit.py'))
+    audit_module=importlib.util.module_from_spec(spec);spec.loader.exec_module(audit_module)
+    token=os.environ.get(manifest['native_token_env'])
+    prover=audit_module.origin_client(manifest['native_url'],token)
+    current=audit_module.audit(manifest['base'],manifest.get('media_root',''),prover)
+    if current.get('status')!='passed' or current.get('complete') is not True:
+        # Diagnostics are scalar aggregates/hashed IDs only. Existing references
+        # and service/worker state have not been changed by this validation.
+        fail('release gate blocked: '+name+' '+json.dumps(current,ensure_ascii=False,sort_keys=True))
+    if current['input_version']!=proof['input_version'] or current['counts']!=counts:
+        fail('legacy reference audit inputs changed; rerun and review the scalar audit before release')
+    return current
 
 
 def gpu_probe(manifest):

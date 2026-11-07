@@ -321,6 +321,10 @@ async fn serve() -> std::result::Result<(), Box<dyn std::error::Error>> {
         )
         .route("/v1/video-health", get(health_summary).post(health_report))
         .route("/v1/metadata", axum::routing::post(metadata_post))
+        .route(
+            "/v1/reference-origin",
+            axum::routing::post(reference_origin),
+        )
         .layer(DefaultBodyLimit::max(8 * 1024 * 1024))
         .with_state(app);
     let listener = tokio::net::TcpListener::bind(&config.bind).await?;
@@ -615,5 +619,31 @@ async fn library_observations(
         })
         .await
         .map_err(|_| Error::new(503, "unavailable", "视频依据读取失败"))??,
+    ))
+}
+
+// Read-only diagnostics remain available under closed write admission. Bounded
+// media permits stay held by the blocking reader even if the caller disconnects.
+async fn reference_origin(
+    State(app): State<App>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<Json<Value>> {
+    authorize(&app.config, &headers)?;
+    if !body.is_object() || serde_json::to_vec(&body)?.len() > 16384 {
+        return Err(Error::new(400, "invalid_request", "标量来源请求格式无效"));
+    }
+    let permit = app
+        .media_reads
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| Error::new(503, "reader_busy", "媒体读取繁忙"))?;
+    Ok(Json(
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            reference_relocation::diagnostic(&app.config, &body)
+        })
+        .await
+        .map_err(|_| Error::new(503, "unavailable", "来源诊断读取失败"))??,
     ))
 }
