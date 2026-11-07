@@ -1,6 +1,8 @@
 import type { Metadata, Viewport } from "next"
 import "./globals.css"
 import { ThemeProvider } from "@/components/theme-provider"
+import { PrivacyProvider } from "@/components/privacy-provider"
+import { privacyInitScript } from "@/lib/privacy"
 
 export const metadata: Metadata = {
   title: "OpenfansFace · 视频人物识别与归档",
@@ -13,12 +15,13 @@ const themeInitScript = `(()=>{try{const s=localStorage.getItem('wb-theme')||loc
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="zh-CN" className="dark" data-theme="dark" suppressHydrationWarning>
+    <html lang="zh-CN" className="dark" data-theme="dark" data-privacy="on" suppressHydrationWarning>
       <head>
         <script dangerouslySetInnerHTML={{ __html: themeInitScript }} />
+        <script dangerouslySetInnerHTML={{ __html: privacyInitScript }} />
       </head>
       <body className="antialiased">
-        <ThemeProvider>{children}</ThemeProvider>
+        <ThemeProvider><PrivacyProvider>{children}</PrivacyProvider></ThemeProvider>
       </body>
     </html>
   )

@@ -188,3 +188,12 @@
   .pw .pw-checkbox, .pw .pw-people-selection .pw-checkbox { min-height:44px; min-width:44px; }
   .pw .pw-people-search-group { height:46px; }
 }
+
+/* Selection actions belong to the list footer and exist only while selected. */
+.pw-people-select-all{display:flex;align-items:center;gap:7px;margin:8px 14px 0;padding:3px 0;border-bottom:1px solid var(--wb-border);font-size:11px;color:var(--wb-muted);flex-shrink:0}
+.pw-live .pw-person-foot{display:flex;flex-direction:column;align-items:stretch;flex-shrink:0;gap:6px;padding:10px 14px;background:var(--wb-bg)}
+.pw-person-foot .pw-people-bulk{margin:0;padding:0;border:0}.pw-person-foot .pw-people-bulk-actions{margin-top:7px}
+.pw .pw-clear-people{padding:0;width:28px;height:28px;min-height:28px;color:var(--wb-muted)}
+@media(pointer:coarse),(max-width:767px){.pw .pw-clear-people{width:44px;min-width:44px;height:44px;min-height:44px}.pw-live .pw-person-foot{padding-bottom:max(10px,env(safe-area-inset-bottom))}}
+
+.pw .pw-people-select-all .pw-checkbox{gap:7px}.pw-people-select-all .pw-checkbox>span>span{font-size:12px;color:var(--wb-muted)}

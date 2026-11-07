@@ -3,7 +3,9 @@
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 import { useEffect, useRef, useState } from 'react'
-import { Clapperboard, Monitor, Moon, PanelLeft, Sun, X } from 'lucide-react'
+import { Clapperboard, Monitor, Moon, PanelLeft, Sun, X, Eye, EyeOff } from 'lucide-react'
+import { Button } from '@/components/beui/motion/button/base'
+import { usePrivacy } from '@/components/privacy-provider'
 import { MotionConfig } from 'motion/react'
 import { workbenchNavigation } from '@/lib/workbench-navigation'
 import { useTheme, type ThemeMode } from '@/components/theme-provider'
@@ -143,6 +145,14 @@ function SidebarThemeControl() {
   )
 }
 
+function PrivacyControl({ mobile = false }: { mobile?: boolean }) {
+  const { enabled, ready, setEnabled } = usePrivacy()
+  const label = `隐私模式：${enabled ? '已开启' : '已关闭'}`
+  return <Button variant="ghost" size="icon" whileTap={undefined} disabled={!ready} aria-label={label} title={`${label}，点击${enabled ? '关闭' : '开启'}`} aria-pressed={enabled} onClick={() => setEnabled(!enabled)} className={`privacy-control ${mobile ? 'privacy-control-mobile' : ''}`}>
+    {enabled ? <EyeOff size={17} /> : <Eye size={17} />}
+  </Button>
+}
+
 function MobileTopBar({ pathname }: { pathname: string }) {
   const { isMobile } = useAnimatedSidebar()
   const { mode, resolved, cycleMode } = useTheme()
@@ -161,6 +171,7 @@ function MobileTopBar({ pathname }: { pathname: string }) {
         <span>OpenfansFace</span>
       </Link>
       {currentNav && <span className="home-mobile-current">{currentNav.label}</span>}
+      <PrivacyControl mobile />
       <button
         type="button"
         aria-label={`切换主题（当前：${modeLabel}）`}
@@ -176,7 +187,7 @@ function MobileTopBar({ pathname }: { pathname: string }) {
 
 export function HomeShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname()
-  const isSplitPane = pathname === '/integration' || pathname === '/persons' || pathname.startsWith('/persons/')
+  const isSplitPane = pathname === '/review' || pathname === '/operations' || pathname === '/integration' || pathname === '/persons' || pathname.startsWith('/persons/')
 
   return (
     <MotionConfig reducedMotion="user">
@@ -209,6 +220,7 @@ export function HomeShell({ children }: { children: React.ReactNode }) {
             </AnimatedSidebarMenu>
           </AnimatedSidebarContent>
           <AnimatedSidebarFooter className="home-sidebar-footer">
+            <PrivacyControl />
             <SidebarThemeControl />
           </AnimatedSidebarFooter>
         </AnimatedSidebar>

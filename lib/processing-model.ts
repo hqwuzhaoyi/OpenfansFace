@@ -34,3 +34,7 @@ export function groupReviewTasks(tasks: ProcessingTask[]) {
   }
   return [...groups.values()].sort((a, b) => Number(a.kind !== 'suggested') - Number(b.kind !== 'suggested') || b.count - a.count || a.label.localeCompare(b.label, 'zh-CN'))
 }
+
+export function matchesReviewSelection(task:ProcessingTask,scope:{key:string;deferred:boolean}) {
+  return (task.stage==='review'||!!task.manual)&&reviewGroup(task).key===scope.key&&!!task.deferred===scope.deferred
+}

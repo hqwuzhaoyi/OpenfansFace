@@ -56,6 +56,9 @@ request('/api/processing',dict(action='priority',vids=[vid('review')]))
 request('/api/processing',dict(action='retry',vids=[vid('a')]),expected=409)
 review=request('/api/review');assert review['counts']['all']==3 and sum(g['count']for g in review['groups'])==3
 assert request('/api/review?person=NotInLibrary')['total']==0
+filtered=request('/api/review?group=person%3AAlice&q=does-not-exist')
+assert filtered['group']['key']=='person:Alice' and filtered['total']==0
+assert request('/api/review?group=person%3ANotInLibrary')['group'] is None
 request('/api/processing',dict(action='takeover',vids=[vid('pipeline-error')]))
 assert request('/api/review')['counts']['manual']==1
 request('/api/review',dict(action='defer',vids=[vid('a')]))
@@ -65,6 +68,8 @@ request('/api/review',dict(action='note',vids=[vid('a')],note='另有其他出�
 fingerprint={k:items[0][k]for k in ['path','size','mtime_ns']}
 body=dict(vids=[vid('a')],creator='Alice',source='review',fingerprints={vid('a'):fingerprint})
 request('/api/plan/queue',{**body,'fingerprints':{}},expected=409)
+request('/api/plan/queue',{**body,'review_group':{'key':'person:Bob','deferred':False}},expected=409)
+request('/api/plan/queue',{**body,'review_group':{'key':'person:Alice','deferred':True}},expected=409)
 request('/api/plan/queue',body)
 queue=json.loads((ROOT/'base/integration-queue.json').read_text());added=next(v for v in queue if v['vid']==vid('a'))
 assert added['note']=='另有其他出镜人物'and added['return_href']=='/review'

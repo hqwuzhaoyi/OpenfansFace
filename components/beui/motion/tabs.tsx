@@ -25,6 +25,7 @@ type Variant = "pill" | "underline" | "segment";
 type IconDisplay = "always" | "selected";
 
 type Ctx = {
+  instant: boolean;
   value: string;
   setValue: (v: string) => void;
   layoutId: string;
@@ -73,6 +74,7 @@ const transition: Transition = {
 
 export function Tabs({
   defaultValue,
+  instant = false,
   value,
   onValueChange,
   variant = "pill",
@@ -81,6 +83,8 @@ export function Tabs({
   className,
 }: {
   defaultValue?: string;
+  /** Frequent workbench filtering updates without an animated indicator or scroll. */
+  instant?: boolean;
   value?: string;
   onValueChange?: (v: string) => void;
   variant?: Variant;
@@ -94,7 +98,8 @@ export function Tabs({
 }) {
   const [internal, setInternal] = useState(defaultValue ?? "");
   const layoutId = useId();
-  const reduce = useReducedMotion();
+  const systemReduce = useReducedMotion();
+  const reduce = instant || systemReduce;
   const controlled = value !== undefined;
   const current = controlled ? value : internal;
   const setValue = useCallback(
@@ -146,6 +151,7 @@ export function Tabs({
   const panelId = useCallback((tab: string) => `${baseId}-panel-${tab.replace(/[^\w-]/g, "_")}`, [baseId]);
   const contextValue = useMemo(
     () => ({
+      instant: !!reduce,
       value: current,
       setValue,
       layoutId,
@@ -163,7 +169,7 @@ export function Tabs({
       tabId,
       panelId,
     }),
-    [current, icons, layoutId, setValue, variant, track, placed, tabStop, registerTab, unregisterTab, panels, registerPanel, unregisterPanel, tabId, panelId],
+    [reduce, current, icons, layoutId, setValue, variant, track, placed, tabStop, registerTab, unregisterTab, panels, registerPanel, unregisterPanel, tabId, panelId],
   );
   return (
     <MotionConfig transition={reduce ? { duration: 0 } : transition}>
@@ -195,8 +201,9 @@ export function TabsList({
 }: {
   wrapperClassName?: string;
 } & HTMLAttributes<HTMLDivElement>) {
-  const { variant, value, icons, track, placed, setPlaced } = useTabs();
-  const reduce = useReducedMotion();
+  const { variant, value, icons, track, placed, setPlaced, instant } = useTabs();
+  const systemReduce = useReducedMotion();
+  const reduce = instant || systemReduce;
   const tracked = icons === "selected" && variant !== "underline";
   const rootRef = useRef<HTMLDivElement>(null);
   const viewportRef = useRef<HTMLDivElement>(null);

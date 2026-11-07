@@ -1,4 +1,5 @@
 'use client'
+import { PrivateVideo } from '@/components/private-media'
 import { useRef, useState } from 'react'
 import Link from 'next/link'
 import { api } from '@/lib/face-api'
@@ -30,7 +31,7 @@ export function PathText({ value, label = '原路径' }: { value: string; label?
 }
 export function VideoThumbnail({ video, onPlay, className }: { video: ReviewVideo; onPlay: (v: ReviewVideo) => void; className?:string }) {
   return <button type="button" className={cn("video-thumb group relative aspect-video w-28 shrink-0 overflow-hidden rounded-lg border bg-muted sm:w-36",className)} onClick={() => onPlay(video)} aria-label={`播放 ${video.name || fileName(video.vid)}`}>
-    {video.thumb && <img src={video.thumb} alt="" loading="lazy" className="h-full w-full object-cover" />}
+    {video.thumb && <img data-private-media draggable={false} src={video.thumb} alt="" loading="lazy" className="h-full w-full object-cover" />}
     <span className="absolute inset-0 flex items-center justify-center bg-black/25"><span className="flex h-9 w-9 items-center justify-center rounded-full bg-black/65 text-white"><Play className="ml-0.5 h-4 w-4" fill="currentColor" /></span></span>
     <span className="absolute bottom-1 right-1 rounded bg-black/75 px-1.5 py-0.5 text-[10px] text-white">播放</span>
   </button>
@@ -51,7 +52,7 @@ export function VideoPlayer({ video, onClose }: { video: ReviewVideo | null; onC
   return <Dialog open={!!video} onOpenChange={o => { if (!o) close() }}>
     <ResponsiveDialogContent open={!!video} className="flex max-h-[92dvh] flex-col gap-0 overflow-hidden p-0 sm:max-w-4xl sm:p-0">
       <DialogHeader className="shrink-0 border-b p-4 pr-14 text-left"><DialogTitle>视频预览</DialogTitle><DialogDescription>关闭后回到刚才的位置，勾选保持不变。</DialogDescription></DialogHeader>
-      {video&&<div data-sheet-scroll className="min-h-0 flex-1 space-y-3 overflow-y-auto p-4"><p className="break-all text-sm font-medium">{video.name}</p><video key={src} src={src} controls autoPlay playsInline preload="metadata" onError={playbackError} className="max-h-[55dvh] w-full rounded-lg bg-black"/>
+      {video&&<div data-sheet-scroll className="min-h-0 flex-1 space-y-3 overflow-y-auto p-4"><p className="break-all text-sm font-medium">{video.name}</p><PrivateVideo key={src} src={src} controls autoPlay playsInline preload="metadata" onError={playbackError} className="max-h-[55dvh] w-full rounded-lg bg-black"/>
         {failed&&<div role="alert" className="space-y-3 rounded-lg border border-amber-500/30 p-3 text-sm text-amber-300"><p className="flex items-start gap-2"><AlertCircle className="mt-0.5 h-4 w-4 shrink-0"/>暂时无法播放，可能是路径变化、网络中断或手机不支持此编码。</p>{reported&&<p className="text-xs">已记下本次失败，下一次自动体检会优先复查。原文件保留。</p>}<Button asChild variant="outline" className="min-h-11"><Link href="/staging#video-health" onClick={close}>查看视频体检与失效记录</Link></Button></div>}<PathText value={video.path||video.vid}/></div>}
       <div className="mobile-bottom-actions shrink-0 border-t p-3"><Button variant="outline" className="min-h-11 w-full" onClick={close}>关闭播放，继续核对</Button></div>
     </ResponsiveDialogContent>

@@ -23,7 +23,7 @@ function AvatarImage({
   ...props
 }: React.ComponentProps<typeof AvatarPrimitive.Image>) {
   return (
-    <AvatarPrimitive.Image
+    <AvatarPrimitive.Image data-private-media draggable={false}
       data-slot='avatar-image'
       className={cn('aspect-square size-full', className)}
       {...props}

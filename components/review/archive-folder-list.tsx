@@ -52,7 +52,7 @@ export function ArchiveFolderList({ items, selected, active, collapsed, disabled
         {folder.items.map(item => <div key={item.vid} data-vid={item.vid} data-active={active === item.vid} data-selected={selected.has(item.vid)} className="archive-row">
           {!history && <ArchiveCheckbox checked={selected.has(item.vid)} disabled={disabled} label={`选择 ${item.name}`} onChange={() => onToggle([item.vid])} />}
           <button className="archive-rowOpen" aria-current={active === item.vid ? 'true' : undefined} onClick={() => onOpen(item.vid)} title={item.name}>
-            <span className="archive-rowThumbnail">{item.thumb ? <img src={item.thumb} alt="" loading="lazy" /> : <FileVideo size={18} />}</span>
+            <span className="archive-rowThumbnail">{item.thumb ? <img data-private-media draggable={false} src={item.thumb} alt="" loading="lazy" /> : <FileVideo size={18} />}</span>
             <span className="archive-rowText"><strong>{item.name}</strong><small>{item.creator}{item.size_gb !== undefined && <> · {item.size_gb.toFixed(2)} GB</>}</small></span>
             <span className={item.status === 'ok' || history ? 'archive-good' : 'archive-warning'} title={item.statusLabel}>
               {item.status === 'ok' || history ? <><span className="archive-dot" /><span className="sr-only">{item.statusLabel}</span></> : <span className="archive-rowStatus">{item.statusLabel}</span>}

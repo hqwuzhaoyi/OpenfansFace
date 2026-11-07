@@ -1,4 +1,5 @@
 'use client'
+import { PrivateVideo } from '@/components/private-media'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { FileVideo, Play, X } from 'lucide-react'
 import { Card } from '@/components/beui/motion/card'
@@ -38,7 +39,7 @@ function VideoCover({video}:{video:PersonVideo}){
     const observer=new IntersectionObserver(entries=>{if(entries.some(entry=>entry.isIntersecting)){setVisible(true);observer.disconnect()}},{rootMargin:'100px'})
     observer.observe(ref.current);return()=>observer.disconnect()
   },[])
-  return <span ref={ref} className="pw-merge-cover" aria-hidden="true">{failed?<FileVideo size={22}/>:video.thumb?<img src={video.thumb} alt="" loading="lazy" onError={()=>setFailed(true)}/>:visible?<video src={videoUrl(video)+'#t=0.1'} muted playsInline preload="metadata" onError={()=>setFailed(true)} tabIndex={-1}/>:<FileVideo size={22}/>}<span className="pw-merge-play"><Play size={15} fill="currentColor"/></span></span>
+  return <span ref={ref} className="pw-merge-cover" aria-hidden="true">{failed?<FileVideo size={22}/>:video.thumb?<img data-private-media draggable={false} src={video.thumb} alt="" loading="lazy" onError={()=>setFailed(true)}/>:visible?<video data-private-media disablePictureInPicture disableRemotePlayback controlsList="nofullscreen nodownload noremoteplayback" src={videoUrl(video)+'#t=0.1'} muted playsInline preload="metadata" onError={()=>setFailed(true)} tabIndex={-1}/>:<FileVideo size={22}/>}<span className="pw-merge-play"><Play size={15} fill="currentColor"/></span></span>
 }
 export interface MergePlaying {person:string;video:PersonVideo}
 export function MergePersonVideos({name,state,target,disabled,playing,onTarget,onPlay,onLoad}:{name:string;state?:PersonPreviewState;target:string;disabled:boolean;playing:MergePlaying|null;onTarget:(name:string)=>void;onPlay:(video:MergePlaying|null)=>void;onLoad:(name:string,offset?:number)=>void}){
@@ -48,7 +49,7 @@ export function MergePersonVideos({name,state,target,disabled,playing,onTarget,o
   const files=expanded?data?.files||[]:(data?.files||[]).slice(0,2)
   return <Card size="compact" selected={target===name} className="pw-merge-person-card" data-person={name}>
     <header><div><strong title={name}>{name}</strong><small>{data?`${data.total_videos} 个视频 · ${size(data.total_bytes)}`:state?.error?'读取失败':'读取视频…'}</small></div><Button aria-label={`保留人物 ${name}`} aria-pressed={target===name} disabled={disabled} onClick={()=>onTarget(name)} className={target===name?'pw-primary':'pw-outline'}>{target===name?'保留此人':'设为保留'}</Button></header>
-    {active&&<div className="pw-merge-player"><div><span>{active.name}</span><Button aria-label="关闭视频预览" onClick={()=>onPlay(null)}><X size={15}/></Button></div><video ref={player} key={active.path} src={videoUrl(active)} poster={active.thumb||undefined} controls autoPlay playsInline onError={()=>setPlayError('暂时无法播放，请检查文件或浏览器编码支持。')}/>{playError&&<p role="alert">{playError}</p>}<code>{active.path}</code></div>}
+    {active&&<div className="pw-merge-player"><div><span>{active.name}</span><Button aria-label="关闭视频预览" onClick={()=>onPlay(null)}><X size={15}/></Button></div><PrivateVideo ref={player} key={active.path} src={videoUrl(active)} poster={active.thumb||undefined} controls autoPlay playsInline onError={()=>setPlayError('暂时无法播放，请检查文件或浏览器编码支持。')}/>{playError&&<p role="alert">{playError}</p>}<code>{active.path}</code></div>}
     <div className="pw-merge-video-grid">{files.map(video=><Button key={video.path} className="pw-merge-video" aria-label={`预览 ${name} 的 ${video.name}`} disabled={disabled} onClick={()=>onPlay({person:name,video})}><VideoCover video={video}/><strong title={video.name}>{video.name}</strong><small>{video.folder==='.'?'根目录':video.folder} · {size(video.size)}</small></Button>)}</div>
     {data&&!data.total_videos&&<p className="pw-merge-no-video">暂无视频，仍可合并人物资料。</p>}
     {state?.error&&<div className="pw-error" role="alert"><p>{state.error}</p><Button disabled={state.loading||disabled} onClick={()=>onLoad(name,data?.files.length||0)}>重新加载视频</Button></div>}

@@ -47,7 +47,7 @@ export function processingOverview(params: URLSearchParams) {
     b.total++; b.ready += Number(task.stage === 'review'||!!task.manual); b.error += Number(task.stage === 'error'&&!task.manual); b.running += Number(['text','face'].includes(task.stage)); batches.set(b.id, b)
   }
   const { tasks, ...summary } = state
-  return { ...summary, counts, total, page, limit, all_count: tasks.length, rows: rows.map(t => ({ ...t, data: { kind: t.data.kind, suggested: t.data.suggested, face_skipped: t.data.face_skipped } })), batches: [...batches.values()].sort((a,b) => b.id.localeCompare(a.id)).slice(0,20) }
+  return { ...summary, counts, total, page, limit, all_count: tasks.length, task: params.has('vid') ? tasks.find(t=>t.vid===params.get('vid')) || null : undefined, rows: rows.map(t => ({ ...t, data: { kind: t.data.kind, suggested: t.data.suggested, face_skipped: t.data.face_skipped } })), batches: [...batches.values()].sort((a,b) => b.id.localeCompare(a.id)).slice(0,20) }
 }
 
 export function reviewData(params: URLSearchParams) {
@@ -55,15 +55,16 @@ export function reviewData(params: URLSearchParams) {
   const ready = state.tasks.filter(t => t.stage === 'review' || t.manual)
   const counts = { all: ready.filter(t => !t.deferred).length, suggested: 0, conflict: 0, none: 0, manual: 0, deferred: ready.filter(t => t.deferred).length }
   for (const t of ready.filter(t => !t.deferred)) counts[reviewBucket(t)]++
-  let rows = ready.filter(t => (view === 'deferred' ? !!t.deferred : !t.deferred && (view === 'all' || reviewBucket(t) === view)) && (!folder || path.dirname(t.path) === folder) && (!query || `${t.name} ${t.path} ${(t.data.candidates || []).map(c => c.name).join(' ')}`.toLowerCase().includes(query)))
+  let rows = ready.filter(t => view === 'deferred' ? !!t.deferred : !t.deferred && (view === 'all' || reviewBucket(t) === view))
   const person=params.get('person'), cluster=params.get('cluster')
   if(person)rows=rows.filter(t=>t.data.candidates?.some(c=>c.name===person))
   if(cluster){const ids=new Set((loadClusters().find(c=>c.cid===cluster)?.vids||[]).map((v:any)=>v.vid));rows=rows.filter(t=>ids.has(t.vid))}
-  const focus = params.get('vid'), target = rows.find(t => t.vid === focus)
+  // Groups remain stable while filtering files within the current group.
   const groups = groupReviewTasks(rows)
-  const requested = target ? reviewGroup(target).key : params.get('group') || (params.get('person') ? 'person:' + params.get('person') : '')
-  const group = groups.find(g => g.key === requested) || groups[0] || null
-  rows = rows.filter(t => group && reviewGroup(t).key === group.key)
+  const focus = params.get('vid'), target = rows.find(t => t.vid === focus)
+  const requested = target ? reviewGroup(target).key : params.get('group') || (person ? 'person:' + person : '')
+  const group = requested ? groups.find(g => g.key === requested) || null : groups[0] || null
+  rows = rows.filter(t => group && reviewGroup(t).key === group.key && (!folder || path.dirname(t.path) === folder) && (!query || `${t.name} ${t.path} ${(t.data.candidates || []).map(c => c.name).join(' ')}`.toLowerCase().includes(query)))
   const limit = 24, focusIndex = target ? rows.findIndex(t => t.vid === target.vid) : -1
   const page = focusIndex >= 0 ? Math.floor(focusIndex / limit) : Math.min(Math.max(0, Number(params.get('page')) || 0), Math.max(0, Math.ceil(rows.length / limit) - 1))
   return { counts, groups, group, total: rows.length, rows: rows.slice(page * limit, (page + 1) * limit), page, limit, focus_missing:!!focus&&!target,

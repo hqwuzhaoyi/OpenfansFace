@@ -1,6 +1,7 @@
 'use client'
 
 import { useEffect, useRef, useState } from 'react'
+import { PrivateVideo } from '@/components/private-media'
 import Link from 'next/link'
 import { AlertCircle, RefreshCw } from 'lucide-react'
 import { api } from '@/lib/face-api'
@@ -42,7 +43,7 @@ export function ArchiveVideoPlayer({ video, detailVisibleOnMobile }: { video: Re
       .then(() => { if (sequence === reportSequence.current) setReported(true) }).catch(() => {})
   }
   return <div className="archive-inlinePlayer">
-    <video ref={player} key={attempt} src={source} poster={video.thumb || undefined} controls playsInline preload="none" aria-label={`播放 ${video.name}`} onError={playbackError} />
+    <PrivateVideo ref={player} key={attempt} src={source} poster={video.thumb || undefined} controls playsInline preload="none" aria-label={`播放 ${video.name}`} onError={playbackError} />
     {failed && <div role="alert" className="archive-playerError"><p><AlertCircle size={15} />暂时无法播放，请检查文件路径、网络或视频编码。</p>{reported && <small>已记录播放失败，原文件保留。</small>}<div><Button variant="outline" size="sm" onClick={() => { reportSequence.current++; setFailed(false); setReported(false); setAttempt(value => value + 1) }}><RefreshCw size={14} />重新加载</Button><Link href="/staging#video-health">查看视频体检</Link></div></div>}
   </div>
 }

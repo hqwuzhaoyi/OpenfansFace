@@ -1,3 +1,4 @@
+import { matchesReviewSelection } from '@/lib/processing-model'
 import { rememberPerson } from '@/lib/people-catalog'
 import { canonicalPersonName } from '@/lib/person-names'
 import { isStagedPath } from '@/lib/person-file-paths'
@@ -34,6 +35,7 @@ export async function POST(req: NextRequest) {
       for (const vid of vids) {
         const task=reviewTasks.get(vid), expected=body.fingerprints?.[vid], file=videoSource(vid,sources)
         if(!task || (task.stage!=='review'&&!task.manual) || !expected || !file)throw new ReviewError('视频尚未就绪或状态已变化，请刷新',409)
+        if(body.review_group && (typeof body.review_group.key!=='string'||typeof body.review_group.deferred!=='boolean'||!matchesReviewSelection(task,body.review_group)))throw new ReviewError('所选视频的确认组或暂缓状态已变化，请重新核对',409)
         const stat=fs.statSync(file,{bigint:true})
         if(expected.path!==file||expected.size!==Number(stat.size)||expected.mtime_ns!==stat.mtimeNs.toString()||task.path!==file||task.size!==Number(stat.size)||task.mtime_ns!==stat.mtimeNs.toString())throw new ReviewError('视频文件已变化，请重新分析后核对',409)
         if(body.watermark_key){

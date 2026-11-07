@@ -1,5 +1,35 @@
 @import "tailwindcss";
 
+/* Privacy applies at the document root so portal dialogs are protected too.
+   No transition: concealing media must never expose an intermediate frame. */
+html:not([data-privacy="off"]) [data-private-media]:not([data-privacy-revealed="true"]),
+html:not([data-privacy="off"]) [data-state="closed"] [data-private-media] {
+  filter: blur(18px) !important;
+  opacity: .3 !important;
+  clip-path: inset(0);
+  pointer-events: none;
+  user-select: none;
+  -webkit-user-drag: none;
+  transition: none !important;
+}
+.privacy-video { display: block; position: relative; min-width: 0; overflow: hidden; border-radius: 8px; }
+.privacy-video > video { display: block; width: 100%; }
+.privacy-image { display: inline-grid; position: relative; max-width: 100%; min-width: 44px; min-height: 44px; overflow: hidden; border-radius: 6px; vertical-align: middle; }
+.privacy-reveal { position: absolute; z-index: 1; left: 50%; top: 50%; transform: translate(-50%, -50%); white-space: nowrap; border-radius: 8px; border: 1px solid var(--border); background: var(--background); color: var(--foreground); }
+[data-revealed="true"] > .privacy-reveal { left: auto; top: 8px; right: 8px; transform: none; }
+.privacy-image[data-compact] { display: inline-flex; flex-direction: column; align-items: center; gap: 4px; }
+.privacy-image[data-compact] .privacy-reveal { position: static; transform: none; width: 44px; height: 32px; padding: 0; }
+.privacy-image[data-compact] .privacy-reveal span { display: none; }
+.privacy-control { width: 40px; height: 40px; color: var(--muted-foreground); border: 1px solid transparent; }
+.privacy-control[aria-pressed="true"] { color: var(--foreground); background: var(--accent); border-color: var(--border); }
+.privacy-control:focus-visible, .privacy-reveal:focus-visible { outline: 2px solid var(--ring); outline-offset: 2px; }
+.privacy-control-mobile { margin-left: auto; min-width: 44px; min-height: 44px; }
+.home-mobile-nav .privacy-control-mobile + .home-mobile-theme { margin-left: 0; }
+@media (max-width: 767px) {
+  .privacy-reveal { min-height: 44px; }
+  .home-mobile-current { min-width: 0; }
+}
+
 :root,
 html[data-theme="light"] {
   --wb-font: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
