@@ -182,7 +182,8 @@ button, [role="button"] { user-select: none; -webkit-user-select: none; }
 .review-actionbar { padding-bottom: max(12px, env(safe-area-inset-bottom)); }
 @media (pointer: coarse), (max-width: 767px) {
   input, textarea, select { font-size: 16px !important; }
-  button, [role="button"], [data-slot="button"] { min-height: 44px; min-width: 44px; }
+  button, [role="button"], [data-slot="button"] { min-height: 44px; }
+  button:not([role="checkbox"]), [role="button"], [data-slot="button"] { min-width: 44px; }
 }
 @keyframes review-overlay-in { from { opacity: 0; } to { opacity: 1; } }
 @keyframes review-dialog-in { from { opacity: 0; transform: scale(.98); } to { opacity: 1; transform: scale(1); } }
