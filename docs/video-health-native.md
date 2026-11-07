@@ -77,3 +77,8 @@ Rust 文件服务内的单独 `video-health-lane` 负责每日北京时间 03:30
 明确断言 inode、大小、mtime 与路径指纹仍相同，以验证处置代次保护。
 `tests/http-rust-staging-archive-delete.py` 另验证实际归档重复件的删除／恢复不污染
 正式副本。HTTP 验收也覆盖探测前／后的异常激增、7 天过期和损坏报告的 503 语义。
+
+Linux 与真实 NFS 的独立验收使用 `tests/linux-video-health-rehearsal.py`。`processes`
+验证探测进程组回收及 helper 的 PDEATHSIG；`nfs` 只读取预先准备的只读挂载夹具，
+比对内容哈希、大小、mtime 和 inode。NFS 模式可用 `--state-parent /tmp/<task>/state`
+将本地状态集中在本次任务目录，便于证据收回后精确清理。脚本不改变共享挂载。
