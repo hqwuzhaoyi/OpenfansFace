@@ -32,6 +32,7 @@ pub fn validate(request: &Request) -> Result<()> {
         }
         "delete-files" | "restore-files" => crate::staging::validate(request),
         "rename-person" => crate::person_rename::validate(request),
+        "merge-person" => crate::person_merge::validate(request),
         _ => Err(Error::new(400, "unsupported_scope", "此原生操作尚未启用")),
     }
 }
@@ -42,6 +43,7 @@ pub fn plan(config: &Config, request: Request) -> Result<Plan> {
         action if review_action(action) => crate::review::plan(config, request),
         "delete-files" | "restore-files" => crate::staging::plan(config, request),
         "rename-person" => crate::person_rename::plan(config, request),
+        "merge-person" => crate::person_merge::plan(config, request),
         _ => Err(Error::new(400, "unsupported_scope", "此原生操作尚未启用")),
     }
 }
@@ -52,6 +54,7 @@ pub fn snapshot(config: &Config, plan: &Plan, successful: &[usize]) -> Result<Do
         action if review_action(action) => crate::review::snapshot(config, plan, successful),
         "delete-files" | "restore-files" => crate::staging::snapshot(config, plan, successful),
         "rename-person" => crate::person_rename::snapshot(config, plan, successful),
+        "merge-person" => crate::person_merge::snapshot(config, plan, successful),
         _ => Err(Error::new(400, "unsupported_scope", "此原生操作尚未启用")),
     }
 }
@@ -62,6 +65,7 @@ pub fn revalidate(config: &Config, plan: &Plan) -> Result<()> {
         action if review_action(action) => crate::review::revalidate(config, plan),
         "delete-files" | "restore-files" => crate::staging::revalidate(config, plan),
         "rename-person" => crate::person_rename::revalidate(config, plan),
+        "merge-person" => crate::person_merge::revalidate(config, plan),
         _ => Err(Error::new(400, "unsupported_scope", "此原生操作尚未启用")),
     }
 }

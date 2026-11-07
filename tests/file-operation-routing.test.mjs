@@ -16,7 +16,7 @@ test('provider selection defaults to legacy and Rust opt-in selects migrated ren
  assert.equal(selectedPersonFileBackend('delete-files',enabled),'rust')
  assert.equal(selectedPersonFileBackend('restore-files',enabled),'rust')
  assert.equal(selectedPersonFileBackend('rename-person',enabled),'rust')
- assert.equal(selectedPersonFileBackend('merge-person',enabled),'legacy')
+ assert.equal(selectedPersonFileBackend('merge-person',enabled),'rust')
  assert.throws(()=>selectedPersonFileBackend('rename-file',{FILE_OPERATIONS_BACKEND:'typo'}),{status:503})
 })
 test('one operation ID has one immutable backend and action',t=>{

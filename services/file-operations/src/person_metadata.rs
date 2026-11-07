@@ -55,6 +55,9 @@ fn owner_transform(value: &Value, plan: &Plan) -> Value {
 }
 fn updated(config: &Config, name: &str, value: &Value, plan: &Plan) -> Value {
     if name.starts_with("external-profiles/") {
+        if plan.action == "merge-person" {
+            return crate::person_merge_metadata::updated(config, name, value, plan);
+        }
         if plan.action != "rename-person" {
             return value.clone();
         }
@@ -76,7 +79,11 @@ fn updated(config: &Config, name: &str, value: &Value, plan: &Plan) -> Value {
         }
         return next;
     }
-    let mut next = owner_transform(&metadata::transform(config, value, plan), plan);
+    let mut next = if plan.action == "merge-person" {
+        crate::person_merge_metadata::updated(config, name, value, plan)
+    } else {
+        owner_transform(&metadata::transform(config, value, plan), plan)
+    };
     if plan.action == "rename-person" {
         next = crate::person_rename::transform(&next, plan);
         if name == "person-renames.json" {
@@ -221,7 +228,7 @@ fn selected_rows(
     table: &str,
     plan: &Plan,
 ) -> Result<Vec<Value>> {
-    if plan.action == "rename-person" {
+    if ["rename-person", "merge-person"].contains(&plan.action.as_str()) {
         let rows = crate::delta::local_identity(
             connection,
             if table == "videos" {
@@ -258,11 +265,13 @@ fn selected_rows(
             format!("{target}/"),
             format!("{}\\", metadata::win(config, &target)),
         ];
-        if rows.iter().any(|r| {
-            r["path"]
-                .as_str()
-                .is_some_and(|p| prefixes.iter().any(|prefix| p.starts_with(prefix)))
-        }) {
+        if plan.action == "rename-person"
+            && rows.iter().any(|r| {
+                r["path"]
+                    .as_str()
+                    .is_some_and(|p| prefixes.iter().any(|prefix| p.starts_with(prefix)))
+            })
+        {
             return Err(crate::model::Error::conflict(
                 "目标人物目录已有视频或处理任务索引，请先核对",
             ));
@@ -343,7 +352,7 @@ fn delta(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect();
-    let guard = if plan.action == "rename-person" {
+    let guard = if ["rename-person", "merge-person"].contains(&plan.action.as_str()) {
         db::Guard::LocalIdentity {
             table,
             vids,
@@ -429,7 +438,7 @@ pub fn snapshot(config: &Config, plan: &Plan) -> Result<Snapshot> {
                         json!(Path::new(&file.dst).parent().unwrap().to_string_lossy());
                 }
             }
-            if plan.action == "rename-person" && next == *row {
+            if ["rename-person", "merge-person"].contains(&plan.action.as_str()) && next == *row {
                 next = metadata::transform(config, row, plan);
                 if next["path"] != row["path"] {
                     let path = Path::new(next["path"].as_str().unwrap()).to_owned();
@@ -478,16 +487,18 @@ pub fn snapshot(config: &Config, plan: &Plan) -> Result<Snapshot> {
                     plan
                 ))?);
             }
-            if plan.action == "rename-person" {
+            if ["rename-person", "merge-person"].contains(&plan.action.as_str()) {
                 let data: Value = serde_json::from_str(
                     row["data"]
                         .as_str()
                         .ok_or_else(|| crate::model::Error::conflict("任务数据无效"))?,
                 )?;
-                let changed = crate::person_rename::transform(
-                    &metadata::transform(config, &data, plan),
-                    plan,
-                );
+                let transformed = metadata::transform(config, &data, plan);
+                let changed = if plan.action == "merge-person" {
+                    crate::person_merge_metadata::transform(&transformed, plan)
+                } else {
+                    crate::person_rename::transform(&transformed, plan)
+                };
                 next["data"] = json!(serde_json::to_string(&changed)?);
                 if next["path"] == row["path"] {
                     next["path"] = json!(metadata::mapped(

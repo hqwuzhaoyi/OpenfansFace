@@ -92,7 +92,7 @@ pub fn roots(config: &Config, plan: &Plan) -> (PathBuf, PathBuf) {
     )
 }
 pub fn approved(config: &Config, plan: &Plan, path: &str) -> bool {
-    if plan.action != "rename-person" {
+    if !["rename-person", "merge-person"].contains(&plan.action.as_str()) {
         return false;
     }
     let (_, target) = roots(config, plan);

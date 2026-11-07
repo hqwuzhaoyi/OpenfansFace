@@ -18,6 +18,10 @@ pub struct CreatorIntent {
     pub normalized_name: String,
     /// Complete native asset_entity rows except for the not-yet-allocated entity_id.
     pub links: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aliases: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata_json: Option<String>,
 }
 
 fn conflict(message: &str) -> Error {
@@ -104,6 +108,43 @@ fn validate_intents(conn: &Connection, changes: &Delta, creators: &[CreatorInten
             })
         {
             return Err(conflict("具体行变更与待创建人物意图重叠"));
+        }
+        if let Some(raw) = &intent.metadata_json {
+            let value: Value = serde_json::from_str(raw)?;
+            if !value.is_object() {
+                return Err(conflict("人物附加资料必须为对象"));
+            }
+        }
+        if !intent.aliases.is_empty() {
+            let columns = db::columns(conn, "entity_alias")?;
+            let keys = primary_columns(conn, "entity_alias")?;
+            let mut seen = BTreeSet::new();
+            for alias in &intent.aliases {
+                let object = alias
+                    .as_object()
+                    .ok_or_else(|| conflict("别名必须是完整对象"))?;
+                if object.len() + 1 != columns.len()
+                    || object.contains_key("entity_id")
+                    || columns
+                        .iter()
+                        .filter(|k| k.as_str() != "entity_id")
+                        .any(|k| !object.contains_key(k))
+                {
+                    return Err(conflict("别名实际列不完整"));
+                }
+                for value in object.values() {
+                    db::sql_value(value)?;
+                }
+                let key = Value::Object(
+                    keys.iter()
+                        .filter(|k| k.as_str() != "entity_id")
+                        .map(|k| (k.clone(), alias[k].clone()))
+                        .collect(),
+                );
+                if !seen.insert(serde_json::to_string(&key)?) {
+                    return Err(conflict("别名主键重复"));
+                }
+            }
         }
         let mut seen = BTreeSet::new();
         for link in &intent.links {
@@ -295,13 +336,20 @@ pub fn apply(conn: &Connection, changes: &Delta, creators: &[CreatorIntent]) -> 
     inspect_before(conn, changes, creators)?;
     let mut resolved = changes.clone();
     ensure_guards(conn, &mut resolved, creators)?;
-    delta::apply(conn, changes)?;
+    let mut application = changes.clone();
+    let mut allocated = vec![];
     for creator in creators {
         if !creators_named(conn, creator)?.is_empty() {
             return Err(conflict("具体变更后人物创建范围出现冲突"));
         }
         conn.execute("INSERT INTO entity(kind,canonical_name,normalized_name,created_at,updated_at) VALUES('creator',?,?,strftime('%Y-%m-%dT%H:%M:%fZ','now'),strftime('%Y-%m-%dT%H:%M:%fZ','now'))", params![creator.canonical_name,creator.normalized_name])?;
         let id = conn.last_insert_rowid();
+        if let Some(metadata) = &creator.metadata_json {
+            conn.execute(
+                "UPDATE entity SET metadata_json=? WHERE id=?",
+                params![metadata, id],
+            )?;
+        }
         let entity = db::rows(conn, "SELECT * FROM entity WHERE id=?", [id])?
             .into_iter()
             .next()
@@ -312,8 +360,85 @@ pub fn apply(conn: &Connection, changes: &Delta, creators: &[CreatorIntent]) -> 
         {
             return Err(conflict("新建人物记录与接受的意图不一致"));
         }
+        // Allocate while source entities still exist so SQLite cannot recycle a
+        // deleted source ID. Apply the base delta with this transaction-local,
+        // unchanged insertion visible; the durable receipt still has no before row.
+        extend_guards(&mut application, Table::Entity, &entity);
+        for guard in &mut application.guards {
+            match guard {
+                Guard::CreatorName {
+                    canonical,
+                    normalized,
+                    before,
+                    ..
+                } if entity["canonical_name"] == canonical.as_str()
+                    || entity["normalized_name"] == normalized.as_str() =>
+                {
+                    before.push(entity.clone())
+                }
+                Guard::CreatorCanonical {
+                    canonical, before, ..
+                } if entity["canonical_name"] == canonical.as_str() => before.push(entity.clone()),
+                _ => {}
+            }
+        }
+        append_insert(
+            conn,
+            &mut application,
+            Table::Entity,
+            "entity",
+            entity.clone(),
+        )?;
+        application
+            .tables
+            .iter_mut()
+            .find(|t| t.table == Table::Entity)
+            .unwrap()
+            .before
+            .push(entity.clone());
         extend_guards(&mut resolved, Table::Entity, &entity);
         append_insert(conn, &mut resolved, Table::Entity, "entity", entity)?;
+        allocated.push((creator, id));
+    }
+    delta::apply(conn, &application)?;
+    for (creator, id) in allocated {
+        let mut created_aliases = vec![];
+        for pending in &creator.aliases {
+            let mut alias = pending.clone();
+            alias["entity_id"] = json!({"$integer":id.to_string()});
+            let object = alias.as_object().unwrap();
+            let columns = object
+                .keys()
+                .map(|k| quote(k))
+                .collect::<Vec<_>>()
+                .join(",");
+            let placeholders = vec!["?"; object.len()].join(",");
+            conn.execute(
+                &format!("INSERT INTO entity_alias({columns}) VALUES({placeholders})"),
+                params_from_iter(
+                    object
+                        .values()
+                        .map(db::sql_value)
+                        .collect::<Result<Vec<_>>>()?,
+                ),
+            )?;
+            created_aliases.push(alias.clone());
+            append_insert(
+                conn,
+                &mut resolved,
+                Table::EntityAlias,
+                "entity_alias",
+                alias,
+            )?;
+        }
+        if !created_aliases.is_empty() {
+            resolved.guards.push(Guard::EntityAliases {
+                entity_id: json!({"$integer":id.to_string()}),
+                before: vec![],
+                after: created_aliases,
+            });
+        }
+        let mut created_links = vec![];
         for pending in &creator.links {
             let mut link = pending.clone();
             link["entity_id"] = json!({"$integer":id.to_string()});
@@ -334,6 +459,7 @@ pub fn apply(conn: &Connection, changes: &Delta, creators: &[CreatorIntent]) -> 
             )?;
             // Retain the complete accepted row, not a new read which could hide
             // a trigger changing supplied confidence/source/metadata values.
+            created_links.push(link.clone());
             extend_guards(&mut resolved, Table::AssetEntity, &link);
             append_insert(
                 conn,
@@ -343,6 +469,11 @@ pub fn apply(conn: &Connection, changes: &Delta, creators: &[CreatorIntent]) -> 
                 link,
             )?;
         }
+        resolved.guards.push(Guard::EntityLinks {
+            entity_id: json!({"$integer":id.to_string()}),
+            before: vec![],
+            after: created_links,
+        });
     }
     delta::inspect(conn, &resolved, true)?;
     Ok(resolved)

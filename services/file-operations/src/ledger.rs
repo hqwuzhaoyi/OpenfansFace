@@ -210,7 +210,7 @@ fn validate_delta(delta: &Delta) -> Result<()> {
     if delta.changes.tables.iter().any(|t| {
         !matches!(
             t.table,
-            db::Table::Entity | db::Table::Asset | db::Table::AssetEntity
+            db::Table::Entity | db::Table::Asset | db::Table::AssetEntity | db::Table::EntityAlias
         )
     }) {
         return Err(Error::conflict("账本事务包含错误的存储表"));
@@ -218,7 +218,9 @@ fn validate_delta(delta: &Delta) -> Result<()> {
     if delta.changes.guards.iter().any(|guard| {
         !matches!(
             guard,
-            db::Guard::AssetPath { .. }
+            db::Guard::EntityLinks { .. }
+                | db::Guard::EntityAliases { .. }
+                | db::Guard::AssetPath { .. }
                 | db::Guard::AssetPrefix { .. }
                 | db::Guard::CreatorName { .. }
                 | db::Guard::CreatorCanonical { .. }

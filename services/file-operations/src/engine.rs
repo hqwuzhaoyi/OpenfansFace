@@ -1009,7 +1009,7 @@ fn validate_plan(config: &Config, plan: &Plan) -> Result<()> {
             if !identities.insert((
                 identity["dev"].clone().to_string(),
                 identity["ino"].clone().to_string(),
-            )) && plan.action != "rename-person"
+            )) && !["rename-person", "merge-person"].contains(&plan.action.as_str())
             {
                 return Err(Error::conflict("同一物理文件不能重复移动"));
             }
