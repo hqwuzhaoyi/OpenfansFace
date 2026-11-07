@@ -51,6 +51,9 @@ impl Engine {
         Ok(serde_json::to_value(plan)?)
     }
     fn plan(&self, request: Request) -> Result<Plan> {
+        if crate::staging_delete::action(&request.action) {
+            return crate::staging_delete::plan(&self.config, request);
+        }
         if request.action != "rename-file" {
             let mut plan = native::plan(&self.config, request)?;
             seal_plan(&self.config, &mut plan)?;
@@ -174,6 +177,9 @@ impl Engine {
         let gate = WriteGate::acquire(&self.config, &request.id)?;
         self.store.remember_gate(&request.id, &gate.evidence()?)?;
         crate::fault::checkpoint(&self.config, "gate_acquired")?;
+        if crate::staging_delete::action(&record.plan.action) {
+            return crate::staging_delete::apply(self, &record.plan, gate);
+        }
         let prepared = (|| {
             let current = if record.plan.execution.is_some() {
                 validate_plan(&self.config, &record.plan)?;
@@ -345,6 +351,9 @@ impl Engine {
                 .evidence(id)?
                 .ok_or_else(|| Error::conflict("缺少持久化执行证据"))?;
             let gate = WriteGate::recover(&self.config, id, &evidence["gate"])?;
+            if crate::staging_delete::action(&record.plan.action) {
+                return crate::staging_delete::recover(self, &record.plan, gate);
+            }
             let domain = if record.plan.execution.is_some() {
                 if evidence["schema"] != 2 {
                     return Err(Error::conflict("未知执行证据版本"));
@@ -387,7 +396,7 @@ impl Engine {
             let _ = self.recovery_failure(&record.plan, &error);
         }
     }
-    fn require_resolved_mutation(&self, id: &str, cause: Option<&Error>) -> Result<()> {
+    pub(crate) fn require_resolved_mutation(&self, id: &str, cause: Option<&Error>) -> Result<()> {
         let phase: Option<String> = self.store.db.query_row(
             "SELECT phase FROM steps WHERE operation_id=? AND phase IN ('filesystem_mutation_intent','filesystem_mutation_resolved') ORDER BY revision DESC LIMIT 1",
             [id], |r| r.get(0)).optional()?;

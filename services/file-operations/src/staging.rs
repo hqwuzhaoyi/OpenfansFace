@@ -95,7 +95,7 @@ pub fn validate(request: &Request) -> Result<()> {
     Ok(())
 }
 /// Read immutable source receipts for older person operations without rewriting their audit history.
-fn origin(config: &Config, path: &str, origins: &Value) -> Result<Value> {
+pub(crate) fn origin(config: &Config, path: &str, origins: &Value) -> Result<Value> {
     if let Some(value) = origins.get(path) {
         return Ok(value.clone());
     }
@@ -153,7 +153,52 @@ fn origin(config: &Config, path: &str, origins: &Value) -> Result<Value> {
             );
         }
     }
-    Ok(Value::Null)
+    // Older archive duplicate manifests record the exact staged destination. Never infer IDs
+    // from the canonical archive asset or turn a name match into provenance.
+    let manifests = config.base.join("manifests");
+    let entries = match fs::read_dir(&manifests) {
+        Ok(v) => Some(v),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.into()),
+    };
+    let mut found: Option<Value> = None;
+    if let Some(entries) = entries {
+        for entry in entries {
+            let entry = entry?;
+            let name = entry
+                .file_name()
+                .into_string()
+                .map_err(|_| Error::conflict("归档来源文件名无效"))?;
+            if !name.starts_with("apply-") || !name.ends_with(".json") {
+                continue;
+            }
+            let (_, manifest) =
+                registration::document(config, &format!("manifests/{name}"), false)?;
+            if !matches!(manifest["status"].as_str(), Some("complete" | "partial")) {
+                continue;
+            }
+            for row in manifest["moves"].as_array().into_iter().flatten() {
+                if row["dst"] != path || row["restored"] == true {
+                    continue;
+                }
+                let Some(src) = row["src"]
+                    .as_str()
+                    .filter(|s| original_scope(config, Path::new(s)).is_ok())
+                else {
+                    continue;
+                };
+                let value = json!({"operation":manifest["operation_id"].as_str().unwrap_or(&name),"action":"stage-duplicate","original_path":src,"person":"","vids":[],"source":"legacy-manifest"});
+                if found
+                    .as_ref()
+                    .is_some_and(|previous| previous["original_path"] != value["original_path"])
+                {
+                    return Ok(Value::Null);
+                }
+                found = Some(value);
+            }
+        }
+    }
+    Ok(found.unwrap_or(Value::Null))
 }
 pub fn plan(config: &Config, request: Request) -> Result<Plan> {
     validate(&request)?;
@@ -467,7 +512,7 @@ pub fn snapshot(config: &Config, plan: &Plan, successful: &[usize]) -> Result<Do
         ledger: Some(crate::person_ledger::snapshot(config, &domain_plan)?),
     })
 }
-pub fn list(config: &Config, offset: usize) -> Result<Value> {
+pub fn list(config: &Config, offset: usize, query: &str) -> Result<Value> {
     let root = root(config);
     let (_, origins) = registration::document(config, ORIGINS, false)?;
     let mut pending = vec![root.clone()];
@@ -506,7 +551,13 @@ pub fn list(config: &Config, offset: usize) -> Result<Value> {
         }
     }
     let total = paths.len();
-    let selected: Vec<_> = paths.into_iter().skip(offset).take(100).collect();
+    let query = query.to_lowercase();
+    let filtered: Vec<_> = paths
+        .into_iter()
+        .filter(|(path, _)| path.to_lowercase().contains(&query))
+        .collect();
+    let matched = filtered.len();
+    let selected: Vec<_> = filtered.into_iter().skip(offset).take(100).collect();
     let sources = registration::SourceIndex::load(
         config,
         &selected.iter().map(|(p, _)| p.clone()).collect::<Vec<_>>(),
@@ -519,6 +570,6 @@ pub fn list(config: &Config, offset: usize) -> Result<Value> {
         rows.push(json!({"vid":vid,"path":path,"name":Path::new(&path).file_name().unwrap().to_string_lossy(),"size":stat.len(),"version":files::fingerprint(&path,&stat),"origin":source}));
     }
     Ok(
-        json!({"files":total,"gb":(bytes as f64/1073741824.0*10.0).round()/10.0,"bytes":bytes,"path":root,"rows":rows,"offset":offset,"next_offset":if offset.saturating_add(100)<total{Some(offset+100)}else{None}}),
+        json!({"files":total,"gb":(bytes as f64/1073741824.0*10.0).round()/10.0,"bytes":bytes,"path":root,"rows":rows,"matched":matched,"offset":offset,"next_offset":if offset.saturating_add(100)<matched{Some(offset+100)}else{None}}),
     )
 }

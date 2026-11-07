@@ -15,7 +15,7 @@ export function validateFileOperationId(value:unknown):asserts value is string {
 export function selectedPersonFileBackend(action:string,env:NodeJS.ProcessEnv=process.env):FileOperationBackendName {
   const selected=env.FILE_OPERATIONS_BACKEND||'legacy'
   if(selected!=='legacy'&&selected!=='rust')throw new FileOperationRoutingError('文件操作后端配置无效',503)
-  if(!['rename-file','move-files','delete-files','restore-files','rename-person','delete-person'].includes(action)||selected==='legacy')return 'legacy'
+  if(!['rename-file','move-files','delete-files','restore-files','delete-staged','clear-staging','rename-person','delete-person'].includes(action)||selected==='legacy')return 'legacy'
   if(env.FILE_OPERATIONS_ENABLE_RUST!=='1')throw new FileOperationRoutingError('Rust 文件操作尚未启用',503)
   return 'rust'
 }
@@ -27,6 +27,10 @@ export function fileOperationOwner(base:string,id:string):FileOperationOwner|nul
   try{value=JSON.parse(fs.readFileSync(file,'utf8'))}
   catch(e){
     if((e as NodeJS.ErrnoException).code!=='ENOENT')throw e
+    try {
+      const old=JSON.parse(fs.readFileSync(path.join(base,'staging-operations',id,'operation.json'),'utf8'))
+      return {id,backend:'legacy',action:old.plan?.action||'staging'}
+    } catch(error) {if((error as NodeJS.ErrnoException).code!=='ENOENT')throw error}
     // Already executed operations predate routing records and must remain owned by legacy.
     try{
       const old=JSON.parse(fs.readFileSync(path.join(base,'person-operations',id,'operation.json'),'utf8'))

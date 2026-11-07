@@ -5,6 +5,7 @@ Run: python3 tests/http-rust-read-lanes.py [--binary PATH] [--port ISOLATED_PORT
 import http.client
 import importlib.util
 import json
+import uuid
 from pathlib import Path
 import time
 
@@ -40,6 +41,10 @@ def run():
             assert value['code']=='reader_busy' and time.monotonic()-start<1,value
         assert {p.name for p in f.root.glob('media-read-*.started')}==markers
 
+        old_id = str(uuid.uuid4())
+        receipt = f.base/'staging-operations'/old_id/'operation.json'
+        receipt.parent.mkdir(parents=True)
+        receipt.write_text(json.dumps({'id':old_id, 'status':'complete', 'result':{'ok':True,'fixture':'historical'}}))
         latencies=[]
         for _ in range(3):
             start=time.monotonic()
@@ -47,6 +52,7 @@ def run():
             assert status['status']=='not_started' and status['id']==plan['id'],status
             assert f.call(route='/v1/archive')=={'job':None}
             assert f.call(route='/health')['ok']
+            assert f.call(route='/v1/staging?id='+old_id)['result']['fixture'] == 'historical'
             latencies.append(time.monotonic()-start)
         assert max(latencies)<1,latencies
         print('PASS all four media permits occupied: file receipt/archive progress/health responsive',latencies)

@@ -25,6 +25,7 @@ mod person_rename;
 mod review;
 mod shared_metadata;
 mod staging;
+mod staging_delete;
 mod store;
 
 use crate::{
@@ -47,7 +48,7 @@ use std::{
 use tokio::sync::{Semaphore, oneshot};
 
 enum Command {
-    Files(Envelope),
+    Files(Box<Envelope>),
     Metadata { command: String, body: Value },
     Archive { command: String, body: Value },
 }
@@ -88,7 +89,7 @@ async fn post(
     let (reply, wait) = oneshot::channel();
     app.worker
         .try_send(Work {
-            command: Command::Files(envelope),
+            command: Command::Files(Box::new(envelope)),
             reply,
         })
         .map_err(|_| {
@@ -141,18 +142,32 @@ async fn staging_list(
         .transpose()
         .map_err(|_| Error::new(400, "invalid_request", "分页位置无效"))?
         .unwrap_or(0);
-    let permit = app
-        .media_reads
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| Error::new(503, "reader_busy", "媒体目录读取繁忙，请稍后重试"))?;
+    let permit = if query.contains_key("id") {
+        app.status_reads
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::new(503, "unavailable", "读取服务不可用"))?
+    } else {
+        app.media_reads
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Error::new(503, "reader_busy", "媒体目录读取繁忙，请稍后重试"))?
+    };
     Ok(Json(
         tokio::task::spawn_blocking(move || {
             // A disconnected HTTP waiter cannot cancel a blocking syscall. Keep the
             // permit here until the real read returns; never admit replacement work early.
             let _permit = permit;
+            if let Some(id) = query.get("id") {
+                return staging_delete::historical_status(&app.config, id);
+            }
             media_listing_checkpoint(&app.config, offset)?;
-            staging::list(&app.config, offset)
+            staging::list(
+                &app.config,
+                offset,
+                query.get("q").map(String::as_str).unwrap_or(""),
+            )
         })
         .await
         .map_err(|_| Error::new(503, "unavailable", "暂存列表读取失败"))??,
@@ -198,6 +213,19 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                     Command::Files(envelope) => match envelope.mode.as_str() {
                         "preview" => engine.preview(envelope.request),
                         "reconcile" => engine.reconcile_request(envelope.request, envelope.version),
+                        "apply"
+                            if staging_delete::action(&envelope.request.action)
+                                && envelope.confirmation.as_deref()
+                                    != Some(staging_delete::confirmation(
+                                        &envelope.request.action,
+                                    )) =>
+                        {
+                            Err(Error::new(
+                                400,
+                                "confirmation_required",
+                                "请输入完整确认文字：永久删除或清空回收站",
+                            ))
+                        }
                         "apply" => match envelope.version {
                             Some(version) => engine.apply(envelope.request, version),
                             None => Err(Error::new(400, "invalid_request", "缺少预览版本")),
