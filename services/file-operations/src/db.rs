@@ -2,7 +2,10 @@
 // Public native planner API; individual integration harnesses use a subset.
 pub use crate::delta::{Delta, Guard, Table, TableDelta};
 use crate::model::{Error, Result};
-use rusqlite::{Connection, OpenFlags, Params, types::ValueRef};
+use rusqlite::{
+    Connection, OpenFlags, Params,
+    types::{Type, ValueRef},
+};
 use serde_json::{Map, Value, json};
 use std::{path::Path, time::Duration};
 
@@ -25,8 +28,20 @@ pub fn rows(db: &Connection, sql: &str, args: impl Params) -> Result<Vec<Value>>
             let value = match row.get_ref(index)? {
                 ValueRef::Null => Value::Null,
                 ValueRef::Integer(n) => json!({"$integer": n.to_string()}),
-                ValueRef::Real(n) => json!(n),
-                ValueRef::Text(s) => json!(String::from_utf8_lossy(s)),
+                ValueRef::Real(n) if n.is_finite() => json!(n),
+                ValueRef::Real(_) => {
+                    return Err(rusqlite::Error::FromSqlConversionFailure(
+                        index,
+                        Type::Real,
+                        Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "non-finite SQLite REAL cannot be recorded losslessly",
+                        )),
+                    ));
+                }
+                ValueRef::Text(s) => json!(std::str::from_utf8(s).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(index, Type::Text, Box::new(error))
+                })?),
                 ValueRef::Blob(b) => json!({"$blob":b}),
             };
             result.insert(name.clone(), value);
@@ -96,6 +111,26 @@ pub fn sql_value(value: &Value) -> Result<rusqlite::types::Value> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn non_finite_sqlite_real_is_rejected_instead_of_recorded_as_null() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE fixture_values(value REAL)")
+            .unwrap();
+        for value in [f64::INFINITY, f64::NEG_INFINITY] {
+            conn.execute("DELETE FROM fixture_values", []).unwrap();
+            conn.execute("INSERT INTO fixture_values VALUES(?)", [value])
+                .unwrap();
+            assert!(super::rows(&conn, "SELECT * FROM fixture_values", []).is_err());
+        }
+    }
+
+    #[test]
+    fn invalid_utf8_sqlite_text_is_rejected_instead_of_lossily_replaced() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE fixture_values(value TEXT); INSERT INTO fixture_values VALUES(CAST(X'80FF' AS TEXT))").unwrap();
+        assert!(super::rows(&conn, "SELECT * FROM fixture_values", []).is_err());
+    }
+
     #[test]
     fn persisted_real_values_keep_exact_sqlite_bits() {
         // Real-valued SQLite timestamps/scores are durable before-images. A JSON
