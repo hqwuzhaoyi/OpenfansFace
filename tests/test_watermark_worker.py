@@ -74,45 +74,16 @@ class WatermarkWorkerTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 validate_source(fingerprint(organized), media)
 
-    def test_resume_cache_force_and_per_video_failure(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            directory = root / 'watermarks'
-            directory.mkdir()
-            file = root / 'one.mp4'
-            file.write_bytes(b'video')
-            item = dict(fingerprint(file), vid='one')
-            calls = []
-            def scan(*args):
-                calls.append(args[0]['vid'])
-                return dict(candidates=[], sampled_frames=8)
-            job = dict(id='job-1', videos=[item], force=False)
-            self.assertEqual(process_job(job, directory, root, object, scan)['processed'], 1)
-            process_job(job, directory, root, object, scan)
-            process_job(dict(job, id='job-2'), directory, root, object, scan)
-            self.assertEqual(calls, ['one'])
-            process_job(dict(job, id='job-3', force=True), directory, root, object, scan)
-            self.assertEqual(calls, ['one', 'one'])
-            file.write_bytes(b'changed video')
-            updated = dict(fingerprint(file), vid='one')
-            result = process_job(dict(job, id='job-4', videos=[updated, dict(item, vid='bad')]), directory, root, object, scan)
-            self.assertEqual(result['processed'], 2)
-            self.assertEqual(result['failed'], 1)
-            records = json.loads((directory / 'results.json').read_text())
-            self.assertEqual(records['one']['pipeline'], PIPELINE)
-            self.assertEqual(records['bad']['status'], 'error')
-
-    def test_model_failure_is_visible_and_does_not_publish_empty_results(self):
-        with tempfile.TemporaryDirectory() as temp:
-            root = Path(temp)
-            video = root / 'one.mp4'
-            video.write_bytes(b'video')
-            def unavailable():
-                raise RuntimeError('model unavailable')
-            result = process_job(dict(id='failure', videos=[dict(fingerprint(video), vid='one')]), root, root, unavailable)
-            self.assertEqual(result['status'], 'error')
-            self.assertIn('model unavailable', result['error'])
-            self.assertFalse((root / 'results.json').exists())
+    def test_legacy_job_cannot_publish_even_without_native_environment(self):
+        from maintenance.watermark_worker import publish
+        with tempfile.TemporaryDirectory(prefix='face-watermark-fixture-') as temp:
+            root=Path(temp);directory=root/'watermarks';directory.mkdir()
+            with patch.dict('os.environ', {}, clear=True):
+                with self.assertRaisesRegex(RuntimeError, '已退役'):
+                    process_job({'id':'retired'},directory,root)
+                with self.assertRaisesRegex(RuntimeError, '原生协调器'):
+                    publish(directory/'results.json',{})
+            self.assertEqual(list(directory.iterdir()), [])
 
     @unittest.skipUnless(find_spec('PIL'), 'Pillow needed for frame extraction regression')
     def test_empty_ffmpeg_output_cannot_reuse_previous_frame(self):

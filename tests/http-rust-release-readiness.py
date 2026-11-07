@@ -1,5 +1,5 @@
 """Release safety on marked synthetic files. Does not access production paths."""
-import importlib.util, pathlib, json, tempfile, sqlite3, hashlib, subprocess, time, threading
+import importlib.util, pathlib, json, tempfile, sqlite3, hashlib, subprocess, time, threading, os
 spec=importlib.util.spec_from_file_location('fixture', pathlib.Path(__file__).with_name('http-rust-file-operations.py'))
 f=importlib.util.module_from_spec(spec);spec.loader.exec_module(f)
 
@@ -16,6 +16,7 @@ def drain():
             if (x.root/'rust-fault-reached.json').exists():break
             time.sleep(.02)
         else:raise AssertionError('checkpoint missing')
+        assert x.call(route='/v1/readiness')['ready'], 'normal admitted work must remain operationally ready'
         state=x.call({'accepting':False},'/v1/admission')
         assert not state['drained'] and state['pending']==1,state
         assert x.call({'mode':'apply','request':p['request'],'version':p['version']},status=503)['code']=='admission_closed'
@@ -23,9 +24,27 @@ def drain():
         assert x.status(p)['status'] in ('accepted','running')
         (x.root/'rust-fault.json').unlink();t.join(timeout=10);assert result
         state=x.call(route='/v1/readiness');assert state['drained'] and not state['accepting'],state
-        x.stop();x.start();state=x.call(route='/v1/readiness');assert state['drained'] and not state['accepting'],state
+        x.stop()
+        previous=os.environ.get('FILEOPS_PREVIOUS_BINARY')
+        if previous:
+            attempt=subprocess.run([previous],env=x.env,capture_output=True,timeout=10)
+            assert attempt.returncode!=0 and b'schema_version' in attempt.stderr,attempt.stderr
+            print('PASS older binary refuses schema 9 without reopening admission')
+        x.start();state=x.call(route='/v1/readiness');assert state['drained'] and not state['accepting'],state
         assert x.call({'accepting':True},'/v1/admission')['ready']
         x.assert_complete(p)
+        with sqlite3.connect(x.base/'file-operations-rust/operations.sqlite3') as db:db.execute("UPDATE operations SET status='recovery_needed' WHERE id=?",(p['id'],))
+        assert not x.call(route='/v1/readiness')['ready']
+        with sqlite3.connect(x.base/'file-operations-rust/operations.sqlite3') as db:db.execute("UPDATE operations SET status='complete' WHERE id=?",(p['id'],))
+        marker=x.base/'file-operations-rust/admission-closed'
+        marker.symlink_to(x.root/'missing-marker-target')
+        x.call({'accepting':False},'/v1/admission',status=409)
+        assert not x.call(route='/v1/readiness')['accepting']
+        x.call({'mode':'preview','request':p['request']},status=503)
+        marker.unlink();assert x.call({'accepting':True},'/v1/admission')['ready']
+        (x.base/'.review-write.lock').symlink_to(x.root/'missing-shared-gate')
+        x.call(route='/v1/readiness',status=409)
+        (x.base/'.review-write.lock').unlink()
         print('PASS persisted close, admitted work drains, receipts remain readable, reopen')
     finally:x.stop()
 
@@ -58,4 +77,22 @@ def parity():
     finally:
         x.stop()
 
-drain();parity()
+def health_cycle():
+    spec=importlib.util.spec_from_file_location('health', pathlib.Path(__file__).with_name('http-rust-video-health.py'))
+    h=importlib.util.module_from_spec(spec);spec.loader.exec_module(h)
+    x=h.Fixture()
+    try:
+        x.controlled("touch '"+str(x.root/'health-probe-started')+"'\nsleep 1\necho '{\"streams\":[{\"codec_type\":\"video\",\"codec_name\":\"h264\"}]}'\n")
+        x.run()
+        for _ in range(200):
+            if (x.root/'health-probe-started').exists():break
+            time.sleep(.02)
+        else:raise AssertionError('health probe did not start')
+        state=x.call({'accepting':False},'/v1/admission')
+        assert state['publishers']==1 and not state['drained'],state
+        x.done()
+        state=x.call(route='/v1/readiness');assert state['publishers']==0 and state['drained'] and not state['accepting'],state
+        print('PASS admitted health scan completes publication after close; drain covers background publisher')
+    finally:x.stop()
+
+drain();parity();health_cycle()

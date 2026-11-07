@@ -1,13 +1,7 @@
-import { nativeMetadataEnabled, nativeMetadata } from '@/lib/shared-metadata-backend'
-import fs from 'fs'
+import { nativeMetadata } from '@/lib/shared-metadata-backend'
 import { NextRequest, NextResponse } from 'next/server'
-import { acquireReviewLock } from '@/lib/review-store'
-import { validateCreator, validateVids, ReviewError } from '@/lib/review-logic'
-import { writeJson } from '@/lib/jsonio'
-import { loadWatermarkMappings, requestWatermarkScan, watermarkData, watermarkFile, WATERMARK_DIR } from '@/lib/watermarks'
-import { watermarkRuleChanged } from '@/lib/processing'
-import { BASE } from '@/lib/env'
-import path from 'path'
+import { validateCreator, ReviewError } from '@/lib/review-logic'
+import { watermarkData } from '@/lib/watermarks'
 
 export const runtime = 'nodejs'
 export async function GET() {
@@ -16,7 +10,6 @@ export async function GET() {
 }
 export async function POST() { return NextResponse.json({error:'旧水印扫描入口已退役，请在处理操作台查看或重试任务'},{status:410}) }
 export async function PUT(req: NextRequest) {
-  let release: (() => void) | undefined
   try {
     const body = await req.json()
     if (typeof body.key !== 'string' || !/^[a-f0-9]{64}$/.test(body.key) || !['person', 'source', 'remove'].includes(body.kind)) throw new ReviewError('水印映射参数无效')
@@ -30,5 +23,4 @@ export async function PUT(req: NextRequest) {
       return NextResponse.json(result)
     }
   } catch (e: any) { return NextResponse.json({ error: e.message, code:e.code, operation_id:e.operation_id }, { status: e.status || 500 }) }
-  finally { release?.() }
 }

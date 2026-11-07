@@ -1,7 +1,7 @@
 import fs from 'node:fs'
 import path from 'node:path'
 import { BASE } from './env'
-import { validArchiveId } from './archive-run'
+import { validateFileOperationId } from './file-operation-routing'
 import type { ArchiveRun } from './archive-run-model'
 import { invalidateIntegrationCache } from './integration'
 /** Thin transport only. Rust owns queue, metadata, media and Peach mutations. */
@@ -16,7 +16,7 @@ function legacyProgress(id:string|null):Pick<ArchiveRun,'job'|'result'>|null {
     try { id=JSON.parse(fs.readFileSync(path.join(BASE,'jobs/archive.json'),'utf8')).id }
     catch(error){if((error as NodeJS.ErrnoException).code==='ENOENT')return null;throw error}
   }
-  if(!validArchiveId(id))throw Object.assign(new Error('归档操作编号无效'),{status:400})
+  validateFileOperationId(id)
   try { const run=JSON.parse(fs.readFileSync(path.join(BASE,'archive-runs',id+'.json'),'utf8')) as ArchiveRun;return {job:run.job,result:run.result} }
   catch(error){if((error as NodeJS.ErrnoException).code==='ENOENT')return null;throw error}
 }

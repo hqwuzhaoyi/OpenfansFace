@@ -1,4 +1,4 @@
-import { nativeMetadataEnabled, nativeMetadata } from './shared-metadata-backend'
+import { nativeMetadata } from './shared-metadata-backend'
 import { canonicalPersonName } from './person-names'
 import { ReviewError, validateCreator } from './review-logic'
 import { creatorDirectory } from './creator-directory'

@@ -984,7 +984,11 @@ pub fn summary(config: &Config) -> Result<Value> {
     Ok(value)
 }
 
-fn dispatch(worker: &crate::admission::Worker, command: &str, body: Value) -> Result<Value> {
+fn dispatch(
+    worker: &crate::admission::AcceptedPublisher,
+    command: &str,
+    body: Value,
+) -> Result<Value> {
     let (reply, wait) = tokio::sync::oneshot::channel();
     worker
         .send(crate::Work {
@@ -1023,8 +1027,15 @@ fn scheduled(config: Config, worker: crate::admission::Worker, stop: Arc<AtomicB
             std::thread::sleep(Duration::from_millis(200));
             continue;
         }
+        let cycle = match worker.begin_publisher() {
+            Ok(cycle) => cycle,
+            Err(_) => {
+                next = clock(&config) + 60;
+                continue;
+            }
+        };
         let run_id = uuid::Uuid::new_v4().to_string();
-        if let Err(error) = dispatch(&worker, "health-start", json!({"run_id":run_id})) {
+        if let Err(error) = dispatch(&cycle, "health-start", json!({"run_id":run_id})) {
             eprintln!("health start: {}", error.error);
             next = clock(&config) + 60;
             continue;
@@ -1033,10 +1044,10 @@ fn scheduled(config: Config, worker: crate::admission::Worker, stop: Arc<AtomicB
             Ok(result) => json!({"run_id":run_id,"result":result}),
             Err(error) => json!({"run_id":run_id,"error":error.error}),
         };
-        if let Err(error) = dispatch(&worker, "health-finish", body) {
+        if let Err(error) = dispatch(&cycle, "health-finish", body) {
             eprintln!("health publish: {}", error.error);
             let _ = dispatch(
-                &worker,
+                &cycle,
                 "health-finish",
                 json!({"run_id":run_id,"error":format!("发布前资料变化或发布失败：{}",error.error)}),
             );

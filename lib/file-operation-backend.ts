@@ -3,7 +3,7 @@ import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { BASE } from './env'
 import { invalidateIntegrationCache } from './integration'
-import { claimFileOperation, fileOperationOwner, selectedPersonFileBackend, validateFileOperationId, FileOperationRoutingError, type FileOperationBackendName } from './file-operation-routing'
+import { fileOperationOwner, selectedPersonFileBackend, validateFileOperationId, FileOperationRoutingError, type FileOperationBackendName } from './file-operation-routing'
 import type { PersonFileRequest, PersonFilePlan, PersonFileResult } from './person-file-model'
 
 export interface PersonFileOperationStatus {

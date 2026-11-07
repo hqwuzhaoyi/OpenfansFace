@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto'
 import { BASE } from './env'
 import { invalidateIntegrationCache } from './integration'
 import { rustRequest, personFileOperationStatus } from './file-operation-backend'
-import { claimFileOperation, fileOperationOwner, selectedPersonFileBackend, validateFileOperationId, FileOperationRoutingError } from './file-operation-routing'
+import { fileOperationOwner, selectedPersonFileBackend, validateFileOperationId, FileOperationRoutingError } from './file-operation-routing'
 import type { PersonFileMove, PersonFileResult } from './person-file-model'
 export interface StagedFile {vid:string;path:string;name:string;size:number;version:string;origin:null|{original_path:string|null;person?:string;operation?:string;action?:string;source:string}}
 export interface StagingList {files:number;matched:number;gb:number;bytes:number;path:string;rows:StagedFile[];offset:number;next_offset:number|null}
