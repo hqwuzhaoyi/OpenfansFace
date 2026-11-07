@@ -64,6 +64,13 @@ pub enum Guard {
         before: Vec<Value>,
         after: Vec<Value>,
     },
+    LocalFiles {
+        table: Table,
+        vids: Vec<String>,
+        paths: Vec<String>,
+        before: Vec<Value>,
+        after: Vec<Value>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -247,6 +254,12 @@ fn validate(conn: &Connection, delta: &Delta) -> Result<BTreeMap<Table, Schema>>
                 db::integer(asset_id)?;
                 ("asset_entity", before, after)
             }
+            Guard::LocalFiles {
+                table,
+                before,
+                after,
+                ..
+            } => (local_table(*table)?, before, after),
         };
         let structure = schema(conn, table)?;
         for row in before.iter().chain(after) {
@@ -271,6 +284,40 @@ fn predicate(columns: &[String]) -> String {
 }
 fn values(row: &Value, columns: &[String]) -> Result<Vec<rusqlite::types::Value>> {
     columns.iter().map(|c| db::sql_value(&row[c])).collect()
+}
+
+fn local_table(table: Table) -> Result<&'static str> {
+    match table {
+        Table::Videos | Table::Tasks => Ok(table.name()),
+        _ => Err(invalid("本地文件查询保护只允许 videos 或 tasks")),
+    }
+}
+
+/// Union the fixed vid/path predicates in bounded chunks so large accepted file
+/// sets do not depend on SQLite's build-specific parameter limit. Rows matching
+/// both selectors occur only once in the resulting snapshot.
+fn local_files(
+    conn: &Connection,
+    table: Table,
+    vids: &[String],
+    paths: &[String],
+) -> Result<Vec<Value>> {
+    let table = local_table(table)?;
+    let mut found = BTreeMap::new();
+    for (column, selectors) in [("vid", vids), ("path", paths)] {
+        for chunk in selectors.chunks(400) {
+            let sql = format!(
+                "SELECT * FROM {} WHERE {} IN ({})",
+                quoted(table),
+                quoted(column),
+                vec!["?"; chunk.len()].join(",")
+            );
+            for row in db::rows(conn, &sql, params_from_iter(chunk))? {
+                found.insert(serde_json::to_string(&row)?, row);
+            }
+        }
+    }
+    Ok(found.into_values().collect())
 }
 
 fn inspect_rows(conn: &Connection, delta: &Delta, after: bool) -> Result<()> {
@@ -356,6 +403,17 @@ fn inspect_rows(conn: &Connection, delta: &Delta, after: bool) -> Result<()> {
                     "asset_entity",
                 )
             }
+            Guard::LocalFiles {
+                table,
+                vids,
+                paths,
+                before,
+                after: next,
+            } => (
+                local_files(conn, *table, vids, paths)?,
+                if after { next } else { before },
+                local_table(*table)?,
+            ),
         };
         let structure = schema(conn, table)?;
         for row in expected {
