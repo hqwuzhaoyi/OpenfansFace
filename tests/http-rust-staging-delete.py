@@ -90,8 +90,6 @@ def boundary_errors():
             state=f.status(p);(f.root/'rust-fault.json').unlink()
             if phase in ('delete_item_intent','delete_ledger_reserved'):
                 assert state['status']=='complete' and state['result']['status']=='partial' and dst.exists(),state
-            elif phase=='delete_before_unlink':
-                state=reconcile(f,p);assert state['status']=='recovery_needed' and dst.exists() and (f.base/'.review-write.lock').exists(),state
             elif phase=='delete_result_committed':
                 assert state['status']=='complete';f.stop();f.start();assert not (f.base/'.review-write.lock').exists()
             else:
@@ -114,8 +112,7 @@ def crash():
             else:raise AssertionError(('not reached',phase))
             f.process.kill();f.process.wait();t.join();f.log.close();(f.root/'rust-fault.json').unlink();f.start()
             s=f.status(p)
-            if phase=='delete_before_unlink':assert s['status']=='recovery_needed' and dst.exists(),s
-            else:assert s['status']=='complete' and not dst.exists(),s
+            assert s['status']=='complete' and not dst.exists(),s
             print('PASS actual SIGKILL/restart',phase)
         finally:f.stop()
 def unknown_mutations():
@@ -223,5 +220,25 @@ def disconnected_waiter():
         with sqlite3.connect(f.ledger) as db:assert db.execute('SELECT count(*) FROM _face_admin_person_ops WHERE id=?',(p['id']+':delete:0',)).fetchone()==(1,)
         print('PASS disconnected HTTP waiter completes once and replays original receipt')
     finally:f.stop()
+
+def late_ledger_and_corrupt_origin():
+    f=Fixture()
+    try:
+        dst=stage(f);saved=json.loads((f.base/'staging-origins.json').read_text());m.write(f.base/'staging-origins.json',{str(dst):'malformed'})
+        row=f.call(route='/v1/staging')['rows'][0]
+        f.preview({'id':str(uuid.uuid4()),'action':'delete-staged','person':'','files':[{k:row[k] for k in ('vid','path','version')}]},409)
+        m.write(f.base/'staging-origins.json',saved)
+        p=preview(f);f.fault('delete_ledger_committed','pause',milliseconds=800);outcome=[]
+        def submit():outcome.append(apply(f,p,503))
+        thread=threading.Thread(target=submit);thread.start()
+        for _ in range(200):
+            if (f.root/'rust-fault-reached.json').exists():break
+            time.sleep(.01)
+        else:raise AssertionError('ledger checkpoint not reached')
+        with sqlite3.connect(f.ledger) as db:db.execute("UPDATE asset SET name='external writer' WHERE id=1")
+        thread.join();assert outcome and dst.read_bytes()==m.PAYLOAD
+        assert f.status(p)['status']=='recovery_needed' and (f.base/'.review-write.lock').exists()
+        print('PASS malformed provenance rejects safely and post-commit external ledger change blocks unlink')
+    finally:f.stop()
 if __name__=='__main__':
-    success();clear_scope();safety();boundary_errors();crash();unknown_mutations();partial();duplicate_and_legacy();real_store_failures();downgrade();disconnected_waiter()
+    success();clear_scope();safety();boundary_errors();crash();unknown_mutations();partial();duplicate_and_legacy();real_store_failures();downgrade();disconnected_waiter();late_ledger_and_corrupt_origin()

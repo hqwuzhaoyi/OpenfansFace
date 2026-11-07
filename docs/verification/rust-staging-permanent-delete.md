@@ -35,7 +35,9 @@ scoped JSON updates complete forward after the byte boundary. A failed item
 stops the batch; prior successful items remain complete and later items remain
 unexecuted. Deleted bytes are never described as rolled back or restored.
 Unknown mutation responses and unresolved syscall journals retain the gate
-across restart and repeated reconciliation, even if paths look normal. A known
+across restart and repeated reconciliation, even if paths look normal. A deletion
+intent with no media-mutation marker proves the syscall never started and can
+resume once under recovered authority after identity/permission checks. A known
 completed unlink can finish local records after repair. Recovery never starts
 later untouched items from an interrupted batch.
 

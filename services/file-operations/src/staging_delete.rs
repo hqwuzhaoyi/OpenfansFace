@@ -397,6 +397,9 @@ fn domain(
                 }
             }
             "staging-origins.json" => {
+                if v.get(&file.src).is_some_and(|entry| !entry.is_object()) {
+                    return Err(Error::conflict("暂存来源记录格式无效").at(&file.src));
+                }
                 if v.get(&file.src).is_none() {
                     v[&file.src] = json!({"source":"unknown","original_path":null});
                 }
@@ -745,14 +748,24 @@ fn one(
     if removed && pinned.present() {
         return Err(Error::conflict("已删除路径被重新占用，不能重删"));
     }
-    if unlink_intent && !removed && pinned.present() {
+    let mutation_started: bool = engine.store.db.query_row(
+        "SELECT EXISTS(SELECT 1 FROM steps WHERE operation_id=? AND phase='filesystem_mutation_intent' AND json_extract(evidence,'$.file_index')=?)",
+        rusqlite::params![plan.id, index as i64], |row| row.get(0))?;
+    if unlink_intent && !removed && pinned.present() && mutation_started {
         return Err(Error::new(
             503,
             "outcome_unknown",
-            "删除系统调用结果未确认，禁止自动重放",
+            "删除系统调用已开始但内容仍存在，禁止自动重放",
         ));
     }
-    if !unlink_intent {
+    // A durable media-mutation marker is always written before entering the syscall.
+    // Its absence under the recovered process authority proves this item never entered
+    // unlink; an admitted, still-identical file can therefore continue exactly once.
+    let needs_unlink = !unlink_intent || (!mutation_started && pinned.present());
+    if !mutation_started && !pinned.present() {
+        return Err(Error::conflict("删除调用开始前文件消失，保留核对状态"));
+    }
+    if needs_unlink {
         pinned.verify(&item.proof)?;
     }
     let state = ledger::inspect_delta(&engine.config, &sub, delta)?;
@@ -785,8 +798,11 @@ fn one(
     for doc in &item.domain.metadata.documents {
         inspect_document(&engine.config, file, doc)?;
     }
-    if !unlink_intent {
+    if needs_unlink {
         pinned.verify(&item.proof)?;
+        if ledger::inspect_delta(&engine.config, &sub, delta)? != "committed" {
+            return Err(Error::conflict("删除前无法确认 Peach 提交结果"));
+        }
         engine.store.step(
             &plan.id,
             "running",
