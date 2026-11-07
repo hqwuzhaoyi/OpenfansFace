@@ -122,6 +122,11 @@ function PersonWorkbenchContent({initialName=''}:{initialName?:string}) {
     if(!confirmArchive||busy)return;const snapshot=confirmArchive;setConfirmArchive(null);setBusy(true);setUndo(null)
     try{const result=await api<{moved:number;errors?:string[]}>('/api/plan/apply',{method:'POST',body:JSON.stringify({vids:snapshot.rows.map(v=>v.vid),version:snapshot.version})});notify(`已归档 ${result.moved} 个。${result.errors?.length?result.errors.join('；'):'Peach 账本已同步。'}`);setSelected([]);await reloadAfterSave(snapshot.name)}catch(e){notify((e as Error).message);await loadPlan(snapshot.name).catch(()=>{})}finally{setBusy(false)}
   }
+  async function rolledBackFileAction(){
+    const current=nameRef.current
+    // Refresh observations after compensation without applying success-only selection or notice changes.
+    await Promise.allSettled([loadPeople(),loadStats(true),...(current?[refresh(current)]:[]),...(current&&tab==='queued'?[loadPlan(current)]:[])])
+  }
   async function savedFileAction(result:PersonFileResult){
     setSelected([]);setUndo(null)
     notify(result.warning|| (fileAction?.action==='merge-person'?`已将 ${name} 合并到 ${result.person}`:fileAction?.action==='rename-person'?`人物已重命名为 ${result.person}`:result.staged?`已将 ${result.changed} 个视频移入全局暂存区`:`已更新 ${result.changed} 个文件，路径和记录已同步`))
@@ -180,7 +185,7 @@ function PersonWorkbenchContent({initialName=''}:{initialName?:string}) {
     </div>
     <AnimatePresence initial={false}>{message&&<WorkbenchNotice><span>{message}</span>{undo&&<Button disabled={busy} onClick={()=>void undoLast()}><Undo2 size={13}/>撤销这次</Button>}<Button aria-label="关闭提示" onClick={()=>setMessage('')}><X size={14}/></Button></WorkbenchNotice>}</AnimatePresence>
     {peopleAction&&<PeopleActionDialog action={peopleAction} people={selectedPeople} theme={theme} onClose={()=>setPeopleAction(null)} onSaved={savedPeopleAction} onBusyChange={setBusy}/>}
-    {fileAction&&<FileActionDialog key={`${fileAction.action}:${fileAction.files.map(v=>v.vid).join()}`} selection={fileAction} person={fileAction.resumePlan?.person||name} people={people} theme={theme} onClose={()=>setFileAction(null)} onSaved={savedFileAction} onBusyChange={setBusy} onSubmitted={setPendingFilePlan} onForget={()=>{localStorage.removeItem(FILE_OPERATION_STORAGE_KEY);setPendingFilePlan(null)}}/>}
+    {fileAction&&<FileActionDialog key={`${fileAction.action}:${fileAction.files.map(v=>v.vid).join()}`} selection={fileAction} person={fileAction.resumePlan?.person||name} people={people} theme={theme} onClose={()=>setFileAction(null)} onSaved={savedFileAction} onRolledBack={rolledBackFileAction} onBusyChange={setBusy} onSubmitted={setPendingFilePlan} onForget={()=>{localStorage.removeItem(FILE_OPERATION_STORAGE_KEY);setPendingFilePlan(null)}}/>}
     {accountPerson&&<AccountAssociation key={accountPerson} name={accountPerson} theme={theme} onClose={()=>setAccountPerson(null)} onChanged={()=>{setAccountsRevision(n=>n+1);void loadPeople()}}/>}
     <Player video={playing} close={()=>setPlaying(null)} theme={theme}/>
     <Dialog open={!!confirmArchive} onOpenChange={open=>!open&&setConfirmArchive(null)}><DialogContent className="pw-modal" data-theme={theme}><DialogTitle>归档选中的 {confirmArchive?.rows.length} 个视频？</DialogTitle><DialogDescription>这一步会移动文件到已确认人物的目录，并同步 Peach 账本。未选中的任务继续保留。</DialogDescription><div className="pw-archive-confirm">{confirmArchive?.rows.map(row=><div key={row.vid}><strong>{row.name}</strong><CopyPath value={row.dst||''} label="目标路径" notify={notify}/></div>)}</div><div className="pw-modal-actions"><Button onClick={()=>setConfirmArchive(null)}>返回检查</Button><Button className="pw-primary" onClick={()=>void applyArchive()}>确认移动并归档</Button></div></DialogContent></Dialog>
