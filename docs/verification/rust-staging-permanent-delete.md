@@ -75,3 +75,33 @@ No production files were deleted or cleared. File-size totals describe logical
 selected bytes, not guaranteed disk-space reclamation (hardlinks/NFS snapshots).
 Production/NFS permissions and #6/#11 joint rollout remain central migration
 checks; these local fixtures are not NFS deployment evidence.
+
+## Operator handoff for ambiguous mutation results
+
+An ambiguous result requires explicit operator recovery; automatic replay stays
+blocked. This version deliberately exposes no timeout, PID-based unlock or
+"force delete" endpoint. Do not remove `.review-write.lock` to bypass it.
+
+1. Keep the operation ID and its `/api/staging?id=<id>` receipt. Preserve the
+   local `file-operations-rust/operations.sqlite3` database and its WAL with a
+   consistent SQLite backup, the gate/routing markers and each affected store.
+2. Export the operation's immutable `operations.plan`, `operations.evidence`,
+   `operations.error` and ordered `steps` rows. Evidence includes source/parent
+   identity, scope, per-item snapshots and the unresolved mutation boundary.
+3. For each `<id>:delete:<index>`, inspect native `_face_admin_person_ops` in
+   Peach and `_face_admin_rust_commits` in faces/processing databases. Compare
+   exact path/disposal/related-row images and the scoped JSON records. Identify
+   which item is confirmed complete, uncertain or never started.
+4. Have the storage operator establish that the original storage client/server
+   has no pending delayed mutation, using storage-side evidence. Elapsed time,
+   process death, an inode/path observation or a currently absent path alone is
+   insufficient. Preserve existing bytes while obtaining this evidence.
+5. Hand off the evidence bundle for a separately reviewed, explicit recovery
+   decision. Any resolution must be durably attached to the original operation,
+   validate current identities/store receipts and preserve successful items;
+   it must not silently authorize another unlink. Already deleted content can
+   only come from an independent backup, not from journal rollback.
+
+Ordinary known-outcome interruptions use the existing reconcile request. It can
+finish confirmed unlink records or continue a proven never-started syscall,
+without clearing ambiguous mutation evidence.
