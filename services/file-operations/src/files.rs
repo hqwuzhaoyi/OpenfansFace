@@ -1,13 +1,13 @@
 //! All media mutations use pinned directory descriptors and atomic no-replace link publication.
 use crate::{
     config::Config,
-    model::{Error, Plan, Result, hash},
+    model::{Error, FileMove, MoveScope, Plan, Result, ScopeRoot, hash},
 };
 use rustix::fs::{AtFlags, Mode, OFlags, linkat, open, openat, unlinkat};
 use serde_json::json;
 use std::{
     fs::{self, File, OpenOptions},
-    io::Write,
+    io::{Read, Seek, SeekFrom, Write},
     os::{fd::OwnedFd, unix::fs::MetadataExt},
     path::{Component, Path},
 };
@@ -82,46 +82,190 @@ fn directory(path: &Path) -> Result<OwnedFd> {
     }
     Ok(fd)
 }
-pub struct PinnedMove {
-    parent: File,
-    source: File,
-    pub src: String,
-    pub dst: String,
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+pub struct MoveEvidence {
+    #[serde(default)]
+    pub source_parent: serde_json::Value,
+    #[serde(default)]
+    pub destination_parent: serde_json::Value,
+    #[serde(default)]
+    pub copy: Option<CopyProof>,
+    #[serde(default)]
+    pub restored: Option<CopyProof>,
 }
-impl PinnedMove {
-    pub fn new(config: &Config, person: &str, src: &str, dst: &str) -> Result<Self> {
-        let src_path = Path::new(src);
-        let dst_path = Path::new(dst);
-        let root = config.creators().join(person);
-        if !src_path.starts_with(&root)
-            || src_path == root
-            || src_path.parent() != dst_path.parent()
-            || src_path
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct CopyProof {
+    pub temp: String,
+    pub identity: serde_json::Value,
+    pub digest: Option<String>,
+}
+fn same_inode(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+    a["dev"] == b["dev"] && a["ino"] == b["ino"]
+}
+fn root(config: &Config, scope: &ScopeRoot) -> Result<std::path::PathBuf> {
+    match scope {
+        ScopeRoot::Person(person) => {
+            validate_name(person)?;
+            Ok(config.creators().join(person))
+        }
+        ScopeRoot::Unorganized => Ok(config.media.join("pikpak")),
+    }
+}
+fn scoped(config: &Config, scope: &MoveScope, file: &FileMove) -> Result<()> {
+    for (path, scope) in [(&file.src, &scope.source), (&file.dst, &scope.destination)] {
+        let path = Path::new(path);
+        let root = root(config, scope)?;
+        if matches!(scope, ScopeRoot::Unorganized)
+            && (path.starts_with(config.creators())
+                || path.starts_with(config.media.join("pikpak/.face-cleanup-staging")))
+        {
+            return Err(
+                Error::new(400, "invalid_request", "归档来源不能来自人物或暂存区")
+                    .at(path.display().to_string()),
+            );
+        }
+        if !path.is_absolute()
+            || !path.starts_with(&root)
+            || path == root
+            || path
                 .components()
                 .any(|p| !matches!(p, Component::RootDir | Component::Normal(_)))
         {
-            return Err(
-                Error::new(400, "invalid_request", "文件路径超出人物目录或包含无效路径").at(src),
-            );
+            return Err(Error::new(400, "invalid_request", "文件路径超出批准范围")
+                .at(path.display().to_string()));
         }
-        crate::permissions::require_move_permissions(src_path, dst_path)?;
-        let parent: File = directory(src_path.parent().unwrap())
-            .map_err(|e| e.at(src).during("source_directory"))?
-            .into();
-        let source: File = openat(
-            &parent,
-            src_path.file_name().unwrap(),
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(|e| Error::from(e).at(src).during("source_read"))?
-        .into();
-        if !source.metadata()?.is_file() {
-            return Err(Error::new(409, "source_changed", "只允许操作普通视频文件").at(src));
+    }
+    if file.src == file.dst {
+        return Err(Error::conflict("源文件与目标路径相同"));
+    }
+    Ok(())
+}
+pub fn parent_identity(path: &str) -> Result<serde_json::Value> {
+    let parent: File = directory(
+        Path::new(path)
+            .parent()
+            .ok_or_else(|| Error::conflict("文件父目录无效"))?,
+    )?
+    .into();
+    Ok(identity(&parent.metadata()?))
+}
+pub fn approved_directory(config: &Config, scope: &MoveScope, path: &Path) -> Result<bool> {
+    Ok(path.is_absolute()
+        && path.starts_with(root(config, &scope.destination)?)
+        && path
+            .components()
+            .all(|p| matches!(p, Component::RootDir | Component::Normal(_))))
+}
+pub fn check_move(config: &Config, scope: &MoveScope, file: &FileMove) -> Result<fs::Metadata> {
+    scoped(config, scope, file)?;
+    crate::permissions::require_move_permissions(Path::new(&file.src), Path::new(&file.dst))?;
+    let parent: File = directory(Path::new(&file.src).parent().unwrap())?.into();
+    let source: File = openat(
+        &parent,
+        Path::new(&file.src).file_name().unwrap(),
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?
+    .into();
+    let stat = source.metadata()?;
+    if !stat.is_file() || fingerprint(&file.src, &stat) != file.version {
+        return Err(Error::conflict("源文件已变化").at(&file.src));
+    }
+    match fs::symlink_metadata(&file.dst) {
+        Ok(_) => {
+            return Err(Error::new(409, "target_exists", "目标文件已存在，不能覆盖").at(&file.dst));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => (),
+        Err(e) => return Err(Error::from(e).at(&file.dst)),
+    }
+    Ok(stat)
+}
+pub struct PinnedMove {
+    parent: File,
+    destination_parent: File,
+    source: File,
+    pub src: String,
+    pub dst: String,
+    pub evidence: MoveEvidence,
+}
+pub fn prepare_move(config: &Config, scope: &MoveScope, file: &FileMove) -> Result<PinnedMove> {
+    check_move(config, scope, file)?;
+    PinnedMove::open(file, MoveEvidence::default())
+}
+pub fn recover_move(
+    config: &Config,
+    scope: &MoveScope,
+    file: &FileMove,
+    evidence: MoveEvidence,
+) -> Result<PinnedMove> {
+    scoped(config, scope, file)?;
+    let pinned = PinnedMove::open(file, evidence)?;
+    pinned.position(&file.version)?;
+    Ok(pinned)
+}
+impl PinnedMove {
+    fn open(file: &FileMove, mut evidence: MoveEvidence) -> Result<Self> {
+        let parent: File = directory(Path::new(&file.src).parent().unwrap())?.into();
+        let destination_parent: File = directory(Path::new(&file.dst).parent().unwrap())?.into();
+        for (actual, expected) in [
+            (&parent, &mut evidence.source_parent),
+            (&destination_parent, &mut evidence.destination_parent),
+        ] {
+            let stat = identity(&actual.metadata()?);
+            if !expected.is_null() && !same_inode(&stat, expected) {
+                return Err(Error::conflict("文件目录已被替换"));
+            }
+            *expected = stat;
+        }
+        let mut source = None;
+        for (dir, path) in [(&parent, &file.src), (&destination_parent, &file.dst)] {
+            match openat(
+                dir,
+                Path::new(path).file_name().unwrap(),
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            ) {
+                Ok(fd) => {
+                    source = Some(File::from(fd));
+                    break;
+                }
+                Err(rustix::io::Errno::NOENT) => (),
+                Err(e) => return Err(Error::from(e).at(path)),
+            }
+        }
+        Ok(Self {
+            parent,
+            destination_parent,
+            source: source.ok_or_else(|| Error::conflict("源文件与目标文件均不存在"))?,
+            src: file.src.clone(),
+            dst: file.dst.clone(),
+            evidence,
+        })
+    }
+    pub fn new(config: &Config, person: &str, src: &str, dst: &str) -> Result<Self> {
+        if Path::new(src).parent() != Path::new(dst).parent() {
+            return Err(Error::new(400, "invalid_request", "改名必须位于同一目录"));
+        }
+        let file = FileMove {
+            src: src.into(),
+            dst: dst.into(),
+            vids: vec![],
+            size: 0,
+            version: String::new(),
+        };
+        let scope = MoveScope {
+            source: ScopeRoot::Person(person.into()),
+            destination: ScopeRoot::Person(person.into()),
+        };
+        scoped(config, &scope, &file)?;
+        crate::permissions::require_move_permissions(Path::new(src), Path::new(dst))?;
+        let pinned = Self::open(&file, MoveEvidence::default())?;
+        if !pinned.source.metadata()?.is_file() {
+            return Err(Error::conflict("只允许操作普通视频文件"));
         }
         match rustix::fs::statat(
-            &parent,
-            dst_path.file_name().unwrap(),
+            &pinned.destination_parent,
+            Path::new(dst).file_name().unwrap(),
             AtFlags::SYMLINK_NOFOLLOW,
         ) {
             Ok(_) => {
@@ -130,79 +274,101 @@ impl PinnedMove {
             Err(rustix::io::Errno::NOENT) => (),
             Err(e) => return Err(Error::from(e).at(dst)),
         }
-        Ok(Self {
-            parent,
-            source,
-            src: src.into(),
-            dst: dst.into(),
-        })
+        Ok(pinned)
     }
-    /// Reopen only an exact accepted inode, under no-follow directory descriptors.
-    /// The original source fingerprint is also used for a published destination.
     pub fn recover(config: &Config, plan: &Plan) -> Result<Self> {
-        let src = &plan.file().src;
-        let dst = &plan.file().dst;
-        let root = config.creators().join(&plan.person);
-        if !Path::new(src).starts_with(root) || Path::new(src).parent() != Path::new(dst).parent() {
+        if Path::new(&plan.file().src).parent() != Path::new(&plan.file().dst).parent() {
             return Err(Error::conflict("恢复路径超出原范围"));
         }
-        let parent: File = directory(Path::new(src).parent().unwrap())?.into();
-        let mut source = None;
-        for path in [src, dst] {
+        recover_move(
+            config,
+            &MoveScope {
+                source: ScopeRoot::Person(plan.person.clone()),
+                destination: ScopeRoot::Person(plan.person.clone()),
+            },
+            plan.file(),
+            MoveEvidence::default(),
+        )
+    }
+    fn verify_parents(&self) -> Result<()> {
+        for (path, pinned) in [
+            (&self.src, &self.parent),
+            (&self.dst, &self.destination_parent),
+        ] {
+            let current: File = directory(Path::new(path).parent().unwrap())?.into();
+            if !same_inode(
+                &identity(&current.metadata()?),
+                &identity(&pinned.metadata()?),
+            ) {
+                return Err(Error::conflict("文件目录已被替换").at(path));
+            }
+        }
+        Ok(())
+    }
+    fn proof_matches(file: &mut File, proof: &CopyProof) -> Result<bool> {
+        if identity(&file.metadata()?) != proof.identity {
+            return Ok(false);
+        }
+        let Some(expected) = &proof.digest else {
+            return Ok(false);
+        };
+        Ok(&digest(file)? == expected)
+    }
+    pub fn position(&self, expected: &str) -> Result<(bool, bool)> {
+        self.verify_parents()?;
+        let mut present = [false, false];
+        for (index, (dir, path, proof)) in [
+            (&self.parent, &self.src, &self.evidence.restored),
+            (&self.destination_parent, &self.dst, &self.evidence.copy),
+        ]
+        .into_iter()
+        .enumerate()
+        {
             match openat(
-                &parent,
+                dir,
                 Path::new(path).file_name().unwrap(),
                 OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::empty(),
             ) {
                 Ok(fd) => {
-                    let file: File = fd.into();
+                    let mut file: File = fd.into();
                     if !file.metadata()?.is_file()
-                        || fingerprint(src, &file.metadata()?) != plan.file().version
+                        || !(fingerprint(&self.src, &file.metadata()?) == expected
+                            || proof.as_ref().is_some_and(|p| {
+                                Self::proof_matches(&mut file, p).unwrap_or(false)
+                            }))
                     {
-                        return Err(Error::conflict("恢复路径已被外部替换，保留冲突依据").at(path));
+                        return Err(Error::conflict("文件身份发生外部变化，不能继续恢复").at(path));
                     }
-                    source = Some(file);
+                    present[index] = true;
                 }
                 Err(rustix::io::Errno::NOENT) => (),
                 Err(e) => return Err(Error::from(e).at(path)),
             }
         }
-        let pinned = Self {
-            parent,
-            source: source.ok_or_else(|| Error::conflict("源文件与目标文件均不存在"))?,
-            src: src.clone(),
-            dst: dst.clone(),
-        };
-        pinned.position(&plan.file().version)?;
-        Ok(pinned)
-    }
-    pub fn position(&self, expected: &str) -> Result<(bool, bool)> {
-        let current_parent: File = directory(Path::new(&self.src).parent().unwrap())?.into();
-        if identity(&current_parent.metadata()?)["ino"] != identity(&self.parent.metadata()?)["ino"]
-            || current_parent.metadata()?.dev() != self.parent.metadata()?.dev()
-        {
-            return Err(Error::conflict("恢复目录已被替换"));
-        }
-        let mut present = [false, false];
-        for (index, path) in [&self.src, &self.dst].iter().enumerate() {
-            match openat(
-                &self.parent,
-                Path::new(path).file_name().unwrap(),
-                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::empty(),
-            ) {
-                Ok(fd) => {
-                    let file: File = fd.into();
-                    if fingerprint(&self.src, &file.metadata()?) != expected
-                        || !file.metadata()?.is_file()
-                    {
-                        return Err(Error::conflict("文件身份发生外部变化，不能继续恢复").at(*path));
+        for (parent, proof) in [
+            (&self.destination_parent, &self.evidence.copy),
+            (&self.parent, &self.evidence.restored),
+        ] {
+            if let Some(proof) = proof {
+                match openat(
+                    parent,
+                    proof.temp.as_str(),
+                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                ) {
+                    Ok(fd) => {
+                        let mut file: File = fd.into();
+                        if proof.identity.is_null()
+                            || !same_inode(&identity(&file.metadata()?), &proof.identity)
+                            || (proof.digest.is_some() && !Self::proof_matches(&mut file, proof)?)
+                        {
+                            return Err(Error::conflict("临时复制文件缺少所有权证据或已变化"));
+                        }
                     }
-                    present[index] = true;
+                    Err(rustix::io::Errno::NOENT) => (),
+                    Err(e) => return Err(e.into()),
                 }
-                Err(rustix::io::Errno::NOENT) => (),
-                Err(e) => return Err(Error::from(e).at(*path)),
             }
         }
         if !present[0] && !present[1] {
@@ -210,36 +376,11 @@ impl PinnedMove {
         }
         Ok((present[0], present[1]))
     }
-    pub fn compensate(&self, config: &Config, expected: &str) -> Result<()> {
-        let (source, target) = self.position(expected)?;
-        if !source {
-            linkat(
-                &self.parent,
-                Path::new(&self.dst).file_name().unwrap(),
-                &self.parent,
-                Path::new(&self.src).file_name().unwrap(),
-                AtFlags::empty(),
-            )?;
-            self.parent.sync_all()?;
-        }
-        crate::fault::checkpoint(config, "compensation_source_published")?;
-        self.position(expected)?;
-        if target {
-            crate::fault::checkpoint(config, "compensation_destination_remove_intent")?;
-            unlinkat(
-                &self.parent,
-                Path::new(&self.dst).file_name().unwrap(),
-                AtFlags::empty(),
-            )?;
-            self.parent.sync_all()?;
-            crate::fault::checkpoint(config, "compensation_destination_removed")?;
-        }
-        Ok(())
-    }
     pub fn stat(&self) -> Result<fs::Metadata> {
         Ok(self.source.metadata()?)
     }
     pub fn verify(&self, expected: &str) -> Result<()> {
+        self.verify_parents()?;
         let current: File = openat(
             &self.parent,
             Path::new(&self.src).file_name().unwrap(),
@@ -247,20 +388,10 @@ impl PinnedMove {
             Mode::empty(),
         )?
         .into();
-        if fingerprint(&self.src, &current.metadata()?) != expected
-            || fingerprint(&self.src, &self.source.metadata()?) != expected
-        {
+        if fingerprint(&self.src, &current.metadata()?) != expected {
             return Err(
                 Error::new(409, "source_changed", "源文件已变化，请重新预览").at(&self.src),
             );
-        }
-        let current_parent: File = directory(Path::new(&self.src).parent().unwrap())?.into();
-        if (
-            current_parent.metadata()?.dev(),
-            current_parent.metadata()?.ino(),
-        ) != (self.parent.metadata()?.dev(), self.parent.metadata()?.ino())
-        {
-            return Err(Error::new(409, "source_changed", "文件所在目录已变化").at(&self.src));
         }
         Ok(())
     }
@@ -269,32 +400,177 @@ impl PinnedMove {
         linkat(
             &self.parent,
             Path::new(&self.src).file_name().unwrap(),
-            &self.parent,
+            &self.destination_parent,
             Path::new(&self.dst).file_name().unwrap(),
             AtFlags::empty(),
         )
         .map_err(|e| Error::from(e).at(&self.dst).during("destination_publish"))?;
-        self.parent.sync_all()?;
-        self.verify_destination(expected)
+        self.destination_parent.sync_all()?;
+        self.position(expected)?;
+        Ok(())
     }
-    fn verify_destination(&self, expected: &str) -> Result<()> {
+    pub fn publish_recoverable(
+        &mut self,
+        expected: &str,
+        record: &mut impl FnMut(&str, &MoveEvidence) -> Result<()>,
+    ) -> Result<()> {
+        if self.evidence.copy.is_some() {
+            return self.copy_publish(false, expected, record);
+        }
         self.verify(expected)?;
-        let target: File = openat(
+        match linkat(
             &self.parent,
+            Path::new(&self.src).file_name().unwrap(),
+            &self.destination_parent,
             Path::new(&self.dst).file_name().unwrap(),
+            AtFlags::empty(),
+        ) {
+            Ok(()) => {
+                self.destination_parent.sync_all()?;
+                self.position(expected)?;
+                Ok(())
+            }
+            Err(e)
+                if [
+                    rustix::io::Errno::XDEV,
+                    rustix::io::Errno::OPNOTSUPP,
+                    rustix::io::Errno::PERM,
+                ]
+                .contains(&e) =>
+            {
+                self.copy_publish(false, expected, record)
+            }
+            Err(e) => Err(Error::from(e).at(&self.dst).during("destination_publish")),
+        }
+    }
+    fn copy_publish(
+        &mut self,
+        reverse: bool,
+        expected: &str,
+        record: &mut impl FnMut(&str, &MoveEvidence) -> Result<()>,
+    ) -> Result<()> {
+        let (from, to, from_parent, to_parent) = if reverse {
+            (&self.dst, &self.src, &self.destination_parent, &self.parent)
+        } else {
+            (&self.src, &self.dst, &self.parent, &self.destination_parent)
+        };
+        let mut proof = if reverse {
+            self.evidence.restored.clone()
+        } else {
+            self.evidence.copy.clone()
+        };
+        if proof.is_none() {
+            proof = Some(CopyProof {
+                temp: format!(".face-move-{}.tmp", uuid::Uuid::new_v4()),
+                identity: serde_json::Value::Null,
+                digest: None,
+            });
+            if reverse {
+                self.evidence.restored = proof.clone();
+            } else {
+                self.evidence.copy = proof.clone();
+            }
+            record("copy_create_intent", &self.evidence)?;
+        }
+        let mut proof = proof.unwrap();
+        if proof.identity.is_null() {
+            // A pre-existing name without inode proof is never adopted after a crash.
+            let output: File = openat(
+                to_parent,
+                proof.temp.as_str(),
+                OFlags::RDWR | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::from_raw_mode(0o666),
+            )?
+            .into();
+            output.sync_all()?;
+            to_parent.sync_all()?;
+            proof.identity = identity(&output.metadata()?);
+            if reverse {
+                self.evidence.restored = Some(proof.clone());
+            } else {
+                self.evidence.copy = Some(proof.clone());
+            }
+            record("copy_created", &self.evidence)?;
+        }
+        if proof.digest.is_none() {
+            let mut output: File = openat(
+                to_parent,
+                proof.temp.as_str(),
+                OFlags::RDWR | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )?
+            .into();
+            if !same_inode(&identity(&output.metadata()?), &proof.identity) {
+                return Err(Error::conflict("临时复制文件被替换"));
+            }
+            output.set_len(0)?;
+            let mut input: File = openat(
+                from_parent,
+                Path::new(from).file_name().unwrap(),
+                OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )?
+            .into();
+            if if reverse {
+                !Self::proof_matches(
+                    &mut input,
+                    self.evidence
+                        .copy
+                        .as_ref()
+                        .ok_or_else(|| Error::conflict("缺少目标复制证据"))?,
+                )?
+            } else {
+                fingerprint(&self.src, &input.metadata()?) != expected
+            } {
+                return Err(Error::conflict("复制源不属于原操作"));
+            }
+            input.seek(SeekFrom::Start(0))?;
+            let before = identity(&input.metadata()?);
+            std::io::copy(&mut input, &mut output)?;
+            output.set_times(fs::FileTimes::new().set_modified(input.metadata()?.modified()?))?;
+            output.sync_all()?;
+            let checksum = digest(&mut input)?;
+            if before != identity(&input.metadata()?) || digest(&mut output)? != checksum {
+                return Err(Error::conflict("复制期间源文件变化或校验失败"));
+            }
+            proof.identity = identity(&output.metadata()?);
+            proof.digest = Some(checksum);
+            if reverse {
+                self.evidence.restored = Some(proof.clone())
+            } else {
+                self.evidence.copy = Some(proof.clone())
+            };
+            record("copy_verified", &self.evidence)?;
+        }
+        self.verify_parents()?;
+        let mut output: File = openat(
+            to_parent,
+            proof.temp.as_str(),
             OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
         )?
         .into();
-        if fingerprint(&self.src, &target.metadata()?) != expected {
-            return Err(
-                Error::new(409, "source_changed", "新路径文件身份不符，需核对恢复").at(&self.dst),
-            );
+        if !Self::proof_matches(&mut output, &proof)? {
+            return Err(Error::conflict("临时复制文件校验失败"));
         }
-        Ok(())
+        self.position(expected)?;
+        record("copy_publish_intent", &self.evidence)?;
+        rustix::fs::renameat_with(
+            to_parent,
+            proof.temp.as_str(),
+            to_parent,
+            Path::new(to).file_name().unwrap(),
+            rustix::fs::RenameFlags::NOREPLACE,
+        )
+        .map_err(|e| Error::from(e).at(to).during("copy_publish"))?;
+        to_parent.sync_all()?;
+        record("copy_published", &self.evidence)
     }
     pub fn remove_source(&self, expected: &str) -> Result<()> {
-        self.verify_destination(expected)?;
+        self.verify(expected)?;
+        if !self.position(expected)?.1 {
+            return Err(Error::conflict("目标尚未发布"));
+        }
         unlinkat(
             &self.parent,
             Path::new(&self.src).file_name().unwrap(),
@@ -304,6 +580,82 @@ impl PinnedMove {
         self.parent.sync_all()?;
         Ok(())
     }
+    pub fn compensate(&mut self, config: &Config, expected: &str) -> Result<()> {
+        self.compensate_recoverable(config, expected, &mut |_, _| Ok(()))
+    }
+    pub fn compensate_recoverable(
+        &mut self,
+        config: &Config,
+        expected: &str,
+        record: &mut impl FnMut(&str, &MoveEvidence) -> Result<()>,
+    ) -> Result<()> {
+        let (source, target) = self.position(expected)?;
+        if !source {
+            if self.evidence.copy.is_some() {
+                self.copy_publish(true, expected, record)?;
+            } else {
+                linkat(
+                    &self.destination_parent,
+                    Path::new(&self.dst).file_name().unwrap(),
+                    &self.parent,
+                    Path::new(&self.src).file_name().unwrap(),
+                    AtFlags::empty(),
+                )?;
+                self.parent.sync_all()?;
+            }
+        }
+        crate::fault::checkpoint(config, "compensation_source_published")?;
+        self.position(expected)?;
+        if target {
+            crate::fault::checkpoint(config, "compensation_destination_remove_intent")?;
+            unlinkat(
+                &self.destination_parent,
+                Path::new(&self.dst).file_name().unwrap(),
+                AtFlags::empty(),
+            )?;
+            self.destination_parent.sync_all()?;
+            crate::fault::checkpoint(config, "compensation_destination_removed")?;
+        }
+        for (parent, proof) in [
+            (&self.destination_parent, &self.evidence.copy),
+            (&self.parent, &self.evidence.restored),
+        ] {
+            if let Some(proof) = proof {
+                match openat(
+                    parent,
+                    proof.temp.as_str(),
+                    OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                ) {
+                    Ok(fd) => {
+                        let file: File = fd.into();
+                        if !same_inode(&identity(&file.metadata()?), &proof.identity) {
+                            return Err(Error::conflict("临时复制文件被替换"));
+                        }
+                        unlinkat(parent, proof.temp.as_str(), AtFlags::empty())?;
+                        parent.sync_all()?;
+                    }
+                    Err(rustix::io::Errno::NOENT) => (),
+                    Err(e) => return Err(e.into()),
+                }
+            }
+        }
+        Ok(())
+    }
+}
+fn digest(file: &mut File) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    file.seek(SeekFrom::Start(0))?;
+    let mut state = Sha256::new();
+    let mut buffer = [0u8; 65536];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        state.update(&buffer[..count]);
+    }
+    Ok(format!("{:x}", state.finalize()))
 }
 
 pub fn read_optional(path: &Path) -> Result<Option<String>> {
@@ -333,7 +685,7 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     fs::rename(&temp, path)?;
     sync_parent(path)
 }
-pub fn claim_owner(config: &Config, id: &str) -> Result<()> {
+pub fn claim_owner_for(config: &Config, id: &str, action: &str) -> Result<()> {
     let dir = config.base.join("file-operation-routing");
     fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{id}.json"));
@@ -347,7 +699,7 @@ pub fn claim_owner(config: &Config, id: &str) -> Result<()> {
     {
         return Err(Error::conflict("此编号已有旧后端执行记录"));
     }
-    let expected = json!({"id":id,"backend":"rust","action":"rename-file"});
+    let expected = json!({"id":id,"backend":"rust","action":action});
     match OpenOptions::new().write(true).create_new(true).open(&path) {
         Ok(mut file) => {
             file.write_all(serde_json::to_string(&expected)?.as_bytes())?;
@@ -437,3 +789,338 @@ impl WriteGate {
     }
 }
 // No Drop unlock: abnormal unwinding and uncertain results preserve the marker intentionally.
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DirectoryProof {
+    pub path: String,
+    pub temp: String,
+    pub identity: serde_json::Value,
+    pub parent: serde_json::Value,
+}
+/// Publish an owned empty directory without replacing a late arrival. Persist ownership
+/// before publication so restart can distinguish our directory from an external one.
+pub fn create_directory(
+    path: &str,
+    previous: Option<DirectoryProof>,
+    record: &mut impl FnMut(&str, &DirectoryProof) -> Result<()>,
+) -> Result<DirectoryProof> {
+    let path = Path::new(path);
+    let parent: File = directory(
+        path.parent()
+            .ok_or_else(|| Error::conflict("目标目录无效"))?,
+    )?
+    .into();
+    let mut proof = if let Some(proof) = previous {
+        if !same_inode(&identity(&parent.metadata()?), &proof.parent) {
+            return Err(Error::conflict("创建目录的父目录已变化"));
+        }
+        proof
+    } else {
+        let proof = DirectoryProof {
+            path: path.display().to_string(),
+            temp: format!(".face-dir-{}", uuid::Uuid::new_v4()),
+            identity: serde_json::Value::Null,
+            parent: identity(&parent.metadata()?),
+        };
+        record("directory_create_intent", &proof)?;
+        proof
+    };
+    if proof.identity.is_null() {
+        rustix::fs::mkdirat(&parent, proof.temp.as_str(), Mode::from_raw_mode(0o777))?;
+        let owned: File = openat(
+            &parent,
+            proof.temp.as_str(),
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?
+        .into();
+        owned.sync_all()?;
+        parent.sync_all()?;
+        proof.identity = identity(&owned.metadata()?);
+        record("directory_owned", &proof)?;
+    }
+    match openat(
+        &parent,
+        path.file_name().unwrap(),
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => {
+            let actual: File = fd.into();
+            if !same_inode(&identity(&actual.metadata()?), &proof.identity) {
+                return Err(
+                    Error::conflict("目标目录被外部创建或替换").at(path.display().to_string())
+                );
+            }
+        }
+        Err(rustix::io::Errno::NOENT) => {
+            let owned: File = openat(
+                &parent,
+                proof.temp.as_str(),
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )?
+            .into();
+            if !same_inode(&identity(&owned.metadata()?), &proof.identity) {
+                return Err(Error::conflict("临时目录被替换"));
+            }
+            record("directory_publish_intent", &proof)?;
+            rustix::fs::renameat_with(
+                &parent,
+                proof.temp.as_str(),
+                &parent,
+                path.file_name().unwrap(),
+                rustix::fs::RenameFlags::NOREPLACE,
+            )?;
+            parent.sync_all()?;
+        }
+        Err(e) => return Err(e.into()),
+    }
+    record("directory_published", &proof)?;
+    Ok(proof)
+}
+pub fn remove_owned_directory(proof: &DirectoryProof) -> Result<()> {
+    let path = Path::new(&proof.path);
+    let parent: File = directory(path.parent().unwrap())?.into();
+    if !same_inode(&identity(&parent.metadata()?), &proof.parent) {
+        return Err(Error::conflict("清理目录的父目录已变化"));
+    }
+    for name in [path.file_name().unwrap(), std::ffi::OsStr::new(&proof.temp)] {
+        match openat(
+            &parent,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => {
+                let owned: File = fd.into();
+                if !same_inode(&identity(&owned.metadata()?), &proof.identity) {
+                    return Err(Error::conflict("清理目录已被替换"));
+                }
+                // ENOTEMPTY is safe: preserve any external additions, never recursive-delete.
+                match unlinkat(&parent, name, AtFlags::REMOVEDIR) {
+                    Ok(()) => parent.sync_all()?,
+                    Err(rustix::io::Errno::NOTEMPTY) => (),
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            Err(rustix::io::Errno::NOENT) => (),
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
+pub fn inspect_owned_directory(proof: &DirectoryProof) -> Result<()> {
+    let path = Path::new(&proof.path);
+    let parent: File = directory(
+        path.parent()
+            .ok_or_else(|| Error::conflict("目录证明路径无效"))?,
+    )?
+    .into();
+    if !same_inode(&identity(&parent.metadata()?), &proof.parent) {
+        return Err(Error::conflict("创建目录的父目录已变化"));
+    }
+    for name in [path.file_name().unwrap(), std::ffi::OsStr::new(&proof.temp)] {
+        match openat(
+            &parent,
+            name,
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => {
+                let file: File = fd.into();
+                if proof.identity.is_null()
+                    || !same_inode(&identity(&file.metadata()?), &proof.identity)
+                {
+                    return Err(Error::conflict("创建目录缺少所有权证据或已变化"));
+                }
+            }
+            Err(rustix::io::Errno::NOENT) => (),
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn fixture() -> (Config, FileMove, MoveScope) {
+        let root = fs::canonicalize("/tmp").unwrap().join(format!(
+            "face-admin-person-fileops-shared-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(root.join("base")).unwrap();
+        fs::write(root.join(".fileops-fixture"), "person file operations").unwrap();
+        let config = Config {
+            base: root.join("base"),
+            media: root.join("media"),
+            ledger: root.join("ledger.db"),
+            bind: "127.0.0.1:0".into(),
+            token: None,
+            fixture: None,
+        };
+        let src = config.creators().join("甲/input.mp4");
+        let dst = config.creators().join("乙/output.mp4");
+        fs::create_dir_all(src.parent().unwrap()).unwrap();
+        fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        fs::write(&src, b"owned fixture bytes\0\xff").unwrap();
+        let stat = fs::metadata(&src).unwrap();
+        let src = src.display().to_string();
+        let file = FileMove {
+            src: src.clone(),
+            dst: dst.display().to_string(),
+            vids: vec!["v1".into()],
+            size: stat.len(),
+            version: fingerprint(&src, &stat),
+        };
+        let scope = MoveScope {
+            source: ScopeRoot::Person("甲".into()),
+            destination: ScopeRoot::Person("乙".into()),
+        };
+        (config, file, scope)
+    }
+    #[test]
+    fn cross_parent_hard_link_recovers_and_compensates() {
+        let (config, file, scope) = fixture();
+        let mut pinned = prepare_move(&config, &scope, &file).unwrap();
+        let evidence = pinned.evidence.clone();
+        pinned
+            .publish_recoverable(&file.version, &mut |_, _| Ok(()))
+            .unwrap();
+        pinned.remove_source(&file.version).unwrap();
+        drop(pinned);
+        let mut recovered = recover_move(&config, &scope, &file, evidence).unwrap();
+        assert_eq!(recovered.position(&file.version).unwrap(), (false, true));
+        recovered
+            .compensate_recoverable(&config, &file.version, &mut |_, _| Ok(()))
+            .unwrap();
+        assert_eq!(fs::read(&file.src).unwrap(), b"owned fixture bytes\0\xff");
+        assert!(!Path::new(&file.dst).exists());
+    }
+    #[test]
+    fn copy_recovery_and_compensation_use_owned_inode_and_full_digest() {
+        let (config, file, scope) = fixture();
+        let mut pinned = prepare_move(&config, &scope, &file).unwrap();
+        let mut evidence = MoveEvidence::default();
+        let mut phases = vec![];
+        pinned
+            .copy_publish(false, &file.version, &mut |phase, proof| {
+                phases.push(phase.to_owned());
+                evidence = proof.clone();
+                Ok(())
+            })
+            .unwrap();
+        assert!(phases.iter().any(|p| p == "copy_verified"));
+        assert!(evidence.copy.as_ref().unwrap().digest.is_some());
+        pinned.remove_source(&file.version).unwrap();
+        drop(pinned);
+        let mut recovered = recover_move(&config, &scope, &file, evidence.clone()).unwrap();
+        let interrupted =
+            recovered.compensate_recoverable(&config, &file.version, &mut |phase, proof| {
+                evidence = proof.clone();
+                if phase == "copy_published" {
+                    Err(Error::conflict("fixture stop after reverse publication"))
+                } else {
+                    Ok(())
+                }
+            });
+        assert!(interrupted.is_err());
+        drop(recovered);
+        let mut recovered = recover_move(&config, &scope, &file, evidence).unwrap();
+        recovered
+            .compensate_recoverable(&config, &file.version, &mut |_, _| Ok(()))
+            .unwrap();
+        assert_eq!(fs::read(&file.src).unwrap(), b"owned fixture bytes\0\xff");
+        assert!(!Path::new(&file.dst).exists());
+    }
+    #[test]
+    fn copy_never_replaces_a_late_target() {
+        let (config, file, scope) = fixture();
+        let mut pinned = prepare_move(&config, &scope, &file).unwrap();
+        let result = pinned.copy_publish(false, &file.version, &mut |phase, _| {
+            if phase == "copy_verified" {
+                fs::write(&file.dst, b"external").unwrap();
+            }
+            Ok(())
+        });
+        assert!(result.is_err());
+        assert_eq!(fs::read(&file.dst).unwrap(), b"external");
+        assert_eq!(fs::read(&file.src).unwrap(), b"owned fixture bytes\0\xff");
+    }
+    #[test]
+    fn resumed_copy_rejects_same_size_external_change() {
+        let (config, file, scope) = fixture();
+        let mut pinned = prepare_move(&config, &scope, &file).unwrap();
+        let mut proof = MoveEvidence::default();
+        pinned
+            .copy_publish(false, &file.version, &mut |_, e| {
+                proof = e.clone();
+                Ok(())
+            })
+            .unwrap();
+        pinned.remove_source(&file.version).unwrap();
+        drop(pinned);
+        fs::write(&file.dst, b"foreign fixture byt\0\xff").unwrap();
+        assert!(recover_move(&config, &scope, &file, proof).is_err());
+    }
+    #[test]
+    fn unknown_temp_inode_blocks_recovery_before_cleanup() {
+        let (config, file, scope) = fixture();
+        let pinned = prepare_move(&config, &scope, &file).unwrap();
+        let mut proof = pinned.evidence.clone();
+        proof.copy = Some(CopyProof {
+            temp: ".pending-fixture.tmp".into(),
+            identity: serde_json::Value::Null,
+            digest: None,
+        });
+        fs::write(
+            Path::new(&file.dst)
+                .parent()
+                .unwrap()
+                .join(".pending-fixture.tmp"),
+            b"foreign",
+        )
+        .unwrap();
+        drop(pinned);
+        assert!(recover_move(&config, &scope, &file, proof).is_err());
+        assert!(Path::new(&file.src).exists());
+    }
+    #[test]
+    fn directory_proof_recovers_publication_and_preserves_foreign_children() {
+        let (config, _, _) = fixture();
+        let path = config.creators().join("乙/nested").display().to_string();
+        let mut proof = None;
+        assert!(
+            create_directory(&path, None, &mut |phase, value| {
+                proof = Some(value.clone());
+                if phase == "directory_owned" {
+                    Err(Error::conflict("fixture interrupted"))
+                } else {
+                    Ok(())
+                }
+            })
+            .is_err()
+        );
+        let proof = create_directory(&path, proof, &mut |_, _| Ok(())).unwrap();
+        inspect_owned_directory(&proof).unwrap();
+        fs::write(Path::new(&path).join("external.txt"), b"external").unwrap();
+        remove_owned_directory(&proof).unwrap();
+        assert!(Path::new(&path).exists());
+        fs::remove_file(Path::new(&path).join("external.txt")).unwrap();
+        remove_owned_directory(&proof).unwrap();
+        assert!(!Path::new(&path).exists());
+    }
+    #[test]
+    fn two_parent_replacement_is_rejected() {
+        let (config, file, scope) = fixture();
+        let pinned = prepare_move(&config, &scope, &file).unwrap();
+        let evidence = pinned.evidence.clone();
+        drop(pinned);
+        let parent = Path::new(&file.dst).parent().unwrap();
+        fs::rename(parent, parent.with_extension("old")).unwrap();
+        fs::create_dir(parent).unwrap();
+        assert!(recover_move(&config, &scope, &file, evidence).is_err());
+    }
+}

@@ -136,3 +136,51 @@ Every run rejected 14 requests beyond the single active worker plus 32 queue slo
 All pre-existing native HTTP scenarios, `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`, and the Linux release build passed. This proves the isolated same-directory rename and storage primitives under the actual identity/mount mapping. It does not prove full Peach application compatibility, cross-device move recovery, hard-mounted NFS timeout behavior, or production cutover readiness.
 
 After integrating Rust 03, the NFS harness expects provable pre-publication injected failures to compensate as `rolled_back`, preserving bytes and releasing the owned gate. The recorded Rust 04 runs above predate automatic reconciliation and retain their original outcomes; combined local recovery regressions validate the new assertion, while final deployment acceptance must use the integrated image.
+
+## Shared multi-file preparation (#5 / #7)
+
+The same worker, gate, operation store, and recovery loop now accept native domain-built
+execution intents. Public dispatch remains limited to the original registered rename until
+the feature modules wire `native::{validate,plan,snapshot,revalidate,result}`. This is shared
+infrastructure, not proof that archive or cross-person APIs are enabled.
+
+Existing rename Request/Plan JSON omits all new optional fields, preserving old request and
+preview hashes. Evidence without a schema remains the old single-file format. New evidence
+uses `schema:2`, immutable file indexes, and an admitted aggregate domain snapshot. The store
+schema is 3 so older writers refuse a downgrade; legacy records remain readable.
+
+`Plan.execution` declares approved internal scopes, failure policy, affected stores, native
+intent data, and a result template. `native::DomainSnapshot` contains metadata plus an optional
+`ledger::Delta { changes, creators }`. Typed deltas allow only known tables and exact complete
+before/after rows, with path/creator/link predicate guards. Creator IDs are allocated by SQLite
+inside the final Peach transaction, and its receipt stores the fully resolved concrete delta.
+No client SQL or executable callback is accepted. A false store flag means that database is
+not opened; local-only zero-file operations therefore need no faces or Peach access.
+
+File steps carry `(operation_id,file_index)` and source/destination paths. The runner opens
+one file and its two parents at a time, verifies pinned identities, and never retains 5,000
+sets of descriptors. Missing destination directories use exclusive owned temporary directories
+and no-replace publication, with inode evidence persisted before publication. Cleanup removes
+only proven owned empty directories and preserves external children. Hard-link failures on
+unsupported/cross-device filesystems use a streamed, SHA-256 verified owned copy and atomic
+`RENAME_NOREPLACE` publication; source unlink follows durable publication evidence. Reverse
+copy compensation also records its new inode. Unknown temp ownership or foreign changes keep
+the operation in recovery; names and sizes alone never confer ownership.
+
+Archive's continue-unchanged policy may skip a file only before its first mutation boundary.
+It persists `successful_file_subset` before constructing partial native deltas, then persists
+`commit_scope` before the aggregate transactions. Recovery reloads both rather than deriving
+success from filesystem presence. A full-success operation reuses its admitted snapshot.
+Multi-file rollback restores the operation's complete affected subset. `status` now includes
+per-file phases/status, `processed`, and `committed`, distinguishing moved files awaiting local
+and Peach commits from final success.
+
+Bounds are explicit: 5,000 physical moves, 64 MiB domain snapshot, 8 MiB HTTP body, one worker
+and the existing 32 queued commands. Fault phases retain all old names and also support
+`<file-phase>:<index>` for targeted file interruption. The 12 shared Rust tests cover cross-parent
+moves, copied publication/compensation recovery, foreign temp/parent/content rejection,
+owned directory cleanup, two-file aggregate execution/restart/rollback, zero-file local-only
+writes, and legacy serialization. Existing native HTTP and recovery suites still apply.
+The shared tests run only in newly marked isolated `/tmp` fixtures; copy tests exercise the
+same primitive directly. Production NFS multi-file/cross-device deployment remains unproven
+until the feature and deployment acceptance runs complete.
