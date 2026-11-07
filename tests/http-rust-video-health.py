@@ -101,7 +101,9 @@ def guards_restart_and_io():
         # On macOS abrupt parent death has no PDEATHSIG: explicitly clean the isolated controlled fixture group.
         try:os.killpg(int(marker.read_text()),9)
         except ProcessLookupError:pass
-        print('PASS permission uncertainty, mount failure retains previous results, real SIGKILL restart marks interrupted')
+        x.stop();(x.base/'video-health.json').write_text('{broken');x.env['VIDEO_HEALTH_ENABLED']='0';x.start()
+        x.call(route='/v1/video-health',status=503);assert x.preview()['action']=='rename-file'
+        print('PASS permission uncertainty, mount failure retains previous results, real SIGKILL restart, corrupt health returns 503 without blocking file operations')
     finally:x.stop()
 
 def mass_and_compatibility():

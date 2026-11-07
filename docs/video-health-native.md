@@ -71,3 +71,9 @@ Rust 文件服务内的单独 `video-health-lane` 负责每日北京时间 03:30
 期间改名不堵塞文件操作、权限和挂载失败，以及真实 SIGKILL／服务重启。
 
 生产 NFS 的实际 UID、挂载及资源限额验收由最终统一切换执行；本票本地验证不等于生产部署。
+
+联合验收：`python3 tests/http-rust-health-staging.py --port 19007` 在扫描过程中实际
+执行入暂存→永久删除，或入暂存→原路径恢复，证明旧结果／旧播放报告失效。恢复用例
+明确断言 inode、大小、mtime 与路径指纹仍相同，以验证处置代次保护。
+`tests/http-rust-staging-archive-delete.py` 另验证实际归档重复件的删除／恢复不污染
+正式副本。HTTP 验收也覆盖探测前／后的异常激增、7 天过期和损坏报告的 503 语义。

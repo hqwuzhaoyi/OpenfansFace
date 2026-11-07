@@ -61,8 +61,17 @@ pub fn next_run(time: i64) -> i64 {
     (time + 8 * 3600 - 12600).div_euclid(DAY) * DAY + 12600 - 8 * 3600 + DAY
 }
 fn read(config: &Config, name: &str, default: Value) -> Result<Value> {
-    Ok(review::read(config, name, default)?.1)
+    review::read(config, name, default)
+        .map(|(_, value)| value)
+        .map_err(|error| {
+            Error::new(
+                503,
+                "health_read_failed",
+                format!("无法读取 {name}：{}", error.error),
+            )
+        })
 }
+
 fn report(config: &Config) -> Result<Value> {
     let mut v = read(config, HEALTH, json!({"records":{},"status":"never_run"}))?;
     if v.get("records").is_none() {
@@ -963,7 +972,11 @@ pub fn summary(config: &Config) -> Result<Value> {
     value["hidden"] = json!(rows.iter().filter(|r| r["hidden"] == true).count());
     value["rows"] = json!(rows);
     if !fresh && value["last_success_at"].is_string() {
-        value["error"] = json!("检查结果超过 7 天，暂停自动收起，等待下一次成功检查。")
+        let stale = "检查结果超过 7 天，暂停自动收起，等待下一次成功检查。";
+        value["error"] = json!(match value["error"].as_str().filter(|s| !s.is_empty()) {
+            Some(error) => format!("{error}；{stale}"),
+            None => stale.into(),
+        });
     }
     if value["next_run_at"].is_null() {
         value["next_run_at"] = json!(stamp(next_run(clock(config)))?)
