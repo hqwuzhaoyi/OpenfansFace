@@ -176,7 +176,7 @@ def crash_checkpoint(phase,replace=False):
             foreign=Path(plan['files'][1]['dst']);foreign.unlink();foreign.write_bytes(b'foreign replacement')
         f.start();status=f.status(plan)
         if replace:
-            assert status['status']=='recovery_required',status
+            assert status['status']=='recovery_needed',status
             assert foreign.read_bytes()==b'foreign replacement' and (f.base/'.review-write.lock').exists()
             assert f.call({'mode':'apply','request':plan['request'],'version':plan['version']},status=503)['code']=='recovery_required'
         else:
@@ -213,8 +213,33 @@ def identity_resolution():
         print('PASS unrelated creator allocation does not stale absent-target preview')
     finally:f.stop()
 
+
+def source_identity_resolution():
+    for ambiguous in (False,True):
+        f=MoveFixture()
+        try:
+            old=f.source.parent;source_root=old.with_name('Source');old.rename(source_root)
+            f.source=source_root/f.source.name;f.other=source_root/f.other.name;f.untouched=source_root/f.untouched.name
+            fixture.write(f.base/'archive-history.json',[])
+            with sqlite3.connect(f.base/'faces.db') as db:
+                db.execute('UPDATE videos SET path=? WHERE vid=?',(str(f.source),VID));db.execute('UPDATE videos SET path=? WHERE vid=?',(str(f.other),f.vid2))
+            with sqlite3.connect(f.ledger) as db:
+                db.execute("UPDATE entity SET canonical_name='SOURCE',normalized_name='source' WHERE id=1")
+                db.execute('UPDATE asset SET path=? WHERE id=1',(f.win(f.source),));db.execute('UPDATE asset SET path=? WHERE id=2',(f.win(f.other),))
+                if ambiguous:db.execute("INSERT INTO entity(kind,canonical_name,normalized_name,created_at,updated_at) VALUES('creator','Source','other','fixture','fixture')")
+            request=f.move_request();request['person']='Source'
+            if ambiguous:
+                f.preview(request,409);assert f.source.exists() and f.other.exists()
+            else:
+                plan=f.preview(request);f.apply(plan)
+                with sqlite3.connect(f.ledger) as db:
+                    assert db.execute("SELECT COUNT(*) FROM asset_entity WHERE entity_id=1 AND role='creator'").fetchone()[0]==0
+                    assert db.execute("SELECT COUNT(*) FROM asset_entity WHERE entity_id=1 AND role='performer'").fetchone()[0]==1
+            print('PASS normalized source identity', 'ambiguity rejects' if ambiguous else 'old creator links removed, unrelated role retained')
+        finally:f.stop()
+
 if __name__=='__main__':
-    success();guards();registration();rollback();identity_resolution();boundary()
+    success();guards();registration();rollback();identity_resolution();source_identity_resolution();boundary()
     for phase in ('destination_published:1','source_removed:1','faces_committed','ledger_committed_unrecorded'):
         crash_checkpoint(phase)
     crash_checkpoint('destination_published:1',replace=True)

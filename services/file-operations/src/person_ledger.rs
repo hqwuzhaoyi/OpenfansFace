@@ -56,8 +56,8 @@ pub fn snapshot(config: &Config, plan: &Plan) -> Result<ledger::Delta> {
     let mut link_scope = vec![];
     let source = db::rows(
         &tx,
-        "SELECT * FROM entity WHERE kind='creator' AND canonical_name=? ORDER BY id",
-        [&plan.person],
+        "SELECT * FROM entity WHERE kind='creator' AND (canonical_name=? OR normalized_name=?) ORDER BY id",
+        params![plan.person, plan.person.to_lowercase()],
     )?;
     let target = db::rows(
         &tx,
@@ -210,12 +210,16 @@ pub fn snapshot(config: &Config, plan: &Plan) -> Result<ledger::Delta> {
             link_scope.push(selector);
         }
     }
-    guards.push(db::Guard::CreatorCanonical {
+    guards.push(db::Guard::CreatorName {
         canonical: plan.person.clone(),
+        normalized: plan.person.to_lowercase(),
         before: source.clone(),
         after: next_entities
             .values()
-            .filter(|r| r["canonical_name"] == plan.person)
+            .filter(|r| {
+                r["canonical_name"] == plan.person
+                    || r["normalized_name"] == plan.person.to_lowercase()
+            })
             .cloned()
             .collect(),
     });
