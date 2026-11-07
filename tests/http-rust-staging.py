@@ -1,5 +1,5 @@
 """#8 native delete/restore/list acceptance. Isolated media + full Peach schema; no external executables."""
-import importlib.util,json,sqlite3,uuid,time,signal,http.client
+import importlib.util,json,sqlite3,uuid,time,signal,http.client,os
 from pathlib import Path
 spec=importlib.util.spec_from_file_location('fixture',Path(__file__).with_name('http-rust-file-operations.py'))
 fmod=importlib.util.module_from_spec(spec);spec.loader.exec_module(fmod)
@@ -180,5 +180,18 @@ def database_failures():
             print('PASS actual SQLite rejection compensates restore',kind)
         finally:f.stop()
 
+def special_files():
+    f=Fixture()
+    try:
+        stage=f.media/'pikpak/.face-cleanup-staging';stage.mkdir();fifo=stage/'pipe.mp4';os.mkfifo(fifo)
+        assert listing(f)['files']==0
+        request={'id':str(uuid.uuid4()),'action':'restore-files','person':'','target_person':'甲','files':[{'vid':str(fifo),'path':str(fifo),'version':'0'*64}]}
+        f.preview(request,409)
+        # The shared writer still serves a real operation immediately after rejection.
+        assert f.apply(delete(f))['changed']==1
+        assert fifo.exists()
+        print('PASS FIFO excluded/rejected without blocking shared writer')
+    finally:f.stop()
+
 if __name__=='__main__':
-    success();guards();unknown_and_deleted();rollback();legacy();crashes();nested_and_native_receipt();database_failures()
+    success();guards();unknown_and_deleted();rollback();legacy();crashes();nested_and_native_receipt();database_failures();special_files()
