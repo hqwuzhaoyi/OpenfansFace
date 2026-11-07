@@ -11,6 +11,7 @@ pub struct DomainSnapshot {
 }
 fn review_action(action: &str) -> bool {
     [
+        "archive-resolve",
         "queue-confirm",
         "queue-undo",
         "claim-decide",

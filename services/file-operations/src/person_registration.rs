@@ -72,10 +72,11 @@ impl SourceIndex {
         let selected: BTreeSet<&str> = selected_paths.iter().map(String::as_str).collect();
         let mut by_path = BTreeMap::<String, Vec<String>>::new();
         let mut consider = |id: &str, path: &str| {
-            let effective = historical
-                .get(id)
-                .copied()
-                .or(overrides[id].as_str())
+            // A staged/restored source can have a historical canonical target.
+            // Its explicit current override remains the authoritative location.
+            let effective = overrides[id]
+                .as_str()
+                .or_else(|| historical.get(id).copied())
                 .unwrap_or(path);
             let candidates: Vec<_> = [effective, id]
                 .into_iter()

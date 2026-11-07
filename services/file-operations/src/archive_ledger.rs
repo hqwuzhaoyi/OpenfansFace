@@ -78,6 +78,7 @@ pub fn prepare(config: &Config, rows: &[Value], at: &str, operation_id: &str) ->
     let mut db = db::open(&config.ledger)?;
     let tx = db.transaction()?;
     let mut planned = vec![];
+    let mut canonical_links = BTreeMap::<i64, Vec<Value>>::new();
     let mut entities = BTreeMap::<String, Value>::new();
     let mut entity_before = vec![];
     let entity_keys = keys(&tx, "entity")?;
@@ -145,21 +146,53 @@ pub fn prepare(config: &Config, rows: &[Value], at: &str, operation_id: &str) ->
             "SELECT * FROM asset_entity WHERE asset_id=? ORDER BY entity_id,role,source",
             [aid],
         )?;
-        let mut after_links = links.clone();
-        if !links
-            .iter()
-            .any(|r| r["entity_id"] == entity["id"] && r["role"] == "creator")
-        {
-            let mut fields = json!({"asset_id":review::integer(aid),"entity_id":review::integer(eid),"role":"creator","source":"face-curation-8919","confidence":0.95,"metadata_json":"{}","first_seen_at":at,"last_seen_at":at});
-            if link_keys == ["id"] {
-                fields["id"] = review::integer(next_link);
-                next_link += 1;
+        let mut link_creator = |aid: i64, links: &[Value]| -> Result<Vec<Value>> {
+            let mut after_links = links.to_vec();
+            if !links
+                .iter()
+                .any(|r| r["entity_id"] == entity["id"] && r["role"] == "creator")
+            {
+                let mut fields = json!({"asset_id":review::integer(aid),"entity_id":review::integer(eid),"role":"creator","source":"face-curation-8919","confidence":0.95,"metadata_json":"{}","first_seen_at":at,"last_seen_at":at});
+                if link_keys == ["id"] {
+                    fields["id"] = review::integer(next_link);
+                    next_link += 1;
+                }
+                after_links.push(new_row(&tx, "asset_entity", fields)?);
             }
-            after_links.push(new_row(&tx, "asset_entity", fields)?);
-        }
+            Ok(after_links)
+        };
+        let after_links = link_creator(aid, &links)?;
+        let canonical = if let Some(path) = row["canonical"].as_str() {
+            let assets = db::rows(
+                &tx,
+                "SELECT * FROM asset WHERE path=? ORDER BY id",
+                [metadata::win(config, path)],
+            )?;
+            if assets.len() != 1 || !assets[0]["disposal"].is_null() {
+                return Err(
+                    Error::new(409, "ledger_conflict", "重复件目标账本记录缺失或不唯一").at(path),
+                );
+            }
+            let canonical_id = db::integer(&assets[0]["id"])?;
+            let before = db::rows(
+                &tx,
+                "SELECT * FROM asset_entity WHERE asset_id=? ORDER BY entity_id,role,source",
+                [canonical_id],
+            )?;
+            let after = if let Some(cached) = canonical_links.get(&canonical_id) {
+                cached.clone()
+            } else {
+                let after = link_creator(canonical_id, &before)?;
+                canonical_links.insert(canonical_id, after.clone());
+                after
+            };
+            json!({"assets":assets,"links":before,"after_links":after})
+        } else {
+            Value::Null
+        };
         let mut after_asset = asset.clone();
         after_asset["path"] = json!(metadata::win(config, dst));
-        planned.push(json!({"asset":asset,"after_asset":after_asset,"links":links,"after_links":after_links,"entity":entity,"requested_name":name,"entity_matches":matches,"old_path_assets":db::rows(&tx,"SELECT * FROM asset WHERE path=? ORDER BY id",[metadata::win(config,src)])?,"new_path_assets":db::rows(&tx,"SELECT * FROM asset WHERE path=? ORDER BY id",[metadata::win(config,dst)])?}));
+        planned.push(json!({"canonical":canonical,"asset":asset,"after_asset":after_asset,"links":links,"after_links":after_links,"entity":entity,"requested_name":name,"entity_matches":matches,"old_path_assets":db::rows(&tx,"SELECT * FROM asset WHERE path=? ORDER BY id",[metadata::win(config,src)])?,"new_path_assets":db::rows(&tx,"SELECT * FROM asset WHERE path=? ORDER BY id",[metadata::win(config,dst)])?}));
     }
     Ok(
         json!({"files":planned,"entities_before":entity_before,"entities_after":entities.values().collect::<Vec<_>>(),"entity_keys":entity_keys,"link_keys":link_keys}),
@@ -179,10 +212,48 @@ pub fn delta(prepared: &Value, successful: &[usize]) -> Result<crate::ledger::De
             .ok_or_else(|| Error::conflict("归档提交范围越界"))?;
         assets.push(row["asset"].clone());
         after_assets.push(row["after_asset"].clone());
-        links.extend(row["links"].as_array().unwrap().clone());
+        let mut all_links = row["links"].as_array().unwrap().clone();
+        let mut all_after_links = row["after_links"].as_array().unwrap().clone();
+        if let Some(canonical) = row["canonical"].as_object() {
+            let canonical_assets = canonical["assets"].as_array().unwrap().clone();
+            let canonical_id = canonical_assets[0]["id"].clone();
+            let guard = db::Guard::AssetPath {
+                path: canonical_assets[0]["path"].as_str().unwrap().into(),
+                before: canonical_assets.clone(),
+                after: canonical_assets,
+            };
+            if !guards.contains(&guard) {
+                guards.push(guard);
+            }
+            let before = canonical["links"].as_array().unwrap().clone();
+            let after = canonical["after_links"].as_array().unwrap().clone();
+            let guard = db::Guard::AssetLinks {
+                asset_id: canonical_id,
+                before: before.clone(),
+                after: if row["entity_matches"].as_array().unwrap().is_empty() {
+                    before.clone()
+                } else {
+                    after.clone()
+                },
+            };
+            if !guards.contains(&guard) {
+                guards.push(guard);
+            }
+            all_links.extend(before);
+            all_after_links.extend(after);
+        }
+        for link in &all_links {
+            if !links.contains(link) {
+                links.push(link.clone());
+            }
+        }
         let pending = row["entity_matches"].as_array().unwrap().is_empty();
         if pending {
-            after_links.extend(row["links"].as_array().unwrap().clone());
+            for link in &all_links {
+                if !after_links.contains(link) {
+                    after_links.push(link.clone());
+                }
+            }
             let normalized = row["entity"]["normalized_name"].as_str().unwrap();
             let intent =
                 creators
@@ -192,16 +263,22 @@ pub fn delta(prepared: &Value, successful: &[usize]) -> Result<crate::ledger::De
                         normalized_name: normalized.into(),
                         links: vec![],
                     });
-            for link in row["after_links"].as_array().unwrap() {
-                if row["links"].as_array().unwrap().contains(link) {
+            for link in &all_after_links {
+                if all_links.contains(link) {
                     continue;
                 }
                 let mut link = link.clone();
                 link.as_object_mut().unwrap().remove("entity_id");
-                intent.links.push(link);
+                if !intent.links.contains(&link) {
+                    intent.links.push(link);
+                }
             }
         } else {
-            after_links.extend(row["after_links"].as_array().unwrap().clone());
+            for link in &all_after_links {
+                if !after_links.contains(link) {
+                    after_links.push(link.clone());
+                }
+            }
             entity_ids.insert(db::integer(&row["entity"]["id"])?);
         }
         let old = row["old_path_assets"].as_array().unwrap().clone();

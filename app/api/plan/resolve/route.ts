@@ -1,4 +1,5 @@
 import path from 'path'
+import { nativeArchive, nativeArchiveEnabled } from '@/lib/archive-native-backend'
 import { NextRequest, NextResponse } from 'next/server'
 import { acquireReviewLock, queuedWithOrigin } from '@/lib/review-store'
 import { saveQueue } from '@/lib/jsonio'
@@ -9,7 +10,9 @@ import { ReviewError, validateVids, type ArchiveResolution } from '@/lib/review-
 export async function POST(req: NextRequest) {
   let release: (() => void) | undefined
   try {
-    const body = await req.json(), vids = validateVids(body.vids), ids = new Set(vids)
+    const body = await req.json()
+    if (nativeArchiveEnabled()) return NextResponse.json(await nativeArchive('archive-resolve', body))
+    const vids = validateVids(body.vids), ids = new Set(vids)
     if (!['rename', 'stage-duplicate', 'clear'].includes(body.kind)) throw new ReviewError('请选择处理方式')
     release = acquireReviewLock()
     const queue = queuedWithOrigin(), plan = buildPlan(queue)

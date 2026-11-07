@@ -49,6 +49,7 @@ pub fn execute(engine: &mut Engine, command: &str, mut body: Value) -> Result<Va
     }
     let action = match command {
         "archive-apply" => "archive",
+        "archive-resolve" => "archive-resolve",
         "queue-confirm" => "queue-confirm",
         "queue-undo" => "queue-undo",
         "claim-decide" => "claim-decide",
@@ -220,7 +221,14 @@ pub fn progress(config: &Config, id: Option<&str>) -> Result<Value> {
         || phase.starts_with("destination_")
         || phase.starts_with("source_");
     let partial = state == "complete" && status["result"]["ok"] == false;
-    let title = if partial {
+    let current = if phase == "duplicate_verification_intent" {
+        db.query_row("SELECT json_extract(evidence,'$.src') FROM steps WHERE operation_id=? AND phase='duplicate_verification_intent' ORDER BY revision DESC LIMIT 1",[&id],|r|r.get::<_,String>(0)).optional()?.map(Value::String).unwrap_or_else(|| status["current_file"].clone())
+    } else {
+        status["current_file"].clone()
+    };
+    let title = if phase.starts_with("duplicate_") {
+        "校验重复文件"
+    } else if partial {
         "部分归档完成"
     } else if state == "complete" {
         "归档完成"
@@ -239,7 +247,7 @@ pub fn progress(config: &Config, id: Option<&str>) -> Result<Value> {
     } else {
         "核对归档"
     };
-    let mut out = json!({"job":{"id":id,"kind":"archive","title":"归档视频","status":if state=="complete"&&!partial{"complete"}else if terminal||state=="recovery_needed"{"error"}else{"running"},"stage":title,"current":status["current_file"],"done":if moving{status["completed"].clone()}else{Value::Null},"total":if moving{status["total"].clone()}else{Value::Null},"unit":if moving{"个文件"}else{""},"failed":status["failed"],"started_at":created,"updated_at":updated,"heartbeat_at":updated,"href":"/integration","error":status["error"]}});
+    let mut out = json!({"job":{"id":id,"kind":"archive","title":"归档视频","status":if state=="complete"&&!partial{"complete"}else if terminal||state=="recovery_needed"{"error"}else{"running"},"stage":title,"current":current,"done":if moving{status["completed"].clone()}else{Value::Null},"total":if moving{status["total"].clone()}else{Value::Null},"unit":if moving{"个文件"}else{""},"failed":status["failed"],"started_at":created,"updated_at":updated,"heartbeat_at":updated,"href":"/integration","error":status["error"]}});
     if let Some(result) = status.get("result") {
         out["result"] = result.clone()
     } else if let Some(plan) = &plan

@@ -230,7 +230,8 @@ pub fn registered_ids(config: &Config, src: &str) -> Result<Vec<String>> {
             .rev()
             .find(|r| r["vid"] == id)
             .and_then(|r| r["win_dst"].as_str().or(r["dst"].as_str()));
-        let stored = archived.or(overrides[id].as_str()).or(row["path"].as_str());
+        // Explicit current locations outrank historical canonical archive targets.
+        let stored = overrides[id].as_str().or(archived).or(row["path"].as_str());
         let candidates: Vec<String> = stored
             .into_iter()
             .chain(std::iter::once(id))

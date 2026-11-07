@@ -44,3 +44,16 @@ pub fn checkpoint(config: &Config, phase: &str) -> Result<()> {
         _ => Err(Error::new(400, "fixture_fault", "未知故障注入模式")),
     }
 }
+
+/// Exercise the real bounded-copy/recovery path on same-device isolated fixtures.
+/// This switch is ignored outside the full Config fixture guard.
+pub fn copy_required(config: &Config) -> Result<bool> {
+    let Some(root) = &config.fixture else {
+        return Ok(false);
+    };
+    let Some(raw) = read_optional(&root.join("rust-fault.json"))? else {
+        return Ok(false);
+    };
+    let value: serde_json::Value = serde_json::from_str(&raw)?;
+    Ok(value["force_copy"] == true)
+}
