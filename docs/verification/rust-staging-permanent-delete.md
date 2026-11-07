@@ -63,18 +63,24 @@ windows, EIO/ESTALE/ETIMEDOUT after/delayed unlink, restart and disconnected HTT
 waiters. Set `FILEOPS_OLD_BINARY` to a schema-3 build for actual downgrade refusal.
 
 `tests/http-rust-staging-delete-gateway.py` uses the dedicated seeded
-`/tmp/face-admin-person-fileops-staging-16` fixture and ports 19002/19003. It checks
+`/tmp/face-admin-person-fileops-staging-16` fixture (or a fresh suffixed root via
+`STAGING_GATEWAY_FIXTURE`) and ports 19002/19003. It checks
 Next adapters, #8 restore, both confirmation texts, receipt replay and actual
 HTTP 206 playback after canonical duplicate disposal. Browser evidence covers
 1280px desktop, 390×844, reduced motion, search-preserved selection, clear scope,
 keyboard submission, Escape/focus restoration, sample decoding at 960px and
-refreshing a completed receipt. The existing video-health panel's unconfigured
-fixture status is separate from this deletion workflow.
-
+refreshing a completed receipt. 
 No production files were deleted or cleared. File-size totals describe logical
 selected bytes, not guaranteed disk-space reclamation (hardlinks/NFS snapshots).
-Production/NFS permissions and #6/#11 joint rollout remain central migration
-checks; these local fixtures are not NFS deployment evidence.
+Production/NFS permissions and the final #11 whole-person union remain central
+migration checks; these local fixtures are not NFS deployment evidence.
+
+The additional `tests/http-rust-staging-archive-delete.py --port 19003` joint
+regression runs actual native archive confirmation/resolution/application, then
+renames a canonical file, permanently deletes its staged duplicate and restores
+a second duplicate. Canonical bytes, assets, creator links, stable IDs and
+thumbnail rows survive; the staged source ID remains distinct. This passed on
+the validated #6/#9 union `da949b3` merged into this branch.
 
 ## Operator handoff for ambiguous mutation results
 

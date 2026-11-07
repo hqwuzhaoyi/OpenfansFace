@@ -1,7 +1,7 @@
 """Public Next #16 adapter and stable playback test; requires isolated seeded fixture + servers."""
 import json,sqlite3,urllib.request,urllib.parse,urllib.error,uuid,os
 from pathlib import Path
-root=Path('/tmp/face-admin-person-fileops-staging-16').resolve();assert (root/'.fileops-fixture').read_text()=='person file operations'
+root=Path(os.environ.get('STAGING_GATEWAY_FIXTURE','/tmp/face-admin-person-fileops-staging-16')).resolve();assert root.parent==Path('/tmp').resolve() and root.name.startswith('face-admin-person-fileops-staging-16');assert (root/'.fileops-fixture').read_text()=='person file operations'
 url='http://127.0.0.1:19002';base=root/'base';media=root/'media'
 def call(route,body=None,status=200):
     req=urllib.request.Request(url+route,data=None if body is None else json.dumps(body).encode(),headers={'Content-Type':'application/json'})
