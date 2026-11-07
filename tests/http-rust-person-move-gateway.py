@@ -43,6 +43,17 @@ with sqlite3.connect(root/'ledger.db') as db:
     assert db.execute("SELECT asset_id,entity_id FROM asset_entity WHERE asset_id IN (1,2) AND role='creator' ORDER BY asset_id").fetchall()==[(1,2),(2,2)]
     assert db.execute("SELECT entity_id FROM asset_entity WHERE asset_id=3 AND role='creator'").fetchall()==[(1,)]
     assert not db.execute('PRAGMA foreign_key_check').fetchall()
+# The public stable link must also recover after an actual native ledger rollback.
+current=next(f for f in listing('乙')['files'] if f['vid']==synthetic)
+rollback=preview({'action':'move-files','person':'乙','target_person':'甲','target_folder':'回退验收','files':[chosen(current)]})
+with sqlite3.connect(root/'ledger.db') as db:db.executescript("CREATE TRIGGER fixture_gateway_reject BEFORE UPDATE OF path ON asset WHEN old.id=2 BEGIN SELECT RAISE(ABORT,'gateway rollback fixture'); END;")
+try:
+    call('/api/persons/manage',{'mode':'apply','request':rollback['request'],'version':rollback['version']},503)
+    assert call('/api/persons/manage?id='+rollback['id'])['status']=='rolled_back'
+    assert Path(current['path']).read_bytes()==content['未扫描.mp4'] and not Path(rollback['files'][0]['dst']).exists()
+    range_bytes(synthetic,content['未扫描.mp4'])
+finally:
+    with sqlite3.connect(root/'ledger.db') as db:db.execute('DROP TRIGGER fixture_gateway_reject')
 assert call('/api/persons/manage?id='+plan['id'])['status']=='complete'
 assert not (base/'.review-write.lock').exists()
-print('PASS public Next person move/registration/repeated rename/real video Range/native schema/scope/result lookup')
+print('PASS public Next person move/registration/repeated rename/real video Range/native schema/scope/result lookup/rollback playback')

@@ -15,6 +15,16 @@ fixture=importlib.util.module_from_spec(spec);spec.loader.exec_module(fixture)
 Fixture,PAYLOAD,VID=fixture.Fixture,fixture.PAYLOAD,fixture.VID
 
 class MoveFixture(Fixture):
+    def call(self,body=None,route='/v1/person-files',status=200,token=True):
+        headers={'Content-Type':'application/json'}
+        if token:headers['Authorization']='Bearer fixture-token'
+        request=fixture.urllib.request.Request(self.url+route,data=None if body is None else json.dumps(body).encode(),headers=headers)
+        try:
+            with fixture.urllib.request.urlopen(request,timeout=120) as response:code,value=response.status,json.load(response)
+        except fixture.urllib.error.HTTPError as error:code,value=error.code,json.load(error)
+        assert code==status,(code,status,value,self.root)
+        return value
+
     def __init__(self):
         super().__init__()
         self.other=self.source.with_name('second.mp4');self.other.write_bytes(PAYLOAD+b'second')
@@ -77,7 +87,7 @@ def success():
 
 
 def guards():
-    for mutation in ('target','source','index','links','permission'):
+    for mutation in ('target','source','index','target_index','links','permission'):
         f=MoveFixture()
         try:
             plan=f.preview(f.move_request(folder=''))
@@ -85,6 +95,8 @@ def guards():
             elif mutation=='source':f.other.write_bytes(b'changed')
             elif mutation=='index':
                 with sqlite3.connect(f.base/'faces.db') as db:db.execute('UPDATE videos SET name=? WHERE vid=?',('changed',f.vid2))
+            elif mutation=='target_index':
+                with sqlite3.connect(f.base/'faces.db') as db:db.execute('INSERT INTO videos VALUES(?,?,?,?,?)',('foreign-index',plan['files'][1]['dst'],'foreign.mp4','foreign',1))
             elif mutation=='links':
                 with sqlite3.connect(f.ledger) as db:db.execute("INSERT INTO asset_entity(asset_id,entity_id,role,source) VALUES(1,1,'creator','late')")
             elif mutation=='permission':f.destination.chmod(0o555)
@@ -269,8 +281,32 @@ def late_unstarted_file():
             print('PASS later selected file '+kind+' change compensates earlier move, preserves external bytes')
         finally:f.stop()
 
+
+def late_local_phantom():
+    f=MoveFixture()
+    try:
+        plan=f.preview(f.move_request())
+        f.fault('faces_commit_intent','pause',milliseconds=900)
+        client=http.client.HTTPConnection('127.0.0.1',f.port,timeout=15)
+        client.request('POST','/v1/person-files',json.dumps({'mode':'apply','request':plan['request'],'version':plan['version']}),{'Content-Type':'application/json','Authorization':'Bearer fixture-token'})
+        reached=f.root/'rust-fault-reached.json'
+        for _ in range(500):
+            if reached.exists() and json.loads(reached.read_text())['phase']=='faces_commit_intent':break
+            time.sleep(.01)
+        else:raise AssertionError('faces checkpoint missing')
+        with sqlite3.connect(f.base/'faces.db') as db:db.execute('INSERT INTO videos VALUES(?,?,?,?,?)',('late-index',plan['files'][0]['dst'],'foreign-index.mp4','foreign',7))
+        response=client.getresponse();body=json.load(response);client.close()
+        assert response.status==503 and body['code']=='recovery_required',body
+        assert f.status(plan)['status']=='recovery_needed'
+        with sqlite3.connect(f.base/'faces.db') as db:
+            assert db.execute("SELECT name,size FROM videos WHERE vid='late-index'").fetchone()==('foreign-index.mp4',7)
+            assert db.execute('SELECT path FROM videos WHERE vid=?',(VID,)).fetchone()[0]==str(f.source)
+        assert (f.base/'.review-write.lock').exists()
+        print('PASS late matching local index insert is preserved and blocks stale commit')
+    finally:f.stop()
+
 if __name__=='__main__':
-    success();guards();registration();rollback();identity_resolution();source_identity_resolution();late_unstarted_file();boundary()
+    success();guards();registration();rollback();identity_resolution();source_identity_resolution();late_unstarted_file();late_local_phantom();boundary()
     for phase in ('destination_published:1','source_removed:1','faces_committed','ledger_committed_unrecorded'):
         crash_checkpoint(phase)
     crash_checkpoint('destination_published:1',replace=True)

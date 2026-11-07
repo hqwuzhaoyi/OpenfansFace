@@ -182,33 +182,85 @@ fn selected_rows(
 ) -> Result<Vec<Value>> {
     let mut ids = BTreeSet::new();
     let mut paths = BTreeSet::new();
+    let mut targets = BTreeSet::new();
     for file in &plan.files {
         ids.extend(file.vids.iter().cloned());
         paths.insert(file.src.clone());
         paths.insert(metadata::win(config, &file.src));
+        targets.insert(file.dst.clone());
+        targets.insert(metadata::win(config, &file.dst));
     }
+    paths.extend(targets.iter().cloned());
     let placeholders = |n| std::iter::repeat_n("?", n).collect::<Vec<_>>().join(",");
     let sql = format!(
         "SELECT * FROM {table} WHERE vid IN ({}) OR path IN ({}) ORDER BY vid",
         placeholders(ids.len()),
         placeholders(paths.len())
     );
-    db::rows(
+    let rows = db::rows(
         connection,
         &sql,
         rusqlite::params_from_iter(ids.iter().chain(&paths)),
-    )
+    )?;
+    if rows.iter().any(|r| {
+        r["path"].as_str().is_some_and(|p| targets.contains(p))
+            && !r["vid"].as_str().is_some_and(|id| ids.contains(id))
+    }) {
+        return Err(crate::model::Error::conflict(
+            "目标路径已有其他视频或处理任务索引，请先核对",
+        ));
+    }
+    Ok(rows)
 }
-fn delta(table: db::Table, before: Vec<Value>, after: Vec<Value>, plan: &Plan) -> db::Delta {
+fn delta(
+    config: &Config,
+    plan: &Plan,
+    table: db::Table,
+    before: Vec<Value>,
+    after: Vec<Value>,
+) -> db::Delta {
     let scope = before
         .iter()
         .chain(&after)
         .map(|r| r["vid"].as_str().unwrap().to_owned())
-        .chain(plan.files.iter().flat_map(|f| f.vids.iter().cloned()))
         .collect::<BTreeSet<_>>()
         .into_iter()
         .map(|id| json!({"vid":id}))
         .collect();
+    let vids = plan
+        .files
+        .iter()
+        .flat_map(|f| f.vids.iter().cloned())
+        .chain(
+            before
+                .iter()
+                .chain(&after)
+                .filter_map(|r| r["vid"].as_str().map(str::to_owned)),
+        )
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let paths = plan
+        .files
+        .iter()
+        .flat_map(|f| {
+            [
+                f.src.clone(),
+                f.dst.clone(),
+                metadata::win(config, &f.src),
+                metadata::win(config, &f.dst),
+            ]
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let guard = db::Guard::LocalFiles {
+        table,
+        vids,
+        paths,
+        before: before.clone(),
+        after: after.clone(),
+    };
     db::Delta {
         tables: vec![db::TableDelta {
             table,
@@ -217,7 +269,7 @@ fn delta(table: db::Table, before: Vec<Value>, after: Vec<Value>, plan: &Plan) -
             before,
             after,
         }],
-        guards: vec![],
+        guards: vec![guard],
     }
 }
 pub fn snapshot(config: &Config, plan: &Plan) -> Result<Snapshot> {
@@ -262,7 +314,7 @@ pub fn snapshot(config: &Config, plan: &Plan) -> Result<Snapshot> {
         .map(|row| {
             let mut next = row.clone();
             if let Some(file) = plan.files.iter().find(|f| {
-                f.vids.iter().any(|v| row["vid"] == v)
+                f.vids.iter().any(|v| row["vid"] == *v)
                     || row["path"] == f.src
                     || row["path"] == metadata::win(config, &f.src)
             }) {
@@ -279,7 +331,7 @@ pub fn snapshot(config: &Config, plan: &Plan) -> Result<Snapshot> {
             next
         })
         .collect();
-    let faces_delta = Some(delta(db::Table::Videos, before, after, plan));
+    let faces_delta = Some(delta(config, plan, db::Table::Videos, before, after));
     let jobs_path = config.base.join("processing/processing.db");
     let jobs_delta = if jobs_path.exists() {
         let before = selected_rows(config, &db::open(&jobs_path)?, "tasks", plan)?;
@@ -292,7 +344,7 @@ pub fn snapshot(config: &Config, plan: &Plan) -> Result<Snapshot> {
         for row in &before {
             let mut next = row.clone();
             if let Some(file) = plan.files.iter().find(|f| {
-                f.vids.iter().any(|v| row["vid"] == v)
+                f.vids.iter().any(|v| row["vid"] == *v)
                     || row["path"] == f.src
                     || row["path"] == metadata::win(config, &f.src)
             }) {
@@ -315,7 +367,7 @@ pub fn snapshot(config: &Config, plan: &Plan) -> Result<Snapshot> {
             }
             after.push(next);
         }
-        Some(delta(db::Table::Tasks, before, after, plan))
+        Some(delta(config, plan, db::Table::Tasks, before, after))
     } else {
         None
     };
