@@ -36,15 +36,17 @@ class ReferenceTests(unittest.TestCase):
         with patch('processing_faces.native',return_value={'version':'a'*64}):
             return build_references(self.base,self.root)
 
-    def test_cache_only_confirmed_person_becomes_reference_and_survives_same_filesystem_archive(self):
+    def test_cache_only_reference_requires_native_proof_for_a_changed_path(self):
         self.assertEqual(self.build()['people'],1)
         archived=self.root/'pikpak/creators/Cache Only Person/after.mp4';archived.parent.mkdir(parents=True)
         self.file.rename(archived)
         with sqlite3.connect(self.base/'faces.db') as db:db.execute('UPDATE videos SET path=? WHERE vid=?',(str(archived),self.vid))
         (self.base/'integration-queue.json').write_text('[]')
         (self.base/'archive-history.json').write_text(json.dumps([{'vid':self.vid,'creator':'Cache Only Person','dst':str(archived)}]))
-        self.assertEqual(self.build()['people'],1)
-        self.assertEqual(len(reference_features(self.base,self.vid,archived)),6)
+        # A manual path rewrite has no committed native receipt. Valid native
+        # rename/archive/copy chains are covered by the actual HTTP fixtures.
+        self.assertEqual(self.build()['people'],0)
+        self.assertEqual(len(reference_features(self.base,self.vid,archived)),0)
         # Same size and preserved mtime still cannot turn a replaced inode into the old file.
         archived.unlink();archived.write_bytes(b'synthetic-media')
         import os

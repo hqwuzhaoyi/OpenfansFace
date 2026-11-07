@@ -37,10 +37,24 @@ not add an automatic garbage collector. Do not remove pending publication files.
 
 Reference building brackets authoritative faces/business inputs with native
 analysis-state, records that input token in `references.npz`, and each attempt
-copies the reference snapshot. Legacy `processing/faces/*.npz` references must
-match the current path, size, mtime and model version. New receipt-backed caches
-also bind their byte hash and source device/inode: a same-filesystem rename or
-archive can preserve reference usefulness, while replacement or tampering cannot.
+copies the reference snapshot. Legacy `processing/faces/*.npz` references retain their original path, size,
+mtime and model-version guards. New receipt-backed caches additionally require
+the accepted SHA-256 and original source device/inode. When a native move changes
+the path or inode, the read-only `reference-relocation` command bridges only a
+completed successful per-file receipt chain for that stable vid. It verifies the
+cache bytes, original evidence, exact edge identities and current destination
+parent/file identity. Verified copy receipts preserve their committed digest;
+reference reuse does not rehash multi-GB media. Failed, pending, rolled-back or
+unresolved records never authorize a bridge. At most 1,024 records and 128 edges
+for the requested video are streamed; unrelated history is not materialized.
+
+The proof version contains only the used chain. Existing `analysis-state` already
+binds the current stable source path/full fingerprint and all assigned cache
+hashes; the shared write gate and serialized native read prevent observing a
+partially committed relocation. Completed receipts are immutable, so no global
+journal digest is added to every face attempt. Cache bytes and original metadata
+are never rewritten to hide a move. Missing historical model hashes or inode
+fields in legacy NPZs remain unknown; the bridge does not invent them.
 Confirmed people with only valid cached features remain reference people. An
 accepted per-video cache can avoid repeated extraction. Matching remains on VM;
 new candidate/reference consistency measurements are required before rollout.

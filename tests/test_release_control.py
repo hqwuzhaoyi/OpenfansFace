@@ -173,4 +173,96 @@ class ReleaseControlTests(unittest.TestCase):
             with patch.object(r,'check_peer_drain'),self.assertRaisesRegex(RuntimeError,'changed'):r.release_deploy_fence(m,root/'receipt')
             self.assertEqual(marker.read_bytes(),raw)
 
+    def test_legacy_staging_states_and_nested_recovery_cannot_be_acknowledged(self):
+        import hashlib
+        with tempfile.TemporaryDirectory(prefix='face-release-fixture-') as tmp:
+            base=Path(tmp);path=base/'staging-operations/fixture/operation.json';path.parent.mkdir(parents=True)
+            m={'base':str(base),'legacy_terminal_acknowledgements':{}}
+            for value in ({'state':'running'}, {'state':'finished','result':{'status':'recovery_needed'}},
+                          {'status':'complete','result':{'status':'outcome_unknown'}},
+                          {'state':'finished','result':{'recovery_errors':['ledger unknown']}},
+                          {'state':'finished','job':{'state':'running'}},
+                          {'status':'failed','moves':[{'src':'a','dst':'b'}]}):
+                with self.subTest(value=value):
+                    path.write_text(json.dumps(value));m['legacy_terminal_acknowledgements'][str(path.relative_to(base))]=hashlib.sha256(path.read_bytes()).hexdigest()
+                    with self.assertRaisesRegex(RuntimeError,'unresolved'):r.legacy_journals(m)
+            for value in ({'state':'preview'}, {'state':'finished','result':{'status':'complete'}}, {'state':'finished','result':{'status':'partial'}}):
+                path.write_text(json.dumps(value));self.assertEqual(len(r.legacy_journals(m)),1)
+
+    def test_fence_ownership_is_durable_before_shared_publication_and_resumes(self):
+        import os
+        for window in ('receipt-write','before-link','after-link','after-directory-sync'):
+            with self.subTest(window=window),tempfile.TemporaryDirectory(prefix='face-release-fixture-') as tmp:
+                root=Path(tmp);base=root/'base';base.mkdir();receipt=root/'receipt';receipt.mkdir();m={'base':str(base),'release_id':'fixture'};shared=base/'.review-write.lock'
+                original_json,original_link,original_sync=r.private_json,r.os.link,r.sync_directory
+                def save(path,value):
+                    if window=='receipt-write' and path.name=='fence-owned.json':raise OSError('isolated receipt failure')
+                    return original_json(path,value)
+                def link(source,dest,**kwargs):
+                    if Path(dest)==shared:
+                        self.assertTrue((receipt/'fence-owned.json').exists())
+                        owned=r.control_json(receipt/'fence-owned.json');self.assertEqual(owned['identity']['ino'],str(Path(source).stat().st_ino))
+                        if window=='before-link':raise OSError('isolated publication failure')
+                    result=original_link(source,dest,**kwargs)
+                    if Path(dest)==shared and window=='after-link':raise OSError('isolated crash after publication')
+                    return result
+                def sync(path):
+                    result=original_sync(path)
+                    if window=='after-directory-sync' and Path(path)==base and shared.exists():raise OSError('isolated crash after directory sync')
+                    return result
+                with patch.object(r,'private_json',side_effect=save),patch.object(r.os,'link',side_effect=link),patch.object(r,'sync_directory',side_effect=sync),self.assertRaises(OSError):
+                    r.acquire_deploy_fence(m,receipt,0)
+                self.assertEqual(shared.exists(),window in ('after-link','after-directory-sync'))
+                if shared.exists():self.assertTrue((receipt/'fence-owned.json').exists())
+                evidence=r.acquire_deploy_fence(m,receipt,0)
+                self.assertEqual(str(shared.stat().st_ino),evidence['identity']['ino'])
+                with patch.object(r,'check_peer_drain'):r.release_deploy_fence(m,receipt);r.release_deploy_fence(m,receipt)
+                self.assertFalse(shared.exists());self.assertFalse(Path(evidence['prepared']).exists())
+
+    def test_release_can_close_unpublished_intent_without_claiming_an_unowned_inode(self):
+        with tempfile.TemporaryDirectory(prefix='face-release-fixture-') as tmp:
+            root=Path(tmp);base=root/'base';base.mkdir();receipt=root/'receipt';receipt.mkdir();m={'base':str(base),'release_id':'fixture'}
+            original=r.private_json
+            def save(path,value):
+                if path.name=='fence-owned.json':raise OSError('isolated ownership receipt failure')
+                original(path,value)
+            with patch.object(r,'private_json',side_effect=save),self.assertRaises(OSError):r.acquire_deploy_fence(m,receipt,0)
+            intent=r.control_json(receipt/'fence-intent.json');prepared=Path(intent['prepared']);identity=prepared.stat().st_ino
+            with patch.object(r,'check_peer_drain'):r.release_deploy_fence(m,receipt)
+            self.assertTrue(r.control_json(receipt/'fence-released.json')['not_published'])
+            self.assertEqual(prepared.stat().st_ino,identity)
+            self.assertFalse((base/'.review-write.lock').exists())
+
+    def test_release_recovers_after_unlink_before_receipt(self):
+        with tempfile.TemporaryDirectory(prefix='face-release-fixture-') as tmp:
+            root=Path(tmp);base=root/'base';base.mkdir();receipt=root/'receipt';receipt.mkdir();m={'base':str(base),'release_id':'fixture'}
+            r.acquire_deploy_fence(m,receipt,0);original=r.private_json
+            def save(path,value):
+                if path.name=='fence-released.json':raise OSError('isolated final receipt failure')
+                original(path,value)
+            with patch.object(r,'check_peer_drain'),patch.object(r,'private_json',side_effect=save),self.assertRaises(OSError):r.release_deploy_fence(m,receipt)
+            self.assertFalse((base/'.review-write.lock').exists())
+            with patch.object(r,'check_peer_drain'):r.release_deploy_fence(m,receipt)
+            self.assertTrue((receipt/'fence-released.json').is_file())
+
+    def test_fence_reads_refuse_fifo_symlink_oversize_and_corrupt_receipts_without_hanging(self):
+        import os,signal,time
+        for target in ('marker','receipt'):
+            for kind in ('fifo','symlink','oversize','corrupt'):
+                with self.subTest(target=target,kind=kind),tempfile.TemporaryDirectory(prefix='face-release-fixture-') as tmp:
+                    root=Path(tmp);base=root/'base';base.mkdir();receipt=root/'receipt';receipt.mkdir();m={'base':str(base),'release_id':'fixture'}
+                    r.acquire_deploy_fence(m,receipt,0);shared=base/'.review-write.lock';path=shared if target=='marker' else receipt/'fence-owned.json'
+                    path.rename(root/'saved-owned');other=root/'foreign';other.write_bytes(b'foreign')
+                    if kind=='fifo':os.mkfifo(path)
+                    elif kind=='symlink':path.symlink_to(other)
+                    elif kind=='oversize':path.write_bytes(b'x'*(r.CONTROL_LIMIT+1))
+                    else:path.write_bytes(b'{corrupt')
+                    identity=path.lstat();started=time.monotonic()
+                    old=signal.signal(signal.SIGALRM,lambda *_:(_ for _ in ()).throw(TimeoutError('control read hung')));signal.setitimer(signal.ITIMER_REAL,1)
+                    try:
+                        with patch.object(r,'check_peer_drain'),self.assertRaises((RuntimeError,OSError,ValueError)):r.release_deploy_fence(m,receipt)
+                    finally:signal.setitimer(signal.ITIMER_REAL,0);signal.signal(signal.SIGALRM,old)
+                    self.assertLess(time.monotonic()-started,1)
+                    self.assertEqual(path.lstat().st_ino,identity.st_ino);self.assertEqual(other.read_bytes(),b'foreign')
+
 if __name__=='__main__':unittest.main()

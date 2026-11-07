@@ -322,13 +322,6 @@ pub fn analysis_state(config: &Config) -> Result<Value> {
         "assigned_feature_caches".into(),
         crate::processing_result::assigned_reference_inputs(config)?,
     );
-    // Completed relocation receipts authorize cache origin bridges. Pending worker
-    // progress is deliberately absent from the reference input version.
-    let journal = db::open(&config.state_db())?;
-    input.insert("reference_relocations".into(), json!(table_digest(&journal,
-        "SELECT id,plan,evidence FROM operations WHERE status='complete' AND json_array_length(plan,'$.files')>0 ORDER BY rowid")?));
-    input.insert("reference_relocation_steps".into(), json!(table_digest(&journal,
-        "SELECT s.operation_id,s.revision,s.phase,s.evidence FROM steps s JOIN operations o ON o.id=s.operation_id WHERE o.status='complete' AND json_array_length(o.plan,'$.files')>0 AND (s.phase='commit_scope' OR json_type(s.evidence,'$.move_evidence')='object') ORDER BY s.operation_id,s.revision")?));
     Ok(json!({"version":model::hash(&input)}))
 }
 fn table_digest(conn: &rusqlite::Connection, sql: &str) -> Result<String> {

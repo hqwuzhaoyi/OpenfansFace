@@ -95,17 +95,22 @@ pub fn verify(engine: &Engine, body: &Value) -> Result<Value> {
             return Err(rejected());
         }
     }
-    let operations = db::rows(
-        &engine.store.db,
-        "SELECT rowid AS sequence,id,plan,evidence FROM operations WHERE status='complete' AND json_array_length(plan,'$.files')>0 ORDER BY rowid DESC",
-        [],
-    )?;
+    // Only this stable video's history is streamed. No library-wide journal
+    // materialization, and a pathological history fails closed at a fixed bound.
+    let mut query = engine.store.db.prepare(
+        "SELECT plan,evidence FROM operations o WHERE status='complete' AND EXISTS(SELECT 1 FROM json_each(o.plan,'$.files') f JOIN json_each(f.value,'$.vids') v ON v.value=?1) ORDER BY rowid DESC LIMIT 1025")?;
+    let mut operations = query.query([vid])?;
     let mut endpoint = source.to_owned();
     let mut identity = current.clone();
     let mut chain = vec![];
-    for row in operations {
-        let plan: Plan = serde_json::from_str(row["plan"].as_str().ok_or_else(rejected)?)?;
-        let admitted: Value = serde_json::from_str(row["evidence"].as_str().ok_or_else(rejected)?)?;
+    let mut visited = 0;
+    while let Some(row) = operations.next()? {
+        visited += 1;
+        if visited > 1024 || chain.len() >= 128 {
+            return Err(rejected());
+        }
+        let plan: Plan = serde_json::from_str(&row.get::<_, String>(0)?)?;
+        let admitted: Value = serde_json::from_str(&row.get::<_, String>(1)?)?;
         for (index, file) in plan.files.iter().enumerate() {
             if file.dst != endpoint || !file.vids.iter().any(|v| v == vid) {
                 continue;

@@ -91,6 +91,20 @@ try:
         x.call({'mode':'apply','request':request,'version':plan['version']})
         destination=destination.with_name('renamed-reference.mp4')
         assert build_references(x.base,x.media)['people']==1
+        stored=json.loads(con.execute('SELECT data FROM tasks WHERE vid=?',[vid]).fetchone()[0])
+        cache=Path(stored['face']['feature_cache']);payload=cache.read_bytes();current=destination.stat()
+        with np.load(cache,allow_pickle=False) as saved:
+            origin={'path':str(saved['path']),'size':str(int(saved['size'])),'mtime_ns':str(saved['mtime_ns']),'dev':str(int(saved['source_dev'])),'ino':str(int(saved['source_ino']))}
+        binding={'vid':vid,'source':str(destination),'cache':str(cache),'cache_sha256':hashlib.sha256(payload).hexdigest(),'origin':origin,'current_identity':{k:str(getattr(current,'st_'+k)) for k in ('dev','ino','size','mtime_ns')}}
+        proof=native('reference-relocation',binding)
+        unrelated=x.preview(x.request(filename='unrelated-renamed.mp4'));x.apply(unrelated)
+        assert native('reference-relocation',binding)['version']==proof['version']
+        accepted_caches={Path(json.loads(row[0])['data']['face']['feature_cache']) for row in con.execute("SELECT result FROM _face_admin_processing_results WHERE json_extract(result,'$.vid')=? AND json_type(result,'$.data.face.feature_cache')='text'",[vid])}
+        originals={path:path.read_bytes() for path in accepted_caches}
+        for path,raw in originals.items():path.write_bytes(raw+b'changed-cache')
+        assert build_references(x.base,x.media)['people']==0
+        for path,raw in originals.items():path.write_bytes(raw)
+        assert build_references(x.base,x.media)['people']==1
         old=destination.stat();replacement=destination.with_suffix('.replacement');replacement.write_bytes(destination.read_bytes());os.utime(replacement,ns=(old.st_atime_ns,old.st_mtime_ns));os.replace(replacement,destination)
         assert build_references(x.base,x.media)['people']==0
         print('PASS cache-only confirmed reference after native archive move; same-size/mtime inode replacement rejected')
