@@ -1,3 +1,6 @@
+#[allow(unused_imports)]
+// Public native planner API; individual integration harnesses use a subset.
+pub use crate::delta::{Delta, Guard, Table, TableDelta};
 use crate::model::{Error, Result};
 use rusqlite::{Connection, OpenFlags, Params, types::ValueRef};
 use serde_json::{Map, Value, json};

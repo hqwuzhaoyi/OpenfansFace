@@ -197,3 +197,126 @@ pub fn cancel(config: &Config, plan: &Plan) -> Result<()> {
     tx.commit()?;
     Ok(())
 }
+
+/// Native domain-built row changes, bound to the immutable plan and selected file set.
+pub use crate::creator_delta::CreatorIntent;
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct Delta {
+    pub changes: db::Delta,
+    #[serde(default)]
+    pub creators: Vec<CreatorIntent>,
+}
+fn validate_delta(delta: &Delta) -> Result<()> {
+    if delta.changes.tables.iter().any(|t| {
+        !matches!(
+            t.table,
+            db::Table::Entity | db::Table::Asset | db::Table::AssetEntity
+        )
+    }) {
+        return Err(Error::conflict("账本事务包含错误的存储表"));
+    }
+    Ok(())
+}
+pub fn inspect_delta(config: &Config, plan: &Plan, delta: &Delta) -> Result<String> {
+    validate_delta(delta)?;
+    let mut conn = db::open(&config.ledger)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    inspect_delta_db(&tx, plan, delta)
+}
+fn inspect_delta_db(conn: &Connection, plan: &Plan, delta: &Delta) -> Result<String> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='_face_admin_person_ops')",
+        [],
+        |r| r.get(0),
+    )?;
+    let row: Option<(String, String, String)> = if exists {
+        conn.query_row(
+            "SELECT signature,state,data FROM _face_admin_person_ops WHERE id=?",
+            [&plan.id],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?
+    } else {
+        None
+    };
+    let Some((signature, state, data)) = row else {
+        crate::creator_delta::inspect_before(conn, &delta.changes, &delta.creators)?;
+        return Ok("absent".into());
+    };
+    let evidence: Value = serde_json::from_str(&data)?;
+    if signature != plan.version
+        || evidence["delta"] != serde_json::to_value(delta)?
+        || !["prepared", "committed", "cancelled"].contains(&state.as_str())
+    {
+        return Err(Error::conflict("账本回执范围或状态不匹配"));
+    }
+    if state == "committed" {
+        let resolved: db::Delta = serde_json::from_value(evidence["resolved"].clone())?;
+        crate::delta::inspect(conn, &resolved, true)?;
+    } else {
+        crate::creator_delta::inspect_before(conn, &delta.changes, &delta.creators)?;
+    }
+    Ok(state)
+}
+pub fn reserve_delta(config: &Config, plan: &Plan, delta: &Delta) -> Result<()> {
+    validate_delta(delta)?;
+    let mut conn = db::open(&config.ledger)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if inspect_delta_db(&tx, plan, delta)? != "absent" {
+        return Err(Error::conflict("账本编号已有事务"));
+    }
+    tx.execute_batch("CREATE TABLE IF NOT EXISTS _face_admin_person_ops (id TEXT PRIMARY KEY, signature TEXT NOT NULL, state TEXT NOT NULL, data TEXT NOT NULL)")?;
+    tx.execute(
+        "INSERT INTO _face_admin_person_ops VALUES(?,?,'prepared',?)",
+        params![
+            plan.id,
+            plan.version,
+            serde_json::to_string(&json!({"backend":"rust","kind":plan.action,"delta":delta}))?
+        ],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+pub fn apply_delta(config: &Config, plan: &Plan, delta: &Delta) -> Result<Value> {
+    validate_delta(delta)?;
+    let mut conn = db::open(&config.ledger)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if inspect_delta_db(&tx, plan, delta)? != "prepared" {
+        return Err(Error::conflict("账本意图不是待提交状态"));
+    }
+    let resolved = crate::creator_delta::apply(&tx, &delta.changes, &delta.creators)?;
+    let evidence = json!({"backend":"rust","kind":plan.action,"delta":delta,"resolved":resolved});
+    tx.execute(
+        "UPDATE _face_admin_person_ops SET state='committed',data=? WHERE id=? AND signature=?",
+        params![serde_json::to_string(&evidence)?, plan.id, plan.version],
+    )?;
+    tx.commit()?;
+    Ok(evidence)
+}
+pub fn cancel_delta(config: &Config, plan: &Plan, delta: &Delta) -> Result<()> {
+    validate_delta(delta)?;
+    let mut conn = db::open(&config.ledger)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    match inspect_delta_db(&tx, plan, delta)?.as_str() {
+        "committed" => return Err(Error::conflict("账本已经提交，不能补偿")),
+        "cancelled" => return Ok(()),
+        "absent" => {
+            tx.execute_batch("CREATE TABLE IF NOT EXISTS _face_admin_person_ops (id TEXT PRIMARY KEY, signature TEXT NOT NULL, state TEXT NOT NULL, data TEXT NOT NULL)")?;
+            tx.execute(
+                "INSERT INTO _face_admin_person_ops VALUES(?,?,'cancelled',?)",
+                params![
+                    plan.id,
+                    plan.version,
+                    serde_json::to_string(
+                        &json!({"backend":"rust","kind":plan.action,"delta":delta})
+                    )?
+                ],
+            )?;
+        }
+        _ => {
+            tx.execute("UPDATE _face_admin_person_ops SET state='cancelled' WHERE id=? AND signature=? AND state='prepared'",params![plan.id,plan.version])?;
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}

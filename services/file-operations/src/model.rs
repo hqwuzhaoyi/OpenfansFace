@@ -100,7 +100,14 @@ pub struct Request {
     pub action: String,
     pub person: String,
     pub files: Vec<SelectedFile>,
+    #[serde(default)]
     pub filename: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_person: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target_folder: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<Value>,
 }
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -130,6 +137,37 @@ pub struct Plan {
     pub directories: Vec<String>,
     pub ledger_version: String,
     pub metadata_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<ExecutionIntent>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ScopeRoot {
+    Person(String),
+    Unorganized,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MoveScope {
+    pub source: ScopeRoot,
+    pub destination: ScopeRoot,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub enum FailurePolicy {
+    Rollback,
+    ContinueUnchanged,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AffectedStores {
+    pub faces: bool,
+    pub jobs: bool,
+    pub ledger: bool,
+}
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExecutionIntent {
+    pub scopes: Vec<MoveScope>,
+    pub failure_policy: FailurePolicy,
+    pub stores: AffectedStores,
+    pub data: Value,
+    pub result: Value,
 }
 impl Plan {
     pub fn file(&self) -> &FileMove {
@@ -154,5 +192,5 @@ pub fn validate_id(id: &str) -> Result<()> {
     Ok(())
 }
 pub fn final_result(plan: &Plan) -> Value {
-    json!({"ok":true,"id":plan.id,"person":plan.person,"changed":1,"staged":false})
+    json!({"ok":true,"id":plan.id,"person":plan.person,"changed":plan.files.len(),"staged":false})
 }

@@ -25,17 +25,21 @@ const DOCUMENTS: &[&str] = &[
     "external-profiles/manual-links.json",
     "external-profiles/reviewed-links.json",
 ];
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Document {
     pub name: String,
     pub before: Option<String>,
     pub after: Option<String>,
 }
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {
     pub documents: Vec<Document>,
     pub videos: Vec<Value>,
     pub jobs: Vec<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub faces_delta: Option<db::Delta>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub jobs_delta: Option<db::Delta>,
 }
 pub fn win(config: &Config, path: &str) -> String {
     let prefix = format!("{}/pikpak/", config.media.display());
@@ -45,14 +49,15 @@ pub fn win(config: &Config, path: &str) -> String {
     }
 }
 pub fn mapped(config: &Config, value: &str, plan: &Plan) -> String {
-    let file = plan.file();
-    if value == file.src {
-        file.dst.clone()
-    } else if value == win(config, &file.src) {
-        win(config, &file.dst)
-    } else {
-        value.into()
+    for file in &plan.files {
+        if value == file.src {
+            return file.dst.clone();
+        }
+        if value == win(config, &file.src) {
+            return win(config, &file.dst);
+        }
     }
+    value.into()
 }
 pub fn transform(config: &Config, value: &Value, plan: &Plan) -> Value {
     fn visit(config: &Config, v: &Value, key: &str, parent: &Value, plan: &Plan) -> Value {
@@ -77,20 +82,15 @@ pub fn transform(config: &Config, value: &Value, plan: &Plan) -> Value {
                     return json!(mapped(config, s, plan));
                 }
                 if key == "name"
-                    && parent["vid"]
-                        .as_str()
-                        .is_some_and(|id| plan.file().vids.iter().any(|v| v == id))
-                    && Some(s.as_str())
-                        == Path::new(&plan.file().src)
-                            .file_name()
-                            .and_then(|v| v.to_str())
+                    && let Some(file) = plan.files.iter().find(|file| {
+                        parent["vid"]
+                            .as_str()
+                            .is_some_and(|id| file.vids.iter().any(|v| v == id))
+                            && Some(s.as_str())
+                                == Path::new(&file.src).file_name().and_then(|v| v.to_str())
+                    })
                 {
-                    return json!(
-                        Path::new(&plan.file().dst)
-                            .file_name()
-                            .unwrap()
-                            .to_string_lossy()
-                    );
+                    return json!(Path::new(&file.dst).file_name().unwrap().to_string_lossy());
                 }
                 v.clone()
             }
@@ -136,15 +136,17 @@ fn updated(config: &Config, name: &str, value: &Value, plan: &Plan) -> Value {
                 })
                 .collect(),
         );
-        for id in &plan.file().vids {
-            next[id] = json!(plan.file().dst)
+        for file in &plan.files {
+            for id in &file.vids {
+                next[id] = json!(file.dst);
+            }
         }
     }
     if name == "archive-history.json" {
         for row in next.as_array_mut().unwrap() {
             if row["vid"]
                 .as_str()
-                .is_some_and(|id| plan.file().vids.iter().any(|v| v == id))
+                .is_some_and(|id| plan.files.iter().any(|f| f.vids.iter().any(|v| v == id)))
             {
                 row["last_file_operation"] = json!(plan.id)
             }
@@ -244,7 +246,7 @@ pub fn registered_ids(config: &Config, src: &str) -> Result<Vec<String>> {
 fn affected(config: &Config, row: &Value, plan: &Plan) -> bool {
     row["vid"]
         .as_str()
-        .is_some_and(|id| plan.file().vids.iter().any(|v| v == id))
+        .is_some_and(|id| plan.files.iter().any(|f| f.vids.iter().any(|v| v == id)))
         || row["path"]
             .as_str()
             .is_some_and(|s| mapped(config, s, plan) != s)
@@ -290,12 +292,17 @@ pub fn snapshot(config: &Config, plan: &Plan) -> Result<Snapshot> {
         documents,
         videos,
         jobs,
+        faces_delta: None,
+        jobs_delta: None,
     })
 }
 pub fn version(snapshot: &Snapshot) -> String {
     hash(snapshot)
 }
 pub fn apply_faces(config: &Config, plan: &Plan, before: &Snapshot) -> Result<Value> {
+    if let Some(delta) = &before.faces_delta {
+        return apply_delta_domain(config, plan, delta, false);
+    }
     let mut db = db::open(&config.base.join("faces.db"))?;
     let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     let rows = db::rows(&tx, "SELECT * FROM videos ORDER BY vid", [])?
@@ -309,8 +316,8 @@ pub fn apply_faces(config: &Config, plan: &Plan, before: &Snapshot) -> Result<Va
     let columns = db::columns(&tx, "videos")?;
     for row in rows {
         let id = row["vid"].as_str().unwrap();
-        let next = if plan.file().vids.iter().any(|v| v == id) {
-            plan.file().dst.clone()
+        let next = if let Some(file) = plan.files.iter().find(|f| f.vids.iter().any(|v| v == id)) {
+            file.dst.clone()
         } else {
             mapped(config, row["path"].as_str().unwrap(), plan)
         };
@@ -345,6 +352,9 @@ pub fn apply_faces(config: &Config, plan: &Plan, before: &Snapshot) -> Result<Va
     Ok(evidence)
 }
 pub fn apply_jobs(config: &Config, plan: &Plan, before: &Snapshot) -> Result<Value> {
+    if let Some(delta) = &before.jobs_delta {
+        return apply_delta_domain(config, plan, delta, true);
+    }
     let path = config.base.join("processing/processing.db");
     if !path.exists() {
         if !before.jobs.is_empty() {
@@ -362,8 +372,19 @@ pub fn apply_jobs(config: &Config, plan: &Plan, before: &Snapshot) -> Result<Val
         return Err(Error::conflict("相关处理任务已变化"));
     }
     db::receipt_table(&tx)?;
-    let stat = fs::metadata(&plan.file().dst)?;
     for row in &rows {
+        let file = plan
+            .files
+            .iter()
+            .find(|file| {
+                row["vid"]
+                    .as_str()
+                    .is_some_and(|id| file.vids.iter().any(|v| v == id))
+                    || row["path"] == file.src
+                    || row["path"] == win(config, &file.src)
+            })
+            .ok_or_else(|| Error::conflict("处理任务缺少对应物理文件"))?;
+        let stat = fs::metadata(&file.dst)?;
         let data: Value = serde_json::from_str(
             row["data"]
                 .as_str()
@@ -371,7 +392,7 @@ pub fn apply_jobs(config: &Config, plan: &Plan, before: &Snapshot) -> Result<Val
         )?;
         let size = i64::try_from(stat.len())
             .map_err(|_| Error::new(409, "invalid_request", "文件大小超出 SQLite 范围"))?;
-        tx.execute("UPDATE tasks SET path=?,name=?,size=?,mtime_ns=?,data=?,stage='excluded',updated_at=unixepoch('subsec') WHERE vid=?",params![plan.file().dst,Path::new(&plan.file().dst).file_name().unwrap().to_string_lossy(),size,files::mtime_ns(&stat),serde_json::to_string(&transform(config,&data,plan))?,row["vid"].as_str().unwrap()])?;
+        tx.execute("UPDATE tasks SET path=?,name=?,size=?,mtime_ns=?,data=?,stage='excluded',updated_at=unixepoch('subsec') WHERE vid=?",params![file.dst,Path::new(&file.dst).file_name().unwrap().to_string_lossy(),size,files::mtime_ns(&stat),serde_json::to_string(&transform(config,&data,plan))?,row["vid"].as_str().unwrap()])?;
     }
     let after = db::rows(&tx, "SELECT * FROM tasks ORDER BY vid", [])?
         .into_iter()
@@ -397,6 +418,9 @@ pub fn apply_document(config: &Config, item: &Document) -> Result<()> {
     if let Some(raw) = &item.after {
         fs::create_dir_all(path.parent().unwrap())?;
         files::atomic_write(&path, raw.as_bytes())?;
+    } else if item.before.is_some() {
+        fs::remove_file(&path)?;
+        files::sync_parent(&path)?;
     }
     Ok(())
 }
@@ -404,6 +428,13 @@ pub fn apply_document(config: &Config, item: &Document) -> Result<()> {
 /// Native receipts are transaction-local evidence, never merely an engine phase label.
 /// Return true only when this domain is committed and its exact after-image still exists.
 pub fn inspect_domain(config: &Config, plan: &Plan, before: &Snapshot, jobs: bool) -> Result<bool> {
+    if let Some(delta) = if jobs {
+        &before.jobs_delta
+    } else {
+        &before.faces_delta
+    } {
+        return inspect_delta_domain(config, plan, delta, jobs);
+    }
     let path = config.base.join(if jobs {
         "processing/processing.db"
     } else {
@@ -477,6 +508,13 @@ pub fn compensate_domain(
     before: &Snapshot,
     jobs: bool,
 ) -> Result<()> {
+    if let Some(delta) = if jobs {
+        &before.jobs_delta
+    } else {
+        &before.faces_delta
+    } {
+        return compensate_delta_domain(config, plan, delta, jobs);
+    }
     let path = config.base.join(if jobs {
         "processing/processing.db"
     } else {
@@ -538,5 +576,96 @@ pub fn compensate_document(config: &Config, item: &Document) -> Result<()> {
         fs::remove_file(&path)?;
         files::sync_parent(&path)?;
     }
+    Ok(())
+}
+
+fn domain_path(config: &Config, jobs: bool) -> std::path::PathBuf {
+    config.base.join(if jobs {
+        "processing/processing.db"
+    } else {
+        "faces.db"
+    })
+}
+fn validate_delta_domain(delta: &db::Delta, jobs: bool) -> Result<()> {
+    if delta.tables.iter().any(|t| {
+        if jobs {
+            !matches!(t.table, db::Table::Tasks | db::Table::Settings)
+        } else {
+            t.table != db::Table::Videos
+        }
+    }) {
+        return Err(Error::conflict("本地事务包含错误的存储表"));
+    }
+    Ok(())
+}
+fn apply_delta_domain(
+    config: &Config,
+    plan: &Plan,
+    delta: &db::Delta,
+    jobs: bool,
+) -> Result<Value> {
+    validate_delta_domain(delta, jobs)?;
+    let mut conn = db::open(&domain_path(config, jobs))?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    db::receipt_table(&tx)?;
+    if db::receipt(&tx, &plan.id, &plan.version)?.is_some() {
+        return Err(Error::conflict("本地事务已有回执"));
+    }
+    crate::delta::apply(&tx, delta)?;
+    let evidence = json!({"delta":delta});
+    tx.execute(
+        "INSERT INTO _face_admin_rust_commits VALUES(?,?,?)",
+        params![plan.id, plan.version, serde_json::to_string(&evidence)?],
+    )?;
+    tx.commit()?;
+    Ok(evidence)
+}
+fn inspect_delta_domain(
+    config: &Config,
+    plan: &Plan,
+    delta: &db::Delta,
+    jobs: bool,
+) -> Result<bool> {
+    validate_delta_domain(delta, jobs)?;
+    let mut conn = db::open(&domain_path(config, jobs))?;
+    let tx = conn.transaction()?;
+    let receipt = db::receipt(&tx, &plan.id, &plan.version)?;
+    let after = if let Some(receipt) = receipt {
+        if receipt["delta"] != serde_json::to_value(delta)? {
+            return Err(Error::conflict("本地事务快照不匹配"));
+        }
+        if !receipt["state"].is_null() && receipt["state"] != "rolled_back" {
+            return Err(Error::conflict("本地事务状态未知"));
+        }
+        receipt["state"] != "rolled_back"
+    } else {
+        false
+    };
+    crate::delta::inspect(&tx, delta, after)?;
+    Ok(after)
+}
+fn compensate_delta_domain(
+    config: &Config,
+    plan: &Plan,
+    delta: &db::Delta,
+    jobs: bool,
+) -> Result<()> {
+    if !inspect_delta_domain(config, plan, delta, jobs)? {
+        return Ok(());
+    }
+    let mut conn = db::open(&domain_path(config, jobs))?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let mut receipt = db::receipt(&tx, &plan.id, &plan.version)?
+        .ok_or_else(|| Error::conflict("缺少本地事务回执"))?;
+    if receipt["delta"] != serde_json::to_value(delta)? || receipt["state"] == "rolled_back" {
+        return Err(Error::conflict("本地回执发生变化"));
+    }
+    crate::delta::restore(&tx, delta)?;
+    receipt["state"] = json!("rolled_back");
+    tx.execute(
+        "UPDATE _face_admin_rust_commits SET data=? WHERE id=?",
+        params![serde_json::to_string(&receipt)?, plan.id],
+    )?;
+    tx.commit()?;
     Ok(())
 }
