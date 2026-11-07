@@ -73,10 +73,10 @@ fn relevant(
     vids: &BTreeSet<String>,
 ) -> Result<bool> {
     for key in ["creator", "person", "name"] {
-        if let Some(name) = row[key].as_str() {
-            if people.contains(&canonical(config, name)?) {
-                return Ok(true);
-            }
+        if let Some(name) = row[key].as_str()
+            && people.contains(&canonical(config, name)?)
+        {
+            return Ok(true);
         }
     }
     Ok(row["vid"].as_str().is_some_and(|v| vids.contains(v)))
@@ -516,10 +516,10 @@ fn prepare(config: &Config, body: &Value, id: &str) -> Result<Prepared> {
                 .map(|i| rows.remove(i))
                 .unwrap_or_else(|| json!({"name":name,"created_at":at,"rep_thumb":null}));
             row["last_used_at"] = json!(at);
-            if row["rep_thumb"].as_str().is_none_or(str::is_empty) {
-                if let Some(thumb) = body["thumb"].as_str() {
-                    row["rep_thumb"] = json!(thumb)
-                }
+            if row["rep_thumb"].as_str().is_none_or(str::is_empty)
+                && let Some(thumb) = body["thumb"].as_str()
+            {
+                row["rep_thumb"] = json!(thumb)
             }
             rows.push(row);
             add("people-manual.json", before, value)?;
