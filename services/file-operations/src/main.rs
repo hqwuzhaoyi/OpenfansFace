@@ -3,6 +3,7 @@ mod archive_api;
 mod archive_ledger;
 mod archive_resolution;
 mod config;
+mod control;
 mod creator_delta;
 mod db;
 mod delta;

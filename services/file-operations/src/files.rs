@@ -661,11 +661,7 @@ fn digest(file: &mut File) -> Result<String> {
 }
 
 pub fn read_optional(path: &Path) -> Result<Option<String>> {
-    match fs::read_to_string(path) {
-        Ok(s) => Ok(Some(s)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(e) => Err(Error::from(e).at(path.display().to_string())),
-    }
+    crate::control::read_document(path)
 }
 pub fn sync_parent(path: &Path) -> Result<()> {
     File::open(path.parent().unwrap())?.sync_all()?;
@@ -709,7 +705,10 @@ pub fn claim_owner_for(config: &Config, id: &str, action: &str) -> Result<()> {
             sync_parent(&path)?;
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            let value: serde_json::Value = serde_json::from_str(&fs::read_to_string(&path)?)?;
+            let value: serde_json::Value = serde_json::from_str(
+                &crate::control::read(&path, crate::control::MARKER_LIMIT)?
+                    .ok_or_else(|| Error::conflict("操作路由标记已消失"))?,
+            )?;
             if value != expected {
                 return Err(Error::conflict("此操作已绑定另一执行后端或操作类型"));
             }
@@ -727,6 +726,7 @@ impl WriteGate {
     pub fn acquire(config: &Config, id: &str) -> Result<Self> {
         let path = config.base.join(".review-write.lock");
         let mut file = OpenOptions::new()
+            .read(true)
             .write(true)
             .create_new(true)
             .open(&path)
@@ -749,8 +749,13 @@ impl WriteGate {
         Ok(Self { file, path })
     }
     pub fn evidence(&self) -> Result<serde_json::Value> {
+        let (raw, stat) = crate::control::read_held_snapshot(
+            &self.file,
+            &self.path,
+            crate::control::MARKER_LIMIT,
+        )?;
         Ok(
-            json!({"identity":identity(&self.file.metadata()?),"marker":serde_json::from_str::<serde_json::Value>(&fs::read_to_string(&self.path)?)?}),
+            json!({"identity":identity(&stat),"marker":serde_json::from_str::<serde_json::Value>(&raw)?}),
         )
     }
     /// Caller must hold the process-lifetime executor flock. PID/TTL never confer authority.
@@ -776,6 +781,7 @@ impl WriteGate {
         Ok(gate)
     }
     pub fn release(self) -> Result<()> {
+        crate::control::verify_path(&self.file, &self.path)?;
         let actual = fs::symlink_metadata(&self.path)?;
         let owned = self.file.metadata()?;
         if actual.dev() != owned.dev() || actual.ino() != owned.ino() {
