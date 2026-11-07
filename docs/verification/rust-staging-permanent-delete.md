@@ -10,7 +10,7 @@ These action names deliberately adapt the uncommitted behavioral reference's
 `delete`/`clear`; there is no old Node/Python execution fallback.
 
 The staging page reuses existing Card, Button, Dialog and the already integrated
-ReUI Input Group. Search retains selections; select-all reads matching pages
+ReUI Input Group plus BEUI Checkbox with instant feedback. Search retains selections; select-all reads matching pages
 and refuses an incomplete selection above the selected-delete limit. The clear
 preview always shows its full scope. Details retain actual video playback and
 single-file restore. Submitted deletion plans persist a browser recovery hint;
