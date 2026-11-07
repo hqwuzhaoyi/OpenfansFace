@@ -237,7 +237,7 @@ function Integration() {
     }catch{if(watchRef.current===id)setConnection('连接中断，正在核对本次归档结果…')}
   }
   const progressPercent=job?jobPercent(job):null
-  const resultTitle=result?.recovery_needed?'需要核对恢复，已暂停写操作':result?.rolled_back?'归档失败，文件已恢复原位置':result?.moved?`已归档 ${result.moved} 个${result.errors.length?' · 部分项目未完成':''}`:'本轮未归档，任务已保留'
+  const resultTitle=result?.recovery_needed?'需要核对恢复，已暂停写操作':result?.rolled_back?'归档失败，本轮已移动的文件已恢复':result?.moved?`已归档 ${result.moved} 个${result.errors.length?' · 部分项目未完成':''}`:'本轮未归档，任务已保留'
 
 
   return <main className="archive-workbench">
