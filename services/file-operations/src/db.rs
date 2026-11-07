@@ -93,3 +93,24 @@ pub fn sql_value(value: &Value) -> Result<rusqlite::types::Value> {
         _ => return Err(Error::conflict("无效数据库值")),
     })
 }
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn persisted_real_values_keep_exact_sqlite_bits() {
+        // Real-valued SQLite timestamps/scores are durable before-images. A JSON
+        // roundtrip must not turn an unchanged row into an apparent conflict.
+        let mut state = 0x9e3779b97f4a7c15u64;
+        for _ in 0..4096 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let value = f64::from_bits(state);
+            if value.is_finite() {
+                let raw = serde_json::to_string(&value).unwrap();
+                let recovered: f64 = serde_json::from_str(&raw).unwrap();
+                assert_eq!(value.to_bits(), recovered.to_bits(), "{raw}");
+            }
+        }
+    }
+}
