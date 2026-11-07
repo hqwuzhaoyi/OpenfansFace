@@ -443,3 +443,173 @@ fn processing_discovery_setting_restores_without_touching_other_settings() {
     );
     tx.commit().unwrap();
 }
+
+#[test]
+fn local_file_guards_detect_late_vid_and_path_inserts_but_allow_unrelated_rows() {
+    for table in [Table::Videos, Table::Tasks] {
+        let conn = fixture();
+        let table_name = if table == Table::Videos {
+            "videos"
+        } else {
+            "tasks"
+        };
+        let delta = Delta {
+            tables: vec![],
+            guards: vec![Guard::LocalFiles {
+                table,
+                vids: vec!["selected".into()],
+                paths: vec!["source.mp4".into(), "destination.mp4".into()],
+                before: vec![],
+                after: vec![],
+            }],
+        };
+        conn.execute(
+            &format!("INSERT INTO {table_name}(vid,path) VALUES('unrelated','elsewhere.mp4')"),
+            [],
+        )
+        .unwrap();
+        delta::inspect(&conn, &delta, false).unwrap();
+        for (vid, path) in [
+            ("selected", "other.mp4"),
+            ("new-source", "source.mp4"),
+            ("new-destination", "destination.mp4"),
+        ] {
+            conn.execute(
+                &format!("INSERT INTO {table_name}(vid,path) VALUES(?,?)"),
+                [vid, path],
+            )
+            .unwrap();
+            assert!(delta::inspect(&conn, &delta, false).is_err());
+            conn.execute(&format!("DELETE FROM {table_name} WHERE vid=?"), [vid])
+                .unwrap();
+            delta::inspect(&conn, &delta, false).unwrap();
+        }
+    }
+}
+
+#[test]
+fn local_file_guard_tracks_after_and_restore_for_registration_and_move() {
+    let mut conn = fixture();
+    let inserted = json!({"vid":"selected","path":"destination.mp4","payload":null,"size":null});
+    let mut delta = plan(vec![change(
+        Table::Videos,
+        &["vid"],
+        vec![],
+        vec![inserted.clone()],
+    )]);
+    delta.guards.push(Guard::LocalFiles {
+        table: Table::Videos,
+        vids: vec!["selected".into()],
+        paths: vec!["source.mp4".into(), "destination.mp4".into()],
+        before: vec![],
+        after: vec![inserted],
+    });
+    let tx = conn.transaction().unwrap();
+    delta::apply(&tx, &delta).unwrap();
+    delta::inspect(&tx, &delta, true).unwrap();
+    delta::restore(&tx, &delta).unwrap();
+    delta::inspect(&tx, &delta, false).unwrap();
+    tx.commit().unwrap();
+
+    conn.execute(
+        "INSERT INTO tasks VALUES('selected','source.mp4','original')",
+        [],
+    )
+    .unwrap();
+    let before = rows(&conn, "tasks");
+    let mut after = before.clone();
+    after[0]["path"] = json!("destination.mp4");
+    let mut delta = plan(vec![change(
+        Table::Tasks,
+        &["vid"],
+        before.clone(),
+        after.clone(),
+    )]);
+    delta.guards.push(Guard::LocalFiles {
+        table: Table::Tasks,
+        vids: vec!["selected".into()],
+        paths: vec!["source.mp4".into(), "destination.mp4".into()],
+        before,
+        after,
+    });
+    let tx = conn.transaction().unwrap();
+    delta::apply(&tx, &delta).unwrap();
+    tx.execute(
+        "INSERT INTO tasks VALUES('foreign-source','source.mp4','new')",
+        [],
+    )
+    .unwrap();
+    assert!(delta::restore(&tx, &delta).is_err());
+    tx.execute("DELETE FROM tasks WHERE vid='foreign-source'", [])
+        .unwrap();
+    delta::restore(&tx, &delta).unwrap();
+    tx.execute(
+        "INSERT INTO tasks VALUES('foreign','destination.mp4','new')",
+        [],
+    )
+    .unwrap();
+    assert!(delta::apply(&tx, &delta).is_err());
+}
+
+#[test]
+fn local_file_guard_rejects_other_tables_and_incomplete_snapshots() {
+    let conn = fixture();
+    for table in [
+        Table::Asset,
+        Table::Entity,
+        Table::AssetEntity,
+        Table::Settings,
+    ] {
+        let delta = Delta {
+            tables: vec![],
+            guards: vec![Guard::LocalFiles {
+                table,
+                vids: vec![],
+                paths: vec![],
+                before: vec![],
+                after: vec![],
+            }],
+        };
+        assert!(
+            delta::inspect(&conn, &delta, false)
+                .unwrap_err()
+                .error
+                .contains("只允许")
+        );
+    }
+    let delta = Delta {
+        tables: vec![],
+        guards: vec![Guard::LocalFiles {
+            table: Table::Videos,
+            vids: vec!["selected".into()],
+            paths: vec![],
+            before: vec![],
+            after: vec![json!({"vid":"selected"})],
+        }],
+    };
+    assert!(delta::inspect(&conn, &delta, false).is_err());
+}
+
+#[test]
+fn local_file_guard_unions_duplicates_and_large_selector_chunks() {
+    let conn = fixture();
+    conn.execute(
+        "INSERT INTO videos(vid,path) VALUES('selected','source.mp4')",
+        [],
+    )
+    .unwrap();
+    let mut vids = (0..1500).map(|n| format!("absent-{n}")).collect::<Vec<_>>();
+    vids.extend(["selected".into(), "selected".into()]);
+    let snapshot = rows(&conn, "videos");
+    let delta = Delta {
+        tables: vec![],
+        guards: vec![Guard::LocalFiles {
+            table: Table::Videos,
+            vids,
+            paths: vec!["source.mp4".into(), "source.mp4".into()],
+            before: snapshot.clone(),
+            after: snapshot,
+        }],
+    };
+    delta::inspect(&conn, &delta, false).unwrap();
+}
