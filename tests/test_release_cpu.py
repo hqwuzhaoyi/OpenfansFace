@@ -131,6 +131,8 @@ class CpuReleaseTests(unittest.TestCase):
         self.m['startup_timeout']=0
         with patch.object(r,'inspect',return_value=state),self.assertRaisesRegex(RuntimeError,'fresh current-container'):
             r.wait_cpu_worker_ready(self.m,allow_waiting=True)
+        # A predecessor's protocol-2 shutdown marker also waits for replacement.
+        path=self.root/'processing/heartbeat.json';path.write_text(json.dumps({'at':0,'protocol':2}))
         self.m['startup_timeout']=30
         with patch.object(r,'inspect',return_value=state) as inspected,patch.object(r.time,'sleep',side_effect=lambda _:self.write_heartbeat(max(now,started)+.1,waiting=True)):
             r.wait_cpu_worker_ready(self.m,allow_waiting=True)

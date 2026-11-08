@@ -245,11 +245,12 @@ def cpu_worker_heartbeat(manifest, allow_waiting=True, not_before=None):
         return None
     heartbeat = json.loads(raw)
     stamp=heartbeat.get('at',0)
-    if type(stamp) not in (int,float) or heartbeat.get('protocol') != 3:
-        fail('CPU worker heartbeat has invalid timestamp or protocol')
+    if type(stamp) not in (int,float):
+        fail('CPU worker heartbeat has invalid timestamp')
     age = time.time() - stamp
     if not -30 <= age < 90 or (not_before is not None and stamp <= not_before):
         return None
+    if heartbeat.get('protocol') != 3: fail('CPU worker heartbeat has invalid protocol')
     if heartbeat.get('waiting_native_admission') is True:
         if heartbeat.get('native_ready') is not False or heartbeat.get('active') != 0:
             fail('CPU worker waiting heartbeat has inconsistent readiness')
