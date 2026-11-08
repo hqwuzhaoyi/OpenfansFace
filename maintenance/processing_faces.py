@@ -272,7 +272,7 @@ def extract_features(task, base, root, progress=None):
     model_hashes = {name: hashlib.sha256((model_home / name).read_bytes()).hexdigest() for name in ('det_10g.onnx', 'w600k_r50.onnx')}
     if model_hashes != MODEL_HASHES:
         raise ValueError('人脸模型内容与已登记版本不符，暂停该次分析')
-    remote = Detector(task) if backend() == 'gpu-detection' else None
+    remote = Detector(task, progress=progress) if backend() == 'gpu-detection' else None
     if remote:
         from insightface.model_zoo import get_model
         recognition_path = Path(os.environ.get('INSIGHTFACE_HOME', '/root/.insightface')) / 'models/buffalo_l/w600k_r50.onnx'

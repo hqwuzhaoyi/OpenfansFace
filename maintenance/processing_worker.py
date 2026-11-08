@@ -194,7 +194,7 @@ def stage_subprocess(task, base, root):
     folder = base / 'processing/tmp'; folder.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(dir=folder, prefix='stage-') as tmp:
         manifest, result = Path(tmp) / 'task.json', Path(tmp) / 'result.json'
-        manifest.write_text(json.dumps(task, ensure_ascii=False))
+        manifest.write_text(json.dumps({**task, '_stage_deadline_ms': int((time.time() + 600) * 1000)}, ensure_ascii=False))
         command = [sys.executable, str(Path(__file__).resolve()), '--base', str(base), '--root', str(root),
                    '--stage', task['stage'], '--task', str(manifest), '--result', str(result)]
         process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)

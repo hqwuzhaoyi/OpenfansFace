@@ -8,6 +8,30 @@ The sections below are chronological records. Initial no-stop/no-640 statements 
 
 During that initial phase, no production service was installed, stopped or restarted. No existing model was unloaded, live dependency installed, firewall changed, business DB/media accessed, or real person identified. The initial probes used new temporary code/profile files and anonymous zero/gradient/seeded-noise rasters.
 
+## Bounded queue/retry implementation — CPU/synthetic validation
+
+The source now pins manifest schema 2 / retry policy v1, documented in the package
+README. This is implementation evidence, **not a new GPU or production acceptance**.
+The pre-fix HTTP busy→available regression failed immediately with `resource_busy`;
+it now waits and computes once. Full policy windows are tested with injected time,
+without lowering the production wait or resource thresholds.
+
+- **46** GPU contract/HTTP tests pass: finite wait/rearm/send budgets; same-ID
+  recovery; cache pressure/TTL/clock rollback; cancellation/drain/close; missing
+  telemetry; FIFO/backpressure; late results and refusal observability.
+- **37** worker/publication/reference tests pass, including stage/lease deadline
+  clipping. Compile checks and diff whitespace checks pass.
+- The new synthetic HTTP → actual VM claim → real native test sends eight frames
+  nine times after one lost GPU response, computes exactly eight times, keeps the
+  face-stage attempt count at one, and retains one batch completion after a second
+  deliberately lost native commit response and exact receipt recovery.
+- Existing worker/native/review continuity and accepted-reference regression pass.
+
+[Sanitized evidence](../../tests/evidence/gpu-queue-retry-20261108.json) records policy,
+checks and digests. No hardware inference, service change, NAS write, legacy-cache
+adoption or deployment occurred. TTS remains OFF. The retained-runtime eight-frame
+GPU/VM trial must still validate this exact policy after source integration.
+
 ## Initial contract and HTTP checks (historical)
 
 `python3 -m unittest discover -s tests -p test_gpu_inference.py -v`: **19 tests pass**. Includes actual loopback HTTP transport using a clearly synthetic model fixture. No GPU claim comes from those mock-model tests. Compile check and `git diff --check` also pass.

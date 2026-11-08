@@ -119,6 +119,24 @@ class PublicationTests(unittest.TestCase):
                 self.assertEqual(result['backend'], 'gpu-detection')
                 self.assertEqual(result['error'], code)
 
+    def test_remote_frame_deadline_is_clipped_to_stage_and_lease_reserve(self):
+        class Image:
+            shape = (8, 8, 3)
+        requests = []
+        class Transport:
+            def detect(self, request):
+                requests.append(request)
+                raise ProtocolError('synthetic-stop', 503)
+        self.task['_stage_deadline_ms'] = int(time.time()*1000)+1234
+        detector = Detector(self.task, Transport())
+        with self.assertRaisesRegex(ProtocolError, 'synthetic-stop'):
+            detector.detect(Image(), b'marked-synthetic', 0, 0)
+        self.assertEqual(requests[0].deadline_ms, self.task['_stage_deadline_ms'])
+        self.assertEqual(requests[0].binding.lease_expires_at_ms, int(self.task['lease_expires_at']*1000))
+        self.task['_stage_deadline_ms'] += 900_000
+        detector = Detector(self.task, Transport())
+        self.assertEqual(detector.stage_deadline_ms, int(self.task['lease_expires_at']*1000)-60_000)
+
     def test_remote_failure_is_never_converted_to_no_faces(self):
         class Image:
             shape = (160, 160, 3)

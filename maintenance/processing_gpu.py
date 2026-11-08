@@ -20,9 +20,9 @@ def backend():
     return value
 
 
-def client():
+def client(*, on_wait=None):
     return Client(os.environ.get('PROCESSING_GPU_URL', ''), os.environ.get('PROCESSING_GPU_TOKEN', ''),
-                  timeout=60, allow_private_http=os.environ.get('PROCESSING_GPU_PRIVATE_HTTP') == '1')
+                  timeout=60, allow_private_http=os.environ.get('PROCESSING_GPU_PRIVATE_HTTP') == '1', on_wait=on_wait)
 
 
 def inference_status():
@@ -50,17 +50,30 @@ def binding(task):
 
 
 class Detector:
-    def __init__(self, task, transport=None):
+    def __init__(self, task, transport=None, progress=None):
         self.task, self.binding = task, binding(task)
-        self.client = transport or client()
+        self.progress = progress
+        self.client = transport or client(on_wait=self._waiting)
+        # Claim lease is 660 seconds; reserve its final minute for fenced publication.
+        # The parent additionally supplies the actual 600-second subprocess deadline.
+        self.stage_deadline_ms = min(int(task.get('_stage_deadline_ms', self.binding.lease_expires_at_ms - 60_000)),
+                                     self.binding.lease_expires_at_ms - 60_000)
         self.execution = None
         self.timings = []
 
+    def _waiting(self, reason, retry, delay):
+        if self.progress:
+            labels = {'queue_full': 'GPU 队列已满', 'resource_busy': 'GPU 资源繁忙',
+                      'request_in_progress': 'GPU 请求处理中', 'transport_unavailable': '核对 GPU 请求结果'}
+            self.progress.update(stage=f'{labels[reason]}，等待重试 {retry}')
+
     def detect(self, image, encoded, index, timestamp):
+        if self.progress:
+            self.progress.update(stage='等待 GPU 检测（含资源排队）')
         request = Request(str(uuid.uuid4()), self.binding,
             os.environ.get('PROCESSING_GPU_MODEL_SHA256', DETECTOR_SHA),
             os.environ.get('PROCESSING_GPU_PREPROCESS_VERSION', PREPROCESS),
-            min(now_ms() + 60_000, self.binding.lease_expires_at_ms), index, round(timestamp * 1000),
+            min(now_ms() + 60_000, self.stage_deadline_ms, self.binding.lease_expires_at_ms), index, round(timestamp * 1000),
             hashlib.sha256(encoded).hexdigest(), image.shape[1], image.shape[0], encoded)
         result = self.client.detect(request)
         result.require_current(self.binding)

@@ -1,14 +1,18 @@
-"""Single execution lane, bounded waiting queue, volatile computation deduplication."""
+"""Single execution lane, bounded resource waiting and volatile deduplication."""
 from __future__ import annotations
 
 import collections
+import logging
 import queue
 import threading
-import time
 import uuid
 from dataclasses import dataclass, field
 
-from .protocol import ProtocolError, Request, Result, SCHEMA, now_ms
+from .protocol import (Clock, ProtocolError, Request, Result, SCHEMA,
+                       RESOURCE_WAIT_SECONDS, RESOURCE_POLL_SECONDS, RESOURCE_REARMS,
+                       retry_policy)
+
+LOG = logging.getLogger(__name__)
 
 
 @dataclass
@@ -17,7 +21,12 @@ class Job:
     request_hash: str
     attempt_id: str
     deadline_ms: int
-    submitted: float = field(default_factory=time.monotonic)
+    submitted: float
+    expires: float
+    resource_expires: float
+    rearms: int = 0
+    execution_started: bool = False
+    waiting_reason: str | None = None
     done: threading.Event = field(default_factory=threading.Event)
     cancelled: threading.Event = field(default_factory=threading.Event)
     result: dict | None = None
@@ -26,10 +35,11 @@ class Job:
 
 
 class Broker:
-    def __init__(self, model, resources, waiting=1, cache_entries=64, cache_ttl=60):
+    def __init__(self, model, resources, waiting=1, cache_entries=64, cache_ttl=60, *, clock=None):
         if waiting not in (0, 1) or not 1 <= cache_entries <= 128 or not 1 <= cache_ttl <= 120:
             raise ValueError('unverified concurrency or unbounded cache')
         self.model, self.resources = model, resources
+        self.clock = clock or Clock()
         self.instance = str(uuid.uuid4())
         self.capacity = waiting + 1
         self.cache_entries, self.cache_ttl = cache_entries, cache_ttl
@@ -38,6 +48,8 @@ class Broker:
         self.queue = queue.Queue(maxsize=self.capacity)
         self.inflight = 0
         self.running = 0
+        self.resource_waiting = 0
+        self.waiting_reason = None
         self.fault = None
         self.closed = False
         self.draining = False
@@ -46,12 +58,17 @@ class Broker:
         self.thread.start()
 
     def _prune(self):
-        now = time.monotonic()
+        now = self.clock.monotonic()
+        wall_ms = self.clock.now_ms()
+        # Never evict a replayable identity before its original deadline. A lost
+        # response must not turn cache pressure/TTL expiry into a second execution.
         for key, job in list(self.jobs.items()):
-            if job.finished is not None and now - job.finished >= self.cache_ttl:
+            if (job.finished is not None and now >= job.expires and wall_ms >= job.deadline_ms
+                    and now - job.finished >= self.cache_ttl):
                 del self.jobs[key]
         while len(self.jobs) >= self.cache_entries:
-            key = next((key for key, job in self.jobs.items() if job.done.is_set()), None)
+            key = next((key for key, job in self.jobs.items()
+                        if job.done.is_set() and now >= job.expires and wall_ms >= job.deadline_ms), None)
             if key is None:
                 break
             del self.jobs[key]
@@ -59,15 +76,20 @@ class Broker:
     def health(self):
         resource = self.resources.sample()
         with self.lock:
+            self._prune()
             ready = not self.closed and self.fault is None and self.model is not None
+            resource_ready = resource.get('available') is True and resource.get('busy') is False
             return {'live': True, 'model_ready': ready, 'service_instance': self.instance,
                     'execution': self.model.execution if self.model else None,
                     'running': self.running, 'queued': self.inflight - self.running,
+                    'resource_waiting': self.resource_waiting, 'waiting_reason': self.waiting_reason,
                     'capacity': self.capacity, 'concurrency': 1, 'resources': resource,
+                    'retry_policy': retry_policy(), 'resource_ready': resource_ready,
                     'release': self.release, 'draining': self.draining,
                     'drained': self.draining and self.inflight == 0,
-                    'busy': resource['busy'] or self.inflight >= self.capacity,
-                    'accepting': ready and not self.draining and not resource['busy'] and self.inflight < self.capacity,
+                    'busy': not resource_ready or self.inflight >= self.capacity,
+                    'accepting': ready and not self.draining and self.inflight < self.capacity
+                                 and len(self.jobs) < self.cache_entries,
                     'fault': self.fault}
 
     def submit(self, request):
@@ -79,18 +101,31 @@ class Broker:
                     raise ProtocolError('idempotency_conflict', 409)
                 if not previous.done.is_set():
                     raise ProtocolError('request_in_progress', 409, True)
-                return previous
+                # Only a proven pre-execution resource refusal is rearmable. All
+                # success, cancellation, fault and uncertain executions stay sealed.
+                if not (previous.error and previous.error.code == 'resource_busy'
+                        and not previous.execution_started and not previous.cancelled.is_set()
+                        and previous.rearms < RESOURCE_REARMS):
+                    return previous
             if self.draining:
                 raise ProtocolError('service_draining', 503, True)
             if self.closed or self.model is None or self.fault:
                 raise ProtocolError('model_not_ready', 503, True)
             if request.model_sha256 != self.model.model_sha256 or request.preprocess_version != self.model.preprocess_version:
                 raise ProtocolError('model_version_mismatch', 409)
-            if self.inflight >= self.capacity or len(self.jobs) >= self.cache_entries:
+            deadline_ms = min(request.deadline_ms, request.binding.lease_expires_at_ms)
+            remaining = (deadline_ms - self.clock.now_ms()) / 1000
+            now = self.clock.monotonic()
+            if remaining <= 0 or (previous and now >= previous.expires):
+                raise ProtocolError('expired_or_invalid_deadline', 408)
+            if self.inflight >= self.capacity or (not previous and len(self.jobs) >= self.cache_entries):
+                LOG.info('gpu_refusal hash=%s reason=queue_full', request.request_hash[:16])
                 raise ProtocolError('queue_full', 429, True)
-            if self.resources.sample()['busy']:
-                raise ProtocolError('resource_busy', 503, True)
-            job = Job(request, request.request_hash, request.binding.attempt_id, request.deadline_ms)
+            expires = previous.expires if previous else now + remaining
+            job = Job(request, request.request_hash, request.binding.attempt_id, deadline_ms,
+                      previous.submitted if previous else now, expires,
+                      min(now + RESOURCE_WAIT_SECONDS, expires),
+                      rearms=previous.rearms + 1 if previous else 0)
             self.jobs[request.request_id] = job
             self.inflight += 1
             self.queue.put_nowait(job)
@@ -99,6 +134,8 @@ class Broker:
     def begin_drain(self):
         with self.lock:
             self.draining = True
+            # Already owned work retains its finite budget; no new admission or
+            # resource rearm is allowed. A running kernel still owns its slot.
             return {'draining': True, 'drained': self.inflight == 0,
                     'running': self.running, 'queued': self.inflight - self.running}
 
@@ -110,22 +147,73 @@ class Broker:
             if job.attempt_id != attempt_id:
                 raise ProtocolError('attempt_mismatch', 409)
             job.cancelled.set()
-            # Do not claim ORT has stopped. The single execution slot stays reserved
-            # until the worker actually exits infer(). Never return an old cached result.
             return {'cancel_requested': True, 'execution_finished': job.done.is_set()}
 
+    def _remaining(self, job):
+        return min(job.expires - self.clock.monotonic(), (job.deadline_ms - self.clock.now_ms()) / 1000)
+
     def wait(self, job):
-        remaining = max(0, (job.deadline_ms - now_ms()) / 1000)
-        if not job.done.wait(remaining):
+        if not self.clock.wait(job.done, max(0, self._remaining(job))):
             job.cancelled.set()
             raise ProtocolError('deadline_exceeded', 504, True)
         if job.cancelled.is_set():
             raise ProtocolError('cancelled', 409)
         if job.error:
             raise job.error
-        if now_ms() >= job.deadline_ms:
+        if self._remaining(job) <= 0:
             raise ProtocolError('deadline_exceeded', 504, True)
         return job.result
+
+    def _check_current(self, job):
+        if job.cancelled.is_set() or self.closed:
+            raise ProtocolError('cancelled', 409)
+        if self._remaining(job) <= 0:
+            raise ProtocolError('deadline_exceeded', 504, True)
+        if self.fault:
+            raise ProtocolError('model_not_ready', 503, True)
+
+    def _check_resource_budget(self, job):
+        if self.clock.monotonic() >= job.resource_expires:
+            code = 'resource_busy' if job.rearms < RESOURCE_REARMS else 'resource_wait_exhausted'
+            raise ProtocolError(code, 503, code == 'resource_busy')
+
+    def _await_resources(self, job):
+        waiting_started = False
+        outcome = 'stopped'
+        try:
+            while True:
+                self._check_current(job)
+                self._check_resource_budget(job)
+                resource = self.resources.sample(timeout=min(3, self._remaining(job),
+                                                             job.resource_expires - self.clock.monotonic()))
+                # Sampling may itself block; recheck deadline/cancellation afterwards.
+                self._check_current(job)
+                self._check_resource_budget(job)
+                if resource.get('available') is True and resource.get('busy') is False:
+                    outcome = 'ready'
+                    return
+                reason = resource.get('reason')
+                if reason not in ('telemetry_unavailable', 'memory_low', 'utilization_high'):
+                    reason = 'telemetry_unavailable' if resource.get('available') is not True else 'resource_busy'
+                with self.lock:
+                    self.resource_waiting, self.waiting_reason = 1, reason
+                    job.waiting_reason = reason
+                if not waiting_started:
+                    LOG.info('gpu_wait_start hash=%s reason=%s rearm=%s available=%s free_mib=%s utilization_pct=%s',
+                             job.request_hash[:16], reason, job.rearms, resource.get('available') is True,
+                             resource.get('memory_free_mib'), resource.get('utilization_pct'))
+                    waiting_started = True
+                remaining = min(self._remaining(job), job.resource_expires - self.clock.monotonic())
+                if remaining <= 0:
+                    code = 'resource_busy' if job.rearms < RESOURCE_REARMS else 'resource_wait_exhausted'
+                    raise ProtocolError(code, 503, code == 'resource_busy')
+                self.clock.resource_wait(job.cancelled, min(RESOURCE_POLL_SECONDS, remaining))
+        finally:
+            if waiting_started:
+                LOG.info('gpu_wait_end hash=%s reason=%s outcome=%s queue_ms=%.1f', job.request_hash[:16],
+                         job.waiting_reason, outcome, (self.clock.monotonic()-job.submitted)*1000)
+            with self.lock:
+                self.resource_waiting, self.waiting_reason = 0, None
 
     def _run(self):
         while True:
@@ -136,39 +224,38 @@ class Broker:
                     return
                 continue
             request = job.request
-            with self.lock:
-                self.running = 1
-            started = time.monotonic()
             try:
-                if job.cancelled.is_set() or now_ms() >= job.deadline_ms or self.closed:
-                    raise ProtocolError('cancelled_or_expired', 409)
-                if self.fault:
-                    raise ProtocolError('model_not_ready', 503, True)
-                if self.resources.sample()['busy']:
-                    raise ProtocolError('resource_busy', 503, True)
+                self._await_resources(job)
+                with self.lock:
+                    self._check_current(job)
+                    self._check_resource_budget(job)
+                    self.running = 1
+                    job.execution_started = True
+                started = self.clock.monotonic()
                 faces = self.model.infer(request)
-                elapsed = (time.monotonic() - started) * 1000
-                if job.cancelled.is_set() or now_ms() >= job.deadline_ms or self.closed:
-                    raise ProtocolError('cancelled_or_expired', 409)
+                elapsed = (self.clock.monotonic() - started) * 1000
+                self._check_current(job)
                 response = {'schema_version': SCHEMA, 'context': request.context(),
                             'request_hash': request.request_hash, 'service_instance': self.instance,
                             'execution': self.model.execution, 'faces': faces,
                             'timing': {'queue_ms': (started-job.submitted)*1000, 'inference_ms': elapsed,
-                                       'total_ms': (time.monotonic()-job.submitted)*1000}}
+                                       'total_ms': (self.clock.monotonic()-job.submitted)*1000}}
                 Result.parse(response, request)
                 job.result = response
             except ProtocolError as exc:
                 job.error = exc
+                LOG.info('gpu_request_end hash=%s reason=%s executed=%s waiting_reason=%s',
+                         job.request_hash[:16], exc.code, job.execution_started, job.waiting_reason)
             except Exception:
-                # CUDA errors/OOM can poison a session. Fail closed until an operator
-                # replaces this isolated process; never silently change provider.
                 job.error = ProtocolError('inference_failed', 503, True)
                 with self.lock:
                     self.fault = 'inference_failed'
+                LOG.warning('gpu_request_end hash=%s reason=inference_failed executed=%s',
+                            job.request_hash[:16], job.execution_started)
             finally:
                 with self.lock:
-                    job.request = None  # do not retain encoded images in the replay cache
-                    job.finished = time.monotonic()
+                    job.request = None  # never retain images in the replay cache
+                    job.finished = self.clock.monotonic()
                     self.inflight -= 1
                     self.running = 0
                     job.done.set()
@@ -182,6 +269,5 @@ class Broker:
             for job in self.jobs.values():
                 if not job.done.is_set():
                     job.cancelled.set()
-        # This is a drain signal, not a forced model cancellation. Do not overlap a
-        # replacement instance until the old process has actually exited.
+        # Never overlap replacement until the old process actually exits infer().
         self.thread.join(timeout=5)

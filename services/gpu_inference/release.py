@@ -7,7 +7,7 @@ import json
 import pathlib
 import re
 
-from .protocol import SCHEMA, canonical, sha, token
+from .protocol import SCHEMA, canonical, sha, token, retry_policy
 
 PACKAGE = pathlib.Path(__file__).parent
 
@@ -26,14 +26,14 @@ def create_manifest(release_id, revision, model_sha256, package=PACKAGE):
     token(release_id); sha(model_sha256)
     if not re.fullmatch(r'[a-f0-9]{40}', revision):
         raise ValueError('full_git_revision_required')
-    return {'manifest_schema': 1, 'release_id': release_id, 'revision': revision,
+    return {'manifest_schema': 2, 'release_id': release_id, 'revision': revision,
             'protocol_schema': SCHEMA, 'code_sha256': code_digest(package),
             'lock_sha256': hashlib.sha256((pathlib.Path(package)/'deploy/requirements.lock').read_bytes()).hexdigest(),
             'model_sha256': model_sha256, 'stage': 'detection', 'detector_size': 640,
             'preprocess_version': 'scrfd-640-bgr8-det0.5-nms0.4-v1',
             'python_abi': 'cp312', 'platform': 'linux-x86_64',
             'admission': {'min_free_mib': 600, 'max_utilization_pct': 25, 'arena_mib': 128,
-                          'concurrency': 1, 'waiting': 1}}
+                          'concurrency': 1, 'waiting': 1}, 'retry_policy': retry_policy()}
 
 
 def verify_manifest(path, package=PACKAGE):
