@@ -20,7 +20,7 @@ export function VideoThumbnail({ video, onPlay, className }: { video: ReviewVide
     <span className="absolute bottom-1 right-1 rounded bg-black/75 px-1.5 py-0.5 text-[10px] text-white">播放</span>
   </button>
 }
-export function VideoPlayer({ video, onClose }: { video: ReviewVideo | null; onClose: () => void }) {
+export function VideoPlayer({ video, onClose, returnFocus, instantEntry }: { video: ReviewVideo | null; onClose: () => void; returnFocus?: React.RefObject<HTMLButtonElement | null>; instantEntry?: boolean }) {
   const [failed, setFailed] = useState(false)
   const [reported,setReported]=useState(false),reportSequence=useRef(0)
   const trigger=useRef<HTMLElement|null>(null)
@@ -42,7 +42,7 @@ export function VideoPlayer({ video, onClose }: { video: ReviewVideo | null; onC
   }
   const src = video ? `/api/video?p=${encodeURIComponent(video.path || video.vid)}` : ''
   return <Dialog open={!!video} onOpenChange={o => { if (!o) close() }}>
-    <ResponsiveDialogContent open={!!video} onOpenAutoFocus={()=>{trigger.current=document.activeElement instanceof HTMLElement?document.activeElement:null}} onCloseAutoFocus={event=>{event.preventDefault();if(trigger.current?.isConnected)trigger.current.focus({preventScroll:true})}} className="flex max-h-[92dvh] flex-col gap-0 overflow-hidden p-0 sm:max-w-4xl sm:p-0">
+    <ResponsiveDialogContent open={!!video} inert={!video} style={instantEntry === undefined ? undefined : { animationName: video ? 'review-dialog-in' : 'review-dialog-out', animationDuration: instantEntry ? '0ms' : '180ms' }} overlayProps={instantEntry === undefined ? undefined : { style: { animationName: video ? 'review-overlay-in' : 'review-dialog-out', animationDuration: instantEntry ? '0ms' : '140ms' } }} onOpenAutoFocus={()=>{trigger.current=document.activeElement instanceof HTMLElement?document.activeElement:null}} onCloseAutoFocus={event=>{event.preventDefault();const target=returnFocus?.current?.isConnected?returnFocus.current:trigger.current;if(target?.isConnected)target.focus({preventScroll:true})}} className="flex max-h-[92dvh] flex-col gap-0 overflow-hidden p-0 sm:max-w-4xl sm:p-0">
       <DialogHeader className="shrink-0 border-b p-4 pr-14 text-left"><DialogTitle>视频预览</DialogTitle><DialogDescription>关闭后回到刚才的位置，勾选保持不变。</DialogDescription></DialogHeader>
       {video&&<div data-sheet-scroll className="min-h-0 flex-1 space-y-3 overflow-y-auto p-4"><p className="break-all text-sm font-medium">{video.name}</p><PrivateVideo key={src} src={src} controls autoPlay playsInline preload="metadata" onError={playbackError} className="max-h-[55dvh] w-full rounded-lg bg-black"/>
         {failed&&<div role="alert" className="space-y-3 rounded-lg border border-amber-500/30 p-3 text-sm text-amber-300"><p className="flex items-start gap-2"><AlertCircle className="mt-0.5 h-4 w-4 shrink-0"/>暂时无法播放，可能是路径变化、网络中断或手机不支持此编码。</p>{reported&&<p className="text-xs">已记下本次失败，下一次自动体检会优先复查。原文件保留。</p>}<Button asChild variant="outline" className="min-h-11"><Link href="/staging#video-health" onClick={close}>查看视频体检与失效记录</Link></Button></div>}<PathText value={video.path||video.vid}/></div>}

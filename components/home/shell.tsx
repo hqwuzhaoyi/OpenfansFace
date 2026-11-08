@@ -187,7 +187,7 @@ function MobileTopBar({ pathname }: { pathname: string }) {
 
 export function HomeShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname()
-  const isSplitPane = pathname === '/review' || pathname === '/operations' || pathname === '/integration' || pathname === '/persons' || pathname.startsWith('/persons/')
+  const isSplitPane = pathname === '/review' || pathname === '/operations' || pathname === '/integration' || pathname === '/staging' || pathname === '/persons' || pathname.startsWith('/persons/')
 
   return (
     <MotionConfig reducedMotion="user">
