@@ -257,6 +257,7 @@ impl Engine {
         let executed = self.execute(&plan, &domain);
         match executed {
             Ok(result) => {
+                crate::archive_cancel::release_scanner_lease(&self.config, &plan.id, "committed");
                 gate.release()?;
                 crate::fault::checkpoint(&self.config, "complete")?;
                 Ok(result)
@@ -265,10 +266,20 @@ impl Engine {
                 // A failed call is not a failed transaction. Inspect all domains before deciding.
                 match self.reconcile(&plan, &domain, true, &error) {
                     Ok(Some(result)) => {
+                        crate::archive_cancel::release_scanner_lease(
+                            &self.config,
+                            &plan.id,
+                            "committed",
+                        );
                         gate.release()?;
                         Ok(result)
                     }
                     Ok(None) => {
+                        crate::archive_cancel::release_scanner_lease(
+                            &self.config,
+                            &plan.id,
+                            "rolled_back",
+                        );
                         gate.release()?;
                         Err(error)
                     }
@@ -281,6 +292,7 @@ impl Engine {
         }
     }
     fn recovery_failure(&mut self, plan: &Plan, error: &Error) -> Result<()> {
+        crate::archive_cancel::release_scanner_lease(&self.config, &plan.id, "recovery_needed");
         if error.code == "recovery_required" && error.mutation_outcome.is_some() {
             return self.store.fail(&plan.id, error, true);
         }
@@ -331,6 +343,9 @@ impl Engine {
         crate::store::status(&self.config.state_db(), &request.id)
     }
     fn recover_startup(&mut self) -> Result<()> {
+        let active_ids: std::collections::BTreeSet<String> =
+            self.store.recovery_ids()?.into_iter().collect();
+        crate::archive_cancel::recover_scanner_leases(&self.config, &active_ids);
         for id in self.store.recovery_ids()? {
             self.recover_one(&id);
         }
@@ -458,6 +473,18 @@ impl Engine {
         self.require_resolved_mutation(&plan.id, Some(cause))?;
         let (domain, selected) = self.commit_scope(plan, accepted)?;
         let snapshot = &domain.metadata;
+        let has_retained_step = self
+            .store
+            .latest_step(&plan.id, "archive_external_indexes_retained")?
+            .is_some();
+        let has_ledger_reserved = self
+            .store
+            .latest_step(&plan.id, "ledger_reserved")?
+            .is_some();
+        let allow_unreserved = !has_ledger_reserved
+            && self
+                .verify_published_archive_destinations(plan, &selected)
+                .is_ok();
         let mut retained_indexes = vec![];
         let ledger_state = match self.ledger_state(plan, &domain) {
             Ok(state) => state,
@@ -469,6 +496,7 @@ impl Engine {
                         .ledger
                         .as_ref()
                         .ok_or_else(|| Error::conflict("缺少归档账本取消依据"))?,
+                    allow_unreserved,
                 )
                 .map_err(|_| error)?;
                 "prepared".into()
@@ -490,6 +518,7 @@ impl Engine {
                         .ledger
                         .as_ref()
                         .ok_or_else(|| Error::conflict("缺少归档账本取消依据"))?,
+                    allow_unreserved,
                 )?;
             }
             if saved["rows"] != json!(retained_indexes) {
@@ -525,7 +554,7 @@ impl Engine {
             None
         };
         let cause = persisted_cause.as_ref().unwrap_or(cause);
-        let rollback = rollback || failed_rollback || !retained_indexes.is_empty();
+        let rollback = rollback || failed_rollback || has_retained_step;
         let external_cause = Error::new(
             409,
             "archive_external_index_retained",
@@ -598,6 +627,7 @@ impl Engine {
                     plan,
                     domain.ledger.as_ref().unwrap(),
                     &retained_indexes,
+                    allow_unreserved,
                 )?;
             }
             crate::fault::checkpoint(&self.config, "compensation_ledger_fenced")?;
@@ -630,6 +660,7 @@ impl Engine {
                         &self.config,
                         plan,
                         domain.ledger.as_ref().unwrap(),
+                        allow_unreserved,
                     )? != retained_indexes
                 {
                     return Err(Error::conflict("归档回退期间外部索引已变化"));
@@ -670,15 +701,41 @@ impl Engine {
                     &self.config,
                     plan,
                     domain.ledger.as_ref().unwrap(),
+                    allow_unreserved,
                 )? != retained_indexes
             {
                 return Err(Error::conflict("归档回退期间外部索引已变化"));
             }
             self.store.rolled_back(&plan.id, cause)?;
+            crate::archive_cancel::release_scanner_lease(&self.config, &plan.id, "rolled_back");
             Ok(None)
         } else {
-            self.execute(plan, &domain).map(Some)
+            let result = self.execute(plan, &domain)?;
+            crate::archive_cancel::release_scanner_lease(&self.config, &plan.id, "committed");
+            Ok(Some(result))
         }
+    }
+    fn verify_published_archive_destinations(
+        &self,
+        plan: &Plan,
+        successful: &[usize],
+    ) -> Result<()> {
+        if plan.action != "archive" || successful.is_empty() {
+            return Err(Error::conflict("缺少已发布的归档目标文件依据"));
+        }
+        for &index in successful {
+            let file = plan
+                .files
+                .get(index)
+                .ok_or_else(|| Error::conflict("归档文件索引越界"))?;
+            let pinned = self.pin(plan, index)?;
+            if pinned.position(&file.version)? != (false, true) {
+                return Err(Error::conflict("归档目标文件位置与已发布记录不一致").at(&file.dst));
+            }
+            let evidence = self.store.file_evidence(&plan.id, index)?;
+            files::inspect_committed_destination(file, &evidence)?;
+        }
+        Ok(())
     }
     fn pin(&self, plan: &Plan, index: usize) -> Result<PinnedMove> {
         if let Some(execution) = &plan.execution {
@@ -800,6 +857,9 @@ impl Engine {
     fn execute(&mut self, plan: &Plan, accepted: &DomainSnapshot) -> Result<Value> {
         let id = &plan.id;
         self.require_resolved_mutation(id, None)?;
+        if plan.action == "archive" {
+            let _ = crate::archive_cancel::acquire_scanner_lease(&self.config, plan)?;
+        }
         if plan.execution.is_none() {
             self.checkpoint(
                 id,
@@ -952,13 +1012,34 @@ impl Engine {
             crate::archive::verify_duplicate(&self.config, plan, index, false)?;
         }
         if plan.execution.is_some() {
+            let has_ledger_reserved = self.store.latest_step(id, "ledger_reserved")?.is_some();
             self.checkpoint(
                 id,
                 "ledger_reserve_intent",
                 json!({"signature":plan.version,"successful_file_indexes":successful}),
             )?;
-            if self.ledger_state(plan, &domain)? == "absent" {
-                self.ledger_reserve(plan, &domain)?;
+            match self.ledger_state(plan, &domain) {
+                Ok(state) => {
+                    if state == "absent" {
+                        self.ledger_reserve(plan, &domain)?;
+                    }
+                }
+                Err(error) if plan.action == "archive" => {
+                    self.verify_published_archive_destinations(plan, &successful)
+                        .map_err(|_| error.clone())?;
+                    let delta = domain
+                        .ledger
+                        .as_ref()
+                        .ok_or_else(|| Error::conflict("缺少账本意图"))?;
+                    crate::archive_cancel::reserve_with_scanner_index(
+                        &self.config,
+                        plan,
+                        delta,
+                        !has_ledger_reserved,
+                    )
+                    .map_err(|_| error)?;
+                }
+                Err(error) => return Err(error),
             }
             self.checkpoint(id, "ledger_reserved", json!({"state":"prepared"}))?;
         }
@@ -1007,14 +1088,73 @@ impl Engine {
             "ledger_commit_intent",
             json!({"signature":plan.version}),
         )?;
-        let evidence = if self.ledger_state(plan, &domain)? == "committed" {
-            json!({"reconciled":true})
-        } else {
-            for &index in &successful {
-                crate::archive::verify_duplicate(&self.config, plan, index, false)?;
+        let mut reconciled_scanner_assets: Vec<i64> = vec![];
+        let evidence = match self.ledger_state(plan, &domain) {
+            Ok(state) if state == "committed" => {
+                if plan.action == "archive" {
+                    reconciled_scanner_assets =
+                        crate::archive_cancel::committed_reconciled_assets(&self.config, plan)?;
+                }
+                json!({"reconciled":true})
             }
-            self.ledger_apply(plan, &domain)?
+            Ok(_) => {
+                for &index in &successful {
+                    crate::archive::verify_duplicate(&self.config, plan, index, false)?;
+                }
+                match self.ledger_apply(plan, &domain) {
+                    Ok(applied) => applied,
+                    Err(error) if plan.action == "archive" => {
+                        self.verify_published_archive_destinations(plan, &successful)
+                            .map_err(|_| error.clone())?;
+                        let delta = domain
+                            .ledger
+                            .as_ref()
+                            .ok_or_else(|| Error::conflict("缺少账本意图"))?;
+                        let applied = crate::archive_cancel::apply_with_scanner_reconciliation(
+                            &self.config,
+                            plan,
+                            delta,
+                        )
+                        .map_err(|_| error)?;
+                        if let Some(ids) = applied["reconciled_scanner_assets"].as_array() {
+                            reconciled_scanner_assets =
+                                ids.iter().filter_map(Value::as_i64).collect();
+                        }
+                        applied
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error) if plan.action == "archive" => {
+                for &index in &successful {
+                    crate::archive::verify_duplicate(&self.config, plan, index, false)?;
+                }
+                self.verify_published_archive_destinations(plan, &successful)
+                    .map_err(|_| error.clone())?;
+                let delta = domain
+                    .ledger
+                    .as_ref()
+                    .ok_or_else(|| Error::conflict("缺少账本意图"))?;
+                let applied = crate::archive_cancel::apply_with_scanner_reconciliation(
+                    &self.config,
+                    plan,
+                    delta,
+                )
+                .map_err(|_| error)?;
+                if let Some(ids) = applied["reconciled_scanner_assets"].as_array() {
+                    reconciled_scanner_assets = ids.iter().filter_map(Value::as_i64).collect();
+                }
+                applied
+            }
+            Err(error) => return Err(error),
         };
+        if !reconciled_scanner_assets.is_empty() {
+            self.checkpoint(
+                id,
+                "archive_scanner_indexes_reconciled",
+                json!({"asset_ids":reconciled_scanner_assets}),
+            )?;
+        }
         crate::fault::checkpoint(&self.config, "ledger_committed_unrecorded")?;
         self.checkpoint(id, "ledger_committed", evidence)?;
         let mut directory_warning = None;
@@ -1064,11 +1204,15 @@ impl Engine {
         } else {
             model::final_result(plan)
         };
+        if !reconciled_scanner_assets.is_empty() {
+            result["reconciled_scanner_assets"] = json!(reconciled_scanner_assets);
+        }
         if let Some(warning) = directory_warning {
             result["warning"] = json!(warning);
         }
         self.checkpoint(id, "final_receipt_intent", json!({"result":result}))?;
         self.store.complete(plan, &result)?;
+        crate::archive_cancel::release_scanner_lease(&self.config, &plan.id, "committed");
         crate::fault::checkpoint(&self.config, "final_receipt_unreleased")?;
         Ok(result)
     }
