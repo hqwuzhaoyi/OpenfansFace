@@ -14,7 +14,7 @@ class PublicationError(RuntimeError):
         self.status, self.operation_id, self.uncertain = status, operation_id, uncertain
 
 
-def native(command, body):
+def native(command, body, *, timeout=120):
     origin = os.environ.get('FILE_OPERATIONS_RUST_URL')
     if not origin:
         raise PublicationError('原生结果协调器未配置，保留任务等待恢复')
@@ -25,7 +25,7 @@ def native(command, body):
     request = urllib.request.Request(origin.rstrip('/') + '/v1/metadata',
         data=json.dumps({'command': command, 'body': body}, allow_nan=False).encode(), headers=headers)
     try:
-        with urllib.request.urlopen(request, timeout=120) as response:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
             return json.load(response)
     except urllib.error.HTTPError as error:
         try:

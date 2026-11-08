@@ -256,7 +256,14 @@ are for the central release owner after the missing gates are satisfied.
    be stopped. It saves private original inspect/config and complete local
    snapshots, keeps original containers as anchors, and creates/starts native,
    worker, calibrator and web in order. Native must start closed; the persisted
-   worker pause survives replacement. The unchanged authority inode is checked
+   worker pause survives replacement. Before native opens, the candidate worker
+   publishes a fresh protocol-3 heartbeat with `waiting_native_admission=true`,
+   `native_ready=false`, `active=0`, and concurrency zero. It holds its coordinator
+   lock but does not open/migrate the processing database, recover publications,
+   discover files, read/rebuild references or claim tasks. A bounded state probe
+   retries closed/unavailable 503 responses; wrong authentication still fails.
+   After the state handshake succeeds, recovery precedes discovery and claims.
+   The unchanged authority inode is checked
    after each step. Each step gets its own receipt; a failure leaves completed
    steps visible and admission closed. There is no multi-service atomic commit.
 6. Verify with the produced `activated-manifest.json`, then `open --execute`
@@ -507,3 +514,37 @@ This exception clears only these ten unsupported inputs. GPU/model/coexistence,
 prepared peer, old inflight work, journal, schema, capacity and final runtime
 acceptance gates all remain mandatory. A different release or rollback requires
 a decision bound to its release ID.
+
+
+### Reference evidence after activation
+
+Paused claims alone do not stop discovery. Closed native admission does: both
+the startup `state` handshake and the first `analysis-state` in reference building
+use the admitted metadata route. Keep native closed through replacement and
+pre-open verification. The waiting worker heartbeat means the process is alive
+and intentionally fenced; it does not mean native/model readiness. Verify its
+fresh timestamp, waiting flag, zero active work, persisted pause, and the native
+closed state together. A nonempty HTTP 200 from `/api/processing` alone is not
+proof of worker readiness.
+
+The first controller `open` validates the original frozen raw audit before
+opening native admission. The worker can then complete its state handshake and
+build new references through its existing path, even while claims remain paused.
+That authorized post-open build can change the reference artifact identity and
+therefore stale the prior raw audit. It does not change the ten-case exclusion
+authorization. Do not reopen native early just to obtain a fresh reference file.
+
+If a later gate needs refreshed evidence, preserve the original activated
+manifest, raw audit, decision and entire `release-id-replace` backup directory.
+Capture a new bounded scalar report at a new private path after the build has
+finished; inspect its complete status/counts and require its ten full case objects
+to equal the unchanged decision's reviewed cases. Review any other relevant input
+changes. Create a **new copy** of the activated manifest with the same release ID,
+service identities and unchanged `legacy_reference_exclusion` reference, changing
+only `evidence.legacy_reference_compatibility` to the new raw-report path/SHA.
+Run the fresh legacy gate and normal controller checks against that copy. Retain
+a refresh receipt linking both manifest/report hashes and the observed build;
+never overwrite old evidence, rewrite the decision, rerun replacement merely to
+refresh evidence, restore old references over the new result, or copy the new
+reference artifact into the original backup. If any reviewed case differs, stop
+for a new disposition; a generic evidence refresh cannot extend authorization.
