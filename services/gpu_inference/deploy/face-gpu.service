@@ -6,8 +6,11 @@ ConditionPathExists=/opt/face-gpu/current/release.json
 
 [Service]
 Type=exec
-DynamicUser=yes
+# systemd255 DynamicUser forces PrivateTmp's bind and overrides bounded tmpfs.
+# Provision a dedicated system/nonlogin account; never reuse an application user.
+DynamicUser=no
 User=face-gpu
+Group=face-gpu
 WorkingDirectory=/opt/face-gpu/current
 LoadCredential=api-token:/etc/face-gpu/api-token
 Environment=PYTHONNOUSERSITE=1
@@ -25,7 +28,9 @@ UMask=0077
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
-PrivateTmp=yes
+PrivateTmp=no
+PrivateMounts=yes
+RemoveIPC=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
 ProtectKernelLogs=yes
@@ -41,12 +46,12 @@ CapabilityBoundingSet=
 AmbientCapabilities=
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 IPAddressDeny=any
-IPAddressAllow=localhost
+IPAddressAllow=127.0.0.0/8 ::1/128
 DevicePolicy=closed
 DeviceAllow=/dev/dxg rw
 ReadOnlyPaths=/opt/face-gpu
-InaccessiblePaths=-/mnt -/media -/srv -/data -/var/lib -/var/log -/var/cache
-TemporaryFileSystem=/tmp:rw,nosuid,nodev,noexec,size=64M
+InaccessiblePaths=-/mnt -/media -/srv -/data -/var/lib -/var/log -/var/cache -/var/tmp
+TemporaryFileSystem=/tmp:rw,nosuid,nodev,noexec,size=64M,mode=1777
 MemoryHigh=1G
 MemoryMax=1536M
 TasksMax=64
