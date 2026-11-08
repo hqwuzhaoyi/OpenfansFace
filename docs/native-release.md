@@ -54,7 +54,9 @@ prove every NFS operation.
 mutable BASE state plus ledger and a configured reserve. Capacity and copying
 share the same namespace classification. SQLite WAL bytes are included in the
 estimate because the backup API can incorporate them into the destination DB;
-only actual SQLite sidecars are omitted from copying. Unrelated files ending in
+only actual SQLite sidecars are omitted from copying. Capacity uses file metadata
+when no WAL companion exists, avoiding payload reads of thumbnails/evidence; it
+checks a file header only to classify a present SQLite sidecar. Unrelated files ending in
 `-wal`, `-shm` or `-journal` remain business inputs. Unreadable directories,
 foreign symlinks and nonregular files fail closed. `processing/tmp` is the only
 automatically excluded namespace: disposable worker scratch frames. Accepted

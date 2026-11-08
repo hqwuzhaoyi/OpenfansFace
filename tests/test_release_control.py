@@ -409,4 +409,29 @@ class ReleaseControlTests(unittest.TestCase):
             self.assertIsNotNone(r.preserved_runtime(m));path.write_text('print("changed")')
             with self.assertRaisesRegex(RuntimeError,'mounted source file changed'):r.preserved_runtime(m)
 
+    def test_capacity_inventory_does_not_read_file_payloads_without_wal(self):
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory(prefix='face-release-fixture-') as tmp:
+            root=Path(tmp);base=root/'base';base.mkdir();(base/'.fixture').write_text('isolated capacity metadata fixture')
+            (base/'thumbnail.jpg').write_bytes(b'jpeg fixture bytes')
+            (base/'receipt.json').write_text('{"accepted":true}')
+            for path in (base/'state.db',root/'ledger.db'):
+                with sqlite3.connect(path) as db:db.execute('CREATE TABLE records(value)')
+            expected=sum(p.stat().st_size for p in base.iterdir())+(root/'ledger.db').stat().st_size
+            m=self.manifest();m.update(base=str(base),ledger=str(root/'ledger.db'),evidence_dir=str(root/'backup'))
+            with patch.object(Path,'open',side_effect=AssertionError('capacity opened a no-WAL file payload')),patch.object(r.shutil,'disk_usage',return_value=SimpleNamespace(free=expected+3*1024**3)),patch.object(r,'run',side_effect=self.runtime_image):
+                report=r.capacity(m)
+            self.assertEqual(report['backup_estimate_bytes'],expected)
+
+    def test_non_database_wal_named_business_companion_is_counted_once_and_preserved(self):
+        with tempfile.TemporaryDirectory(prefix='face-release-fixture-') as tmp:
+            root=Path(tmp);base=root/'base';base.mkdir();(base/'.fixture').write_text('isolated')
+            original=base/'history';companion=base/'history-wal'
+            original.write_bytes(b'business history');companion.write_bytes(b'business receipt')
+            self.assertEqual(r.snapshot_size(base),sum(p.stat().st_size for p in base.iterdir()))
+            r.snapshot_tree(base,root/'backup')
+            for path in (original,companion):self.assertEqual((root/'backup'/path.name).read_bytes(),path.read_bytes())
+            companion.unlink();companion.symlink_to(root/'outside')
+            with self.assertRaisesRegex(RuntimeError,'symlink'):r.snapshot_size(base)
+
 if __name__=='__main__':unittest.main()

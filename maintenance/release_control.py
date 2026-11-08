@@ -683,10 +683,12 @@ def database_snapshot_size(path):
     observed = path.lstat()
     if not stat.S_ISREG(observed.st_mode): fail('snapshot database/file must be regular, not a symlink: '+str(path))
     total = observed.st_size
-    with path.open('rb') as stream:
-        if stream.read(16) == b'SQLite format 3\0':
-            wal = path.with_name(path.name+'-wal')
-            if os.path.lexists(wal):
+    wal = path.with_name(path.name+'-wal')
+    # A database without WAL needs only its file size. Avoid opening every
+    # thumbnail/evidence file just to discover that it cannot add WAL pages.
+    if os.path.lexists(wal):
+        with path.open('rb') as stream:
+            if stream.read(16) == b'SQLite format 3\0':
                 mode = wal.lstat().st_mode
                 if not stat.S_ISREG(mode): fail('SQLite WAL must be a regular file: '+str(wal))
                 # Conservatively account for pages committed only in WAL, which
