@@ -79,6 +79,12 @@ def source_item(vid, stored, root):
 
 
 def discover(base, root, api_url, assets=None):
+    if os.environ.get('FILE_OPERATIONS_RUST_URL'):
+        references = build_references(base, root)
+        payload = {'pipeline': PIPELINE, 'face_version': FACE_VERSION, 'references': references}
+        if assets is not None:
+            payload['assets'] = list(assets)
+        return native('processing-discover', payload, timeout=120)['eligible']
     progress = TaskProgress(base, "discovery", "媒体发现")
     progress.update(stage="读取 Peach 账本")
     con = connect(base)
@@ -262,9 +268,7 @@ def process_one(base, root, runner=stage_subprocess, capacity=1, publisher=publi
                 with con:
                     event(con, task['vid'], 'publication_unknown', str(error))
             elif isinstance(error, PublicationError) and error.status >= 500 and not error.operation_id:
-                release_task(con, task, '原生协调器不可用，等待恢复')
-                with con:
-                    con.execute("UPDATE tasks SET next_retry=? WHERE vid=? AND run_id=? AND stage='retry' AND manual=0", (time.time() + 30, task['vid'], task['run_id']))
+                release_task(con, task, '原生协调器不可用，等待恢复', retry_delay=30)
             elif was_handled(base, task['vid']):
                 release_task(con, task, '分析期间已由人工处理', excluded=True)
             elif media_available(con, root):
@@ -313,13 +317,33 @@ def main():
                 else:
                     state = connect(base)
                     try:
-                        desired = effective_concurrency(state, max_concurrency())
-                        active = state.execute("SELECT COUNT(*) FROM tasks WHERE stage IN ('text','face')").fetchone()[0]
-                        publish(folder / 'heartbeat.json', dict(at=time.time(), pid=os.getpid(), text_pipeline=PIPELINE,
-                                protocol=3, max_concurrency=max_concurrency(), concurrency=desired, active=active,
-                                waiting_native_admission=False, native_ready=True, inference=inference_status()))
+                        run_ids = [r[0] for r in state.execute("SELECT run_id FROM tasks WHERE stage IN ('text','face') AND run_id<>''").fetchall()]
                     finally:
                         state.close()
+                    try:
+                        native('processing-heartbeat', {
+                            'run_ids': run_ids,
+                            'capacity': max_concurrency(),
+                            'heartbeat': dict(
+                                pid=os.getpid(),
+                                text_pipeline=PIPELINE,
+                                protocol=3,
+                                max_concurrency=max_concurrency(),
+                                waiting_native_admission=False,
+                                native_ready=True,
+                                inference=inference_status(),
+                            ),
+                        }, timeout=10)
+                    except Exception:
+                        state = connect(base)
+                        try:
+                            desired = effective_concurrency(state, max_concurrency())
+                            active = state.execute("SELECT COUNT(*) FROM tasks WHERE stage IN ('text','face')").fetchone()[0]
+                            publish(folder / 'heartbeat.json', dict(at=time.time(), pid=os.getpid(), text_pipeline=PIPELINE,
+                                    protocol=3, max_concurrency=max_concurrency(), concurrency=desired, active=active,
+                                    waiting_native_admission=False, native_ready=True, inference=inference_status()))
+                        finally:
+                            state.close()
                 stop.wait(10 if native_ready.is_set() else 1)
         def discovery():
             due = 0
