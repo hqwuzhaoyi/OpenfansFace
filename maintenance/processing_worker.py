@@ -294,27 +294,33 @@ def main():
         return
     if not os.environ.get('FILE_OPERATIONS_RUST_URL'):
         raise SystemExit('原生结果协调器未配置，尚未领取任务')
-    native('state', {'scope': {}})
     folder = base / 'processing'; folder.mkdir(exist_ok=True)
     with (folder / '.worker.lock').open('w') as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             raise SystemExit('Processing coordinator already running')
-        recover_publications(base)
-        con = connect(base); recover(con); con.close()
         stop = threading.Event()
+        native_ready = threading.Event()
         def heartbeats():
             while not stop.is_set():
-                state = connect(base)
-                try:
-                    desired = effective_concurrency(state, max_concurrency())
-                    active = state.execute("SELECT COUNT(*) FROM tasks WHERE stage IN ('text','face')").fetchone()[0]
-                    publish(folder / 'heartbeat.json', dict(at=time.time(), pid=os.getpid(), text_pipeline=PIPELINE,
-                            protocol=3, max_concurrency=max_concurrency(), concurrency=desired, active=active, inference=inference_status()))
-                finally:
-                    state.close()
-                stop.wait(10)
+                if not native_ready.is_set():
+                    # Closed-admission bootstrap must be observable without opening
+                    # SQLite, recovering attempts, discovering or reading references.
+                    publish(folder / 'heartbeat.json', dict(at=time.time(), pid=os.getpid(),
+                            text_pipeline=PIPELINE, protocol=3, max_concurrency=max_concurrency(),
+                            concurrency=0, active=0, waiting_native_admission=True, native_ready=False))
+                else:
+                    state = connect(base)
+                    try:
+                        desired = effective_concurrency(state, max_concurrency())
+                        active = state.execute("SELECT COUNT(*) FROM tasks WHERE stage IN ('text','face')").fetchone()[0]
+                        publish(folder / 'heartbeat.json', dict(at=time.time(), pid=os.getpid(), text_pipeline=PIPELINE,
+                                protocol=3, max_concurrency=max_concurrency(), concurrency=desired, active=active,
+                                waiting_native_admission=False, native_ready=True, inference=inference_status()))
+                    finally:
+                        state.close()
+                stop.wait(10 if native_ready.is_set() else 1)
         def discovery():
             due = 0
             while not stop.is_set():
@@ -328,16 +334,34 @@ def main():
                         print('Discovery:', str(error), flush=True)
                     due = time.time() + 300
                 stop.wait(5)
-        heartbeat = threading.Thread(target=heartbeats, daemon=True); heartbeat.start()
-        if args.once:
-            discover(base, root, args.api_url)
-            process_one(base, root)
-            stop.set(); heartbeat.join(timeout=12)
-            return
-        discover_thread = threading.Thread(target=discovery, daemon=True); discover_thread.start()
         signal.signal(signal.SIGTERM, lambda *_: stop.set())
         signal.signal(signal.SIGINT, lambda *_: stop.set())
+        heartbeat = threading.Thread(target=heartbeats, daemon=True); heartbeat.start()
         try:
+            while not stop.is_set():
+                try:
+                    native('state', {'scope': {}}, timeout=5)
+                    break
+                except PublicationError as error:
+                    if error.status != 503:
+                        raise
+                    # Admission closure/unavailability is a wait, not readiness.
+                    # Authentication and other contract errors still fail closed.
+                    stop.wait(2)
+            if stop.is_set():
+                return
+            recover_publications(base)
+            con = connect(base)
+            try:
+                recover(con)
+            finally:
+                con.close()
+            native_ready.set()
+            if args.once:
+                discover(base, root, args.api_url)
+                process_one(base, root)
+                return
+            discover_thread = threading.Thread(target=discovery, daemon=True); discover_thread.start()
             with ThreadPoolExecutor(max_workers=max_concurrency(), thread_name_prefix='processing') as executor:
                 inflight = set()
                 while not stop.is_set():
@@ -363,7 +387,8 @@ def main():
                     stop.wait(1)
         finally:
             stop.set(); heartbeat.join(timeout=12)
-            publish(folder / 'heartbeat.json', dict(at=0, protocol=2, max_concurrency=max_concurrency()))
+            publish(folder / 'heartbeat.json', dict(at=0, protocol=3, max_concurrency=max_concurrency(),
+                    waiting_native_admission=False, native_ready=False, active=0))
 
 
 
