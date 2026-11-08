@@ -1,5 +1,6 @@
 """Retained CPU is explicit and bounded; default GPU release gates stay strict."""
 import copy
+from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
@@ -109,6 +110,48 @@ class CpuReleaseTests(unittest.TestCase):
             return {'accepting':body['accepting']}
         with patch.object(sys,'argv',['controller','open','--manifest',str(file),'--execute']), patch.object(r,'validate'), patch.object(r,'preserved_runtime'), patch.object(r,'baseline'), patch.object(r,'legacy_health_gate'), patch.object(r,'authority'), patch.object(r,'probes'), patch.object(r,'wait_cpu_worker_ready',side_effect=RuntimeError('wrong CPU runtime')), patch.object(r,'api',side_effect=api) as calls:
             with self.assertRaisesRegex(RuntimeError,'wrong CPU runtime'):r.main()
+            admissions=[call.args[2] for call in calls.call_args_list if call.args[1]=='/v1/admission']
+            self.assertEqual(admissions,[{'accepting':True},{'accepting':False}])
+
+    def running_candidate(self, started):
+        return {'Id':self.worker['expected_id'],'Image':self.worker['candidate_image'],
+                'Config':{'Env':['PROCESSING_FACE_BACKEND=cpu','PROCESSING_MAX_CONCURRENCY=1']},
+                'HostConfig':{'NanoCpus':1000000000,'Memory':1610612736},
+                'State':{'Running':True,'StartedAt':started}}
+
+    def write_heartbeat(self, stamp, waiting=False):
+        path=self.root/'processing/heartbeat.json';path.parent.mkdir(exist_ok=True)
+        path.write_text(json.dumps({'at':stamp,'protocol':3,'waiting_native_admission':waiting,
+          'native_ready':not waiting,'active':0,'inference':{'backend':'cpu','fallback':False}}))
+
+    def test_preopen_wait_rejects_predecessor_then_accepts_current_waiting_sample(self):
+        now=time.time();start=datetime.fromtimestamp(now,timezone.utc).strftime('%Y-%m-%dT%H:%M:%S')+'.123456789Z'
+        started=datetime.fromisoformat(start.split('.')[0]+'+00:00').timestamp()+.123456789
+        state=self.running_candidate(start);self.write_heartbeat(now-20)
+        self.m['startup_timeout']=0
+        with patch.object(r,'inspect',return_value=state),self.assertRaisesRegex(RuntimeError,'fresh current-container'):
+            r.wait_cpu_worker_ready(self.m,allow_waiting=True)
+        self.m['startup_timeout']=30
+        with patch.object(r,'inspect',return_value=state) as inspected,patch.object(r.time,'sleep',side_effect=lambda _:self.write_heartbeat(max(now,started)+.1,waiting=True)):
+            r.wait_cpu_worker_ready(self.m,allow_waiting=True)
+            self.assertEqual(inspected.call_count,2)
+
+    def test_postopen_wait_requires_new_sample_after_open_boundary(self):
+        now=time.time();start=datetime.fromtimestamp(now-20,timezone.utc).isoformat()
+        state=self.running_candidate(start);self.write_heartbeat(now-1)
+        with patch.object(r,'inspect',return_value=state) as inspected,patch.object(r.time,'sleep',side_effect=lambda _:self.write_heartbeat(now+.1)):
+            r.wait_cpu_worker_ready(self.m,not_before=now)
+            self.assertEqual(inspected.call_count,2)
+
+    def test_old_ready_sample_times_out_and_open_recloses_without_current_ack(self):
+        now=time.time();state=self.running_candidate(datetime.fromtimestamp(now-20,timezone.utc).isoformat())
+        self.write_heartbeat(now-1);self.m.update(startup_timeout=0,deploy_lock=str(self.root/'deploy.lock'))
+        file=self.root/'manifest-old-heartbeat.json';file.write_text(json.dumps(self.m))
+        def api(manifest,path,body=None):
+            if path=='/v1/readiness':return {'drained':True,'schema':9,'authority':self.m['authority_identity']}
+            return {'accepting':body['accepting']}
+        with patch.object(sys,'argv',['controller','open','--manifest',str(file),'--execute']),patch.object(r,'validate'),patch.object(r,'preserved_runtime'),patch.object(r,'baseline'),patch.object(r,'legacy_health_gate'),patch.object(r,'authority'),patch.object(r,'probes'),patch.object(r,'inspect',return_value=state),patch.object(r,'api',side_effect=api) as calls:
+            with self.assertRaisesRegex(RuntimeError,'fresh current-container'):r.main()
             admissions=[call.args[2] for call in calls.call_args_list if call.args[1]=='/v1/admission']
             self.assertEqual(admissions,[{'accepting':True},{'accepting':False}])
 

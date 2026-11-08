@@ -238,12 +238,18 @@ def cpu_release_gate(manifest):
             'cpu_limit':1, 'memory_bytes':1610612736, 'concurrency':1}
 
 
-def cpu_worker_heartbeat(manifest, allow_waiting=True):
-    raw, _ = read_control(Path(manifest['base'])/'processing/heartbeat.json')
+def cpu_worker_heartbeat(manifest, allow_waiting=True, not_before=None):
+    try:
+        raw, _ = read_control(Path(manifest['base'])/'processing/heartbeat.json')
+    except FileNotFoundError:
+        return None
     heartbeat = json.loads(raw)
-    age = time.time() - heartbeat.get('at',0)
-    if not -30 <= age < 90 or heartbeat.get('protocol') != 3:
-        fail('CPU worker heartbeat missing or stale')
+    stamp=heartbeat.get('at',0)
+    if type(stamp) not in (int,float) or heartbeat.get('protocol') != 3:
+        fail('CPU worker heartbeat has invalid timestamp or protocol')
+    age = time.time() - stamp
+    if not -30 <= age < 90 or (not_before is not None and stamp <= not_before):
+        return None
     if heartbeat.get('waiting_native_admission') is True:
         if heartbeat.get('native_ready') is not False or heartbeat.get('active') != 0:
             fail('CPU worker waiting heartbeat has inconsistent readiness')
@@ -254,7 +260,7 @@ def cpu_worker_heartbeat(manifest, allow_waiting=True):
     return heartbeat
 
 
-def wait_cpu_worker_ready(manifest):
+def wait_cpu_worker_ready(manifest, *, not_before=None, allow_waiting=False):
     deadline=time.monotonic()+max(0,min(float(manifest.get('startup_timeout',30)),120))
     while True:
         state=inspect(manifest['services']['worker']['name'])
@@ -262,8 +268,19 @@ def wait_cpu_worker_ready(manifest):
             fail('CPU worker changed during opening')
         if state.get('State',{}).get('Running') is not True: fail('CPU worker is not running after opening')
         cpu_worker_live(manifest,state,candidate=True)
-        if cpu_worker_heartbeat(manifest,allow_waiting=False) is not None: return
-        if time.monotonic()>=deadline: fail('CPU worker did not acknowledge native opening; keep claims paused')
+        from datetime import datetime
+        try:
+            value=state['State']['StartedAt']
+            parts=re.fullmatch(r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})',value)
+            if parts is None: raise ValueError('invalid start')
+            started=datetime.fromisoformat(parts[1]+parts[3].replace('Z','+00:00')).timestamp()
+            started+=int((parts[2] or '0').ljust(9,'0'))/1000000000
+            if started <= 0: raise ValueError('invalid start')
+        except (KeyError,AttributeError,TypeError,ValueError):
+            fail('CPU worker start identity is missing or invalid')
+        boundary=max(started,not_before or 0)
+        if cpu_worker_heartbeat(manifest,allow_waiting=allow_waiting,not_before=boundary) is not None: return
+        if time.monotonic()>=deadline: fail('CPU worker has no fresh current-container acknowledgement; keep claims paused')
         time.sleep(.2)
 
 
@@ -973,11 +990,7 @@ def await_available(action, seconds):
 
 def probes(manifest):
     gpu_probe(manifest)
-    if inference_backend(manifest)=='cpu':
-        worker=manifest['services']['worker']; state=inspect(worker['name'])
-        if state['Id'] != worker['expected_id'] or state['Image'] != worker['candidate_image']: fail('CPU worker probe identity changed')
-        if state.get('State',{}).get('Running') is not True: fail('CPU worker is not running')
-        cpu_worker_live(manifest,state,candidate=True); cpu_worker_heartbeat(manifest)
+    if inference_backend(manifest)=='cpu': wait_cpu_worker_ready(manifest,allow_waiting=True)
     for probe in manifest['probes']:
         if inference_backend(manifest)=='cpu' and probe['kind']=='gpu':
             fail('CPU release must remove the deferred GPU probe')
@@ -1125,9 +1138,10 @@ def main():
             state = api(manifest, '/v1/readiness')
             if not state.get('drained') or state.get('schema') != manifest['native_schema'] or state.get('authority') != {key:str(manifest['authority_identity'][key]) for key in ('dev','ino')}:
                 fail('native state not ready to open')
+            opening_started=time.time()
             opened=api(manifest, '/v1/admission', {'accepting': True})
             if inference_backend(manifest)=='cpu':
-                try: wait_cpu_worker_ready(manifest)
+                try: wait_cpu_worker_ready(manifest,not_before=opening_started)
                 except Exception:
                     api(manifest, '/v1/admission', {'accepting': False})
                     raise

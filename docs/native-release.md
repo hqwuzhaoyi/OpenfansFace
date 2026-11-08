@@ -613,9 +613,14 @@ preexisting legacy worker alone may omit those two environment keys because its
 verified retained defaults are CPU/single; an explicit GPU value still fails.
 The new candidate may never rely on missing backend settings.
 
-Before opening, require a running candidate with a fresh protocol-3 heartbeat;
+Before opening, require a running candidate with a fresh protocol-3 heartbeat
+newer than that exact container's Docker `State.StartedAt`; predecessor samples
+are ignored while waiting boundedly for the current worker. Docker nanosecond-format
+timestamps are parsed explicitly for this comparison;
 a waiting-native heartbeat with zero active work is allowed while native is
-closed. After opening, the controller waits boundedly for `native_ready=true`
+closed. Immediately before the admission-open POST, capture a new wall-clock boundary.
+After opening, the controller waits boundedly for a heartbeat newer than both
+that boundary and the inspected container start, with `native_ready=true`
 and `inference.backend=cpu, fallback=false`. A waiting heartbeat is not post-open
 semantic readiness. Failure re-closes native admission and leaves claims paused;
 it does not toggle to GPU or relax another gate. The central owner resumes claims
