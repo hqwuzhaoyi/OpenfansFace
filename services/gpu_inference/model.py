@@ -23,20 +23,22 @@ class ResourcePolicy:
     min_free_mib: int = 600
     max_utilization_pct: int = 25
 
-    def sample(self):
+    def sample(self, timeout=3):
         try:
             output = subprocess.run(
                 ['nvidia-smi', '--query-gpu=memory.used,memory.free,utilization.gpu',
                  '--format=csv,noheader,nounits', '--id=0'],
-                capture_output=True, text=True, timeout=3, check=True).stdout.strip()
+                capture_output=True, text=True, timeout=min(3, max(.001, timeout)), check=True).stdout.strip()
             used, free, utilization = (int(x.strip()) for x in output.split(','))
             if min(used, free, utilization) < 0 or utilization > 100:
                 raise ValueError('invalid counters')
             return {'available': True, 'memory_used_mib': used, 'memory_free_mib': free,
                     'utilization_pct': utilization,
-                    'busy': free < self.min_free_mib or utilization > self.max_utilization_pct}
+                    'busy': free < self.min_free_mib or utilization > self.max_utilization_pct,
+                    'reason': 'memory_low' if free < self.min_free_mib else
+                              'utilization_high' if utilization > self.max_utilization_pct else None}
         except (OSError, ValueError, subprocess.SubprocessError):
-            return {'available': False, 'busy': True}
+            return {'available': False, 'busy': True, 'reason': 'telemetry_unavailable'}
 
 
 class Detector:

@@ -24,14 +24,54 @@ MAX_DIMENSION = MAX_HEIGHT
 MAX_PIXELS = MAX_WIDTH * MAX_HEIGHT
 MAX_FACES = 256
 MAX_DEADLINE_MS = 120_000
+# Fixed release policy. Changing these values requires a new manifest and evidence.
+RESOURCE_WAIT_SECONDS = 20
+RESOURCE_POLL_SECONDS = 1
+RESOURCE_REARMS = 2
+CLIENT_MAX_SENDS = 8
+CLIENT_BACKOFF_SECONDS = .5
+CLIENT_BACKOFF_CAP_SECONDS = 4
+CLIENT_JITTER_MIN = .8
+CLIENT_JITTER_MAX = 1.2
+CLIENT_RETRY_AFTER_CAP_SECONDS = 10
+
+
+def retry_policy():
+    return {'version': 1, 'resource_wait_seconds': RESOURCE_WAIT_SECONDS,
+            'resource_poll_seconds': RESOURCE_POLL_SECONDS, 'resource_rearms': RESOURCE_REARMS,
+            'client_max_sends': CLIENT_MAX_SENDS, 'client_backoff_seconds': CLIENT_BACKOFF_SECONDS,
+            'client_backoff_cap_seconds': CLIENT_BACKOFF_CAP_SECONDS,
+            'client_jitter_min': CLIENT_JITTER_MIN, 'client_jitter_max': CLIENT_JITTER_MAX,
+            'client_retry_after_cap_seconds': CLIENT_RETRY_AFTER_CAP_SECONDS}
+
+
+class Clock:
+    """Production time; injectable in tests without shortening release policy."""
+    def monotonic(self):
+        return time.monotonic()
+
+    def now_ms(self):
+        return now_ms()
+
+    def wait(self, event, seconds):
+        return event.wait(seconds)
+
+    def resource_wait(self, event, seconds):
+        return self.wait(event, seconds)
+
+    def sleep(self, seconds):
+        time.sleep(seconds)
+
+
 TOKEN_RE = re.compile(r'[A-Za-z0-9_.:-]{1,128}\Z')
 HASH_RE = re.compile(r'[a-f0-9]{64}\Z')
 
 
 class ProtocolError(ValueError):
-    def __init__(self, code: str, status: int = 400, retryable: bool = False):
+    def __init__(self, code: str, status: int = 400, retryable: bool = False, *, retry_after: float | None = None):
         super().__init__(code)
         self.code, self.status, self.retryable = code, status, retryable
+        self.retry_after = retry_after
 
 
 def now_ms() -> int:

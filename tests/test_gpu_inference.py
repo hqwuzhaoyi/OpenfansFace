@@ -2,6 +2,9 @@
 import copy
 import hashlib
 import http.client
+import email.message
+import io
+import urllib.error
 import pathlib
 import socket
 import struct
@@ -21,7 +24,7 @@ from services.gpu_inference.broker import Broker
 from services.gpu_inference.client import Client
 from services.gpu_inference.protocol import (
     Binding, Fingerprint, MAX_BODY_BYTES, ProtocolError, Request, Result, canonical,
-    decode_json, now_ms,
+    decode_json, now_ms, Clock, RESOURCE_WAIT_SECONDS, RESOURCE_REARMS, CLIENT_MAX_SENDS,
 )
 from services.gpu_inference.server import Server
 
@@ -46,8 +49,31 @@ def request(**changes):
 
 class Resources:
     busy = False
-    def sample(self):
+    def sample(self, timeout=3):
         return {'available': True, 'busy': self.busy, 'memory_free_mib': 800}
+
+
+class VirtualClock(Clock):
+    """Advance real production durations without sleeping or changing policy."""
+    def __init__(self):
+        self.elapsed = 0
+        self.epoch = now_ms()
+        self.sleeps = []
+        self.on_wait = None
+    def monotonic(self):
+        return self.elapsed
+    def now_ms(self):
+        return self.epoch + round(self.elapsed * 1000)
+    def resource_wait(self, event, seconds):
+        if event.is_set():
+            return True
+        if self.on_wait:
+            self.on_wait()
+        self.elapsed += seconds
+        return event.is_set()
+    def sleep(self, seconds):
+        self.sleeps.append(seconds)
+        self.elapsed += seconds
 
 
 class FakeDetector:
@@ -168,11 +194,158 @@ class BrokerTests(unittest.TestCase):
     def test_resource_and_model_readiness_are_distinct(self):
         self.resources.busy = True
         health = self.broker.health()
-        self.assertTrue(health['model_ready']); self.assertTrue(health['busy']); self.assertFalse(health['accepting'])
-        with self.assertRaisesRegex(ProtocolError, 'resource_busy'): self.broker.submit(request())
+        self.assertTrue(health['model_ready']); self.assertTrue(health['busy']); self.assertTrue(health['accepting'])
+        self.assertFalse(health['resource_ready'])
+        job = self.broker.submit(request())
+        self.assertFalse(job.done.is_set())
         self.resources.busy = False
         with self.assertRaisesRegex(ProtocolError, 'model_version_mismatch'):
             self.broker.submit(request(model_sha256='b'*64))
+
+    def test_resource_refusal_rearms_only_never_executed_matching_intent(self):
+        clock = VirtualClock()
+        self.broker.close()
+        self.broker = Broker(self.model, self.resources, clock=clock)
+        self.resources.busy = True
+        req = request(deadline_ms=clock.epoch+120_000)
+        req = replace(req, binding=replace(req.binding, lease_expires_at_ms=clock.epoch+120_000))
+        first = self.broker.submit(req)
+        self.assertTrue(first.done.wait(1))
+        self.assertEqual(clock.elapsed, RESOURCE_WAIT_SECONDS)
+        self.assertEqual(first.error.code, 'resource_busy')
+        self.assertFalse(first.execution_started)
+        with self.assertRaisesRegex(ProtocolError, 'idempotency_conflict'):
+            self.broker.submit(replace(req, frame_index=1))
+        self.resources.busy = False
+        second = self.broker.submit(req)
+        self.assertIsNot(second, first)
+        self.assertTrue(second.done.wait(1))
+        value = self.broker.wait(second)
+        self.assertEqual(value['timing']['queue_ms'], RESOURCE_WAIT_SECONDS * 1000)
+        self.assertIs(self.broker.submit(req), second)
+        self.assertEqual(self.model.calls, 1)
+
+    def test_resource_rearms_are_bounded_and_drain_blocks_rearm(self):
+        clock = VirtualClock()
+        self.broker.close()
+        self.broker = Broker(self.model, self.resources, clock=clock)
+        self.resources.busy = True
+        req = request(deadline_ms=clock.epoch+120_000)
+        req = replace(req, binding=replace(req.binding, lease_expires_at_ms=clock.epoch+120_000))
+        for rearm in range(RESOURCE_REARMS + 1):
+            job = self.broker.submit(req)
+            self.assertTrue(job.done.wait(1))
+            self.assertEqual(job.rearms, rearm)
+        self.assertEqual(clock.elapsed, RESOURCE_WAIT_SECONDS * (RESOURCE_REARMS + 1))
+        self.assertEqual(job.error.code, 'resource_wait_exhausted')
+        self.assertFalse(job.error.retryable)
+        self.assertIs(self.broker.submit(req), job)
+        self.assertEqual(self.model.calls, 0)
+        other = replace(req, request_id=str(uuid.uuid4()))
+        job = self.broker.submit(other)
+        self.assertTrue(job.done.wait(1))
+        self.broker.begin_drain()
+        with self.assertRaisesRegex(ProtocolError, 'service_draining'):
+            self.broker.submit(other)
+
+    def test_waiting_cancel_close_and_fifo_do_not_start_model(self):
+        self.resources.busy = True
+        req = request()
+        first = self.broker.submit(req)
+        second_req = request()
+        second = self.broker.submit(second_req)
+        with self.assertRaisesRegex(ProtocolError, 'queue_full'):
+            self.broker.submit(request())
+        with self.assertRaisesRegex(ProtocolError, 'request_in_progress'):
+            self.broker.submit(req)
+        self.broker.cancel(req.request_id, req.binding.attempt_id)
+        self.assertTrue(first.done.wait(1))
+        self.broker.close()
+        self.assertTrue(second.done.is_set())
+        self.assertEqual(self.model.calls, 0)
+        self.assertEqual(self.broker.inflight, 0)
+        with self.assertRaisesRegex(ProtocolError, 'cancelled'):
+            self.broker.wait(self.broker.submit(req))
+
+    def test_busy_queued_fifo_and_truthful_health(self):
+        self.resources.busy = True
+        seen = []
+        def infer(req):
+            seen.append(req.request_id)
+            return []
+        self.model.infer = infer
+        first_req, second_req = request(), request()
+        first = self.broker.submit(first_req)
+        second = self.broker.submit(second_req)
+        until = time.monotonic()+1
+        while not self.broker.resource_waiting and time.monotonic() < until:
+            time.sleep(.005)
+        health = self.broker.health()
+        self.assertEqual((health['running'], health['queued'], health['resource_waiting']), (0, 2, 1))
+        self.assertEqual(health['waiting_reason'], 'resource_busy')
+        self.resources.busy = False
+        self.broker.wait(first); self.broker.wait(second)
+        self.assertEqual(seen, [first_req.request_id, second_req.request_id])
+        self.assertEqual(self.broker.health()['resource_waiting'], 0)
+
+    def test_unknown_telemetry_never_executes_and_respects_lease(self):
+        clock = VirtualClock()
+        self.broker.close()
+        self.resources.sample = lambda **kwargs: {'available': False, 'busy': False}
+        self.broker = Broker(self.model, self.resources, clock=clock)
+        req = request(deadline_ms=clock.epoch+60_000)
+        req = replace(req, binding=replace(req.binding, lease_expires_at_ms=clock.epoch+5_000))
+        job = self.broker.submit(req)
+        self.assertTrue(job.done.wait(1))
+        self.assertEqual(clock.elapsed, 5)
+        self.assertEqual(job.error.code, 'deadline_exceeded')
+        self.assertEqual(self.model.calls, 0)
+        self.assertEqual(job.waiting_reason, 'telemetry_unavailable')
+
+    def test_terminal_identity_pinned_under_cache_pressure_and_ttl(self):
+        clock = VirtualClock()
+        self.broker.close()
+        self.broker = Broker(self.model, self.resources, cache_entries=1, cache_ttl=1, clock=clock)
+        req = request()
+        job = self.broker.submit(req)
+        self.assertTrue(job.done.wait(1))
+        clock.elapsed += 2
+        with self.assertRaisesRegex(ProtocolError, 'queue_full'):
+            self.broker.submit(request())
+        self.assertIs(self.broker.submit(req), job)
+        self.assertEqual(self.model.calls, 1)
+
+    def test_clock_rollback_does_not_evict_still_wire_valid_identity(self):
+        clock = VirtualClock()
+        self.broker.close()
+        self.broker = Broker(self.model, self.resources, cache_entries=1, cache_ttl=1, clock=clock)
+        req = request()
+        job = self.broker.submit(req)
+        self.assertTrue(job.done.wait(1))
+        clock.elapsed = 40
+        clock.now_ms = lambda: clock.epoch
+        with self.assertRaisesRegex(ProtocolError, 'queue_full'):
+            self.broker.submit(request())
+        self.assertIs(self.broker.submit(req), job)
+        with self.assertRaisesRegex(ProtocolError, 'deadline_exceeded'):
+            self.broker.wait(job)
+        self.assertEqual(self.model.calls, 1)
+
+    def test_slow_telemetry_cannot_start_model_after_resource_budget(self):
+        clock = VirtualClock()
+        self.broker.close()
+        self.broker = Broker(self.model, self.resources, clock=clock)
+        limits = []
+        def slow_sample(timeout=3):
+            limits.append(timeout)
+            clock.elapsed += 21
+            return {'available': True, 'busy': False}
+        self.resources.sample = slow_sample
+        job = self.broker.submit(request())
+        self.assertTrue(job.done.wait(1))
+        self.assertEqual(limits, [3])
+        self.assertEqual(job.error.code, 'resource_busy')
+        self.assertEqual(self.model.calls, 0)
 
     def test_model_error_disables_session_and_drops_queued_work(self):
         self.model.release.clear(); self.model.error = RuntimeError('private CUDA details')
@@ -239,6 +412,50 @@ class HTTPTests(unittest.TestCase):
             response=con.getresponse(); return response.status,response.read()
         finally: con.close()
 
+    def test_busy_then_available_waits_in_admitted_queue(self):
+        self.resources.busy = True
+        timer = threading.Timer(.15, lambda: setattr(self.resources, 'busy', False))
+        timer.start()
+        try:
+            result = self.client.detect(request())
+            self.assertEqual(self.model.calls, 1)
+            self.assertGreaterEqual(result.timing['queue_ms'], 100)
+            self.assertLess(result.timing['inference_ms'], result.timing['queue_ms'])
+        finally:
+            timer.join()
+
+    def test_queue_full_retries_same_request_after_capacity_returns(self):
+        self.model.release.clear()
+        first = self.broker.submit(request())
+        self.assertTrue(self.model.entered.wait(1))
+        second = self.broker.submit(request())
+        timer = threading.Timer(.15, self.model.release.set)
+        timer.start()
+        try:
+            req = request()
+            result = self.client.detect(req)
+            self.assertEqual(result.request_hash, req.request_hash)
+            self.assertEqual(self.model.calls, 3)
+            self.broker.wait(first); self.broker.wait(second)
+        finally:
+            timer.join()
+
+    def test_lost_response_replays_identical_request_exactly_one_compute(self):
+        original = self.client._call
+        bodies = []
+        def lose_first(path, body=None, timeout=None):
+            bodies.append(copy.deepcopy(body))
+            value = original(path, body, timeout)
+            if len(bodies) == 1:
+                raise ProtocolError('transport_unavailable', 503, True)
+            return value
+        with patch.object(self.client, '_call', side_effect=lose_first):
+            req = request()
+            self.assertEqual(self.client.detect(req).request_hash, req.request_hash)
+        self.assertEqual(len(bodies), 2)
+        self.assertEqual(bodies[0], bodies[1])
+        self.assertEqual(self.model.calls, 1)
+
     def test_authenticated_roundtrip_and_replay(self):
         req=request(); result=self.client.detect(req)
         self.assertEqual(result.context,req.context())
@@ -274,11 +491,186 @@ class HTTPTests(unittest.TestCase):
         status,_=self.raw('GET','/file?path=/media',headers={'Authorization':'Bearer '+TOKEN})
         self.assertEqual(status,404)
 
-    def test_network_failure_is_explicit_and_no_retry(self):
-        self.client.timeout=.05; self.model.release.clear()
-        with self.assertRaisesRegex(ProtocolError,'transport_unavailable'): self.client.detect(request())
-        self.assertEqual(self.model.calls,1)
-        self.model.release.set()
+    def test_transport_timeout_keeps_slot_and_same_id_replays(self):
+        self.client.timeout = .05
+        self.model.release.clear()
+        timer = threading.Timer(.2, self.model.release.set)
+        timer.start()
+        try:
+            req = request()
+            self.assertEqual(self.client.detect(req).request_hash, req.request_hash)
+            self.assertEqual(self.model.calls, 1)
+        finally:
+            timer.join()
+
+    def test_client_retries_only_safe_codes_and_keeps_frozen_body(self):
+        for code in ('unauthorized', 'model_version_mismatch', 'expired_or_invalid_deadline',
+                     'attempt_mismatch', 'superseded_result', 'service_draining',
+                     'inference_failed', 'model_not_ready', 'remote_unavailable',
+                     'resource_wait_exhausted'):
+            with self.subTest(code=code), patch.object(self.client, '_call', side_effect=ProtocolError(code, 503, True)) as call:
+                with self.assertRaisesRegex(ProtocolError, code):
+                    self.client.detect(request())
+                self.assertEqual(call.call_count, 1)
+        clock = VirtualClock()
+        self.client.clock = clock
+        self.client.jitter = lambda low, high: high
+        with patch.object(self.client, '_call', side_effect=ProtocolError('queue_full', 429, True)) as call:
+            req = request()
+            with self.assertRaisesRegex(ProtocolError, 'queue_full'):
+                self.client.detect(req)
+            self.assertEqual(call.call_count, CLIENT_MAX_SENDS)
+            self.assertEqual(len(clock.sleeps), CLIENT_MAX_SENDS-1)
+            self.assertLess(clock.elapsed, 30)
+            self.assertTrue(all(args.args[1] == req.wire() for args in call.call_args_list))
+
+    def test_late_transport_result_rejected_even_if_wall_clock_rolls_back(self):
+        clock = VirtualClock()
+        self.client.clock = clock
+        req = request(deadline_ms=clock.epoch+30_000)
+        original = self.client._call
+        def late(path, body=None, timeout=None):
+            value = original(path, body, timeout)
+            clock.elapsed = 31
+            clock.now_ms = lambda: clock.epoch
+            return value
+        with patch.object(self.client, '_call', side_effect=late):
+            with self.assertRaisesRegex(ProtocolError, 'expired_or_invalid_deadline'):
+                self.client.detect(req)
+        self.assertEqual(self.model.calls, 1)
+
+    def test_retry_after_is_honored_and_cancel_interrupts_backoff(self):
+        clock = VirtualClock()
+        self.client.clock = clock
+        self.client.jitter = lambda low, high: low
+        with patch.object(self.client, '_call', side_effect=ProtocolError('queue_full', 429, True, retry_after=2)) as call:
+            with self.assertRaisesRegex(ProtocolError, 'queue_full'):
+                self.client.detect(request(deadline_ms=clock.epoch+3000))
+            self.assertEqual(call.call_count, 2)
+            self.assertEqual(clock.sleeps, [2])
+        cancelled = threading.Event()
+        self.client.on_wait = lambda *args: cancelled.set()
+        with patch.object(self.client, '_call', side_effect=ProtocolError('queue_full', 429, True)) as call:
+            with self.assertRaisesRegex(ProtocolError, 'cancelled'):
+                self.client.detect(request(), cancelled=cancelled)
+            self.assertEqual(call.call_count, 1)
+
+    def test_oversized_retry_after_stops_without_retrying_early(self):
+        headers = email.message.Message()
+        headers['Retry-After'] = '11'
+        response = urllib.error.HTTPError(self.client.base_url, 429, 'busy', headers,
+            io.BytesIO(canonical({'error': {'code': 'queue_full', 'retryable': True}})))
+        with patch.object(self.client.opener, 'open', side_effect=response) as call:
+            with self.assertRaises(ProtocolError) as failure:
+                self.client.detect(request())
+            self.assertEqual(failure.exception.code, 'queue_full')
+            self.assertFalse(failure.exception.retryable)
+            self.assertEqual(call.call_count, 1)
+
+    def test_http_retry_after_header_is_preserved_without_unbounded_delay(self):
+        self.model.release.clear()
+        self.broker.submit(request())
+        self.assertTrue(self.model.entered.wait(1))
+        self.broker.submit(request())
+        with self.assertRaises(ProtocolError) as error:
+            self.client._call('/v1/detect', request().wire())
+        self.assertEqual(error.exception.retry_after, 2)
+        self.assertTrue(error.exception.retryable)
+
+    def test_client_deadline_bounds_retries_without_renewing_lease(self):
+        clock = VirtualClock()
+        self.client.clock = clock
+        self.client.jitter = lambda low, high: high
+        with patch.object(self.client, '_call', side_effect=ProtocolError('transport_unavailable', 503, True)) as call:
+            req = request(deadline_ms=clock.epoch+1000)
+            with self.assertRaisesRegex(ProtocolError, 'transport_unavailable'):
+                self.client.detect(req)
+            self.assertEqual(call.call_count, 2)
+            self.assertEqual(clock.sleeps, [.6])
+            self.assertTrue(all(args.args[1] == req.wire() for args in call.call_args_list))
+
+    def test_http_persistent_busy_uses_full_release_budgets_then_stops(self):
+        clock = VirtualClock()
+        self.broker.close()
+        self.broker = Broker(self.model, self.resources, clock=clock)
+        self.server.broker = self.broker
+        self.resources.busy = True
+        req = request(deadline_ms=clock.epoch+120_000)
+        req = replace(req, binding=replace(req.binding, lease_expires_at_ms=clock.epoch+120_000))
+        with self.assertLogs('services.gpu_inference.broker', level='INFO') as logs:
+            with self.assertRaisesRegex(ProtocolError, 'resource_wait_exhausted'):
+                self.client.detect(req)
+        self.assertEqual(clock.elapsed, 60)
+        self.assertEqual(self.model.calls, 0)
+        self.assertEqual(len([line for line in logs.output if 'gpu_wait_start' in line]), 3)
+        self.assertNotIn(TOKEN, '\n'.join(logs.output))
+        self.assertNotIn('data_base64', '\n'.join(logs.output))
+
+    def test_http_never_executed_cached_refusal_rearms_after_recovery(self):
+        clock = VirtualClock()
+        self.broker.close()
+        self.broker = Broker(self.model, self.resources, clock=clock)
+        self.server.broker = self.broker
+        self.resources.busy = True
+        clock.on_wait = lambda: setattr(self.resources, 'busy', clock.elapsed < 19)
+        req = request(deadline_ms=clock.epoch+60_000)
+        result = self.client.detect(req)
+        self.assertEqual(result.request_hash, req.request_hash)
+        self.assertEqual(self.broker.jobs[req.request_id].rearms, 1)
+        self.assertEqual(result.timing['queue_ms'], 20_000)
+        self.assertEqual(self.model.calls, 1)
+        self.assertEqual(self.client.detect(req).request_hash, result.request_hash)
+        self.assertEqual(self.model.calls, 1)
+
+    def test_http_cancel_interrupts_resource_wait_and_seals_request(self):
+        self.resources.busy = True
+        req = request()
+        errors = []
+        def send():
+            try:
+                self.client.detect(req)
+            except ProtocolError as exc:
+                errors.append(exc.code)
+        worker = threading.Thread(target=send)
+        worker.start()
+        until = time.monotonic()+1
+        while self.broker.inflight == 0 and time.monotonic() < until:
+            time.sleep(.005)
+        self.assertFalse(self.client.cancel(req.request_id, req.binding.attempt_id)['execution_finished'])
+        worker.join(1)
+        self.assertEqual(errors, ['cancelled'])
+        self.assertFalse(worker.is_alive())
+        with self.assertRaisesRegex(ProtocolError, 'cancelled'):
+            self.client.detect(req)
+        self.assertEqual(self.model.calls, 0)
+        self.assertEqual(self.broker.inflight, 0)
+
+    def test_http_drain_retains_wait_budget_and_never_executes_busy_model(self):
+        self.resources.busy = True
+        req = request(deadline_ms=now_ms()+200)
+        errors = []
+        def send():
+            try:
+                self.client.detect(req)
+            except ProtocolError as exc:
+                errors.append(exc.code)
+        worker = threading.Thread(target=send)
+        worker.start()
+        until = time.monotonic()+1
+        while self.broker.inflight == 0 and time.monotonic() < until:
+            time.sleep(.005)
+        state = self.client.drain()
+        self.assertFalse(state['drained'])
+        with self.assertRaisesRegex(ProtocolError, 'service_draining'):
+            self.client.detect(request())
+        worker.join(2)
+        self.assertFalse(worker.is_alive())
+        until = time.monotonic()+1
+        while self.broker.inflight and time.monotonic() < until:
+            time.sleep(.005)
+        self.assertTrue(self.client.ready()['drained'])
+        self.assertEqual(self.model.calls, 0)
+        self.assertTrue(errors)
 
     def test_cancel_does_not_publish_and_returns_execution_state(self):
         req=request(); self.client.detect(req)
@@ -299,9 +691,10 @@ class HTTPTests(unittest.TestCase):
         health=self.client.ready()
         self.assertTrue(health['model_ready'])
         self.assertTrue(health['busy'])
-        self.assertFalse(health['accepting'])
-        with self.assertRaises(ProtocolError) as failure:self.client.detect(request())
-        self.assertEqual((failure.exception.code,failure.exception.status),('resource_busy',503))
+        self.assertTrue(health['accepting'])
+        with self.assertRaises(ProtocolError) as failure:self.client.detect(request(deadline_ms=now_ms()+100))
+        self.assertIn(failure.exception.code, ('deadline_exceeded', 'cancelled', 'transport_unavailable'))
+        self.assertEqual(self.model.calls, 0)
 
 
 class ReleaseTests(unittest.TestCase):

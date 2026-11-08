@@ -76,10 +76,48 @@ new candidate/reference consistency measurements are required before rollout.
 The GPU receives bounded JPEG samples, hashes and opaque IDs, never raw video
 paths, reference identities, business databases or archive credentials. Responses
 must echo the attempt/source/model/preprocess context and contain actual CUDA
-provider proof. Network errors, OOM, refusal and backpressure are failures, never
-converted to an empty/no-face result. At most three attempts with bounded backoff
-are retained; explicit errors remain visible in the dashboard. Cancellation does
+provider proof. Network errors, OOM, refusal and backpressure are never converted to an empty/no-face result.
+Transient queue/resource/transport errors first use the fixed bounded frame retry policy below.
+At most three business-stage attempts with bounded backoff are retained; explicit errors remain visible in the dashboard. Cancellation does
 not assert that remote kernels stopped.
+
+## Bounded GPU queue wait/retry
+
+GPU manifest schema 2 pins retry policy v1. Busy resources can reserve one of the
+existing two accepted slots, with a single FIFO execution lane. Each admission
+waits at most 20 seconds including queue time; counters are checked at one-second
+intervals, with bounded telemetry calls. The 600 MiB free, 25% utilization and
+128 MiB arena values are unchanged. Unknown telemetry never permits inference.
+
+Only a proven never-executed `resource_busy` response can rearm the same request,
+at most twice. The client sends at most eight times with 0.5→4-second exponential
+backoff and 0.8–1.2 jitter; 429/503 Retry-After values up to 10 seconds are honored
+as a minimum, and a larger hint ends local retry. `queue_full`, `resource_busy`,
+`request_in_progress` and uncertain transport are the only retry reasons. Every
+send freezes the same body, ID/hash, frame, attempt, generation, deadline and lease.
+Auth/model/source/material/lease/cancel/fault/drain errors stay explicit.
+
+The frame's total deadline remains 60 seconds, clipped to the 600-second stage
+budget and claim lease minus its final 60-second publication reserve. Resource
+windows and transport retries consume this same budget. They do not increment or
+refund stage attempts; the existing maximum of three attempts is unchanged.
+The native receipt remains the sole completion authority. A lost GPU response
+replays the same request; a lost native response replays its exact journal body.
+
+Health distinguishes queue acceptance from resource readiness: `queued` includes
+the resource-waiting head, `resource_waiting`/`waiting_reason` explain that wait,
+and `running` counts only actual inference. Queue time includes waiting; model time
+does not. Existing stage progress shows the GPU wait and retry reason. Terminal
+request IDs remain cached through their original deadlines; cache capacity can
+therefore also produce `queue_full`, rather than evicting a live idempotency key.
+This cache is volatile; a new service instance can recompute but cannot bypass
+native completion fencing. Drain allows already owned bounded work to finish,
+refuses new/rearmed work, and never claims to stop a running kernel.
+
+See [GPU policy and observability](../services/gpu_inference/README.md#fixed-queueretry-policy-v1).
+The new `tests/http-processing-gpu-queue.py` uses synthetic model/recognition fixtures
+with actual HTTP, VM claims and native publication; it is not hardware acceptance.
+No multi-device routing, production deployment or TTS restoration is included.
 
 ## Dashboard
 

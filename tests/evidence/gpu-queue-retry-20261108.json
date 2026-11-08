@@ -1,0 +1,69 @@
+{
+  "date": "2026-11-08",
+  "scope": "isolated CPU/synthetic transport and real native publication; no GPU or production acceptance",
+  "base_revision": "74c559b6401b26fee38bc5eaa1faf1d480c8fd6d",
+  "release_manifest_schema": 2,
+  "retry_policy": {
+    "version": 1,
+    "resource_wait_seconds": 20,
+    "resource_poll_seconds": 1,
+    "resource_rearms": 2,
+    "client_max_sends": 8,
+    "client_backoff_seconds": 0.5,
+    "client_backoff_cap_seconds": 4,
+    "client_jitter_min": 0.8,
+    "client_jitter_max": 1.2,
+    "client_retry_after_cap_seconds": 10
+  },
+  "unchanged": {
+    "min_free_mib": 600,
+    "max_utilization_pct": 25,
+    "arena_mib": 128,
+    "concurrency": 1,
+    "waiting": 1,
+    "vm_capacity_default": 1,
+    "frame_seconds": 60,
+    "stage_seconds": 600,
+    "lease_seconds": 660,
+    "business_max_attempts": 3
+  },
+  "checks": {
+    "gpu_contract_http_tests": 46,
+    "processing_unit_tests": 37,
+    "new_gpu_worker_native_joint": "pass",
+    "existing_worker_native_review_joint": "pass",
+    "compileall": "pass",
+    "diff_check": "pass"
+  },
+  "regression_first": {
+    "test": "HTTPTests.test_busy_then_available_waits_in_admitted_queue",
+    "old_result": "resource_busy before resource recovery",
+    "fixed_result": "one computation; resource wait recorded in queue_ms"
+  },
+  "joint": {
+    "frames": 8,
+    "http_sends": 9,
+    "model_calls": 8,
+    "face_stage_attempts": 1,
+    "native_completion_count": 1,
+    "lost_gpu_response_replayed": true,
+    "lost_native_response_replayed": true,
+    "synthetic_model_and_recognition": true
+  },
+  "native_binary_sha256": "09aa65981a889f077978fcbffd722f2fe2266a2e760e96da76ffe92c58dc983d",
+  "log_sha256": {
+    "gpu-queue-retry-contract.log": "97e5ec1637a6079800736bed4d614adb14d15de9373986ed8cffbfb5f210d989",
+    "gpu-queue-retry-worker.log": "0fabb7b182d7b5b9502062ff8371b9982e10383d9c1705c0ec63cc40b22cac79",
+    "gpu-queue-retry-native.log": "511e23933aac9780746da79dc2fd55d6a29cfc2ab430cb02c077ff867e295ac5",
+    "gpu-queue-retry-native-review.log": "98c711409d259cd73d7f70fd7f63fc206b0ff98fe7ebec06d6c5f054098d7f56"
+  },
+  "guardrails": {
+    "hardware_inference_run": false,
+    "production_deployed": false,
+    "production_services_changed": false,
+    "tts_changed": false,
+    "nas_written": false,
+    "legacy_cache_adopted": false
+  },
+  "remaining": "Merge source, then use the unchanged v1 policy for separately authorized retained-runtime eight-frame GPU/VM validation. TTS remains OFF."
+}

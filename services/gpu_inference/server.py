@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import hmac
+import logging
 import pathlib
 import signal
 import socket
@@ -194,6 +195,7 @@ def main():
     parser.add_argument('--min-free-mib', type=int, default=600)
     parser.add_argument('--waiting', type=int, choices=(0, 1), default=1)
     args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
     if args.min_free_mib < 600:
         parser.error('resource floor below discovery limit is not validated')
     token_path = pathlib.Path(args.token_file)
