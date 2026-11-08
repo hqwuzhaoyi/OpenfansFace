@@ -185,16 +185,16 @@ def cache_integrity_and_schema():
         x.stop();state=x.base/'file-operations-rust/operations.sqlite3'
         with sqlite3.connect(state) as db:db.execute('PRAGMA user_version=4')
         x.start()
-        with sqlite3.connect(state) as db:assert db.execute('PRAGMA user_version').fetchone()==(8,)
+        with sqlite3.connect(state) as db:assert db.execute('PRAGMA user_version').fetchone()==(9,)
         x.stop()
         old=os.environ.get('OLD_FILE_OPERATIONS_BINARY')
         if old:
             result=subprocess.run([old],env=x.env,capture_output=True,text=True,timeout=10);assert result.returncode!=0 and 'schema_version' in result.stderr,result.stderr
-            with sqlite3.connect(state) as db:assert db.execute('PRAGMA user_version').fetchone()==(8,)
-        with sqlite3.connect(state) as db:db.execute('PRAGMA user_version=9')
+            with sqlite3.connect(state) as db:assert db.execute('PRAGMA user_version').fetchone()==(9,)
+        with sqlite3.connect(state) as db:db.execute('PRAGMA user_version=10')
         result=subprocess.run([str(f.BINARY)],env=x.env,capture_output=True,text=True,timeout=10);assert result.returncode!=0 and 'schema_version' in result.stderr,result.stderr
-        with sqlite3.connect(state) as db:assert db.execute('PRAGMA user_version').fetchone()==(9,);db.execute('PRAGMA user_version=8')
-        x.start();print('PASS schema4 to8 upgrade, future refusal without downgrade'+(' and actual older binary refusal' if old else ''))
+        with sqlite3.connect(state) as db:assert db.execute('PRAGMA user_version').fetchone()==(10,);db.execute('PRAGMA user_version=9')
+        x.start();print('PASS schema4 to9 upgrade, future refusal without downgrade'+(' and actual older binary refusal' if old else ''))
     finally:x.stop()
 
 
