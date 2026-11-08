@@ -249,5 +249,6 @@
   "legacy_reference_inventory_limits": {
     "cache_files": 5000,
     "directory_entries": 10000
-  }
+  },
+  "inference_backend": "gpu-detection"
 }

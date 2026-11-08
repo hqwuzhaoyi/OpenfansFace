@@ -1,6 +1,9 @@
 # Native release and compatible rollback
 
-This is release preparation for #14, not a deployment receipt. Production cutover
+This is release preparation for #14, not a deployment receipt. The current
+explicit retained-CPU decision is handled by the CPU mode below; external GPU
+requirements in this document apply to GPU mode. The CPU exception changes only
+the inference backend/resource gates, not data/recovery or final acceptance. Production cutover
 is still blocked on full 640 GPU coexistence/resource measurement, a prepared
 WSL peer, sandbox enforcement, real-data parity and the final joint/runtime
 checks. A synthetic CUDA probe or successful package build does not clear these
@@ -191,7 +194,7 @@ are for the central release owner after the missing gates are satisfied.
    Range URLs, legacy and native receipts, worker/calibrator/GPU health. The
    controller requires positive evidence files for every gate before fencing or
    replacing services.
-2. Prepare the external GPU separately using the frozen
+2. For GPU mode, prepare the external GPU separately using the frozen
    `services/gpu_inference/deploy/build.py`, reviewed `face-gpu.service`, secret,
    model and immutable bundle. Installation/start/symlink changes on the WSL
    host require the separately authorized central stage. Record the prepared
@@ -550,3 +553,78 @@ never overwrite old evidence, rewrite the decision, rerun replacement merely to
 refresh evidence, restore old references over the new result, or copy the new
 reference artifact into the original backup. If any reviewed case differs, stop
 for a new disposition; a generic evidence refresh cannot extend authorization.
+
+
+### Current-release retained CPU mode
+
+The user explicitly requested keeping the resources used before cutover and
+verifying them. This release may therefore select `inference_backend: "cpu"`
+with the existing VM budget: **1 CPU, 1536 MiB, concurrency 1, OCR on CPU and
+InsightFace detection/recognition on CPUExecutionProvider**. This is a selected
+backend, never automatic GPU fallback. Missing `inference_backend` retains the
+old strict `gpu-detection` contract; unknown values fail. The GPU examples now
+state that mode explicitly. Future releases must make their own reviewed choice.
+
+CPU mode requires a SHA-bound review using
+`deployment/retained-cpu.review.example.json`. It binds the same release ID,
+actual user-decision JSON, actual isolated CPU verification JSON, its source
+manifest, reviewed candidate worker source hashes and frozen worker configuration.
+Use `cpu_worker_configuration(manifest)` from the controller to capture the latter
+without creating containers. It hashes image Config, exact create arguments,
+env-file bytes and effective environment. Review the candidate source files
+against the CPU verification source manifest before filling the five source
+hashes; this is an explicit operator source review bound to the immutable image,
+not a claim that image inspection automatically reads/verifies executable files.
+
+The actual CPU evidence requires separate successful 8-frame OCR and 8-frame face
+extraction with the frozen detector/recognizer model hashes, CPU providers and
+512-dimensional normalized features, plus 40 processing and 5 dashboard tests.
+The native/worker/review joint receipt truthfully labels its model stages mocked
+while its HTTP/SQLite work is real. Actual model extraction was verified separately
+on the VM. One synthetic clip is not a production throughput/coexistence benchmark
+or final runtime acceptance; generic `passed:true`, GPU-provider or wrong-budget
+reports cannot substitute for this evidence.
+
+Prepare a private manifest from the normal release template:
+
+```json
+"inference_backend": "cpu",
+"cpu_release": {
+  "path": "/PRIVATE/retained-cpu-review.json",
+  "sha256": "FREEZE_REVIEW_SHA256"
+}
+```
+
+Remove `gpu_peer` and the `gpu` probe. Only `gpu_full_640_coexistence` is omitted
+from required evidence; all other nine named gates remain. Keep the independent
+legacy ten-input decision, native authority/schema, complete business backup,
+retained-runtime review, journal and timer checks, paused worker, closed startup,
+container identity, UI/playback/receipt and final verification requirements.
+CPU mode never contacts, prepares or modifies the external GPU service.
+
+The candidate worker must use its frozen image command, explicit environment
+`PROCESSING_FACE_BACKEND=cpu` and `PROCESSING_MAX_CONCURRENCY=1`, and separate
+Docker arguments `--cpus 1 --memory 1536m`. Ambiguous/inherited env flags, GPU
+requests/devices and alternative CPU-limit overrides fail preflight. Effective
+image/env-file/explicit-env values are checked. Container inspection then checks
+actual `NanoCpus=1000000000`, `Memory=1610612736`, no GPU devices, and explicit CPU
+settings before candidate startup and during subsequent verification. The
+preexisting legacy worker alone may omit those two environment keys because its
+verified retained defaults are CPU/single; an explicit GPU value still fails.
+The new candidate may never rely on missing backend settings.
+
+Before opening, require a running candidate with a fresh protocol-3 heartbeat;
+a waiting-native heartbeat with zero active work is allowed while native is
+closed. After opening, the controller waits boundedly for `native_ready=true`
+and `inference.backend=cpu, fallback=false`. A waiting heartbeat is not post-open
+semantic readiness. Failure re-closes native admission and leaves claims paused;
+it does not toggle to GPU or relax another gate. The central owner resumes claims
+only after final acceptance as before.
+
+The known external reclassification producer is now also covered by the legacy
+journal gate: `reclassification-operations/<uuid>/result.json`, at most 1,000
+immediate entries and 1 MiB per result, strict directory/file reads. Missing
+results, unreadable entries, symlinks, active/recovery/unknown states block;
+`state` or `status` complete/partial remains terminal under the existing nested
+recovery checks. An acknowledgement cannot override an active/unknown result.
+This check applies to both CPU and GPU mode and does not authorize new batches.
