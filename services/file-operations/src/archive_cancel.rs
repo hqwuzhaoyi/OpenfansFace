@@ -1,19 +1,265 @@
-//! Cancellation-only proof for a prepared archive interrupted by late index rows.
-//! Never authorizes ledger commit or changes/deletes any external asset/reference.
+//! Archive coordination and reconciliation with external Peach background scanning.
+//! Supports lease-bounded scanner coordination, atomic adoption of pure unreferenced
+//! scanner-inserted target stub rows for published archive files, and safe rollback
+//! fencing when another failure aborts commit.
 use crate::{
     config::Config,
-    creator_delta, db, ledger, metadata,
+    creator_delta, db, files, ledger, metadata,
     model::{Error, Plan, Result},
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde_json::{Value, json};
-use std::{collections::BTreeSet, path::Path};
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
+};
+
+const DEFAULT_SCANNER_LEASE_MS: i64 = 300_000;
 
 fn conflict() -> Error {
     Error::conflict("归档账本取消依据不足，保留恢复状态")
 }
 fn quoted(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
+}
+fn now_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
+}
+fn lease_ttl_ms() -> i64 {
+    std::env::var("FILE_OPERATIONS_SCANNER_LEASE_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(DEFAULT_SCANNER_LEASE_MS)
+}
+
+pub fn peach_state_dir(config: &Config) -> Option<PathBuf> {
+    if let Ok(raw) = std::env::var("PEACH_STATE_DIR") {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            let path = PathBuf::from(trimmed);
+            if path.is_dir() {
+                return Some(std::fs::canonicalize(&path).unwrap_or(path));
+            }
+        }
+    }
+    if let Some(parent) = config.ledger.parent() {
+        let direct = parent.join("state");
+        if direct.is_dir() {
+            return Some(std::fs::canonicalize(&direct).unwrap_or(direct));
+        }
+        if let Some(grand) = parent.parent() {
+            let sibling = grand.join("state");
+            if sibling.is_dir() {
+                return Some(std::fs::canonicalize(&sibling).unwrap_or(sibling));
+            }
+        }
+    }
+    None
+}
+
+fn ensure_lease_table(conn: &Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS _face_admin_scanner_leases (
+            id TEXT PRIMARY KEY,
+            action TEXT NOT NULL,
+            state TEXT NOT NULL,
+            scope TEXT NOT NULL,
+            acquired_at INTEGER NOT NULL,
+            expires_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        )",
+    )?;
+    Ok(())
+}
+
+fn write_coordination_files(config: &Config, payload: &Value) {
+    let local = config
+        .state_db()
+        .with_file_name("scanner-coordination.json");
+    if let Some(parent) = local.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(bytes) = serde_json::to_vec(payload) {
+        let _ = files::atomic_write(&local, &bytes);
+    }
+    if let Some(state_dir) = peach_state_dir(config) {
+        let state_file = state_dir.join("archive-scanner-coordination.json");
+        if let Ok(bytes) = serde_json::to_vec(payload) {
+            let _ = files::atomic_write(&state_file, &bytes);
+        }
+        let control_file = state_dir.join("library-processing-control.json");
+        if control_file.is_file()
+            && let Ok(Some(raw)) = crate::control::read(&control_file, crate::control::MARKER_LIMIT)
+            && let Ok(mut control) = serde_json::from_str::<Value>(&raw)
+            && let Some(obj) = control.as_object_mut()
+        {
+            let active = payload["state"] == "active";
+            let op_id = payload["operation_id"].as_str().unwrap_or("");
+            if active {
+                let user_paused = obj.get("paused").and_then(Value::as_bool) == Some(true)
+                    && obj.get("archive_lease").is_none();
+                if !user_paused {
+                    obj.insert("paused".into(), json!(true));
+                    obj.insert(
+                        "archive_lease".into(),
+                        json!({
+                            "holder": "face-file-operations",
+                            "operation_id": op_id,
+                            "acquired_at": payload["acquired_at"],
+                            "expires_at": payload["expires_at"],
+                        }),
+                    );
+                    if let Ok(bytes) = serde_json::to_vec(&control) {
+                        let _ = files::atomic_write(&control_file, &bytes);
+                    }
+                }
+            } else if let Some(lease) = obj.get("archive_lease").cloned() {
+                let expired = lease["expires_at"]
+                    .as_i64()
+                    .is_some_and(|exp| exp <= now_ms());
+                if lease["operation_id"].as_str() == Some(op_id) || op_id.is_empty() || expired {
+                    obj.remove("archive_lease");
+                    obj.insert("paused".into(), json!(false));
+                    if let Ok(bytes) = serde_json::to_vec(&control) {
+                        let _ = files::atomic_write(&control_file, &bytes);
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub fn acquire_scanner_lease(config: &Config, plan: &Plan) -> Result<Value> {
+    if plan.action != "archive" {
+        return Ok(Value::Null);
+    }
+    let now = now_ms();
+    let expires_at = now + lease_ttl_ms();
+    let sources: Vec<String> = plan
+        .files
+        .iter()
+        .map(|f| metadata::win(config, &f.src))
+        .collect();
+    let targets: Vec<String> = plan
+        .files
+        .iter()
+        .map(|f| metadata::win(config, &f.dst))
+        .collect();
+    let scope = json!({
+        "version": plan.version,
+        "sources": sources,
+        "targets": targets,
+    });
+    let mut conn = db::open(&config.ledger)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    ensure_lease_table(&tx)?;
+    tx.execute(
+        "UPDATE _face_admin_scanner_leases SET state='expired',updated_at=?1 WHERE state='active' AND expires_at<=?1",
+        params![now],
+    )?;
+    tx.execute(
+        "INSERT INTO _face_admin_scanner_leases(id,action,state,scope,acquired_at,expires_at,updated_at)
+         VALUES(?1,?2,'active',?3,?4,?5,?4)
+         ON CONFLICT(id) DO UPDATE SET state='active',scope=excluded.scope,expires_at=excluded.expires_at,updated_at=excluded.updated_at",
+        params![plan.id, plan.action, serde_json::to_string(&scope)?, now, expires_at],
+    )?;
+    tx.commit()?;
+    let payload = json!({
+        "operation_id": plan.id,
+        "action": plan.action,
+        "state": "active",
+        "scope": scope,
+        "acquired_at": now,
+        "expires_at": expires_at,
+        "updated_at": now,
+    });
+    write_coordination_files(config, &payload);
+    Ok(payload)
+}
+
+pub fn release_scanner_lease(config: &Config, operation_id: &str, terminal_state: &str) {
+    let now = now_ms();
+    if let Ok(mut conn) = db::open(&config.ledger)
+        && let Ok(tx) = conn.transaction_with_behavior(TransactionBehavior::Immediate)
+        && ensure_lease_table(&tx).is_ok()
+    {
+        let _ = tx.execute(
+            "UPDATE _face_admin_scanner_leases SET state='expired',updated_at=?1 WHERE state='active' AND expires_at<=?1",
+            params![now],
+        );
+        let _ = tx.execute(
+            "UPDATE _face_admin_scanner_leases SET state=?2,updated_at=?3 WHERE id=?1 AND state='active'",
+            params![operation_id, terminal_state, now],
+        );
+        let _ = tx.commit();
+    }
+    let payload = json!({
+        "operation_id": operation_id,
+        "action": "archive",
+        "state": terminal_state,
+        "updated_at": now,
+    });
+    write_coordination_files(config, &payload);
+}
+
+pub fn recover_scanner_leases(config: &Config, active_ids: &BTreeSet<String>) {
+    let now = now_ms();
+    if let Ok(mut conn) = db::open(&config.ledger)
+        && let Ok(tx) = conn.transaction_with_behavior(TransactionBehavior::Immediate)
+        && ensure_lease_table(&tx).is_ok()
+    {
+        let _ = tx.execute(
+            "UPDATE _face_admin_scanner_leases SET state='expired',updated_at=?1 WHERE state='active' AND expires_at<=?1",
+            params![now],
+        );
+        if let Ok(rows) = db::rows(
+            &tx,
+            "SELECT id FROM _face_admin_scanner_leases WHERE state='active'",
+            [],
+        ) {
+            for row in rows {
+                if let Some(id) = row["id"].as_str()
+                    && !active_ids.contains(id)
+                {
+                    let _ = tx.execute(
+                        "UPDATE _face_admin_scanner_leases SET state='recovered',updated_at=?2 WHERE id=?1 AND state='active'",
+                        params![id, now],
+                    );
+                }
+            }
+        }
+        let _ = tx.commit();
+    }
+    let local = config
+        .state_db()
+        .with_file_name("scanner-coordination.json");
+    if let Ok(Some(raw)) = crate::control::read(&local, crate::control::MARKER_LIMIT)
+        && let Ok(current) = serde_json::from_str::<Value>(&raw)
+        && current["state"] == "active"
+    {
+        let op_id = current["operation_id"].as_str().unwrap_or("");
+        let expired = current["expires_at"].as_i64().is_some_and(|exp| exp <= now);
+        if expired || !active_ids.contains(op_id) {
+            let payload = json!({
+                "operation_id": op_id,
+                "action": "archive",
+                "state": if expired { "expired" } else { "recovered" },
+                "updated_at": now,
+            });
+            write_coordination_files(config, &payload);
+        }
+    }
+}
+
+struct ReconcilableRow {
+    stub: Value,
+    original: Value,
+    file: crate::model::FileMove,
 }
 
 fn index_only(
@@ -107,30 +353,13 @@ fn index_only(
     Ok(())
 }
 
-fn proof(
+fn observe_scanner_rows(
     conn: &Connection,
     config: &Config,
     plan: &Plan,
     delta: &ledger::Delta,
-) -> Result<(String, Value, Vec<Value>)> {
+) -> Result<Vec<ReconcilableRow>> {
     if plan.action != "archive" {
-        return Err(conflict());
-    }
-    let receipt: Option<(String, String, String)> = conn
-        .query_row(
-            "SELECT signature,state,data FROM _face_admin_person_ops WHERE id=?",
-            [&plan.id],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .optional()?;
-    let (signature, state, raw) = receipt.ok_or_else(conflict)?;
-    let evidence: Value = serde_json::from_str(&raw)?;
-    if signature != plan.version
-        || !["prepared", "cancelled"].contains(&state.as_str())
-        || evidence["backend"] != "rust"
-        || evidence["kind"] != "archive"
-        || evidence["delta"] != serde_json::to_value(delta)?
-    {
         return Err(conflict());
     }
     let assets = delta
@@ -140,7 +369,7 @@ fn proof(
         .find(|t| t.table == db::Table::Asset)
         .ok_or_else(conflict)?;
     let mut observed = delta.changes.clone();
-    let mut retained = vec![];
+    let mut pairs = vec![];
     for guard in &mut observed.guards {
         let db::Guard::AssetPath {
             path,
@@ -180,16 +409,281 @@ fn proof(
         if original["path"] != metadata::win(config, &file.src) {
             return Err(conflict());
         }
+        let stub_id = db::integer(&current[0]["id"])?;
+        if assets
+            .before
+            .iter()
+            .any(|row| db::integer(&row["id"]).ok() == Some(stub_id))
+        {
+            return Err(conflict());
+        }
         index_only(conn, &current[0], original, file)?;
-        retained.extend(current.iter().cloned());
-        // A transaction-local observation only. The accepted delta/receipt is
-        // unchanged; this adjusted guard can prove cancellation, never commit.
+        pairs.push(ReconcilableRow {
+            stub: current[0].clone(),
+            original: original.clone(),
+            file: file.clone(),
+        });
         *before = current;
     }
-    if retained.is_empty() {
+    if pairs.is_empty() {
         return Err(conflict());
     }
     creator_delta::inspect_before(conn, &observed, &delta.creators)?;
+    Ok(pairs)
+}
+
+fn read_ops_receipt(conn: &Connection, id: &str) -> Result<Option<(String, String, String)>> {
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='_face_admin_person_ops')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !exists {
+        return Ok(None);
+    }
+    conn.query_row(
+        "SELECT signature,state,data FROM _face_admin_person_ops WHERE id=?",
+        [id],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+fn reconcile_peach_state_files(config: &Config, pairs: &[ReconcilableRow]) {
+    let Some(state_dir) = peach_state_dir(config) else {
+        return;
+    };
+    let adopted_ids: BTreeSet<i64> = pairs
+        .iter()
+        .filter_map(|p| db::integer(&p.stub["id"]).ok())
+        .collect();
+    if adopted_ids.is_empty() {
+        return;
+    }
+    let new_assets_path = state_dir.join("library-new-assets.json");
+    if new_assets_path.is_file()
+        && let Ok(Some(raw)) = crate::control::read(&new_assets_path, crate::control::MARKER_LIMIT)
+        && let Ok(Value::Array(items)) = serde_json::from_str::<Value>(&raw)
+    {
+        let filtered: Vec<Value> = items
+            .into_iter()
+            .filter(|v| {
+                let id = v.as_i64().or_else(|| db::integer(v).ok());
+                id.is_none_or(|n| !adopted_ids.contains(&n))
+            })
+            .collect();
+        if let Ok(bytes) = serde_json::to_vec(&Value::Array(filtered)) {
+            let _ = files::atomic_write(&new_assets_path, &bytes);
+        }
+    }
+    let identities_path = state_dir.join("local-file-identities.json");
+    if identities_path.is_file()
+        && let Ok(Some(raw)) = crate::control::read(&identities_path, crate::control::MARKER_LIMIT)
+        && let Ok(Value::Object(mut map)) = serde_json::from_str::<Value>(&raw)
+    {
+        for pair in pairs {
+            let Ok(stub_id) = db::integer(&pair.stub["id"]) else {
+                continue;
+            };
+            let Ok(original_id) = db::integer(&pair.original["id"]) else {
+                continue;
+            };
+            let removed = map.remove(&stub_id.to_string());
+            let identity = removed
+                .as_ref()
+                .and_then(|v| v.get("identity"))
+                .cloned()
+                .or_else(|| {
+                    map.get(&original_id.to_string())
+                        .and_then(|v| v.get("identity"))
+                        .cloned()
+                })
+                .unwrap_or_else(|| json!([]));
+            let win_dst = metadata::win(config, &pair.file.dst);
+            let location = pair.original["location"].as_str().unwrap_or("local");
+            map.insert(
+                original_id.to_string(),
+                json!({
+                    "id": original_id,
+                    "location": location,
+                    "path": win_dst,
+                    "native": pair.file.dst,
+                    "identity": identity,
+                }),
+            );
+        }
+        if let Ok(bytes) = serde_json::to_vec(&Value::Object(map)) {
+            let _ = files::atomic_write(&identities_path, &bytes);
+        }
+    }
+}
+
+pub fn reserve_with_scanner_index(
+    config: &Config,
+    plan: &Plan,
+    delta: &ledger::Delta,
+    allow_absent: bool,
+) -> Result<Vec<Value>> {
+    let mut conn = db::open(&config.ledger)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let pairs = observe_scanner_rows(&tx, config, plan, delta)?;
+    let retained: Vec<Value> = pairs.iter().map(|p| p.stub.clone()).collect();
+    if let Some((signature, state, raw)) = read_ops_receipt(&tx, &plan.id)? {
+        let evidence: Value = serde_json::from_str(&raw)?;
+        if signature != plan.version
+            || state != "prepared"
+            || evidence["backend"] != "rust"
+            || evidence["kind"] != "archive"
+            || evidence["delta"] != serde_json::to_value(delta)?
+        {
+            return Err(conflict());
+        }
+        return Ok(retained);
+    }
+    if !allow_absent {
+        return Err(conflict());
+    }
+    tx.execute_batch("CREATE TABLE IF NOT EXISTS _face_admin_person_ops (id TEXT PRIMARY KEY, signature TEXT NOT NULL, state TEXT NOT NULL, data TEXT NOT NULL)")?;
+    tx.execute(
+        "INSERT INTO _face_admin_person_ops VALUES(?,?,'prepared',?)",
+        params![
+            plan.id,
+            plan.version,
+            serde_json::to_string(&json!({"backend":"rust","kind":plan.action,"delta":delta}))?
+        ],
+    )?;
+    tx.commit()?;
+    Ok(retained)
+}
+
+pub fn apply_with_scanner_reconciliation(
+    config: &Config,
+    plan: &Plan,
+    delta: &ledger::Delta,
+) -> Result<Value> {
+    let mut conn = db::open(&config.ledger)?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let (signature, state, raw) = read_ops_receipt(&tx, &plan.id)?.ok_or_else(conflict)?;
+    let evidence: Value = serde_json::from_str(&raw)?;
+    if signature != plan.version
+        || state != "prepared"
+        || evidence["backend"] != "rust"
+        || evidence["kind"] != "archive"
+        || evidence["delta"] != serde_json::to_value(delta)?
+    {
+        return Err(conflict());
+    }
+    let pairs = observe_scanner_rows(&tx, config, plan, delta)?;
+    let retained: Vec<Value> = pairs.iter().map(|p| p.stub.clone()).collect();
+    let adopted_ids: Vec<i64> = pairs
+        .iter()
+        .map(|p| db::integer(&p.stub["id"]))
+        .collect::<Result<Vec<_>>>()?;
+    for pair in &pairs {
+        let stub_id = db::integer(&pair.stub["id"])?;
+        let location = pair.stub["location"].as_str().ok_or_else(conflict)?;
+        let path = pair.stub["path"].as_str().ok_or_else(conflict)?;
+        let deleted = tx.execute(
+            "DELETE FROM asset WHERE id=?1 AND location=?2 AND path=?3",
+            params![stub_id, location, path],
+        )?;
+        if deleted != 1 {
+            return Err(conflict());
+        }
+    }
+    let resolved = creator_delta::apply(&tx, &delta.changes, &delta.creators)?;
+    let committed_evidence = json!({
+        "backend": "rust",
+        "kind": plan.action,
+        "delta": delta,
+        "resolved": resolved,
+        "reconciled_scanner_assets": adopted_ids,
+        "reconciled_scanner_rows": retained,
+    });
+    let changed = tx.execute(
+        "UPDATE _face_admin_person_ops SET state='committed',data=? WHERE id=? AND signature=? AND state='prepared'",
+        params![
+            serde_json::to_string(&committed_evidence)?,
+            plan.id,
+            plan.version
+        ],
+    )?;
+    if changed != 1 {
+        return Err(conflict());
+    }
+    tx.commit()?;
+    reconcile_peach_state_files(config, &pairs);
+    Ok(committed_evidence)
+}
+
+pub fn committed_reconciled_assets(config: &Config, plan: &Plan) -> Result<Vec<i64>> {
+    let conn = db::open(&config.ledger)?;
+    let Some((signature, state, raw)) = read_ops_receipt(&conn, &plan.id)? else {
+        return Ok(vec![]);
+    };
+    if signature != plan.version || state != "committed" {
+        return Ok(vec![]);
+    }
+    let evidence: Value = serde_json::from_str(&raw)?;
+    let ids: Vec<i64> = evidence["reconciled_scanner_assets"]
+        .as_array()
+        .map(|arr| arr.iter().filter_map(Value::as_i64).collect())
+        .unwrap_or_default();
+    if !ids.is_empty()
+        && let Some(stubs) = evidence["reconciled_scanner_rows"].as_array()
+        && let Some(assets) = evidence["delta"]["changes"]["tables"]
+            .as_array()
+            .and_then(|tables| tables.iter().find(|t| t["table"] == "Asset"))
+    {
+        let before = assets["before"].as_array().cloned().unwrap_or_default();
+        let after = assets["after"].as_array().cloned().unwrap_or_default();
+        let mut pairs = vec![];
+        for stub in stubs {
+            if let Some(after_row) = after.iter().find(|r| r["path"] == stub["path"])
+                && let Some(original) = before.iter().find(|r| r["id"] == after_row["id"])
+                && let Some(file) = plan
+                    .files
+                    .iter()
+                    .find(|f| metadata::win(config, &f.dst) == stub["path"])
+            {
+                pairs.push(ReconcilableRow {
+                    stub: stub.clone(),
+                    original: original.clone(),
+                    file: file.clone(),
+                });
+            }
+        }
+        reconcile_peach_state_files(config, &pairs);
+    }
+    Ok(ids)
+}
+
+fn proof(
+    conn: &Connection,
+    config: &Config,
+    plan: &Plan,
+    delta: &ledger::Delta,
+    allow_unreserved: bool,
+) -> Result<(String, Value, Vec<Value>)> {
+    let pairs = observe_scanner_rows(conn, config, plan, delta)?;
+    let retained: Vec<Value> = pairs.iter().map(|p| p.stub.clone()).collect();
+    let Some((signature, state, raw)) = read_ops_receipt(conn, &plan.id)? else {
+        if !allow_unreserved {
+            return Err(conflict());
+        }
+        let evidence = json!({"backend":"rust","kind":plan.action,"delta":delta});
+        return Ok(("absent".into(), evidence, retained));
+    };
+    let evidence: Value = serde_json::from_str(&raw)?;
+    if signature != plan.version
+        || !["prepared", "cancelled"].contains(&state.as_str())
+        || evidence["backend"] != "rust"
+        || evidence["kind"] != "archive"
+        || evidence["delta"] != serde_json::to_value(delta)?
+    {
+        return Err(conflict());
+    }
     if let Some(previous) = evidence.get("archive_cancel_indexes")
         && previous != &json!(retained)
     {
@@ -198,10 +692,15 @@ fn proof(
     Ok((state, evidence, retained))
 }
 
-pub fn inspect(config: &Config, plan: &Plan, delta: &ledger::Delta) -> Result<Vec<Value>> {
+pub fn inspect(
+    config: &Config,
+    plan: &Plan,
+    delta: &ledger::Delta,
+    allow_unreserved: bool,
+) -> Result<Vec<Value>> {
     let mut conn = db::open(&config.ledger)?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    Ok(proof(&tx, config, plan, delta)?.2)
+    Ok(proof(&tx, config, plan, delta, allow_unreserved)?.2)
 }
 
 pub fn cancel(
@@ -209,15 +708,222 @@ pub fn cancel(
     plan: &Plan,
     delta: &ledger::Delta,
     expected: &[Value],
+    allow_unreserved: bool,
 ) -> Result<()> {
     let mut conn = db::open(&config.ledger)?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let (state, mut evidence, rows) = proof(&tx, config, plan, delta)?;
+    let (state, mut evidence, rows) = proof(&tx, config, plan, delta, allow_unreserved)?;
     if rows != expected {
         return Err(conflict());
     }
     evidence["archive_cancel_indexes"] = json!(rows);
-    if tx.execute("UPDATE _face_admin_person_ops SET state='cancelled',data=? WHERE id=? AND signature=? AND state=?",params![serde_json::to_string(&evidence)?,plan.id,plan.version,state])? != 1 { return Err(conflict()); }
+    if state == "absent" {
+        tx.execute_batch("CREATE TABLE IF NOT EXISTS _face_admin_person_ops (id TEXT PRIMARY KEY, signature TEXT NOT NULL, state TEXT NOT NULL, data TEXT NOT NULL)")?;
+        tx.execute(
+            "INSERT INTO _face_admin_person_ops VALUES(?,?,'cancelled',?)",
+            params![plan.id, plan.version, serde_json::to_string(&evidence)?],
+        )?;
+    } else if tx.execute(
+        "UPDATE _face_admin_person_ops SET state='cancelled',data=? WHERE id=? AND signature=? AND state=?",
+        params![serde_json::to_string(&evidence)?, plan.id, plan.version, state],
+    )? != 1
+    {
+        return Err(conflict());
+    }
     tx.commit()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{FileMove, Request};
+    use std::fs;
+
+    fn test_config_and_plan() -> (PathBuf, Config, Plan) {
+        let root = fs::canonicalize("/tmp")
+            .unwrap()
+            .join(format!("face-admin-scanner-coord-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(root.join("base")).unwrap();
+        fs::create_dir_all(root.join("media/Creators/甲")).unwrap();
+        fs::create_dir_all(root.join("state")).unwrap();
+        let config = Config {
+            base: root.join("base"),
+            media: root.join("media"),
+            ledger: root.join("ledger.db"),
+            bind: "127.0.0.1:0".into(),
+            token: None,
+            parity_root: None,
+            fixture: Some(root.clone()),
+        };
+        let conn = Connection::open(&config.ledger).unwrap();
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS asset (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        let dst = config.creators().join("甲/clip.mp4");
+        fs::create_dir_all(dst.parent().unwrap()).unwrap();
+        fs::write(&dst, b"video-bytes").unwrap();
+        let stat = fs::metadata(&dst).unwrap();
+        let dst_str = dst.display().to_string();
+        let src_str = config
+            .media
+            .join("Downloads/clip.mp4")
+            .display()
+            .to_string();
+        let id = uuid::Uuid::new_v4().to_string();
+        let plan = Plan {
+            id: id.clone(),
+            request: Request {
+                id,
+                action: "archive".into(),
+                person: "甲".into(),
+                files: vec![],
+                filename: String::new(),
+                target_person: None,
+                target_folder: None,
+                payload: None,
+            },
+            version: "v1".into(),
+            action: "archive".into(),
+            person: "甲".into(),
+            target_person: String::new(),
+            total_bytes: stat.len(),
+            files: vec![FileMove {
+                src: src_str,
+                dst: dst_str.clone(),
+                vids: vec!["v1".into()],
+                size: stat.len(),
+                version: files::fingerprint(&dst_str, &stat),
+            }],
+            directories: vec![],
+            metadata_version: String::new(),
+            ledger_version: String::new(),
+            execution: None,
+        };
+        (root, config, plan)
+    }
+
+    #[test]
+    fn scanner_lease_lifecycle_and_user_pause_preservation() {
+        let (root, config, plan) = test_config_and_plan();
+        let control_path = root.join("state/library-processing-control.json");
+        fs::write(&control_path, r#"{"paused":false}"#).unwrap();
+
+        acquire_scanner_lease(&config, &plan).unwrap();
+        let control: Value =
+            serde_json::from_str(&fs::read_to_string(&control_path).unwrap()).unwrap();
+        assert_eq!(control["paused"], true);
+        assert_eq!(control["archive_lease"]["operation_id"], plan.id);
+        let conn = db::open(&config.ledger).unwrap();
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM _face_admin_scanner_leases WHERE id=?1",
+                [&plan.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "active");
+
+        release_scanner_lease(&config, &plan.id, "committed");
+        let control: Value =
+            serde_json::from_str(&fs::read_to_string(&control_path).unwrap()).unwrap();
+        assert_eq!(control["paused"], false);
+        assert!(control.get("archive_lease").is_none());
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM _face_admin_scanner_leases WHERE id=?1",
+                [&plan.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "committed");
+
+        // User-initiated pause must be preserved across archive lease acquire & release.
+        fs::write(&control_path, r#"{"paused":true,"reason":"manual"}"#).unwrap();
+        acquire_scanner_lease(&config, &plan).unwrap();
+        let control: Value =
+            serde_json::from_str(&fs::read_to_string(&control_path).unwrap()).unwrap();
+        assert_eq!(control["paused"], true);
+        assert_eq!(control["reason"], "manual");
+        assert!(control.get("archive_lease").is_none());
+        release_scanner_lease(&config, &plan.id, "committed");
+        let control: Value =
+            serde_json::from_str(&fs::read_to_string(&control_path).unwrap()).unwrap();
+        assert_eq!(control["paused"], true);
+        assert_eq!(control["reason"], "manual");
+
+        // Expired lease recovery clears stale archive_lease pause.
+        fs::write(&control_path, r#"{"paused":false}"#).unwrap();
+        acquire_scanner_lease(&config, &plan).unwrap();
+        conn.execute(
+            "UPDATE _face_admin_scanner_leases SET expires_at=1 WHERE id=?1",
+            [&plan.id],
+        )
+        .unwrap();
+        let local_coord = config
+            .state_db()
+            .with_file_name("scanner-coordination.json");
+        let mut coord: Value =
+            serde_json::from_str(&fs::read_to_string(&local_coord).unwrap()).unwrap();
+        coord["expires_at"] = json!(1);
+        fs::write(&local_coord, serde_json::to_vec(&coord).unwrap()).unwrap();
+        recover_scanner_leases(&config, &BTreeSet::new());
+        let state: String = conn
+            .query_row(
+                "SELECT state FROM _face_admin_scanner_leases WHERE id=?1",
+                [&plan.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "expired");
+        let control: Value =
+            serde_json::from_str(&fs::read_to_string(&control_path).unwrap()).unwrap();
+        assert_eq!(control["paused"], false);
+        assert!(control.get("archive_lease").is_none());
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn peach_sidecar_state_reconciliation_cleans_stub_and_updates_identity() {
+        let (root, config, plan) = test_config_and_plan();
+        let new_assets_path = root.join("state/library-new-assets.json");
+        let identities_path = root.join("state/local-file-identities.json");
+        fs::write(&new_assets_path, r#"[1,1001,42]"#).unwrap();
+        fs::write(
+            &identities_path,
+            r#"{"1":{"id":1,"location":"local","path":"Downloads\\clip.mp4","identity":[11,22]},"1001":{"id":1001,"location":"local","path":"creator-videos\\甲\\clip.mp4","identity":[33,44]}}"#,
+        )
+        .unwrap();
+
+        let pair = ReconcilableRow {
+            stub: json!({
+                "id": {"$integer": "1001"},
+                "location": "local",
+                "path": "creator-videos\\甲\\clip.mp4",
+            }),
+            original: json!({
+                "id": {"$integer": "1"},
+                "location": "local",
+                "path": "Downloads\\clip.mp4",
+            }),
+            file: plan.files[0].clone(),
+        };
+        reconcile_peach_state_files(&config, &[pair]);
+
+        let new_assets: Value =
+            serde_json::from_str(&fs::read_to_string(&new_assets_path).unwrap()).unwrap();
+        assert_eq!(new_assets, json!([1, 42]));
+
+        let identities: Value =
+            serde_json::from_str(&fs::read_to_string(&identities_path).unwrap()).unwrap();
+        assert!(identities.get("1001").is_none());
+        assert_eq!(identities["1"]["id"], 1);
+        assert_eq!(
+            identities["1"]["path"],
+            metadata::win(&config, &plan.files[0].dst)
+        );
+        assert_eq!(identities["1"]["identity"], json!([33, 44]));
+
+        let _ = fs::remove_dir_all(root);
+    }
 }
