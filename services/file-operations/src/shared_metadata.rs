@@ -275,6 +275,9 @@ impl MaterialReader {
             .insert(name.to_owned(), result.clone());
         result
     }
+    pub(crate) fn aliases(&self) -> &Value {
+        &self.aliases
+    }
     fn evidence_alias_chain(&self, name: &str) -> Result<Value> {
         let mut current = name.to_owned();
         let mut seen = BTreeSet::new();

@@ -67,14 +67,13 @@ fn candidate_names(data: &Value) -> BTreeSet<String> {
     }
     names
 }
-fn tasks(config: &Config) -> Result<Vec<Value>> {
+fn tasks(config: &Config, aliases: &Value) -> Result<Vec<Value>> {
     let path = config.base.join("processing/processing.db");
     if !path.exists() {
         return Ok(vec![]);
     }
     let queue = review::read(config, "integration-queue.json", json!([]))?.1;
     let history = review::read(config, "archive-history.json", json!([]))?.1;
-    let aliases = review::read(config, "person-renames.json", json!({}))?.1;
     let sources = review::sources(config)?;
     let paths: BTreeSet<_> = queue
         .as_array()
@@ -105,7 +104,7 @@ fn tasks(config: &Config) -> Result<Vec<Value>> {
         }
         let mut t = public(row)?;
         t["__review_raw_people"] = json!(candidate_names(&t["data"]));
-        canonical_fields(&mut t["data"], "", &aliases)?;
+        canonical_fields(&mut t["data"], "", aliases)?;
         out.push(t)
     }
     Ok(out)
@@ -424,8 +423,8 @@ pub fn validate(config: &Config, body: &Value) -> Result<Vec<Value>> {
     let ids = review::vids(&body["vids"])?;
     let conn = schema(config)?;
     let mut rows = vec![];
-    let current = tasks(config)?;
     let material = shared_metadata::MaterialReader::new(config)?;
+    let current = tasks(config, material.aliases())?;
     let health = HealthReader::new(config)?;
     let dispositions = dispositions(config)?;
     for vid in ids {
@@ -487,8 +486,8 @@ pub fn execute(engine: &mut Engine, command: &str, body: Value) -> Result<Value>
         .as_str()
         .filter(|v| !v.is_empty())
         .map(str::to_owned);
-    let live = tasks(config)?;
     let material = shared_metadata::MaterialReader::new(config)?;
+    let live = tasks(config, material.aliases())?;
     let health = HealthReader::new(config)?;
     let dispositions = dispositions(config)?;
     let created = id.is_none();
@@ -746,4 +745,67 @@ pub fn execute(engine: &mut Engine, command: &str, body: Value) -> Result<Value>
     Ok(
         json!({"session":id,"counts":counts,"groups":groups,"group":selected,"rows":delivered,"total":rows.len(),"remaining":rows.iter().filter(|e|is_remaining(e)).count(),"page":page,"limit":limit,"next_page":next,"previous_page":previous,"waiting":waiting,"online":(-30.0..90.0).contains(&age),"folders":folders,"focus_missing":focus_missing,"has_updates":changed_count>0}),
     )
+}
+
+#[cfg(test)]
+mod alias_snapshot_tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn task_names_and_material_share_one_alias_snapshot() {
+        let root = fs::canonicalize("/tmp")
+            .unwrap()
+            .join(format!("face-review-alias-{}", uuid::Uuid::new_v4()));
+        let base = root.join("base");
+        let media = root.join("media");
+        fs::create_dir_all(base.join("processing")).unwrap();
+        fs::create_dir_all(&media).unwrap();
+        let config = Config {
+            base: base.clone(),
+            media,
+            ledger: root.join("ledger.db"),
+            bind: "127.0.0.1:0".into(),
+            token: None,
+            fixture: None,
+            parity_root: None,
+        };
+        let faces = rusqlite::Connection::open(base.join("faces.db")).unwrap();
+        faces
+            .execute_batch("CREATE TABLE videos(vid TEXT PRIMARY KEY,path TEXT);")
+            .unwrap();
+        let jobs = rusqlite::Connection::open(base.join("processing/processing.db")).unwrap();
+        jobs.execute_batch("CREATE TABLE tasks(vid TEXT PRIMARY KEY,path TEXT,stage TEXT,priority INTEGER,is_new INTEGER,created_at REAL,data TEXT,manual INTEGER,deferred INTEGER,note TEXT);").unwrap();
+        jobs.execute(
+            "INSERT INTO tasks VALUES('v','/fixture/video.mp4','review',0,0,0,?,0,0,'')",
+            [json!({"ready":true,"candidates":[{"name":"Alias"}]}).to_string()],
+        )
+        .unwrap();
+        fs::write(
+            base.join("person-renames.json"),
+            json!({"Alias":"OldName"}).to_string(),
+        )
+        .unwrap();
+        let material = shared_metadata::MaterialReader::new(&config).unwrap();
+        fs::write(
+            base.join("person-renames.json"),
+            json!({"Alias":"NewName"}).to_string(),
+        )
+        .unwrap();
+        let task = tasks(&config, material.aliases()).unwrap().remove(0);
+        assert_eq!(task["data"]["candidates"][0]["name"], "OldName");
+        assert_eq!(task["__review_raw_people"][0], "Alias");
+        let scope =
+            json!({"people":["Alias"],"alias_inputs":["Alias"],"vids":[],"watermark_keys":[]});
+        let frozen = material.state(&config, &scope).unwrap();
+        assert_eq!(frozen["material"]["names"][0][1], "OldName");
+        let changed = shared_metadata::MaterialReader::new(&config)
+            .unwrap()
+            .state(&config, &scope)
+            .unwrap();
+        assert_ne!(frozen["version"], changed["version"]);
+        drop(jobs);
+        drop(faces);
+        fs::remove_dir_all(root).unwrap();
+    }
 }
