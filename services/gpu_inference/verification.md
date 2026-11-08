@@ -32,6 +32,52 @@ checks and digests. No hardware inference, service change, NAS write, legacy-cac
 adoption or deployment occurred. TTS remains OFF. The retained-runtime eight-frame
 GPU/VM trial must still validate this exact policy after source integration.
 
+## Queue review corrections — real HTTP and 20-second expiry
+
+Two additional regressions exposed gaps in the initial queue implementation:
+framing-confirmed response truncation was incorrectly treated as malformed JSON,
+and a queued admission could outlive its 20-second window behind a running kernel.
+Both were reproduced against actual loopback HTTP before correction.
+
+The client now retries incomplete Content-Length/chunked/error bodies under the
+same frozen request, while complete malformed JSON remains nonretryable. One
+independent deadline monitor finishes never-started admissions under the same lock
+as cancellation/admission/model-start; it removes pending entries without leaving
+queue tombstones or touching an actual running kernel's slot. Sealed receipts,
+bounded rearm and cache identity protections remain intact.
+
+**52** contract/HTTP tests and **37** processing tests pass, along with both native
+joint regressions. The real-time HTTP test (no shortened policy or injected clock)
+asserts that a queued response ends between 19.8 and 21.5 seconds while the first
+kernel is still running, then verifies same-ID rearm/cancel and truthful drain.
+Additional races cover a stale sampling-head finalizer and repeated queued cancels.
+The final response-close change also passes the four wire/clock tests and three
+Retry-After tests. [Sanitized evidence](../../tests/evidence/gpu-queue-review-fixes-20261108.json)
+records the corrections and log hashes. The 20/60/600/660-second budgets, GPU
+thresholds, execution concurrency and business retry count are unchanged.
+
+No GPU inference, production service change, NAS write, deployment or TTS change
+occurred. Hardware acceptance remains pending; TTS stays OFF.
+
+## Retry-After survives truncated error bodies — Q3
+
+A further real-wire regression confirmed that truncated HTTP 429/503 responses
+lost their already-received Retry-After policy. Before correction, a 10-second hint
+retried after about **0.524 seconds**; hints above the ten-second cap also resent.
+The client now parses known header constraints before reading the body and carries
+them into framing-unknown transport errors. Known 401/403 status remains
+nonretryable even when its body is truncated; complete malformed JSON also remains
+nonretryable.
+
+The unshortened real HTTP test waits at least **10 seconds**, then replays the exact
+request body/ID/hash/deadline and observes two sends but one computation. Truncated
+429/503 with Retry-After11, truncated 401/403, and complete malformed503 JSON each
+send once only. **54** full contract/HTTP tests pass, and the actual VM/native joint
+still reports eight frames/nine sends/eight computes and one completion.
+[Sanitized Q3 evidence](../../tests/evidence/gpu-queue-header-retry-20261108.json)
+contains the log digests. The fixed v1 policy and all resource/concurrency/deadline
+limits are unchanged. No hardware, production, deployment or TTS action occurred.
+
 ## Initial contract and HTTP checks (historical)
 
 `python3 -m unittest discover -s tests -p test_gpu_inference.py -v`: **19 tests pass**. Includes actual loopback HTTP transport using a clearly synthetic model fixture. No GPU claim comes from those mock-model tests. Compile check and `git diff --check` also pass.

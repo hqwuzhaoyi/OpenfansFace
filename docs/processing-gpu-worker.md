@@ -85,7 +85,10 @@ not assert that remote kernels stopped.
 
 GPU manifest schema 2 pins retry policy v1. Busy resources can reserve one of the
 existing two accepted slots, with a single FIFO execution lane. Each admission
-waits at most 20 seconds including queue time; counters are checked at one-second
+waits at most 20 seconds including queue time; an independent deadline monitor
+expires never-started admissions even behind a running kernel. Expiry/cancel
+removes the queued entry under the shared ownership lock and retains its sealed
+receipt, without releasing a running kernel. Counters are checked at one-second
 intervals, with bounded telemetry calls. The 600 MiB free, 25% utilization and
 128 MiB arena values are unchanged. Unknown telemetry never permits inference.
 
@@ -102,7 +105,9 @@ budget and claim lease minus its final 60-second publication reserve. Resource
 windows and transport retries consume this same budget. They do not increment or
 refund stage attempts; the existing maximum of three attempts is unchanged.
 The native receipt remains the sole completion authority. A lost GPU response
-replays the same request; a lost native response replays its exact journal body.
+replays the same request, including framing-proven short/chunked response bodies.
+Complete malformed responses remain nonretryable. A lost native response replays
+its exact journal body.
 
 Health distinguishes queue acceptance from resource readiness: `queued` includes
 the resource-waiting head, `resource_waiting`/`waiting_reason` explain that wait,

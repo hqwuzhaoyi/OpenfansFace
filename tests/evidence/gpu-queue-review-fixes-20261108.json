@@ -1,0 +1,84 @@
+{
+  "date": "2026-11-08",
+  "scope": "Q1/Q2 review corrections, isolated CPU/HTTP/native fixtures only",
+  "base_revision": "6b9e9f1",
+  "retry_policy": {
+    "version": 1,
+    "resource_wait_seconds": 20,
+    "resource_poll_seconds": 1,
+    "resource_rearms": 2,
+    "client_max_sends": 8,
+    "client_backoff_seconds": 0.5,
+    "client_backoff_cap_seconds": 4,
+    "client_jitter_min": 0.8,
+    "client_jitter_max": 1.2,
+    "client_retry_after_cap_seconds": 10
+  },
+  "q1": {
+    "before": "real HTTP200 Content-Length response truncated after20 JSON bytes failed invalid_json after one send",
+    "after": "Content-Length truncation and incomplete chunked/error bodies retry same immutable request; complete malformed JSON remains nonretryable",
+    "assertions": {
+      "sends": 2,
+      "model_calls": 1,
+      "identical_request_bodies": true
+    }
+  },
+  "q2": {
+    "before": "HTTP queued admission still unfinished after21.5 seconds behind occupied model lane",
+    "after": "independent bounded deadline monitor expires never-started admissions; removable pending deque has no completed tombstones",
+    "real_time_assertions": {
+      "queued_response_seconds_min": 19.8,
+      "queued_response_seconds_max": 21.5,
+      "error": "resource_busy",
+      "running_after_expiry": 1,
+      "queued_after_expiry": 0,
+      "model_calls": 1,
+      "same_id_rearm_then_cancel": true,
+      "drain_truthful": true
+    },
+    "race_regressions": [
+      "expired sampling head finalizer cannot change rearmed receipt or decrement twice",
+      "30 queued cancellations retain one actual running slot and zero pending tombstones"
+    ]
+  },
+  "checks": {
+    "gpu_contract_http_tests": 52,
+    "processing_unit_tests": 37,
+    "actual_worker_native_joint": "pass",
+    "existing_native_review_joint": "pass",
+    "final_wire_subset": 4,
+    "final_retry_after_subset": 3,
+    "compileall": "pass",
+    "diff_check": "pass"
+  },
+  "log_sha256": {
+    "gpu-queue-review-worker.log": "0c391c3edcd14b74b2202d25b258c7ca1538d43268131867e86243fcf91d85e2",
+    "gpu-queue-review-retry-after.log": "911fb54b93e244b037d8a91552be6f018d2cf180af6e749906aa6524328f85c7",
+    "gpu-queue-review-q2-after.log": "6865d5c632896f8579ffe968b0fb416b45ee42a583c5f1a09ddabcd9b334962d",
+    "gpu-queue-review-q2-before.log": "bfcf61b2e5c8690bd589e943021f265fea2cc76b0823c5f8fa66cfb591864c06",
+    "gpu-queue-review-contract.log": "c4dd4681653c3fe9e832b8d15dc2ecfa2d89dfab0cbcc55b8d8c2046af843c60",
+    "gpu-queue-review-wire.log": "893bac20c7e0b03c24ba1dd0541a06bc4f977a411af43f8375afedce8b762d5a",
+    "gpu-queue-review-broker.log": "4fde878d7cc9e0e90bef2796c78b11099262de26b6fc913a93755fd9541fbd8e",
+    "gpu-queue-review-native-review.log": "98c711409d259cd73d7f70fd7f63fc206b0ff98fe7ebec06d6c5f054098d7f56",
+    "gpu-queue-review-native.log": "511e23933aac9780746da79dc2fd55d6a29cfc2ab430cb02c077ff867e295ac5"
+  },
+  "unchanged": [
+    "20-second admission budget",
+    "60-second frame deadline",
+    "600-second stage budget",
+    "660-second lease",
+    "600 MiB free /25% utilization /128 MiB arena",
+    "one GPU execution lane +one waiting slot",
+    "VM capacity1",
+    "business maximum3 stage attempts",
+    "native-only acceptance"
+  ],
+  "guardrails": {
+    "hardware_inference_run": false,
+    "production_services_changed": false,
+    "deployment": false,
+    "nas_write": false,
+    "tts_changed": false
+  },
+  "pending": "hardware acceptance remains unperformed; user currently requests architecture research; no hardware/deployment follow-up started"
+}
