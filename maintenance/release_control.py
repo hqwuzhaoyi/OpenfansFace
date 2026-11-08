@@ -61,21 +61,21 @@ def private_json(path, value):
     private_bytes(path, json.dumps(value, ensure_ascii=False, indent=2).encode())
 
 
-def read_control(path):
+def read_control(path, limit=CONTROL_LIMIT):
     """Bounded nonblocking control read; a foreign FIFO/symlink is never opened blocking."""
     path = Path(path)
     fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     try:
         held = os.fstat(fd)
-        if not stat.S_ISREG(held.st_mode) or held.st_size > CONTROL_LIMIT:
+        if not stat.S_ISREG(held.st_mode) or held.st_size > limit:
             fail('control file is not a bounded regular file: '+str(path))
         raw = bytearray()
-        while len(raw) <= CONTROL_LIMIT:
-            chunk = os.read(fd, min(65536, CONTROL_LIMIT+1-len(raw)))
+        while len(raw) <= limit:
+            chunk = os.read(fd, min(65536, limit+1-len(raw)))
             if not chunk: break
             raw.extend(chunk)
         after, current = os.fstat(fd), path.lstat()
-        if len(raw)>CONTROL_LIMIT or (held.st_dev,held.st_ino,held.st_size,held.st_mtime_ns)!=(after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns) or (held.st_dev,held.st_ino)!=(current.st_dev,current.st_ino):
+        if len(raw)>limit or (held.st_dev,held.st_ino,held.st_size,held.st_mtime_ns)!=(after.st_dev,after.st_ino,after.st_size,after.st_mtime_ns) or (held.st_dev,held.st_ino)!=(current.st_dev,current.st_ino):
             fail('control file changed during read: '+str(path))
         return bytes(raw), {'dev':str(held.st_dev),'ino':str(held.st_ino)}
     finally:
@@ -468,16 +468,177 @@ def permissions(manifest):
     return {'uid':os.geteuid(),'gid':os.getegid(),'groups':os.getgroups(),'read_only_access_inventory':True,'ok':all(r['access'] for r in rows),'paths':rows}
 
 
-def snapshot_size(source, relative=Path()):
-    total=0
-    # Explicit traversal fails on unreadable durable directories instead of silently
-    # underestimating them as Path.rglob can do. Only known disposable scratch is skipped.
-    for item in Path(source).iterdir():
-        child=relative/item.name
-        if child.as_posix() in TRANSIENT_SNAPSHOT_EXCLUSIONS: continue
-        if item.is_symlink(): fail('snapshot source contains symlink: '+str(child))
-        if item.is_dir(): total+=snapshot_size(item,child)
-        elif item.is_file(): total+=item.stat().st_size
+def canonical_digest(value):
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=False).encode()).hexdigest()
+
+
+def runtime_inventory(base):
+    """Stat-only retained namespace inventory; never follow interpreter links/read packages."""
+    base = Path(base)
+    if not base.is_absolute() or base.is_symlink() or base.resolve() != base:
+        fail('preserved runtime requires the exact canonical BASE')
+    root = base / 'venv'
+    allowed_links = {'bin/python': 'python3', 'bin/python3.11': 'python3',
+                     'bin/python3': '/usr/bin/python3', 'lib64': 'lib'}
+    rows = []
+    def walk(path, relative):
+        before = path.lstat()
+        row = {'path': relative, 'dev': str(before.st_dev), 'ino': str(before.st_ino),
+               'mode': before.st_mode, 'uid': before.st_uid, 'gid': before.st_gid,
+               'size': before.st_size, 'mtime_ns': before.st_mtime_ns, 'ctime_ns': before.st_ctime_ns}
+        if stat.S_ISLNK(before.st_mode):
+            row.update(kind='symlink', target=os.readlink(path))
+            if allowed_links.get(relative) != row['target']:
+                fail('unreviewed preserved runtime symlink: '+relative)
+        elif stat.S_ISDIR(before.st_mode):
+            row['kind'] = 'directory'
+            for item in sorted(path.iterdir()):
+                child = item.name if relative == '.' else relative+'/'+item.name
+                walk(item, child)
+        elif stat.S_ISREG(before.st_mode):
+            row['kind'] = 'file'
+        else:
+            fail('unsupported preserved runtime entry: '+relative)
+        after = path.lstat()
+        if any(getattr(before,key) != getattr(after,key) for key in ('st_dev','st_ino','st_mode','st_size','st_mtime_ns','st_ctime_ns')):
+            fail('preserved runtime changed during inventory: '+relative)
+        rows.append(row)
+    walk(root, '.')
+    by_path = {row['path']: row for row in rows}
+    for name, kind in {'bin':'directory', 'lib':'directory', 'include':'directory', 'lib/python3.11':'directory', 'lib/python3.11/site-packages':'directory', 'pyvenv.cfg':'file'}.items():
+        if by_path.get(name, {}).get('kind') != kind: fail('preserved runtime layout missing '+name)
+    if any('/' not in name and name not in ('.','bin','lib','include','lib64','pyvenv.cfg','share') for name in by_path):
+        fail('unexpected nonruntime top-level entry in preserved runtime')
+    for name in by_path:
+        if name.startswith('bin/') and (name.count('/') != 1 or name.endswith(('.json','.db','.sqlite','.sqlite3'))):
+            fail('unexpected nonruntime entry in preserved runtime bin')
+        if name.startswith('lib/') and not (name == 'lib/python3.11' or name.startswith('lib/python3.11/')):
+            fail('unexpected preserved runtime library layout')
+    if any(by_path.get(name, {}).get('target') != target for name, target in allowed_links.items()):
+        fail('preserved runtime interpreter/link layout differs from reviewed Python 3.11 namespace')
+    raw, _ = read_control(root/'pyvenv.cfg')
+    cfg = dict(line.split(' = ', 1) for line in raw.decode().splitlines() if ' = ' in line)
+    if cfg.get('version') != '3.11.2' or cfg.get('home') != '/usr/bin' or cfg.get('executable') != '/usr/bin/python3.11' or cfg.get('include-system-site-packages') != 'false':
+        fail('preserved runtime pyvenv.cfg differs from reviewed Python 3.11.2 namespace')
+    if hashlib.sha256(raw).hexdigest() != hashlib.sha256(read_control(root/'pyvenv.cfg')[0]).hexdigest():
+        fail('preserved runtime config changed during inventory')
+    rows.sort(key=lambda row:row['path'])
+    return {'version':1, 'kind':'preserved-python-runtime-stat-inventory', 'base':str(base), 'relative_path':'venv',
+            'pyvenv_cfg_sha256':hashlib.sha256(raw).hexdigest(), 'entries':rows,
+            'regular_bytes':sum(row['size'] for row in rows if row['kind']=='file')}
+
+
+def evidence_json(reference, limit=CONTROL_LIMIT):
+    raw, _ = read_control(reference['path'], limit=limit)
+    if hashlib.sha256(raw).hexdigest() != reference.get('sha256'): fail('preserved runtime evidence changed')
+    value = json.loads(raw)
+    if not isinstance(value, dict): fail('preserved runtime evidence must be an object')
+    return value
+
+
+def candidate_runtime_configuration(manifest):
+    """Bind review to image defaults, exact Docker args and private env-file bytes."""
+    result = {}
+    for role, service in manifest['services'].items():
+        image = json.loads(run('docker','image','inspect',service['candidate_image']))[0]
+        if image['Id'] != service['candidate_image']: fail(role+': candidate image changed')
+        args = service['create_args']; env_files = {}
+        for index, arg in enumerate(args):
+            if arg == '--env-file':
+                raw, _ = read_control(args[index+1]); env_files[args[index+1]] = hashlib.sha256(raw).hexdigest()
+                if b'/venv' in raw or b'VIRTUAL_ENV=' in raw: fail(role+': candidate env uses preserved runtime')
+            elif arg.startswith('--env-file='):
+                fail('use separate --env-file argument for preserved runtime review')
+        config = image.get('Config', {})
+        if '/venv' in json.dumps([args,config]) or 'VIRTUAL_ENV=' in json.dumps([args,config]):
+            fail(role+': candidate configuration references preserved runtime')
+        result[role] = {'image':image['Id'], 'image_config_sha256':canonical_digest(config),
+                        'create_args_sha256':canonical_digest(args), 'env_files':env_files}
+    return result
+
+
+def preserved_runtime(manifest):
+    policy = manifest.get('preserved_runtime')
+    if policy is None: return None
+    if set(policy) != {'relative_path','inventory','review'} or policy['relative_path'] != 'venv':
+        fail('only explicitly reviewed BASE/venv preservation is supported')
+    base = Path(manifest['base'])
+    for name in ('ledger','authority_dir','evidence_dir','deploy_lock'):
+        if Path(manifest[name]).resolve().is_relative_to(base/'venv'):
+            fail('business/control path overlaps preserved runtime: '+name)
+    frozen = evidence_json(policy['inventory'], limit=32*1024*1024)
+    current = runtime_inventory(base)
+    if frozen != current: fail('preserved runtime source inventory changed; retain originals and review again')
+    review = evidence_json(policy['review'])
+    if review.get('simulated') is True and not rehearsal_guard(manifest): fail('simulated runtime review requires marked rehearsal')
+    if (review.get('version') != 1 or review.get('kind') != 'preserved-runtime-review' or
+        review.get('base') != str(base) or review.get('relative_path') != 'venv' or
+        review.get('inventory_sha256') != policy['inventory']['sha256'] or
+        review.get('retained_in_place') is not True or review.get('candidate_uses_image_runtimes') is not True or
+        review.get('candidate_mutates_preserved_runtime') is not False or
+        review.get('contains_business_state') is not False):
+        fail('preserved runtime review incomplete or mismatched')
+    if review.get('candidate_configuration') != candidate_runtime_configuration(manifest):
+        fail('candidate runtime configuration differs from frozen review')
+    source_files = review.get('source_files')
+    if not isinstance(source_files, list): fail('preserved runtime review requires explicit mounted source file list')
+    for reference in source_files:
+        path = Path(reference['path'])
+        if path.resolve().is_relative_to(base/'venv'): fail('source review must not read preserved runtime packages')
+        raw, _ = read_control(path)
+        if hashlib.sha256(raw).hexdigest() != reference.get('sha256'): fail('reviewed mounted source file changed')
+    for name in ('runtime_namespace_evidence','runtime_source_review'):
+        proof = review.get(name)
+        if not isinstance(proof,dict) or not proof.get('sha256'): fail('preserved runtime review lacks '+name)
+        value = evidence_json(proof, limit=32*1024*1024)
+        if value.get('simulated') is True and not rehearsal_guard(manifest): fail('simulated runtime evidence requires marked rehearsal')
+    return {'relative_path':'venv','disposition':'retained-in-place-not-restored-from-backup',
+            'inventory':policy['inventory'], 'inventory_digest':canonical_digest(current),
+            'review':policy['review'], 'regular_bytes':current['regular_bytes'], 'entry_count':len(current['entries'])}
+
+
+def snapshot_entries(source, relative=Path(), preserved=None, exclude=()):
+    """One classification for capacity and copying; unknown entries fail closed."""
+    for item in sorted(Path(source).iterdir()):
+        child = relative/item.name
+        if child.as_posix() in TRANSIENT_SNAPSHOT_EXCLUSIONS or (not relative.parts and item.name in exclude):
+            continue
+        if preserved and child.as_posix() == preserved['relative_path']:
+            continue
+        mode = item.lstat().st_mode
+        if stat.S_ISLNK(mode): fail('snapshot source contains symlink: '+str(child))
+        if not (stat.S_ISDIR(mode) or stat.S_ISREG(mode)): fail('unsupported snapshot source entry: '+str(child))
+        # SQLite backup API includes committed WAL state. A similarly named business
+        # document is not disposable: skip only sidecars of a verified database.
+        if stat.S_ISREG(mode) and item.name.endswith(('-wal','-shm','-journal')):
+            database = item.with_name(item.name.rsplit('-',1)[0])
+            if database.is_file() and not database.is_symlink():
+                with database.open('rb') as stream:
+                    if stream.read(16) == b'SQLite format 3\0': continue
+        yield item, child, stat.S_ISDIR(mode)
+
+
+def database_snapshot_size(path):
+    path = Path(path)
+    observed = path.lstat()
+    if not stat.S_ISREG(observed.st_mode): fail('snapshot database/file must be regular, not a symlink: '+str(path))
+    total = observed.st_size
+    with path.open('rb') as stream:
+        if stream.read(16) == b'SQLite format 3\0':
+            wal = path.with_name(path.name+'-wal')
+            if os.path.lexists(wal):
+                mode = wal.lstat().st_mode
+                if not stat.S_ISREG(mode): fail('SQLite WAL must be a regular file: '+str(wal))
+                # Conservatively account for pages committed only in WAL, which
+                # the backup API can add to the destination database.
+                total += wal.stat().st_size
+    return total
+
+
+def snapshot_size(source, relative=Path(), preserved=None):
+    total = 0
+    for item, child, directory in snapshot_entries(source, relative, preserved):
+        total += snapshot_size(item, child, preserved) if directory else database_snapshot_size(item)
     return total
 
 
@@ -485,14 +646,15 @@ def capacity(manifest):
     destination=Path(manifest['evidence_dir'])
     while not destination.exists(): destination=destination.parent
     source=Path(manifest['base'])
-    required=snapshot_size(source)+Path(manifest['ledger']).stat().st_size
+    retained=preserved_runtime(manifest)
+    required=snapshot_size(source, preserved=retained)+database_snapshot_size(manifest['ledger'])
     margin=manifest.get('minimum_free_after_backup_bytes',2*1024**3)
     free=shutil.disk_usage(destination).free
     if free < required + margin: fail('backup destination lacks space for complete state plus reserve; do not prune unrelated data')
     for role,service in manifest['services'].items():
         image=json.loads(run('docker','image','inspect',service['candidate_image']))[0]
         if image['Id']!=service['candidate_image']: fail(role+': candidate image not present at frozen digest')
-    return {'backup_estimate_bytes':required,'destination_free_bytes':free,'reserve_bytes':margin,'candidate_images_present':True}
+    return {'backup_estimate_bytes':required,'destination_free_bytes':free,'reserve_bytes':margin,'candidate_images_present':True,'preserved_runtime':retained,'transient_exclusions':sorted(TRANSIENT_SNAPSHOT_EXCLUSIONS)}
 
 
 def authority(manifest):
@@ -534,21 +696,17 @@ def backup_database(source, target):
         dst.execute('PRAGMA journal_mode=DELETE')
 
 
-def snapshot_tree(source, target, exclude=(), relative=Path()):
-    source, target = Path(source).resolve(), Path(target)
-    if target.resolve().is_relative_to(source):
+def snapshot_tree(source, target, exclude=(), relative=Path(), preserved=None):
+    source, target = Path(source), Path(target)
+    if source.is_symlink(): fail('snapshot source contains symlink: '+str(source))
+    if target.resolve().is_relative_to(source.resolve()):
         fail('snapshot destination must be outside source')
     target.mkdir(mode=0o700)
-    for item in source.iterdir():
-        child=relative/item.name
-        if child.as_posix() in TRANSIENT_SNAPSHOT_EXCLUSIONS or item.name in exclude or item.name.endswith(('-wal', '-shm', '-journal')):
-            continue
-        if item.is_symlink():
-            fail('snapshot source contains symlink: ' + item.name)
+    for item, child, directory in snapshot_entries(source, relative, preserved, exclude):
         dest = target / item.name
-        if item.is_dir():
-            snapshot_tree(item, dest, relative=child)
-        elif item.is_file():
+        if directory:
+            snapshot_tree(item, dest, relative=child, preserved=preserved)
+        else:
             with item.open('rb') as stream:
                 sqlite = stream.read(16) == b'SQLite format 3\0'
             if sqlite:
@@ -621,7 +779,7 @@ def probes(manifest):
 
 def replace(manifest, directory):
     validate(manifest, release=True)
-    capacity(manifest)
+    backup_capacity = capacity(manifest)
     original = baseline(manifest)
     gpu_probe(manifest)
     legacy_health_gate(manifest)
@@ -639,9 +797,15 @@ def replace(manifest, directory):
         authority(manifest)
     private_json(directory / 'original-inspect.json', original)
     private_json(directory / 'drained.json', state)
-    private_json(directory / 'backup-policy.json', {'transient_exclusions':sorted(TRANSIENT_SNAPSHOT_EXCLUSIONS),'accepted_attempts_and_receipts':'included'})
-    snapshot_tree(manifest['base'], directory / 'base')
+    retained = preserved_runtime(manifest)
+    private_json(directory / 'backup-policy.json', {'transient_exclusions':sorted(TRANSIENT_SNAPSHOT_EXCLUSIONS),'preserved_runtime':retained,'capacity':backup_capacity,'accepted_attempts_and_receipts':'included'})
+    if retained:
+        private_json(directory / 'preserved-runtime-inventory.json', evidence_json(retained['inventory'], limit=32*1024*1024))
+        private_json(directory / 'preserved-runtime-review.json', evidence_json(retained['review']))
+    snapshot_tree(manifest['base'], directory / 'base', preserved=retained)
     backup_database(manifest['ledger'], directory / 'ledger.db')
+    if preserved_runtime(manifest) != retained: fail('preserved runtime changed during snapshot')
+    private_json(directory / 'backup-complete.json', {'at':time.time(),'preserved_runtime':retained,'business_snapshot_complete':True})
     # Lock inode remains on its original mount. Backup is evidence, never the live authority.
     for role in ROLES:
         service = manifest['services'][role]
@@ -661,6 +825,8 @@ def replace(manifest, directory):
             if env.get('FILE_OPERATIONS_ADMISSION') != 'closed': fail('native must start admission closed')
             if created['Config'].get('User') != str(manifest['native_uid'])+':'+str(manifest['native_gid']): fail('native container UID/GID differs from permission acceptance')
         if role in ('worker','calibrator','web') and not env.get('FILE_OPERATIONS_RUST_URL'): fail('peer lacks native coordinator URL')
+        if retained and ('/venv' in json.dumps(created.get('Config',{})) or 'VIRTUAL_ENV=' in json.dumps(created.get('Config',{}))): fail(role+': created candidate references preserved runtime')
+        if preserved_runtime(manifest) != retained: fail('preserved runtime changed before candidate start')
         run('docker', 'start', candidate)
         private_json(directory / (role + '-started.json'), {'id': candidate})
         if role == 'native' and original['native'] is None:
@@ -670,6 +836,7 @@ def replace(manifest, directory):
             stat=lock.stat();manifest['authority_identity']={'dev':str(stat.st_dev),'ino':str(stat.st_ino)}
         authority(manifest)
         service.update(expected_id=candidate,expected_image=service['candidate_image'],initially_absent=False)
+    if preserved_runtime(manifest) != retained: fail('preserved runtime changed during replacement')
     private_json(directory / 'activated-manifest.json',manifest)
     state = await_available(lambda:api(manifest, '/v1/readiness'),manifest.get('startup_timeout',30))
     if state.get('schema') != manifest['native_schema'] or state.get('accepting') or not state.get('drained') or state.get('mode') != 'writer' or state.get('authority') != {key:str(manifest['authority_identity'][key]) for key in ('dev','ino')}:
@@ -680,20 +847,28 @@ def replace(manifest, directory):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=('check', 'close', 'verify', 'replace', 'rollback', 'open', 'parity-snapshot', 'fence-peers', 'release-fence', 'permissions'))
+    parser.add_argument('action', choices=('check', 'close', 'verify', 'replace', 'rollback', 'open', 'parity-snapshot', 'fence-peers', 'release-fence', 'permissions', 'runtime-inventory', 'runtime-configuration'))
     parser.add_argument('--manifest', type=Path)
     parser.add_argument('--execute', action='store_true')
     parser.add_argument('--source-base'); parser.add_argument('--source-ledger'); parser.add_argument('--output')
     args = parser.parse_args()
+    if args.action == 'runtime-inventory':
+        output=Path(args.output)
+        if output.resolve().is_relative_to(Path(args.source_base).resolve()): fail('runtime inventory evidence must be outside BASE')
+        private_json(output,runtime_inventory(Path(args.source_base)))
+        return
     if args.action == 'parity-snapshot':
         parity_snapshot(args.source_base, args.source_ledger, args.output); return
     manifest = json.loads(args.manifest.read_text()); validate(manifest)
+    if args.action == 'runtime-configuration':
+        if Path(args.output).resolve().is_relative_to(Path(manifest['base']).resolve()): fail('runtime configuration evidence must be outside BASE')
+        private_json(Path(args.output),candidate_runtime_configuration(manifest)); return
     if args.action == 'permissions':
         report=permissions(manifest);print(json.dumps(report,indent=2));
         if not report['ok']: fail('native access checks failed; review targeted ownership/ACL changes')
         return
     if args.action == 'check':
-        baseline(manifest); capacity(manifest); legacy_health_gate(manifest); print('frozen container, Peach schema, candidate images and backup capacity match'); return
+        baseline(manifest); report=capacity(manifest); legacy_health_gate(manifest); print(json.dumps(report,indent=2)); return
     if not args.execute:
         print(json.dumps({'action': args.action, 'release_id': manifest['release_id'], 'roles': ROLES, 'executed': False})); return
     # Existing lock is opened without O_CREAT (Linux protected_regular compatible).
@@ -709,9 +884,9 @@ def main():
         if args.action == 'close':
             print(json.dumps(drain(manifest, manifest.get('drain_timeout', 120)))); return
         if args.action == 'verify':
-            authority(manifest); probes(manifest); print('all frozen probes passed'); return
+            preserved_runtime(manifest); authority(manifest); probes(manifest); print('all frozen probes passed'); return
         if args.action == 'open':
-            validate(manifest, release=True); baseline(manifest); legacy_health_gate(manifest); authority(manifest); probes(manifest)
+            validate(manifest, release=True); preserved_runtime(manifest); baseline(manifest); legacy_health_gate(manifest); authority(manifest); probes(manifest)
             state = api(manifest, '/v1/readiness')
             if not state.get('drained') or state.get('schema') != manifest['native_schema'] or state.get('authority') != {key:str(manifest['authority_identity'][key]) for key in ('dev','ino')}:
                 fail('native state not ready to open')

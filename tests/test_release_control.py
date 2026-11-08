@@ -70,7 +70,7 @@ class ReleaseControlTests(unittest.TestCase):
                 calls.append(args)
                 if args[:2]==('docker','create'):raise RuntimeError('candidate creation failed')
                 return ''
-            with patch.object(r,'validate'),patch.object(r,'capacity'),patch.object(r,'baseline',return_value=original),patch.object(r,'gpu_probe'),patch.object(r,'legacy_health_gate'),patch.object(r,'legacy_journals'),patch.object(r,'check_peer_drain'),patch.object(r,'drain',return_value={'drained':True}),patch.object(r,'authority'),patch.object(r,'snapshot_tree'),patch.object(r,'backup_database'),patch.object(r,'inspect',return_value=original['native']),patch.object(r,'run',side_effect=command),self.assertRaisesRegex(RuntimeError,'creation failed'):
+            with patch.object(r,'validate'),patch.object(r,'capacity',return_value={}),patch.object(r,'baseline',return_value=original),patch.object(r,'gpu_probe'),patch.object(r,'legacy_health_gate'),patch.object(r,'legacy_journals'),patch.object(r,'check_peer_drain'),patch.object(r,'drain',return_value={'drained':True}),patch.object(r,'authority'),patch.object(r,'snapshot_tree'),patch.object(r,'backup_database'),patch.object(r,'inspect',return_value=original['native']),patch.object(r,'run',side_effect=command),self.assertRaisesRegex(RuntimeError,'creation failed'):
                 r.replace(m,receipt)
             self.assertTrue((receipt/'native-stopped.json').exists())
             self.assertFalse((receipt/'native-started.json').exists())
@@ -264,5 +264,149 @@ class ReleaseControlTests(unittest.TestCase):
                     finally:signal.setitimer(signal.ITIMER_REAL,0);signal.signal(signal.SIGALRM,old)
                     self.assertLess(time.monotonic()-started,1)
                     self.assertEqual(path.lstat().st_ino,identity.st_ino);self.assertEqual(other.read_bytes(),b'foreign')
+
+    def runtime_fixture(self, root):
+        import hashlib
+        root=root.resolve();base=root/'base';venv=base/'venv'
+        for name in ('bin','lib/python3.11/site-packages/pkg','include'):(venv/name).mkdir(parents=True,exist_ok=True)
+        (base/'.fixture').write_text('isolated runtime preservation fixture')
+        (venv/'pyvenv.cfg').write_text('home = /usr/bin\ninclude-system-site-packages = false\nversion = 3.11.2\nexecutable = /usr/bin/python3.11\n')
+        for name,target in {'bin/python':'python3','bin/python3.11':'python3','bin/python3':'/usr/bin/python3','lib64':'lib'}.items():(venv/name).symlink_to(target)
+        (venv/'lib/python3.11/site-packages/pkg/runtime.bin').write_bytes(b'R'*10000)
+        (base/'manual.json').write_text('{"manual":true}')
+        (base/'processing/attempts/accepted').mkdir(parents=True);(base/'processing/attempts/accepted/publication.json').write_text('{"accepted":true}')
+        (base/'processing/tmp').mkdir();(base/'processing/tmp/frame').write_bytes(b'x'*20000)
+        (base/'file-operations-rust').mkdir();(base/'file-operations-rust/executor.lock').write_bytes(b'authority')
+        for path in (base/'faces.db',root/'ledger.db',base/'file-operations-rust/operations.sqlite3'):
+            with sqlite3.connect(path) as db:db.execute('CREATE TABLE records(value TEXT)');db.execute("INSERT INTO records VALUES('accepted')")
+        m=self.manifest();m.update(base=str(base),ledger=str(root/'ledger.db'),authority_dir=str(base/'file-operations-rust'),evidence_dir=str(root/'evidence'),deploy_lock=str(root/'deploy.lock'),minimum_free_after_backup_bytes=100)
+        for role,service in m['services'].items():service['create_args']=['--name',service['name'],service['candidate_image']]
+        def freeze(name,value):
+            path=root/name;path.write_text(json.dumps(value));return {'path':str(path),'sha256':hashlib.sha256(path.read_bytes()).hexdigest()}
+        m['preserved_runtime']={'relative_path':'venv','inventory':freeze('inventory.json',r.runtime_inventory(base))}
+        proof=freeze('source-review.json',{'fixture':True,'review':'marked synthetic image runtime; no BASE/venv use or writes'})
+        review={'version':1,'kind':'preserved-runtime-review','base':str(base),'relative_path':'venv','inventory_sha256':m['preserved_runtime']['inventory']['sha256'],'retained_in_place':True,'candidate_uses_image_runtimes':True,'candidate_mutates_preserved_runtime':False,'contains_business_state':False,'source_files':[],'candidate_configuration':r.candidate_runtime_configuration(m),'runtime_namespace_evidence':proof,'runtime_source_review':proof}
+        m['preserved_runtime']['review']=freeze('review.json',review)
+        return m
+
+    def runtime_image(self,*args):
+        self.assertEqual(args[:3],('docker','image','inspect'))
+        return json.dumps([{'Id':args[3],'Config':{'Cmd':['python3','/opt/worker.py'],'Env':['PATH=/usr/local/bin:/usr/bin']}}])
+
+    def test_preserved_runtime_capacity_and_snapshot_agree_and_preserve_business_authority(self):
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory(prefix='face-release-fixture-') as tmp,patch.object(r,'run',side_effect=self.runtime_image):
+            root=Path(tmp).resolve();m=self.runtime_fixture(root);base=Path(m['base']);before=r.runtime_inventory(base)
+            retained=r.preserved_runtime(m);expected=r.snapshot_size(base,preserved=retained)+Path(m['ledger']).stat().st_size
+            with patch.object(r.shutil,'disk_usage',return_value=SimpleNamespace(free=expected+100)):
+                report=r.capacity(m)
+            self.assertEqual(report['backup_estimate_bytes'],expected);self.assertEqual(report['preserved_runtime']['regular_bytes'],before['regular_bytes'])
+            self.assertEqual(report['transient_exclusions'],['processing/tmp'])
+            r.snapshot_tree(base,root/'backup',preserved=retained);r.backup_database(m['ledger'],root/'backup-ledger.db')
+            self.assertFalse((root/'backup/venv').exists());self.assertFalse((root/'backup/processing/tmp').exists())
+            for relative in ('manual.json','processing/attempts/accepted/publication.json','file-operations-rust/executor.lock'):
+                self.assertEqual((root/'backup'/relative).read_bytes(),(base/relative).read_bytes())
+            for relative in ('faces.db','file-operations-rust/operations.sqlite3'):
+                with sqlite3.connect(root/'backup'/relative) as db:self.assertEqual(db.execute('SELECT value FROM records').fetchone(),('accepted',))
+            self.assertEqual(r.runtime_inventory(base),before)
+
+    def test_preserved_runtime_requires_explicit_policy_and_exact_layout(self):
+        with tempfile.TemporaryDirectory(prefix='face-release-fixture-') as tmp,patch.object(r,'run',side_effect=self.runtime_image):
+            m=self.runtime_fixture(Path(tmp));base=Path(m['base'])
+            with self.assertRaisesRegex(RuntimeError,'symlink'):r.snapshot_size(base)
+            m['preserved_runtime']['relative_path']='processing/attempts'
+            with self.assertRaisesRegex(RuntimeError,'only explicitly'):r.preserved_runtime(m)
+            m['preserved_runtime']['relative_path']='venv'
+            (base/'venv/receipts.json').write_text('{}')
+            with self.assertRaisesRegex(RuntimeError,'nonruntime'):r.preserved_runtime(m)
+            (base/'venv/receipts.json').unlink();(base/'venv/bin/business.db').write_text('{}')
+            with self.assertRaisesRegex(RuntimeError,'nonruntime'):r.preserved_runtime(m)
+
+    def test_preserved_runtime_rejects_foreign_symlinks_and_overlapping_business_paths(self):
+        with tempfile.TemporaryDirectory(prefix='face-release-fixture-') as tmp,patch.object(r,'run',side_effect=self.runtime_image):
+            m=self.runtime_fixture(Path(tmp));base=Path(m['base']);retained=r.preserved_runtime(m)
+            (base/'unexpected').symlink_to(base/'venv')
+            for action in (lambda:r.snapshot_size(base,preserved=retained),lambda:r.snapshot_tree(base,base.parent/'backup',preserved=retained)):
+                with self.assertRaisesRegex(RuntimeError,'symlink'):action()
+            (base/'unexpected').unlink()
+            ledger=Path(m['ledger']);saved=ledger.with_name('saved-ledger.db');ledger.rename(saved);ledger.symlink_to(saved)
+            with self.assertRaisesRegex(RuntimeError,'symlink'):r.capacity(m)
+            ledger.unlink();saved.rename(ledger)
+            (base/'venv/lib/python3.11/site-packages/foreign').symlink_to('/outside')
+            with self.assertRaisesRegex(RuntimeError,'unreviewed'):r.preserved_runtime(m)
+            (base/'venv/lib/python3.11/site-packages/foreign').unlink()
+            for key in ('ledger','authority_dir','evidence_dir','deploy_lock'):
+                original=m[key];m[key]=str(base/'venv'/key)
+                with self.assertRaisesRegex(RuntimeError,'overlaps'):r.preserved_runtime(m)
+                m[key]=original
+
+    def test_preserved_runtime_changed_source_or_frozen_review_fails_closed(self):
+        with tempfile.TemporaryDirectory(prefix='face-release-fixture-') as tmp,patch.object(r,'run',side_effect=self.runtime_image):
+            m=self.runtime_fixture(Path(tmp));base=Path(m['base'])
+            path=base/'venv/lib/python3.11/site-packages/pkg/runtime.bin';path.write_bytes(b'changed')
+            with self.assertRaisesRegex(RuntimeError,'inventory changed'):r.preserved_runtime(m)
+            self.assertEqual(path.read_bytes(),b'changed');self.assertTrue(Path(m['preserved_runtime']['inventory']['path']).exists())
+        with tempfile.TemporaryDirectory(prefix='face-release-fixture-') as tmp,patch.object(r,'run',side_effect=self.runtime_image):
+            m=self.runtime_fixture(Path(tmp));Path(m['preserved_runtime']['review']['path']).write_text('{}')
+            with self.assertRaisesRegex(RuntimeError,'evidence changed'):r.preserved_runtime(m)
+
+    def test_candidate_runtime_review_binds_args_image_defaults_and_env_file(self):
+        with tempfile.TemporaryDirectory(prefix='face-release-fixture-') as tmp,patch.object(r,'run',side_effect=self.runtime_image):
+            m=self.runtime_fixture(Path(tmp));args=m['services']['worker']['create_args'];args.insert(0,'--read-only')
+            with self.assertRaisesRegex(RuntimeError,'differs from frozen review'):r.preserved_runtime(m)
+            args.pop(0);args[:0]=['-e','PATH=/data/base/venv/bin']
+            with self.assertRaisesRegex(RuntimeError,'references preserved'):r.preserved_runtime(m)
+            del args[:2];env=Path(tmp)/'worker.env';env.write_text('PATH=/usr/local/bin\n');args[:0]=['--env-file',str(env)]
+            first=r.candidate_runtime_configuration(m);env.write_text('PATH=/usr/bin\n');self.assertNotEqual(first,r.candidate_runtime_configuration(m))
+            env.write_text('VIRTUAL_ENV=/alternate/runtime\n')
+            with self.assertRaisesRegex(RuntimeError,'env uses preserved'):r.candidate_runtime_configuration(m)
+
+    def test_runtime_inventory_unreadable_and_nonregular_entries_fail_closed(self):
+        import os
+        with tempfile.TemporaryDirectory(prefix='face-release-fixture-') as tmp,patch.object(r,'run',side_effect=self.runtime_image):
+            m=self.runtime_fixture(Path(tmp));base=Path(m['base']);original=Path.iterdir
+            def entries(path):
+                if path.name=='site-packages':raise PermissionError('fixture unreadable')
+                return original(path)
+            with patch.object(Path,'iterdir',entries),self.assertRaises(PermissionError):r.preserved_runtime(m)
+            os.mkfifo(base/'venv/bin/pipe')
+            with self.assertRaisesRegex(RuntimeError,'unsupported'):r.preserved_runtime(m)
+
+    def test_sqlite_sidecars_only_skip_verified_database_companions(self):
+        with tempfile.TemporaryDirectory(prefix='face-release-fixture-') as tmp:
+            root=Path(tmp);base=root/'base';base.mkdir();(base/'.fixture').write_text('isolated')
+            (base/'history-wal').write_text('business record');(base/'notes-shm').write_text('manual record');(base/'event-journal').write_text('receipt')
+            db=sqlite3.connect(base/'state.db');db.execute('PRAGMA journal_mode=WAL');db.execute('CREATE TABLE state(value)');db.execute('INSERT INTO state VALUES(42)');db.commit()
+            size=r.snapshot_size(base);r.snapshot_tree(base,root/'backup')
+            self.assertEqual(size,sum(path.stat().st_size for path in base.iterdir() if path.name != 'state.db-shm'))
+            for name in ('history-wal','notes-shm','event-journal'):self.assertEqual((root/'backup'/name).read_bytes(),(base/name).read_bytes())
+            with sqlite3.connect(root/'backup/state.db') as saved:self.assertEqual(saved.execute('SELECT value FROM state').fetchone(),(42,))
+            db.close()
+
+    def test_replace_retains_backup_and_originals_when_runtime_changes_during_copy(self):
+        with tempfile.TemporaryDirectory(prefix='face-release-fixture-') as tmp,patch.object(r,'run',side_effect=self.runtime_image) as commands:
+            root=Path(tmp).resolve();m=self.runtime_fixture(root);base=Path(m['base']);receipt=root/'receipts';receipt.mkdir()
+            original={role:{'Id':service['expected_id'],'Image':service['expected_image']} for role,service in m['services'].items()}
+            source_bytes=(base/'manual.json').read_bytes();lock_inode=(base/'file-operations-rust/executor.lock').stat().st_ino
+            backup=r.backup_database
+            def copy_database(source,target):
+                backup(source,target)
+                if Path(target)==receipt/'ledger.db':(base/'venv/lib/python3.11/site-packages/late.json').write_text('{"unexpected":true}')
+            with patch.object(r,'validate'),patch.object(r,'baseline',return_value=original),patch.object(r,'gpu_probe'),patch.object(r,'legacy_health_gate'),patch.object(r,'legacy_journals'),patch.object(r,'check_peer_drain'),patch.object(r,'drain',return_value={'drained':True}),patch.object(r,'authority'),patch.object(r,'backup_database',side_effect=copy_database),self.assertRaisesRegex(RuntimeError,'inventory changed'):
+                r.replace(m,receipt)
+            self.assertEqual((base/'manual.json').read_bytes(),source_bytes);self.assertEqual((base/'file-operations-rust/executor.lock').stat().st_ino,lock_inode)
+            self.assertEqual((receipt/'base/manual.json').read_bytes(),source_bytes)
+            self.assertTrue((receipt/'ledger.db').exists());self.assertTrue((receipt/'preserved-runtime-inventory.json').exists());self.assertTrue((receipt/'preserved-runtime-review.json').exists())
+            self.assertFalse((receipt/'backup-complete.json').exists());self.assertFalse((receipt/'native-stopped.json').exists())
+            self.assertTrue(all(call.args[:3]==('docker','image','inspect') for call in commands.call_args_list))
+
+    def test_changed_mounted_source_is_not_covered_by_old_runtime_review(self):
+        import hashlib
+        with tempfile.TemporaryDirectory(prefix='face-release-fixture-') as tmp,patch.object(r,'run',side_effect=self.runtime_image):
+            m=self.runtime_fixture(Path(tmp));path=Path(tmp)/'mounted.py';path.write_text('print("image runtime")')
+            reference=m['preserved_runtime']['review'];review=json.loads(Path(reference['path']).read_text());review['source_files']=[{'path':str(path),'sha256':hashlib.sha256(path.read_bytes()).hexdigest()}]
+            Path(reference['path']).write_text(json.dumps(review));reference['sha256']=hashlib.sha256(Path(reference['path']).read_bytes()).hexdigest()
+            self.assertIsNotNone(r.preserved_runtime(m));path.write_text('print("changed")')
+            with self.assertRaisesRegex(RuntimeError,'mounted source file changed'):r.preserved_runtime(m)
 
 if __name__=='__main__':unittest.main()

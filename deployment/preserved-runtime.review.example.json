@@ -1,0 +1,22 @@
+{
+  "version": 1,
+  "kind": "preserved-runtime-review",
+  "base": "/EXACT/CANONICAL/BASE",
+  "relative_path": "venv",
+  "inventory_sha256": "FREEZE_FULL_STAT_INVENTORY_FILE_SHA256",
+  "retained_in_place": false,
+  "candidate_uses_image_runtimes": false,
+  "candidate_mutates_preserved_runtime": null,
+  "contains_business_state": null,
+  "candidate_configuration": {},
+  "source_files": [{"path": "/PRIVATE/EXACT_MOUNTED_SOURCE.py", "sha256": "FREEZE_SOURCE_FILE_SHA256"}],
+  "runtime_namespace_evidence": {
+    "path": "/PRIVATE/reviewed-runtime-namespace.json",
+    "sha256": "FREEZE_EVIDENCE_SHA256"
+  },
+  "runtime_source_review": {
+    "path": "/PRIVATE/reviewed-candidate-runtime-source.json",
+    "sha256": "FREEZE_EVIDENCE_SHA256"
+  },
+  "review_notes": "Failing template. Inspect full inventory, current runtime, all candidate code/config and mounted scripts. Fill actual review conclusions; do not convert placeholders to passed flags automatically."
+}
