@@ -1104,22 +1104,13 @@ impl Engine {
                 match self.ledger_apply(plan, &domain) {
                     Ok(applied) => applied,
                     Err(error) if plan.action == "archive" => {
-                        self.verify_published_archive_destinations(plan, &successful)
-                            .map_err(|_| error.clone())?;
-                        let delta = domain
-                            .ledger
-                            .as_ref()
-                            .ok_or_else(|| Error::conflict("缺少账本意图"))?;
-                        let applied = crate::archive_cancel::apply_with_scanner_reconciliation(
-                            &self.config,
+                        let (applied, reconciled) = self.apply_archive_with_scanner_reconciliation(
                             plan,
-                            delta,
-                        )
-                        .map_err(|_| error)?;
-                        if let Some(ids) = applied["reconciled_scanner_assets"].as_array() {
-                            reconciled_scanner_assets =
-                                ids.iter().filter_map(Value::as_i64).collect();
-                        }
+                            &domain,
+                            &successful,
+                            error,
+                        )?;
+                        reconciled_scanner_assets = reconciled;
                         applied
                     }
                     Err(error) => return Err(error),
@@ -1129,21 +1120,13 @@ impl Engine {
                 for &index in &successful {
                     crate::archive::verify_duplicate(&self.config, plan, index, false)?;
                 }
-                self.verify_published_archive_destinations(plan, &successful)
-                    .map_err(|_| error.clone())?;
-                let delta = domain
-                    .ledger
-                    .as_ref()
-                    .ok_or_else(|| Error::conflict("缺少账本意图"))?;
-                let applied = crate::archive_cancel::apply_with_scanner_reconciliation(
-                    &self.config,
+                let (applied, reconciled) = self.apply_archive_with_scanner_reconciliation(
                     plan,
-                    delta,
-                )
-                .map_err(|_| error)?;
-                if let Some(ids) = applied["reconciled_scanner_assets"].as_array() {
-                    reconciled_scanner_assets = ids.iter().filter_map(Value::as_i64).collect();
-                }
+                    &domain,
+                    &successful,
+                    error,
+                )?;
+                reconciled_scanner_assets = reconciled;
                 applied
             }
             Err(error) => return Err(error),
@@ -1215,6 +1198,32 @@ impl Engine {
         crate::archive_cancel::release_scanner_lease(&self.config, &plan.id, "committed");
         crate::fault::checkpoint(&self.config, "final_receipt_unreleased")?;
         Ok(result)
+    }
+
+    fn apply_archive_with_scanner_reconciliation(
+        &self,
+        plan: &Plan,
+        domain: &DomainSnapshot,
+        successful: &[usize],
+        error: Error,
+    ) -> Result<(Value, Vec<i64>)> {
+        self.verify_published_archive_destinations(plan, successful)
+            .map_err(|_| error.clone())?;
+        let delta = domain
+            .ledger
+            .as_ref()
+            .ok_or_else(|| Error::conflict("缺少账本意图"))?;
+        let applied = crate::archive_cancel::apply_with_scanner_reconciliation(
+            &self.config,
+            plan,
+            delta,
+        )
+        .map_err(|_| error)?;
+        let reconciled = applied["reconciled_scanner_assets"]
+            .as_array()
+            .map(|ids| ids.iter().filter_map(Value::as_i64).collect())
+            .unwrap_or_default();
+        Ok((applied, reconciled))
     }
 }
 fn validate(request: &Request) -> Result<()> {

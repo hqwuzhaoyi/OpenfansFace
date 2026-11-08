@@ -318,6 +318,58 @@ pub fn resolve_candidates(candidates: &[Value]) -> Value {
     })
 }
 
+fn resolve_stage_data(
+    config: &Config,
+    stage: &str,
+    vid: &str,
+    path: &str,
+    data: &mut Value,
+) -> Result<(String, bool)> {
+    let aliases = review::read(config, "person-renames.json", json!({}))?.1;
+    if stage == "text" {
+        let people = load_catalog(config, &aliases)?;
+        let folder = folder_hints(path, &people);
+        let mappings = review::read(config, "watermarks/mappings.json", json!({}))?.1;
+        let text_candidates =
+            candidates_from_text(&data["watermark"], &mappings, &folder, &aliases);
+        let legacy = load_legacy_names(config, vid, &aliases)?;
+        let skip = can_skip_face(&text_candidates, &legacy);
+        let resolved = resolve_candidates(&text_candidates);
+        let next = if skip { "review" } else { "face_queued" };
+        data["folder"] = json!(folder);
+        data["text_candidates"] = json!(text_candidates);
+        data["text_complete"] = json!(true);
+        data["face_skipped"] = json!(skip);
+        data["ready"] = json!(skip);
+        data["kind"] = resolved["kind"].clone();
+        data["candidates"] = resolved["candidates"].clone();
+        data["suggested"] = resolved["suggested"].clone();
+        Ok((next.to_owned(), skip))
+    } else {
+        if let Some(matches) = data["face"]["matches"].as_array_mut() {
+            for m in matches {
+                if let Some(name) = m["name"].as_str() {
+                    m["name"] = json!(canonical_person(name, &aliases));
+                }
+            }
+        }
+        let mut combined = data["text_candidates"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if let Some(matches) = data["face"]["matches"].as_array() {
+            combined.extend(matches.iter().cloned());
+        }
+        let resolved = resolve_candidates(&combined);
+        data["face_complete"] = json!(true);
+        data["ready"] = json!(true);
+        data["kind"] = resolved["kind"].clone();
+        data["candidates"] = resolved["candidates"].clone();
+        data["suggested"] = resolved["suggested"].clone();
+        Ok(("review".to_owned(), false))
+    }
+}
+
 pub fn evaluate_rules(body: &Value) -> Result<Value> {
     match body["op"].as_str() {
         Some("folder_hints") => {
@@ -382,57 +434,22 @@ pub fn evaluate_rules(body: &Value) -> Result<Value> {
                 .or_else(|| task["data"].as_object().map(|m| Value::Object(m.clone())))
                 .unwrap_or_else(|| json!({}));
             let mut data = old.clone();
-            let aliases = review::read(&config, "person-renames.json", json!({}))?.1;
-            let next_stage = if stage == "text" {
-                let watermark = body["data"]["watermark"].clone();
-                let people = load_catalog(&config, &aliases)?;
-                let folder = folder_hints(task["path"].as_str().unwrap_or(""), &people);
-                let mappings = review::read(&config, "watermarks/mappings.json", json!({}))?.1;
-                let text_candidates =
-                    candidates_from_text(&watermark, &mappings, &folder, &aliases);
-                let legacy =
-                    load_legacy_names(&config, task["vid"].as_str().unwrap_or(""), &aliases)?;
-                let skip = can_skip_face(&text_candidates, &legacy);
-                let resolved = resolve_candidates(&text_candidates);
+            if stage == "text" {
                 if let Some(obj) = data.as_object_mut() {
                     obj.remove("face");
                     obj.remove("face_complete");
                 }
-                data["watermark"] = watermark;
-                data["folder"] = json!(folder);
-                data["text_candidates"] = json!(text_candidates);
-                data["text_complete"] = json!(true);
-                data["face_skipped"] = json!(skip);
-                data["ready"] = json!(skip);
-                data["kind"] = resolved["kind"].clone();
-                data["candidates"] = resolved["candidates"].clone();
-                data["suggested"] = resolved["suggested"].clone();
-                if skip { "review" } else { "face_queued" }
+                data["watermark"] = body["data"]["watermark"].clone();
             } else {
-                let mut face = body["data"]["face"].clone();
-                if let Some(matches) = face["matches"].as_array_mut() {
-                    for m in matches {
-                        if let Some(name) = m["name"].as_str() {
-                            m["name"] = json!(canonical_person(name, &aliases));
-                        }
-                    }
-                }
-                let mut combined = data["text_candidates"]
-                    .as_array()
-                    .cloned()
-                    .unwrap_or_default();
-                if let Some(matches) = face["matches"].as_array() {
-                    combined.extend(matches.iter().cloned());
-                }
-                let resolved = resolve_candidates(&combined);
-                data["face"] = face;
-                data["face_complete"] = json!(true);
-                data["ready"] = json!(true);
-                data["kind"] = resolved["kind"].clone();
-                data["candidates"] = resolved["candidates"].clone();
-                data["suggested"] = resolved["suggested"].clone();
-                "review"
-            };
+                data["face"] = body["data"]["face"].clone();
+            }
+            let (next_stage, _) = resolve_stage_data(
+                &config,
+                stage,
+                task["vid"].as_str().unwrap_or(""),
+                task["path"].as_str().unwrap_or(""),
+                &mut data,
+            )?;
             Ok(json!({
                 "data": data,
                 "next_stage": next_stage,
@@ -977,58 +994,20 @@ fn prepare_data(
             }
         }
     }
-    let aliases = review::read(config, "person-renames.json", json!({}))?.1;
-    let next_stage = if s.task.stage == "text" {
-        let people = load_catalog(config, &aliases)?;
-        let folder = folder_hints(&s.task.path, &people);
-        let mappings = review::read(config, "watermarks/mappings.json", json!({}))?.1;
-        let text_candidates =
-            candidates_from_text(&data["watermark"], &mappings, &folder, &aliases);
-        let legacy = load_legacy_names(config, &s.task.vid, &aliases)?;
-        let skip = can_skip_face(&text_candidates, &legacy);
-        let resolved = resolve_candidates(&text_candidates);
-        let next = if skip { "review" } else { "face_queued" };
+    let (next_stage, skip) =
+        resolve_stage_data(config, &s.task.stage, &s.task.vid, &s.task.path, &mut data)?;
+    if s.task.stage == "text" {
         if s.data
             .get("face_skipped")
             .is_some_and(|v| v != &json!(skip))
             || s.data.get("ready").is_some_and(|v| v != &json!(skip))
-            || s.next_stage.as_deref().is_some_and(|n| n != next)
+            || s.next_stage.as_deref().is_some_and(|n| n != next_stage)
         {
             return Err(invalid("文字阶段完成标记不一致"));
         }
-        data["folder"] = json!(folder);
-        data["text_candidates"] = json!(text_candidates);
-        data["text_complete"] = json!(true);
-        data["face_skipped"] = json!(skip);
-        data["ready"] = json!(skip);
-        data["kind"] = resolved["kind"].clone();
-        data["candidates"] = resolved["candidates"].clone();
-        data["suggested"] = resolved["suggested"].clone();
-        next.to_owned()
     } else {
-        if let Some(matches) = data["face"]["matches"].as_array_mut() {
-            for m in matches {
-                if let Some(name) = m["name"].as_str() {
-                    m["name"] = json!(canonical_person(name, &aliases));
-                }
-            }
-        }
-        let mut combined = data["text_candidates"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
-        if let Some(matches) = data["face"]["matches"].as_array() {
-            combined.extend(matches.iter().cloned());
-        }
-        let resolved = resolve_candidates(&combined);
-        data["face_complete"] = json!(true);
         data["face_skipped"] = json!(false);
-        data["ready"] = json!(true);
-        data["kind"] = resolved["kind"].clone();
-        data["candidates"] = resolved["candidates"].clone();
-        data["suggested"] = resolved["suggested"].clone();
-        "review".to_owned()
-    };
+    }
     let input = data["face"]["unknown_group_input"].clone();
     if let Some(face) = data.get_mut("face").and_then(Value::as_object_mut) {
         face.remove("unknown_group_input");

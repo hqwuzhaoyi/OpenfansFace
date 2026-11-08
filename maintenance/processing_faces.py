@@ -15,7 +15,7 @@ from processing_store import connect
 from task_progress import stage_progress
 from processing_publication import attempt_directory, native, PublicationError
 from processing_gpu import backend, Detector, DETECTOR_SHA
-from processing_compute import RUNTIME, compute_write_guard
+from processing_compute import RUNTIME, compute_write_guard, get_resident_client, in_compute_write_guard
 
 FACE_VERSION = 'buffalo_l-det-rec-8frames-v1'
 MODEL_HASHES = {'det_10g.onnx': DETECTOR_SHA, 'w600k_r50.onnx': '4c06341c33c2ca1f86781dab0e829f88ad5b64be9fba56e56bc9ebdefc619e43'}
@@ -50,23 +50,43 @@ def cached_features(base, task):
     cache_check = task.get('_cache_check')
     if isinstance(cache_check, dict) and cache_check.get('face_feature_valid') is False:
         return None
-    previous = json.loads(task.get('data', '{}')).get('face', {}).get('feature_cache')
+    raw_data = task.get('data', '{}')
+    parsed_data = json.loads(raw_data) if isinstance(raw_data, str) else (raw_data or {})
+    face_data = parsed_data.get('face', {}) if isinstance(parsed_data, dict) else {}
+    previous = None
+    expected = None
+    source_identity = None
+    if isinstance(cache_check, dict) and cache_check.get('face_feature_valid') is True:
+        previous = cache_check.get('feature_cache')
+        expected = cache_check.get('feature_cache_sha256')
+        source_identity = cache_check.get('source_identity')
+    if not previous:
+        previous = face_data.get('feature_cache')
+    if not expected:
+        expected = face_data.get('feature_cache_sha256')
+    if not source_identity:
+        source_identity = face_data.get('source_identity')
     if not previous:
         return None
     file = Path(previous)
-    if previous and not file.resolve().is_relative_to((Path(base) / 'processing/attempts').resolve()):
+    if not file.resolve().is_relative_to((Path(base) / 'processing/attempts').resolve()):
         return None
     if not file.exists():
         return None
     payload = file.read_bytes()
-    expected = json.loads(task.get('data', '{}')).get('face', {}).get('feature_cache_sha256')
     if not expected or hashlib.sha256(payload).hexdigest() != expected:
         return None
     with np.load(io.BytesIO(payload), allow_pickle=False) as data:
         if 'model_hashes' in data and json.loads(str(data['model_hashes'])) != MODEL_HASHES:
             return None
-        if str(data['version']) != FACE_VERSION or str(data['path']) != task['path'] or int(data['size']) != task['size'] or str(data['mtime_ns']) != task['mtime_ns']:
+        if str(data['version']) != FACE_VERSION or str(data['path']) != task['path'] or int(data['size']) != task['size'] or str(data['mtime_ns']) != str(task['mtime_ns']):
             return None
+        if source_identity is None and 'source_dev' in data and 'source_ino' in data:
+            source_identity = {'dev': int(data['source_dev']), 'ino': int(data['source_ino'])}
+        task['_feature_cache'] = str(file)
+        task['_feature_cache_sha256'] = expected
+        if source_identity is not None:
+            task['_source_identity'] = source_identity
         return {key: data[key].copy() for key in ('embeddings', 'thumbs', 'timestamps')}
 
 
@@ -273,6 +293,18 @@ def compute_staged_references(base, root, state=None):
     )
 
 
+def _stage_references(base: Path, root: Path, state: dict) -> dict:
+    use_daemon = (
+        os.environ.get('PROCESSING_COMPUTE_MODE') != 'subprocess'
+        and not in_compute_write_guard()
+        and not hasattr(native, 'assert_called')
+    )
+    if use_daemon:
+        return get_resident_client().compute_references(base, root, state=state)
+    with compute_write_guard(base, root):
+        return compute_staged_references(base, root, state=state)
+
+
 def build_references(base, root):
     """Use unambiguous existing representative faces and coherent confirmed-video faces."""
     base = Path(base)
@@ -283,8 +315,7 @@ def build_references(base, root):
         state_resp = native('analysis-state', {})
 
     if isinstance(state_resp, dict) and 'assigned' in state_resp and 'input_version' in state_resp:
-        with compute_write_guard(base, root):
-            staged = compute_staged_references(base, root, state=state_resp)
+        staged = _stage_references(base, root, state_resp)
         published = native('processing-publish-references', staged)
         return dict(
             version=published['version'],
@@ -294,8 +325,7 @@ def build_references(base, root):
         )
 
     input_version = state_resp['version']
-    with compute_write_guard(base, root):
-        staged = compute_staged_references(base, root, state={'input_version': input_version})
+    staged = _stage_references(base, root, {'input_version': input_version})
     staged_file = Path(staged['staged_path'])
     try:
         if native('analysis-state', {})['version'] != input_version:

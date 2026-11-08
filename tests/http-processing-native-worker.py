@@ -57,10 +57,10 @@ try:
         assert calls==['text','face']
         print('PASS real VM claim -> native text/face publish, OCR selected merge, unknown transport committed replay, human preservation and no double count')
         with con:con.execute('UPDATE tasks SET manual=0 WHERE vid=?',(vid,))
-        confirmation_scope={}
+        page=x.call({'command':'review-page','body':{}},'/v1/archive')
+        original=next(row for row in page['rows'] if row['vid']==vid)
+        confirmation_scope={'review_session':page['session'],'review_tokens':{vid:original['review_token']}}
         if os.environ.get('PROCESSING_REVIEW_JOINT')=='1':
-            page=x.call({'command':'review-page','body':{}},'/v1/archive')
-            original=next(row for row in page['rows'] if row['vid']==vid)
             with con:con.execute("UPDATE tasks SET stage='face_queued' WHERE vid=?",(vid,))
             def refreshed(task,base,root):
                 face=runner(task,base,root)
@@ -75,7 +75,6 @@ try:
             assert next(row for row in same['rows'] if row['vid']==vid)['data']==original['data']
             assert same['group']==page['group']
             assert con.execute('SELECT completed FROM batch_items').fetchone()[0]==1
-            confirmation_scope={'review_session':page['session'],'review_tokens':{vid:original['review_token']}}
             print('PASS #18 viewed evidence/group retained after actual native refreshed suggestion; old delivered token still admits explicit decision; completion remains1')
         confirmed=x.call({'command':'queue-confirm','body':{'creator':'甲','vids':[vid],'source':'review','fingerprints':{vid:{'path':str(file),'size':file.stat().st_size,'mtime_ns':str(file.stat().st_mtime_ns)}},'review_group':{'key':'none','deferred':False},**confirmation_scope}},'/v1/archive')
         assert build_references(x.base,x.media)['people']==1

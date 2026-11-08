@@ -234,9 +234,77 @@ try:
         (unaccepted_dir / 'leak.jpg').write_bytes(b'unaccepted')
         chk = meta(x, 'processing-artifact-check', {'attempt': unaccepted_run, 'relative': 'thumbs/leak.jpg'})
         assert chk['accepted'] is False
-        evicted = meta(x, 'processing-evict-artifacts', {'grace_seconds': 0})
+        evicted = meta(x, 'processing-evict-artifacts', {'grace_seconds': 0, 'tmp_max_age_sec': 3600})
         assert unaccepted_run in evicted['evicted_attempts']
         assert not (x.base / 'processing/attempts' / unaccepted_run).exists()
+
+        # 10. Verify Rust-driven processing-step with /v1/compute/ocr and /v1/compute/face HTTP server
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+        import threading
+        step_calls = []
+
+        class _MockComputeHandler(BaseHTTPRequestHandler):
+            def log_message(self, fmt, *args):
+                pass
+
+            def do_POST(self):
+                length = int(self.headers.get('Content-Length', '0'))
+                payload = json.loads(self.rfile.read(length))
+                step_calls.append(self.path)
+                task = payload.get('task', {})
+                if self.path == '/v1/compute/ocr':
+                    res = {
+                        'vid': task['vid'],
+                        'path': task['path'],
+                        'size': task['size'],
+                        'mtime_ns': str(task['mtime_ns']),
+                        'status': 'done',
+                        'pipeline': 'paddleocr-3.4-8frames-v1',
+                        'artifact_attempt': task['run_id'],
+                        'candidates': [],
+                        'sampled_frames': 8,
+                        'execution': {'backend': 'cpu', 'stage': 'ocr'},
+                    }
+                else:
+                    res = {
+                        'matches': [],
+                        'face_count': 0,
+                        'thumbs': [],
+                        'sampled_frames': 8,
+                        'reference_version': (task.get('_references') or {}).get('version', 'none'),
+                        'reference_people': 0,
+                        'version': 'buffalo_l-det-rec-8frames-v1',
+                        'unknown_group': None,
+                        'execution': {'backend': 'cpu'},
+                    }
+                encoded = json.dumps({'ok': True, 'result': res}).encode()
+                self.send_response(200)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(encoded)))
+                self.end_headers()
+                self.wfile.write(encoded)
+
+        compute_srv = HTTPServer(('127.0.0.1', 0), _MockComputeHandler)
+        compute_port = compute_srv.server_address[1]
+        compute_thread = threading.Thread(target=compute_srv.serve_forever, daemon=True)
+        compute_thread.start()
+        try:
+            with sqlite3.connect(db_file) as con_db:
+                valid_batch = con_db.execute("SELECT batch_id FROM batch_items WHERE vid='vid-a' AND excluded=0 LIMIT 1").fetchone()[0]
+                con_db.execute(
+                    "UPDATE tasks SET stage='queued', batch_id=?, next_retry=0, manual=0, run_id='', lease_expires_at=0 WHERE vid='vid-a'",
+                    (valid_batch,),
+                )
+                con_db.execute("UPDATE tasks SET stage='review', run_id='', lease_expires_at=0 WHERE vid!='vid-a'")
+                con_db.commit()
+            step1 = meta(x, 'processing-step', {'capacity': 2, 'compute_url': f'http://127.0.0.1:{compute_port}'})
+            assert step1['stepped'] is True and step1['status'] == 'published' and step1['stage'] == 'text'
+            step2 = meta(x, 'processing-step', {'capacity': 2, 'compute_url': f'http://127.0.0.1:{compute_port}'})
+            assert step2['stepped'] is True and step2['status'] == 'published' and step2['stage'] == 'face'
+            assert '/v1/compute/ocr' in step_calls and '/v1/compute/face' in step_calls
+        finally:
+            compute_srv.shutdown()
+            compute_srv.server_close()
     finally:
         if old_env[0] is None:
             os.environ.pop('FILE_OPERATIONS_RUST_URL', None)

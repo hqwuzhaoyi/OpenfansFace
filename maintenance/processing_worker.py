@@ -24,29 +24,39 @@ from processing_compute import RUNTIME, compute_write_guard, get_resident_client
 from watermark_worker import PIPELINE, PaddleEngine, read_json, publish, scan_video, same_file, validate_source, now
 
 
+_ACTIVE_RUN_IDS = set()
+_ACTIVE_RUN_LOCK = threading.Lock()
+
+
 def media_available(con, root):
     """A shared mount outage must not spend each video's retry budget."""
+    ok = True
+    detail = None
     try:
         root.stat()
         with os.scandir(root) as entries:
             next(entries, None)
     except OSError as error:
-        if os.environ.get('FILE_OPERATIONS_RUST_URL'):
-            try:
-                native('processing-event', {
-                    'kind': 'media_unavailable',
-                    'detail': '媒体挂载不可读，暂停领取任务：' + str(error)[:350],
-                }, timeout=5)
-            except Exception:
-                pass
-            return False
+        ok = False
+        detail = str(error)[:350]
+    if os.environ.get('FILE_OPERATIONS_RUST_URL'):
+        try:
+            resp = native('processing-media-status', {
+                'available': bool(ok),
+                'root': str(root),
+                'error': detail,
+            }, timeout=5)
+            if isinstance(resp, dict) and 'available' in resp:
+                return bool(resp['available'])
+        except Exception:
+            pass
+        return ok
+    if not ok:
         with con:
             if not setting(con, 'media_unavailable', False):
-                event(con, None, 'media_unavailable', '媒体挂载不可读，暂停领取任务：' + str(error)[:350])
-                set_setting(con, 'media_unavailable', dict(at=time.time(), error=str(error)[:350]))
+                event(con, None, 'media_unavailable', '媒体挂载不可读，暂停领取任务：' + detail)
+                set_setting(con, 'media_unavailable', dict(at=time.time(), error=detail))
         return False
-    if os.environ.get('FILE_OPERATIONS_RUST_URL'):
-        return True
     if setting(con, 'media_unavailable', False):
         with con:
             set_setting(con, 'media_unavailable', False)
@@ -250,13 +260,17 @@ def stage_subprocess(task, base, root):
 
 
 def process_one(base, root, runner=stage_subprocess, capacity=1, publisher=publish_result, preparer=prepare, reference_loader=capture_references):
-    con = connect(base)
+    con = None if os.environ.get('FILE_OPERATIONS_RUST_URL') else connect(base)
     try:
         if not media_available(con, root):
             return False
         task = claim(con, capacity=capacity)
         if not task:
             return False
+        run_id = task.get('run_id')
+        if run_id:
+            with _ACTIVE_RUN_LOCK:
+                _ACTIVE_RUN_IDS.add(run_id)
         task["_progress_id"] = task["run_id"]
         progress = None
         try:
@@ -269,6 +283,7 @@ def process_one(base, root, runner=stage_subprocess, capacity=1, publisher=publi
             if os.environ.get('FILE_OPERATIONS_RUST_URL'):
                 try:
                     cache_info = native('processing-cache-check', {
+                        'stage': task['stage'],
                         'vid': task['vid'],
                         'path': task['path'],
                         'size': task['size'],
@@ -316,6 +331,7 @@ def process_one(base, root, runner=stage_subprocess, capacity=1, publisher=publi
                         native('processing-event', {
                             'vid': task['vid'],
                             'kind': 'publication_unknown',
+                            'message': str(error),
                             'detail': str(error),
                         })
                     except Exception:
@@ -333,9 +349,14 @@ def process_one(base, root, runner=stage_subprocess, capacity=1, publisher=publi
                 release_task(con, task, '媒体挂载不可读，等待恢复')
             if progress:
                 progress.finish(error)
+        finally:
+            if run_id:
+                with _ACTIVE_RUN_LOCK:
+                    _ACTIVE_RUN_IDS.discard(run_id)
         return True
     finally:
-        con.close()
+        if con is not None:
+            con.close()
 
 
 def main():
@@ -374,8 +395,10 @@ def main():
                             concurrency=0, active=0, waiting_native_admission=True, native_ready=False))
                 else:
                     try:
+                        with _ACTIVE_RUN_LOCK:
+                            active_run_ids = sorted(_ACTIVE_RUN_IDS)
                         hb_resp = native('processing-heartbeat', {
-                            'run_ids': [],
+                            'run_ids': active_run_ids,
                             'capacity': max_concurrency(),
                             'heartbeat': dict(
                                 pid=os.getpid(),
@@ -426,11 +449,7 @@ def main():
             if stop.is_set():
                 return
             recover_publications(base)
-            con = connect(base)
-            try:
-                recover(con)
-            finally:
-                con.close()
+            recover(None)
             native_ready.set()
             if args.once:
                 discover(base, root, args.api_url)
@@ -449,11 +468,7 @@ def main():
                                 print('Coordinator stage:', str(error), flush=True)
                     if not inflight and shared_state.get('active', 0) > 0:
                         recover_publications(base)
-                        con = connect(base)
-                        try:
-                            recover(con)
-                        finally:
-                            con.close()
+                        recover(None)
                     desired = shared_state.get('desired', max_concurrency())
                     paused = shared_state.get('paused', False)
                     if not paused:

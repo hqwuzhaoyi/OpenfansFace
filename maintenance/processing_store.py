@@ -3,35 +3,37 @@ import json
 import os
 import sqlite3
 import time
-import urllib.error
-import urllib.request
 import uuid
 from pathlib import Path
 
+from processing_publication import native
 
-def _native_call(command, body, timeout=30):
-    url = os.environ.get('FILE_OPERATIONS_RUST_URL', '').rstrip('/')
-    if not url:
+
+def _rust_enabled() -> bool:
+    return bool(os.environ.get('FILE_OPERATIONS_RUST_URL', '').strip())
+
+
+class _RustStoreHandle:
+    """Lightweight handle used when Rust owns `processing.db` so Python opens no SQLite connection."""
+
+    def __init__(self, base):
+        self.base = Path(base)
+        self.in_transaction = False
+
+    def commit(self):
         return None
-    headers = {'Content-Type': 'application/json'}
-    token = os.environ.get('FILE_OPERATIONS_RUST_TOKEN')
-    if token:
-        headers['Authorization'] = f'Bearer {token}'
-    req = urllib.request.Request(
-        f'{url}/v1/metadata',
-        data=json.dumps({'command': command, 'body': body}, ensure_ascii=False).encode(),
-        headers=headers,
-        method='POST',
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.load(resp)
-    except urllib.error.HTTPError as err:
-        try:
-            payload = json.load(err)
-        except Exception:
-            payload = {}
-        raise RuntimeError(payload.get('error') or f'Native scheduler HTTP {err.code}') from err
+
+    def rollback(self):
+        return None
+
+    def close(self):
+        return None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
 
 
 SCHEMA = '''
@@ -71,6 +73,8 @@ CREATE INDEX IF NOT EXISTS processing_run_time ON processing_runs(started_at DES
 
 
 def connect(base):
+    if _rust_enabled():
+        return _RustStoreHandle(base)
     folder = Path(base) / 'processing'
     folder.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(folder / 'processing.db', timeout=15)
@@ -137,16 +141,15 @@ def ensure_member(con, task, legacy=False):
 
 def reconcile(con, items, batch_id, bootstrapped):
     """Fingerprint changes start a new cohort entry; existing completion stays auditable."""
-    if os.environ.get('FILE_OPERATIONS_RUST_URL'):
+    if _rust_enabled():
         if getattr(con, 'in_transaction', False):
             con.commit()
-        res = _native_call('processing-reconcile', {
+        res = native('processing-reconcile', {
             'items': list(items),
             'batch_id': batch_id,
             'bootstrapped': bool(bootstrapped),
-        })
-        if res is not None:
-            return res['eligible']
+        }, timeout=30)
+        return res['eligible']
     current = {row['path']: dict(row) for row in con.execute('SELECT * FROM tasks')}
     by_vid = {row['vid']: row for row in current.values()}
     active = set()
@@ -181,12 +184,11 @@ def reconcile(con, items, batch_id, bootstrapped):
 
 
 def claim(con, capacity=1):
-    if os.environ.get('FILE_OPERATIONS_RUST_URL'):
+    if _rust_enabled():
         if getattr(con, 'in_transaction', False):
             con.commit()
-        res = _native_call('processing-claim', {'capacity': capacity})
-        if res is not None:
-            return res.get('task')
+        res = native('processing-claim', {'capacity': capacity}, timeout=30)
+        return res.get('task')
     con.execute('BEGIN IMMEDIATE')
     try:
         if setting(con, 'paused', False) or con.execute("SELECT COUNT(*) FROM tasks WHERE stage IN ('text','face')").fetchone()[0] >= effective_concurrency(con, capacity):
@@ -229,14 +231,12 @@ def close_run(con, task, status, error=None):
                 (status, str(error)[:500] if error else None, time.time(), task.get('run_id', '')))
 
 
-
 def fail(con, task, error):
-    if os.environ.get('FILE_OPERATIONS_RUST_URL'):
+    if _rust_enabled():
         if getattr(con, 'in_transaction', False):
             con.commit()
-        res = _native_call('processing-fail', {'task': task, 'error': str(error)[:500]})
-        if res is not None:
-            return
+        native('processing-fail', {'task': task, 'error': str(error)[:500]}, timeout=30)
+        return
     attempts = task['text_attempts'] if task['stage'] == 'text' else task['face_attempts']
     stage = 'retry' if attempts < 3 else 'error'
     result = con.execute(f'UPDATE tasks SET stage=?,retry_stage=?,error=?,next_retry=?,updated_at=? WHERE {GUARD}',
@@ -248,20 +248,16 @@ def fail(con, task, error):
 
 
 def release_task(con, task, reason, excluded=False, retry_delay=0):
-    if os.environ.get('FILE_OPERATIONS_RUST_URL'):
+    if _rust_enabled():
         if getattr(con, 'in_transaction', False):
             con.commit()
-        try:
-            res = _native_call('processing-release', {
-                'task': task,
-                'reason': str(reason),
-                'excluded': bool(excluded),
-                'retry_delay': retry_delay,
-            })
-            if res is not None:
-                return
-        except Exception:
-            pass
+        native('processing-release', {
+            'task': task,
+            'reason': str(reason),
+            'excluded': bool(excluded),
+            'retry_delay': retry_delay,
+        }, timeout=30)
+        return
     field = 'text_attempts' if task['stage'] == 'text' else 'face_attempts'
     next_retry = 0 if excluded or not retry_delay else time.time() + retry_delay
     result = con.execute(f'''UPDATE tasks SET stage=?,next_retry=0,{field}=MAX(0,{field}-1),error=?,updated_at=?
@@ -276,12 +272,11 @@ def release_task(con, task, reason, excluded=False, retry_delay=0):
 
 
 def recover(con):
-    if os.environ.get('FILE_OPERATIONS_RUST_URL'):
+    if _rust_enabled():
         if getattr(con, 'in_transaction', False):
             con.commit()
-        res = _native_call('processing-recover', {})
-        if res is not None:
-            return
+        native('processing-recover', {}, timeout=30)
+        return
     set_setting(con, 'coordinator_generation', str(uuid.uuid4()))
     # Only call with the exclusive coordinator lock and no live stage futures.
     con.execute("UPDATE processing_runs SET status='interrupted',finished_at=?,error='协调器重启或阶段意外中断' WHERE status='running'", (time.time(),))

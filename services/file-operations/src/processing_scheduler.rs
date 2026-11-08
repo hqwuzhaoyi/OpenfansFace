@@ -54,7 +54,7 @@ CREATE INDEX IF NOT EXISTS processing_run_time ON processing_runs(started_at DES
 
 const DEFAULT_LEASE_SECONDS: f64 = 660.0;
 const DEFAULT_PIPELINE: &str = "watermark-v1";
-const DEFAULT_FACE_VERSION: &str = "insightface-buffalo_l-v1";
+const DEFAULT_FACE_VERSION: &str = "buffalo_l-det-rec-8frames-v1";
 
 fn bad(message: impl Into<String>) -> Error {
     Error::new(400, "invalid_request", message)
@@ -431,37 +431,112 @@ pub fn media_available(conn: &Connection, root: &Path) -> Result<bool> {
     });
     match check {
         Err(err) => {
-            let current = setting(conn, "media_unavailable")?.unwrap_or(json!(false));
-            if current == json!(false) || current.is_null() {
-                let now = now_sec(conn)?;
-                let msg: String = err.to_string().chars().take(350).collect();
-                event(
-                    conn,
-                    now,
-                    None,
-                    "media_unavailable",
-                    &format!("媒体挂载不可读，暂停领取任务：{msg}"),
-                )?;
-                set_setting(conn, "media_unavailable", &json!({"at": now, "error": msg}))?;
-            }
+            record_media_outage(conn, &err.to_string())?;
             Ok(false)
         }
         Ok(()) => {
-            let current = setting(conn, "media_unavailable")?.unwrap_or(json!(false));
-            if current != json!(false) && !current.is_null() {
-                let now = now_sec(conn)?;
-                set_setting(conn, "media_unavailable", &json!(false))?;
-                event(
-                    conn,
-                    now,
-                    None,
-                    "media_recovered",
-                    "媒体挂载恢复，继续自动分析",
-                )?;
-            }
+            record_media_recovery(conn)?;
             Ok(true)
         }
     }
+}
+
+fn record_media_outage(conn: &Connection, raw_error: &str) -> Result<()> {
+    let current = setting(conn, "media_unavailable")?.unwrap_or(json!(false));
+    if current == json!(false) || current.is_null() {
+        let now = now_sec(conn)?;
+        let msg: String = raw_error.chars().take(350).collect();
+        event(
+            conn,
+            now,
+            None,
+            "media_unavailable",
+            &format!("媒体挂载不可读，暂停领取任务：{msg}"),
+        )?;
+        set_setting(conn, "media_unavailable", &json!({"at": now, "error": msg}))?;
+    }
+    Ok(())
+}
+
+fn record_media_recovery(conn: &Connection) -> Result<()> {
+    let current = setting(conn, "media_unavailable")?.unwrap_or(json!(false));
+    if current != json!(false) && !current.is_null() {
+        let now = now_sec(conn)?;
+        set_setting(conn, "media_unavailable", &json!(false))?;
+        event(
+            conn,
+            now,
+            None,
+            "media_recovered",
+            "媒体挂载恢复，继续自动分析",
+        )?;
+    }
+    Ok(())
+}
+
+pub fn media_status(config: &Config, body: &Value) -> Result<Value> {
+    let conn = open_or_init(config)?;
+    let available = if let Some(explicit) = body.get("available").and_then(Value::as_bool) {
+        if explicit {
+            record_media_recovery(&conn)?;
+        } else {
+            let err_str = body["error"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("媒体挂载不可读");
+            record_media_outage(&conn, err_str)?;
+        }
+        explicit
+    } else {
+        let root = body["root"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(Path::new)
+            .unwrap_or(&config.media);
+        media_available(&conn, root)?
+    };
+    let issue = setting(&conn, "media_unavailable")?.unwrap_or(json!(false));
+    Ok(json!({"ok": true, "available": available, "media_unavailable": issue}))
+}
+
+pub fn record_event(config: &Config, body: &Value) -> Result<Value> {
+    let conn = open_or_init(config)?;
+    let now = now_sec(&conn)?;
+    let vid = body["vid"].as_str().filter(|s| !s.is_empty());
+    let kind = body["kind"].as_str().unwrap_or("info");
+    let message = body
+        .get("message")
+        .or_else(|| body.get("detail"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    event(&conn, now, vid, kind, message)?;
+    Ok(json!({"ok": true}))
+}
+
+pub fn stage_progress(config: &Config, body: &Value) -> Result<Value> {
+    use sha2::{Digest, Sha256};
+    let data = body
+        .get("data")
+        .filter(|v| v.is_object())
+        .unwrap_or(body);
+    let isolated = body["isolated"].as_bool().unwrap_or(true);
+    let id = data["id"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| bad("缺少进度 id"))?;
+    let kind = data["kind"].as_str().unwrap_or("text");
+    let path = if isolated {
+        let digest = format!("{:x}", Sha256::digest(id.as_bytes()));
+        config.base.join("jobs/stages").join(format!("{digest}.json"))
+    } else {
+        config.base.join("jobs").join(format!("{kind}.json"))
+    };
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let bytes = serde_json::to_vec(data)?;
+    files::atomic_write(&path, &bytes)?;
+    Ok(json!({"ok": true, "file": path.to_string_lossy()}))
 }
 
 fn mapped_path(config: &Config, raw: &str) -> Option<String> {
@@ -3336,7 +3411,7 @@ pub fn cache_check(engine: &Engine, body: &Value) -> Result<Value> {
     }))
 }
 
-pub fn reference_state(engine: &Engine, body: &Value) -> Result<Value> {
+pub fn reference_state(engine: &Engine) -> Result<Value> {
     let config = &engine.config;
     let input_version = crate::shared_metadata::analysis_state(config)?["version"]
         .as_str()
@@ -3471,7 +3546,6 @@ pub fn reference_state(engine: &Engine, body: &Value) -> Result<Value> {
         }
     }
 
-    let _ = body;
     Ok(json!({
         "ok": true,
         "version": input_version,
@@ -3615,11 +3689,17 @@ fn entry_age_seconds(path: &Path) -> f64 {
 
 pub fn evict_artifacts(engine: &Engine, body: &Value) -> Result<Value> {
     let config = &engine.config;
-    let grace_seconds = body
-        .get("grace_seconds")
-        .and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|n| n as f64)))
-        .filter(|v| v.is_finite() && *v >= 0.0)
+    let parse_age = |key: &str| -> Option<f64> {
+        body.get(key)
+            .and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|n| n as f64)))
+            .filter(|v| v.is_finite() && *v >= 0.0)
+    };
+    let grace_seconds = parse_age("grace_seconds")
+        .or_else(|| parse_age("tmp_max_age_sec"))
         .unwrap_or(300.0);
+    let tmp_max_age_sec = parse_age("tmp_max_age_sec")
+        .or_else(|| parse_age("grace_seconds"))
+        .unwrap_or(grace_seconds);
 
     let attempts_dir = config.base.join("processing/attempts");
     let mut attempts_roots = vec![attempts_dir.clone()];
@@ -3883,7 +3963,7 @@ pub fn evict_artifacts(engine: &Engine, body: &Value) -> Result<Value> {
             let entry = entry?;
             let name = entry.file_name().to_string_lossy().into_owned();
             let path = entry.path();
-            if entry_age_seconds(&path) < grace_seconds {
+            if entry_age_seconds(&path) < tmp_max_age_sec {
                 preserved_tmp.push(name);
                 continue;
             }
@@ -3906,6 +3986,453 @@ pub fn evict_artifacts(engine: &Engine, body: &Value) -> Result<Value> {
         "preserved_attempts": preserved_attempts,
         "evicted_tmp": evicted_tmp,
         "preserved_tmp": preserved_tmp,
+    }))
+}
+
+fn read_catalog_people(config: &Config) -> Vec<String> {
+    let renames = read_json_fallback(&config.base.join("person-renames.json"), json!({}));
+    let mut raw_names = BTreeSet::new();
+    let report = read_json_fallback(&config.base.join("report.json"), json!({}));
+    if let Some(identities) = report["identities"].as_array() {
+        for item in identities {
+            if let Some(name) = item["name"].as_str().filter(|s| !s.is_empty()) {
+                raw_names.insert(name.to_owned());
+            }
+        }
+    }
+    if let Some(manual) = read_json_fallback(&config.base.join("people-manual.json"), json!([]))
+        .as_array()
+    {
+        for item in manual {
+            if let Some(name) = item["name"].as_str().filter(|s| !s.is_empty()) {
+                raw_names.insert(name.to_owned());
+            }
+        }
+    }
+    for file in ["integration-queue.json", "archive-history.json"] {
+        if let Some(rows) = read_json_fallback(&config.base.join(file), json!([])).as_array() {
+            for item in rows {
+                if let Some(creator) = item["creator"].as_str().filter(|s| !s.is_empty()) {
+                    raw_names.insert(creator.to_owned());
+                }
+            }
+        }
+    }
+    let mut canonical_set = BTreeSet::new();
+    for name in raw_names {
+        let c = crate::processing_result::canonical_person(&name, &renames);
+        if !c.is_empty() {
+            canonical_set.insert(c);
+        }
+    }
+    canonical_set.into_iter().collect()
+}
+
+fn read_handled_vids(config: &Config) -> BTreeSet<String> {
+    let mut ids = BTreeSet::new();
+    for file in ["integration-queue.json", "archive-history.json"] {
+        if let Some(rows) = read_json_fallback(&config.base.join(file), json!([])).as_array() {
+            for item in rows {
+                if let Some(vid) = item["vid"].as_str().filter(|s| !s.is_empty()) {
+                    ids.insert(vid.to_owned());
+                }
+            }
+        }
+    }
+    ids
+}
+
+fn http_post_json(
+    origin: &str,
+    endpoint: &str,
+    payload: &Value,
+) -> std::result::Result<Value, String> {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+    use std::time::Duration;
+
+    let trimmed = origin.trim().trim_end_matches('/');
+    let without_scheme = trimmed
+        .strip_prefix("http://")
+        .ok_or_else(|| format!("不支持的计算服务地址: {origin}"))?;
+    let (host_port, base_path) = match without_scheme.split_once('/') {
+        Some((hp, bp)) => (hp, format!("/{}", bp.trim_matches('/'))),
+        None => (without_scheme, String::new()),
+    };
+    let connect_addr = if host_port.contains(':') {
+        host_port.to_owned()
+    } else {
+        format!("{host_port}:80")
+    };
+    let req_path = format!("{base_path}/{}", endpoint.trim_start_matches('/'));
+    let body_bytes =
+        serde_json::to_vec(payload).map_err(|e| format!("序列化计算请求失败: {e}"))?;
+
+    let mut stream = TcpStream::connect(&connect_addr)
+        .map_err(|e| format!("连接计算服务 {connect_addr} 失败: {e}"))?;
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(600)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(60)));
+
+    let request_head = format!(
+        "POST {req_path} HTTP/1.1\r\nHost: {host_port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body_bytes.len()
+    );
+    stream
+        .write_all(request_head.as_bytes())
+        .and_then(|_| stream.write_all(&body_bytes))
+        .and_then(|_| stream.flush())
+        .map_err(|e| format!("发送计算请求失败: {e}"))?;
+
+    let mut response_bytes = Vec::new();
+    stream
+        .read_to_end(&mut response_bytes)
+        .map_err(|e| format!("读取计算响应失败: {e}"))?;
+    let response_str = String::from_utf8_lossy(&response_bytes);
+    let (headers_part, body_part) = response_str
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| "计算服务返回了无效的 HTTP 响应".to_owned())?;
+    let status_code = headers_part
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .unwrap_or(500);
+    let parsed: Value = serde_json::from_str(body_part.trim())
+        .unwrap_or_else(|_| json!({"ok": false, "error": body_part.trim()}));
+    if status_code >= 400 || parsed["ok"].as_bool() == Some(false) {
+        let msg = parsed["error"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("计算服务调用失败");
+        return Err(msg.to_owned());
+    }
+    Ok(parsed)
+}
+
+pub fn step(engine: &mut Engine, body: &Value) -> Result<Value> {
+    let conn = open_or_init(&engine.config)?;
+    if !media_available(&conn, &engine.config.media)? {
+        return Ok(json!({
+            "ok": true,
+            "stepped": false,
+            "reason": "media_unavailable",
+        }));
+    }
+    drop(conn);
+
+    let claimed = claim(&engine.config, body)?;
+    let mut task_val = claimed["task"].clone();
+    if task_val.is_null() {
+        return Ok(json!({
+            "ok": true,
+            "stepped": false,
+            "task": Value::Null,
+        }));
+    }
+
+    let vid = task_val["vid"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    let run_id = task_val["run_id"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    let stage = task_val["stage"]
+        .as_str()
+        .unwrap_or("text")
+        .to_owned();
+    let path = task_val["path"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    let size = task_val["size"].as_i64().unwrap_or(0);
+    let mtime_ns = task_val["mtime_ns"]
+        .as_str()
+        .map(str::to_owned)
+        .or_else(|| task_val["mtime_ns"].as_i64().map(|n| n.to_string()))
+        .unwrap_or_default();
+
+    let handled_ids = read_handled_vids(&engine.config);
+    if handled_ids.contains(&vid) {
+        release_task(
+            &engine.config,
+            &json!({
+                "task": task_val,
+                "reason": "已由人工处理",
+                "excluded": true,
+            }),
+        )?;
+        return Ok(json!({
+            "ok": true,
+            "stepped": true,
+            "status": "released",
+            "vid": vid,
+            "run_id": run_id,
+        }));
+    }
+
+    let pipeline = body["pipeline"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_PIPELINE);
+    let face_version = body["face_version"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(DEFAULT_FACE_VERSION);
+
+    let cache_info = cache_check(
+        engine,
+        &json!({
+            "stage": stage,
+            "vid": vid,
+            "path": path,
+            "size": size,
+            "mtime_ns": mtime_ns,
+            "pipeline": pipeline,
+            "face_version": face_version,
+        }),
+    )?;
+    task_val["_cache_check"] = cache_info.clone();
+    if cache_info["active_face_groups"].is_array() {
+        task_val["_active_face_groups"] = cache_info["active_face_groups"].clone();
+    }
+
+    let task_data: Value = task_val["data"]
+        .as_str()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .or_else(|| task_val["data"].as_object().map(|m| Value::Object(m.clone())))
+        .unwrap_or_else(|| json!({}));
+    let people = read_catalog_people(&engine.config);
+    let mappings = read_json_fallback(&engine.config.base.join("watermarks/mappings.json"), json!({}));
+    let mut watermark_keys = BTreeSet::new();
+    if let Some(map) = mappings.as_object() {
+        for k in map.keys() {
+            watermark_keys.insert(k.clone());
+        }
+    }
+    if let Some(cands) = task_data["watermark"]["candidates"].as_array() {
+        for c in cands {
+            if let Some(k) = c["key"].as_str().filter(|s| !s.is_empty()) {
+                watermark_keys.insert(k.to_owned());
+            }
+        }
+    }
+    let scope = json!({
+        "vids": [vid],
+        "people": people,
+        "watermark_keys": watermark_keys.into_iter().collect::<Vec<_>>(),
+        "all_watermark_rules": stage == "text",
+    });
+    let state_out =
+        crate::shared_metadata::execute(engine, "state", json!({"scope": scope.clone()}))?;
+    let material_version = state_out["version"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    task_val["_material"] = json!({
+        "scope": scope.clone(),
+        "version": material_version.clone(),
+    });
+
+    let compute_url = body["compute_url"]
+        .as_str()
+        .map(str::to_owned)
+        .or_else(|| std::env::var("PROCESSING_COMPUTE_URL").ok())
+        .unwrap_or_default();
+
+    if stage == "face" {
+        let mut ref_state = reference_state(engine)?;
+        let input_v = ref_state["input_version"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        task_val["_reference_input_version"] = json!(input_v.clone());
+        if !ref_state["valid"].as_bool().unwrap_or(false)
+            && !compute_url.is_empty()
+            && let Ok(ref_resp) = http_post_json(
+                &compute_url,
+                "/v1/compute/references",
+                &json!({
+                    "base": engine.config.base.to_string_lossy(),
+                    "root": engine.config.media.to_string_lossy(),
+                    "input_version": input_v,
+                    "state": ref_state,
+                }),
+            )
+        {
+            let staged = &ref_resp["result"];
+            if staged["staged_path"].is_string() {
+                let _ = publish_references(engine, staged);
+                ref_state = reference_state(engine)?;
+            }
+        }
+        let ref_meta = &ref_state["references"];
+        let ref_path = engine.config.base.join("processing/references.npz");
+        task_val["_references"] = json!({
+            "path": ref_path.to_string_lossy(),
+            "sha256": ref_meta["sha256"],
+            "version": ref_meta["version"],
+            "people": ref_meta["people"],
+            "templates": ref_meta["templates"],
+        });
+    }
+
+    let compute_outcome: std::result::Result<Value, String> = if stage == "text"
+        && cache_info["text_valid"].as_bool() == Some(true)
+        && cache_info["text_cached"].is_object()
+        && compute_url.is_empty()
+    {
+        Ok(json!({"watermark": cache_info["text_cached"].clone()}))
+    } else if compute_url.is_empty() {
+        Err("计算服务 PROCESSING_COMPUTE_URL 未配置".to_owned())
+    } else {
+        let endpoint = if stage == "text" {
+            "/v1/compute/ocr"
+        } else {
+            "/v1/compute/face"
+        };
+        http_post_json(
+            &compute_url,
+            endpoint,
+            &json!({
+                "task": task_val,
+                "base": engine.config.base.to_string_lossy(),
+                "root": engine.config.media.to_string_lossy(),
+            }),
+        )
+        .map(|resp| {
+            if stage == "text" {
+                json!({"watermark": resp["result"].clone()})
+            } else {
+                json!({"face": resp["result"].clone()})
+            }
+        })
+    };
+
+    let raw_data = match compute_outcome {
+        Ok(data) => data,
+        Err(err_msg) => {
+            let handled_after = read_handled_vids(&engine.config);
+            if handled_after.contains(&vid) {
+                release_task(
+                    &engine.config,
+                    &json!({
+                        "task": task_val,
+                        "reason": "分析期间已由人工处理",
+                        "excluded": true,
+                    }),
+                )?;
+                return Ok(json!({
+                    "ok": true,
+                    "stepped": true,
+                    "status": "released",
+                    "vid": vid,
+                    "run_id": run_id,
+                }));
+            }
+            let conn = open_or_init(&engine.config)?;
+            let media_ok = media_available(&conn, &engine.config.media)?;
+            drop(conn);
+            if media_ok {
+                fail_task(
+                    &engine.config,
+                    &json!({
+                        "task": task_val,
+                        "error": err_msg,
+                    }),
+                )?;
+                return Ok(json!({
+                    "ok": true,
+                    "stepped": true,
+                    "status": "failed",
+                    "vid": vid,
+                    "run_id": run_id,
+                    "error": err_msg,
+                }));
+            } else {
+                release_task(
+                    &engine.config,
+                    &json!({
+                        "task": task_val,
+                        "reason": "媒体挂载不可读，等待恢复",
+                    }),
+                )?;
+                return Ok(json!({
+                    "ok": true,
+                    "stepped": true,
+                    "status": "released",
+                    "vid": vid,
+                    "run_id": run_id,
+                }));
+            }
+        }
+    };
+
+    let handled_after = read_handled_vids(&engine.config);
+    if handled_after.contains(&vid) {
+        release_task(
+            &engine.config,
+            &json!({
+                "task": task_val,
+                "reason": "分析期间已由人工处理",
+                "excluded": true,
+            }),
+        )?;
+        return Ok(json!({
+            "ok": true,
+            "stepped": true,
+            "status": "released",
+            "vid": vid,
+            "run_id": run_id,
+        }));
+    }
+
+    let mut pub_body = json!({
+        "operation_id": run_id,
+        "scope": scope,
+        "version": material_version,
+        "task": {
+            "vid": task_val["vid"],
+            "path": task_val["path"],
+            "size": task_val["size"],
+            "mtime_ns": task_val["mtime_ns"],
+            "stage": task_val["stage"],
+            "run_id": task_val["run_id"],
+            "batch_id": task_val["batch_id"],
+            "lease_expires_at": task_val["lease_expires_at"],
+            "coordinator_generation": task_val["coordinator_generation"],
+        },
+        "data": raw_data,
+    });
+    if stage == "face" {
+        pub_body["reference_input_version"] = task_val["_reference_input_version"].clone();
+    }
+
+    let attempt_dir = engine
+        .config
+        .base
+        .join("processing/attempts")
+        .join(&run_id);
+    fs::create_dir_all(&attempt_dir)?;
+    files::atomic_write(
+        &attempt_dir.join("publication.json"),
+        &serde_json::to_vec(&pub_body)?,
+    )?;
+    let pub_result = crate::processing_result::execute(engine, pub_body)?;
+    files::atomic_write(
+        &attempt_dir.join("receipt.json"),
+        &serde_json::to_vec(&pub_result)?,
+    )?;
+
+    Ok(json!({
+        "ok": true,
+        "stepped": true,
+        "status": "published",
+        "vid": vid,
+        "run_id": run_id,
+        "stage": stage,
+        "result": pub_result,
     }))
 }
 
@@ -3938,7 +4465,7 @@ pub fn execute(engine: &mut Engine, command: &str, body: Value) -> Result<Value>
             "processing-evaluate-rules" => crate::processing_result::evaluate_rules(&body),
             "processing-artifact-check" => verify_attempt_artifact(&engine.config, &body),
             "processing-cache-check" => cache_check(engine, &body),
-            "processing-reference-state" => reference_state(engine, &body),
+            "processing-reference-state" => reference_state(engine),
             _ => unreachable!(),
         };
     }
@@ -3977,12 +4504,7 @@ pub fn execute(engine: &mut Engine, command: &str, body: Value) -> Result<Value>
             tx.commit()?;
             Ok(json!({"ok": true, "eligible": count}))
         }
-        "processing-media-status" => {
-            let conn = open_or_init(&engine.config)?;
-            let available = media_available(&conn, &engine.config.media)?;
-            let issue = setting(&conn, "media_unavailable")?.unwrap_or(json!(false));
-            Ok(json!({"ok": true, "available": available, "media_unavailable": issue}))
-        }
+        "processing-media-status" => media_status(&engine.config, &body),
         "processing-claim" => claim(&engine.config, &body),
         "processing-heartbeat" => heartbeat(&engine.config, &body),
         "processing-fail" => fail_task(&engine.config, &body),
@@ -3993,15 +4515,9 @@ pub fn execute(engine: &mut Engine, command: &str, body: Value) -> Result<Value>
         "processing-retry-errors" => retry_errors(&engine.config, &body),
         "processing-publish-references" => publish_references(engine, &body),
         "processing-evict-artifacts" => evict_artifacts(engine, &body),
-        "processing-event" => {
-            let conn = open_or_init(&engine.config)?;
-            let now = now_sec(&conn)?;
-            let vid = body["vid"].as_str().filter(|s| !s.is_empty());
-            let kind = body["kind"].as_str().unwrap_or("info");
-            let message = body["message"].as_str().unwrap_or("");
-            event(&conn, now, vid, kind, message)?;
-            Ok(json!({"ok": true}))
-        }
+        "processing-stage-progress" => stage_progress(&engine.config, &body),
+        "processing-event" => record_event(&engine.config, &body),
+        "processing-step" => step(engine, &body),
         _ => Err(bad("未知分析调度命令")),
     }
 }
@@ -4654,7 +5170,7 @@ mod tests {
             )
             .unwrap();
         drop(faces_conn);
-        let state = reference_state(&engine, &json!({})).unwrap();
+        let state = reference_state(&engine).unwrap();
         let input_v = state["input_version"].as_str().unwrap().to_owned();
         let tmp_dir = env.config.base.join("processing/tmp");
         fs::create_dir_all(&tmp_dir).unwrap();
@@ -4822,5 +5338,44 @@ mod tests {
                 "expected terminal unaccepted/superseded attempt {evicted} to be evicted"
             );
         }
+    }
+
+    #[test]
+    fn media_status_and_record_event_and_stage_progress_roundtrip() {
+        let env = TestEnv::new();
+        let out_down = media_status(
+            &env.config,
+            &json!({"available": false, "error": "mount offline"}),
+        )
+        .unwrap();
+        assert_eq!(out_down["available"], false);
+        assert!(out_down["media_unavailable"].is_object());
+
+        let out_up = media_status(&env.config, &json!({"available": true})).unwrap();
+        assert_eq!(out_up["available"], true);
+        assert_eq!(out_up["media_unavailable"], false);
+
+        record_event(
+            &env.config,
+            &json!({"vid": "v-evt", "kind": "publication_unknown", "detail": "timeout detail"}),
+        )
+        .unwrap();
+        let conn = open_or_init(&env.config).unwrap();
+        let msg: String = conn
+            .query_row(
+                "SELECT message FROM events WHERE vid='v-evt' AND kind='publication_unknown' ORDER BY id DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(msg, "timeout detail");
+
+        let sp_out = stage_progress(
+            &env.config,
+            &json!({"isolated": true, "data": {"id": "run-123", "kind": "text", "status": "running"}}),
+        )
+        .unwrap();
+        let sp_file = PathBuf::from(sp_out["file"].as_str().unwrap());
+        assert!(sp_file.exists());
     }
 }

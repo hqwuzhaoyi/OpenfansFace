@@ -14,7 +14,7 @@ from processing_compute import (
     ResidentComputeClient,
     compute_write_guard,
 )
-from processing_faces import MODEL_HASHES, extract_features
+from processing_faces import FACE_VERSION, MODEL_HASHES, cached_features, extract_features, save_npz
 from processing_worker import text_stage
 
 
@@ -127,22 +127,21 @@ class ResidentComputeTests(unittest.TestCase):
         con.close()
 
         with compute_write_guard(self.base, self.media, run_id=run_id):
-            # Allowed: attempt dir, processing/tmp, jobs
+            # Allowed: attempt dir, processing/tmp
             attempt_file = self.base / 'processing/attempts' / run_id / 'features.npz'
             attempt_file.parent.mkdir(parents=True, exist_ok=True)
             attempt_file.write_bytes(b'ok-attempt')
             tmp_file = self.base / 'processing/tmp/staged.npz'
             tmp_file.write_bytes(b'ok-tmp')
-            job_file = self.base / 'jobs' / f'{run_id}.json'
-            job_file.write_text('{}')
 
             # Allowed: read-only SQLite URI
             ro = sqlite3.connect(f'file:{ro_db}?mode=ro', uri=True)
             ro.execute('SELECT * FROM videos').fetchall()
             ro.close()
 
-            # Forbidden: writing to other attempts, processing.db, references.npz, business JSON, media root
+            # Forbidden: writing to jobs/, other attempts, processing.db, references.npz, business JSON, media root
             for forbidden in (
+                self.base / 'jobs' / f'{run_id}.json',
                 self.base / 'processing/attempts/99999999-9999-4999-8999-999999999999/hack.txt',
                 self.base / 'processing/references.npz',
                 self.base / 'processing/processing.db',
@@ -185,6 +184,42 @@ class ResidentComputeTests(unittest.TestCase):
             self.assertGreaterEqual(client.restart_count, 1)
         finally:
             client.close()
+
+    def test_cached_features_reuses_rust_cache_check_when_task_data_has_no_face_entry(self):
+        import numpy as np
+        task = self._make_video('reuse.mp4', b'video-reuse')
+        task['stage'] = 'face'
+        # Simulate task['data'] after a text stage re-run where only watermark is present
+        task['data'] = json.dumps({'watermark': {'pipeline': 'p1', 'candidates': []}, 'text_complete': True})
+        prev_run = 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa'
+        feat_file = self.base / 'processing/attempts' / prev_run / 'features.npz'
+        save_npz(
+            feat_file,
+            version=FACE_VERSION,
+            model_hashes=json.dumps(MODEL_HASHES, sort_keys=True),
+            path=task['path'],
+            size=task['size'],
+            mtime_ns=str(task['mtime_ns']),
+            source_dev=12,
+            source_ino=34,
+            embeddings=np.ones((2, 512), dtype=np.float32),
+            thumbs=np.array(['a.jpg', 'b.jpg']),
+            timestamps=np.array([1.0, 2.0], dtype=np.float32),
+        )
+        feat_sha = hashlib.sha256(feat_file.read_bytes()).hexdigest()
+        task['_cache_check'] = {
+            'text_valid': True,
+            'face_feature_valid': True,
+            'feature_cache': str(feat_file),
+            'feature_cache_sha256': feat_sha,
+            'source_identity': {'dev': 12, 'ino': 34},
+        }
+        reused = cached_features(self.base, task)
+        self.assertIsNotNone(reused)
+        self.assertEqual(reused['embeddings'].shape, (2, 512))
+        self.assertEqual(task['_feature_cache'], str(feat_file))
+        self.assertEqual(task['_feature_cache_sha256'], feat_sha)
+        self.assertEqual(task['_source_identity'], {'dev': 12, 'ino': 34})
 
 
 if __name__ == '__main__':

@@ -9,6 +9,7 @@ Architecture contract (Ticket #33):
   / `ledger.db` / business JSONs / `processing/references.npz`, or decides business retries.
 """
 import argparse
+import atexit
 import builtins
 from contextlib import contextmanager
 import hashlib
@@ -44,6 +45,10 @@ _ORIG_OS_UNLINK = os.unlink
 _ORIG_SQLITE_CONNECT = sqlite3.connect
 
 
+def in_compute_write_guard() -> bool:
+    return getattr(_GUARD_STATE, 'context', None) is not None
+
+
 def _is_write_mode(mode: str) -> bool:
     return any(ch in str(mode) for ch in ('w', 'a', 'x', '+'))
 
@@ -69,7 +74,6 @@ def assert_compute_writable(path, base, root, run_id=None):
 
     allowed_under_base = [
         (base_path / 'processing/tmp').resolve(strict=False),
-        (base_path / 'jobs').resolve(strict=False),
     ]
     if run_id:
         allowed_under_base.append((base_path / 'processing/attempts' / str(run_id)).resolve(strict=False))
@@ -321,14 +325,39 @@ class _ComputeHandler(BaseHTTPRequestHandler):
             self._send_json(400, {'ok': False, 'error': f'invalid_json: {error}'})
             return
 
-        if self.path == '/v1/compute/stage':
-            stage = body.get('stage')
+        env_overrides = body.get('env')
+        if isinstance(env_overrides, dict):
+            for key in ('FILE_OPERATIONS_RUST_URL', 'FILE_OPERATIONS_RUST_TOKEN', 'PROCESSING_FACE_BACKEND', 'INSIGHTFACE_HOME'):
+                if key in env_overrides:
+                    val = env_overrides[key]
+                    if val is None:
+                        os.environ.pop(key, None)
+                    else:
+                        os.environ[key] = str(val)
+
+        if self.path in ('/v1/compute/stage', '/v1/compute/ocr', '/v1/compute/face'):
+            if self.path == '/v1/compute/ocr':
+                stage = 'text'
+            elif self.path == '/v1/compute/face':
+                stage = 'face'
+            else:
+                stage = body.get('stage')
             task = body.get('task')
             base = Path(body.get('base', ''))
             root = Path(body.get('root', ''))
             if stage not in ('text', 'face') or not isinstance(task, dict):
                 self._send_json(400, {'ok': False, 'error': 'stage and task are required'})
                 return
+            task = dict(task)
+            task['stage'] = stage
+            if 'cache_check' in body and '_cache_check' not in task:
+                task['_cache_check'] = body['cache_check']
+            if 'active_face_groups' in body and '_active_face_groups' not in task:
+                task['_active_face_groups'] = body['active_face_groups']
+            if 'references_path' in body and '_references_path' not in task:
+                task['_references_path'] = body['references_path']
+            if 'reference_input_version' in body and '_reference_input_version' not in task:
+                task['_reference_input_version'] = body['reference_input_version']
             try:
                 from processing_worker import text_stage
                 from processing_faces import analyze
@@ -501,16 +530,25 @@ class ResidentComputeClient:
         with self._lock:
             self._terminate_locked()
 
+    def _forwarded_env(self) -> dict:
+        return {
+            key: os.environ.get(key)
+            for key in ('FILE_OPERATIONS_RUST_URL', 'FILE_OPERATIONS_RUST_TOKEN', 'PROCESSING_FACE_BACKEND', 'INSIGHTFACE_HOME')
+        }
+
     def run_stage(self, task: dict, base: Path, root: Path, timeout: float = 600.0) -> dict:
         self.ensure_alive()
+        stage = task['stage']
+        endpoint = '/v1/compute/ocr' if stage == 'text' else '/v1/compute/face' if stage == 'face' else '/v1/compute/stage'
         payload = {
-            'stage': task['stage'],
+            'stage': stage,
             'task': {**task, '_stage_deadline_ms': int((time.time() + timeout) * 1000)},
             'base': str(base),
             'root': str(root),
+            'env': self._forwarded_env(),
         }
         try:
-            response = self._request('POST', '/v1/compute/stage', payload, timeout=timeout)
+            response = self._request('POST', endpoint, payload, timeout=timeout)
             return response['result']
         except (urllib.error.URLError, ConnectionError, BrokenPipeError, EOFError, TimeoutError, socket.timeout):
             # If the resident daemon crashed or hung mid-flight, terminate and surface error
@@ -526,9 +564,16 @@ class ResidentComputeClient:
             'base': str(base),
             'root': str(root),
             'state': state,
+            'env': self._forwarded_env(),
         }
-        response = self._request('POST', '/v1/compute/references', payload, timeout=timeout)
-        return response['result']
+        try:
+            response = self._request('POST', '/v1/compute/references', payload, timeout=timeout)
+            return response['result']
+        except (urllib.error.URLError, ConnectionError, BrokenPipeError, EOFError, TimeoutError, socket.timeout):
+            with self._lock:
+                self._terminate_locked()
+                self.restart_count += 1
+            raise
 
 
 _DEFAULT_CLIENT: ResidentComputeClient | None = None
@@ -549,6 +594,9 @@ def close_resident_client():
         if _DEFAULT_CLIENT is not None:
             _DEFAULT_CLIENT.close()
             _DEFAULT_CLIENT = None
+
+
+atexit.register(close_resident_client)
 
 
 def serve(host: str = '127.0.0.1', port: int = 0):
