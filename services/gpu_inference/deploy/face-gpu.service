@@ -20,7 +20,7 @@ Environment=OMP_NUM_THREADS=1
 Environment=MKL_NUM_THREADS=1
 Environment=PATH=/opt/face-gpu/current/venv/bin:/usr/lib/wsl/lib:/usr/bin
 EnvironmentFile=/etc/face-gpu/model.env
-ExecStart=/opt/face-gpu/current/venv/bin/python -m services.gpu_inference.server --host 127.0.0.1 --port 8921 --model /opt/face-gpu/model/det_10g.onnx --model-sha256 ${GPU_DETECTOR_SHA256} --token-file %d/api-token --release-manifest /opt/face-gpu/current/release.json
+ExecStart=/opt/face-gpu/current/venv/bin/python -m services.gpu_inference.deploy.launch --credential-name api-token -- --host 127.0.0.1 --port 8921 --model /opt/face-gpu/model/det_10g.onnx --model-sha256 ${GPU_DETECTOR_SHA256} --release-manifest /opt/face-gpu/current/release.json
 Restart=no
 TimeoutStopSec=130
 KillMode=control-group
