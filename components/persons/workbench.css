@@ -197,3 +197,9 @@
 @media(pointer:coarse),(max-width:767px){.pw .pw-clear-people{width:44px;min-width:44px;height:44px;min-height:44px}.pw-live .pw-person-foot{padding-bottom:max(10px,env(safe-area-inset-bottom))}}
 
 .pw .pw-people-select-all .pw-checkbox{gap:7px}.pw-people-select-all .pw-checkbox>span>span{font-size:12px;color:var(--wb-muted)}
+
+/* Existing BEUI link/button; share workbench colors and mobile touch sizing. */
+.pw-live .pw-library-head>div{width:auto;flex:1}
+.pw .pw-peach-link{display:inline-flex;align-items:center;justify-content:center;flex-shrink:0;gap:5px;height:32px;min-height:32px;padding:0 9px;font-size:12px;border:1px solid var(--wb-border);border-radius:7px;background:var(--wb-bg);color:var(--wb-secondary);text-decoration:none}
+.pw .pw-peach-link:focus-visible{outline:2px solid var(--wb-focus);outline-offset:3px}
+@media(max-width:900px),(pointer:coarse){.pw .pw-peach-link{height:44px;min-height:44px}}

@@ -196,3 +196,9 @@ Rust 模式的 `POST /api/persons/manage` 支持 `{action:"merge-person",person,
 推荐候选的当前文件依据由只读 `POST /v1/person-library/observations` 分批读取，每批最多 512 个既有／活动视频 ID；它复用原生健康记录的当前路径和恢复代次，不允许客户端提交任意主机路径。显式路径覆盖优先，旧位置即使仍有文件也不会重新取得已迁移的视频 ID。读取不登记新视频，未扫描文件首次操作前以可播放的实际路径作为 ID，操作后沿用原生持久化 ID。
 
 `tests/http-rust-person-library.py` 验证中文嵌套、隐藏和符号链接排除、无目录、不可读统计、指纹直接提交操作、稳定 ID、候选健康过滤及大目录和读取通道饱和。`tests/http-rust-person-move-gateway.py` 验证同源库详情返回的文件直接进入原生操作，并在成功及回退后通过原稳定 ID 进行真实视频 Range 读取。
+
+## Peach 人物入口
+
+人物目录标题旁的 Peach 入口独立查询 `GET /api/persons/peach?name=...`，读取失败可重试，不阻塞目录浏览。仅匹配 Peach `creator` 实体：当前规范名精确匹配优先，再查询本地旧名和 Peach 别名；无记录或匹配歧义时禁用入口，不凭账号资料猜测。切换人物时取消旧查询，刷新目录后重新查询。
+
+入口在新标签页打开稳定的 `/creators/<id>`。`PEACH_PUBLIC_URL` 可配置 HTTP(S) 基础地址及子路径；留空使用当前访问主机的 HTTP 8900 端口。拒绝含凭据、查询参数或片段的配置。该适配器沿用现有只读 Peach 连接（本地 `PEACH_LEDGER_PATH` 或容器只读查询），在同一只读事务内查找，不新增实体、别名或关系，也不改变 Rust 文件写入流程。`tests/person-peach.test.mjs` 和隔离夹具 `tests/http-person-peach.py` 覆盖地址及身份边界。
