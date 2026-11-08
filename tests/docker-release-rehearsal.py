@@ -50,6 +50,22 @@ def inside(root):
  proofhash=hashlib.sha256(proof.read_bytes()).hexdigest();service=lambda role,args:{'name':prefix+role,'expected_id':inspect(prefix+role)['Id'],'expected_image':inspect(prefix+role)['Image'],'candidate_image':peerimage,'create_args':args}
  m={'version':1,'release_id':'bootstrap','purpose':'release','rehearsal':{'root':str(root),'id':rid},'native_schema':9,'native_max_schema':9,'single_native_writer':True,'workers_start_paused':True,'native_starts_closed':True,'deploy_lock':str(root/'deploy.lock'),'evidence_dir':str(root/'evidence'),'base':str(base),'media_root':str(media),'ledger':str(root/'ledger.db'),'authority_dir':str(base/'file-operations-rust'),'authority_identity':None,'native_uid':1000,'native_gid':1000,'native_url':'http://'+prefix+'native:8930','native_token_env':'REHEARSAL_TOKEN','web_url':'http://'+prefix+'web:8080','calibrator_url':'http://'+prefix+'calibrator:8080','minimum_free_after_backup_bytes':1024*1024,'drain_timeout':2,'services':{role:service(role,peerargs(role)) for role in ('worker','calibrator','web')},'evidence':{g:{'passed':True,'path':str(proof),'sha256':proofhash} for g in ctl.GATES}}
  m['services']['native']={'name':prefix+'native','initially_absent':True,'expected_id':None,'expected_image':None,'candidate_image':nativeimage,'create_args':nativeargs}
+ # Exact retained Python namespace fixture. All bytes/links are synthetic and
+ # remain in place through bootstrap, failure, repair and compatible rollback.
+ runtime=base/'venv'
+ for name in ('bin','lib/python3.11/site-packages','include'):(runtime/name).mkdir(parents=True,exist_ok=True)
+ (runtime/'pyvenv.cfg').write_text('home = /usr/bin\ninclude-system-site-packages = false\nversion = 3.11.2\nexecutable = /usr/bin/python3.11\n')
+ for name,target in {'bin/python':'python3','bin/python3.11':'python3','bin/python3':'/usr/bin/python3','lib64':'lib'}.items():(runtime/name).symlink_to(target)
+ (runtime/'lib/python3.11/site-packages/fixture.py').write_text('# isolated retained runtime bytes\n')
+ runtime_before=ctl.runtime_inventory(base)
+ def ref(path):return {'path':str(path),'sha256':hashlib.sha256(path.read_bytes()).hexdigest()}
+ runtime_inventory_path=root/'runtime-inventory.json';write(runtime_inventory_path,runtime_before)
+ def freeze_runtime(manifest,suffix):
+  review=root/('runtime-review-'+suffix+'.json')
+  write(review,{'version':1,'kind':'preserved-runtime-review','base':str(base),'relative_path':'venv','inventory_sha256':ref(runtime_inventory_path)['sha256'],'retained_in_place':True,'candidate_uses_image_runtimes':True,'candidate_mutates_preserved_runtime':False,'contains_business_state':False,'source_files':[ref(root/'peer.py')],'candidate_configuration':ctl.candidate_runtime_configuration(manifest),'runtime_namespace_evidence':ref(proof),'runtime_source_review':ref(proof),'simulated':True})
+  manifest['preserved_runtime']={'relative_path':'venv','inventory':ref(runtime_inventory_path),'review':ref(review)}
+ freeze_runtime(m,'initial')
+
  peach=inspect(prefix+'peach');m['peach']={'name':prefix+'peach','expected_id':peach['Id'],'expected_image':peach['Image']}
  with sqlite3.connect(root/'ledger.db') as db:rows=db.execute("SELECT type,name,tbl_name,sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY type,name").fetchall()
  m['peach']['schema_sha256']=hashlib.sha256(json.dumps(rows,ensure_ascii=False,separators=(',',':')).encode()).hexdigest()
@@ -88,6 +104,13 @@ def inside(root):
  print('PASS unresolved legacy journal retains durable owned fence; explicit exact-owner recovery after stopped peers',flush=True)
  print('PASS active legacy timer blocks before fencing; held legacy lock timeout leaves web alive and foreign lock untouched',flush=True)
  control('fence-peers',m);m=activate(m);identity=m['authority_identity'];assert native('/v1/readiness')['schema']==9
+ snapshot=root/'evidence/bootstrap-replace'
+ policy=json.loads((snapshot/'backup-policy.json').read_text())
+ assert policy['preserved_runtime']['disposition']=='retained-in-place-not-restored-from-backup'
+ assert not (snapshot/'base/venv').exists() and (snapshot/'base/report.json').exists()
+ assert json.loads((snapshot/'preserved-runtime-inventory.json').read_text())==runtime_before
+ assert (snapshot/'backup-complete.json').is_file() and ctl.runtime_inventory(base)==runtime_before
+ print('PASS frozen retained runtime inventory, shared capacity/snapshot policy and backup receipts; runtime bytes/links unchanged',flush=True)
  control('open',m)
  stat=source.stat();fingerprint=hashlib.sha256(json.dumps([str(source),str(stat.st_dev),str(stat.st_ino),str(stat.st_size),str(stat.st_mtime_ns)],separators=(',',':'),ensure_ascii=False).encode()).hexdigest()
  request={'id':str(uuid.uuid4()),'action':'rename-file','person':'甲','files':[{'vid':vid,'path':str(source),'version':fingerprint}],'filename':'renamed.mp4'}
@@ -100,6 +123,7 @@ def inside(root):
  print('PASS actual bootstrap/create/stop/rename/image+container identities and same-inode receipt across compatible replacement',flush=True)
  # Actual Docker create failure after native replacement: no auto rollback, no new admission.
  m['release_id']='partial-create';control('fence-peers',m);broken=copy.deepcopy(m);broken['services']['worker']['create_args'].insert(0,'--intentionally-invalid-rehearsal-option')
+ freeze_runtime(broken,'intentional-create-failure')
  control('replace',broken,False);assert not native('/v1/readiness')['accepting'];directory=root/'evidence/partial-create-replace';assert (directory/'native-started.json').exists() and (directory/'worker-stopped.json').exists() and not (directory/'web-stopped.json').exists()
  # Explicitly reconstruct only the stopped fixture peer name from its recorded anchor.
  anchor=json.loads((directory/'worker-stopped.json').read_text())['anchor'];docker('rename',anchor,prefix+'worker')
@@ -120,6 +144,7 @@ def inside(root):
  with sqlite3.connect(state_db) as db:db.execute('PRAGMA user_version=10')
  before=inspect(prefix+'native')['Id'];result=control('rollback',m,False);assert 'newer than candidate' in result.stderr and inspect(prefix+'native')['Id']==before and not native('/v1/readiness')['accepting']
  print('PASS actual schema10 state refuses schema9 rollback before container replacement; admission remains closed',flush=True)
+ assert ctl.runtime_inventory(base)==runtime_before
  write(root/'summary.json',{'simulated':True,'scope':'actual local Docker controller; no production/GPU acceptance','native_image':nativeimage,'controller_image':peerimage,'controller_sha256':hashlib.sha256((root/'release_control.py').read_bytes()).hexdigest(),'native_source':'13fc3bfa5e5e0f67594393e7b95994a4ff0b1b33','authority':identity,'receipt_id':request['id'],'history':history,'passed':True})
 
 if __name__=='__main__':

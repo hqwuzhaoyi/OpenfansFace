@@ -50,15 +50,88 @@ only the necessary ownership/ACL correction centrally. Preserve this report
 alongside the marked NFS write-fixture acceptance; access checks alone cannot
 prove every NFS operation.
 
-`check` also verifies all candidate images are local and the backup destination
-has capacity for BASE plus ledger and a configured reserve. The only omitted
-namespace is `processing/tmp`, disposable worker scratch frames; this exclusion
-is recorded. Accepted `processing/attempts`, publication payloads, native state,
-business JSON and all receipts remain included. Unreadable durable directories
-fail capacity inventory instead of being silently counted as empty. It does
-not prune images, delete unrelated data, or silently omit a large part of the
-backup. A full VM filesystem blocks release until an approved persistent backup
-location/capacity plan is available.
+`check` verifies all candidate images are local and reports capacity for the
+mutable BASE state plus ledger and a configured reserve. Capacity and copying
+share the same namespace classification. SQLite WAL bytes are included in the
+estimate because the backup API can incorporate them into the destination DB;
+only actual SQLite sidecars are omitted from copying. Unrelated files ending in
+`-wal`, `-shm` or `-journal` remain business inputs. Unreadable directories,
+foreign symlinks and nonregular files fail closed. `processing/tmp` is the only
+automatically excluded namespace: disposable worker scratch frames. Accepted
+`processing/attempts`, publication payloads, native state and its evidence copy
+of the authority lock, business JSON, databases and all receipts remain included.
+No image/data pruning or automatic relocation occurs.
+
+### Explicitly retained Python runtime
+
+The optional `preserved_runtime` contract supports **only the exact canonical
+BASE/venv** namespace reviewed for this release. It is retained in place,
+untouched, and is **not a disposable directory or part of the recovery copy**.
+Without the contract, ordinary symlink refusal and complete capacity accounting
+still apply. Do not use a directory-name glob or infer approval from `venv` alone.
+A backup containing this omission cannot reconstruct the runtime on another
+host: preserve the original namespace and frozen evidence for recovery.
+
+Capture new private evidence outside BASE (no service pause or runtime import):
+
+```sh
+python3 maintenance/release_control.py runtime-inventory \
+  --source-base /EXACT/CANONICAL/BASE --output /PRIVATE/runtime-inventory.json
+python3 maintenance/release_control.py runtime-configuration \
+  --manifest /PRIVATE/release.json --output /PRIVATE/runtime-configuration.json
+```
+
+The first command uses a no-follow, stat-only traversal, reads only `pyvenv.cfg`,
+and records each directory/file/link's identity, type, size, times, ownership and
+link target. It requires the reviewed Python 3.11.2 config and layout and exactly
+these interpreter/library links: `bin/python -> python3`,
+`bin/python3.11 -> python3`, `bin/python3 -> /usr/bin/python3`, `lib64 -> lib`.
+The external interpreter link is recorded, never followed. Unknown top-level
+content, business JSON/DB in `bin`, foreign links and special files fail. The
+inventory digest is a **metadata inventory digest**, not a package-content hash
+or proof that nobody else uses the runtime. Inspect the full inventory and
+source/runtime evidence before declaring it free of business state.
+
+Prepare a review using `deployment/preserved-runtime.review.example.json`.
+Replace every placeholder and attach the entire configuration object from the
+second command. It binds all four candidate image IDs and image Config digests,
+exact create arguments and env-file content hashes; changing any requires a new
+review. Interpreter environment and config may not reference `/venv` or set
+`VIRTUAL_ENV`. This is a conservative check plus a frozen human source review,
+not an automated proof of arbitrary program behavior. Review actual candidate
+code/entrypoints, mounted scripts and runtime commands for BASE/venv use or
+mutation. List every mounted executable source file in `source_files` with its
+exact path and SHA-256; these bounded regular files are rechecked too. Use an
+explicit empty list only when all executable source is inside the frozen images.
+Hash-bind the namespace evidence and source-review JSON. Existing
+summary/stat evidence alone does not supply the required full inventory or
+approve the exclusion. Never fabricate a passed review from a command result.
+
+Add this optional field to the private release/rollback manifest only after that
+review; all paths and SHA-256 values must identify frozen private files:
+
+```json
+"preserved_runtime": {
+  "relative_path": "venv",
+  "inventory": {"path": "/PRIVATE/runtime-inventory.json", "sha256": "FREEZE"},
+  "review": {"path": "/PRIVATE/runtime-review.json", "sha256": "FREEZE"}
+}
+```
+
+Ledger, authority, evidence and deploy-lock paths cannot fall under the omitted
+runtime. Capacity, final snapshot, candidate startup, verification and reopening revalidate the full
+inventory and configuration. Added/removed/changed runtime entries, changed
+review evidence or read errors fail closed with originals and recovery receipts
+retained. The release directory records `backup-policy.json`, the full preserved
+inventory/review, and `backup-complete.json` only after copying and revalidation;
+the policy distinguishes retained runtime bytes from disposable scratch. The
+live authority inode remains on its original mount; its backup is evidence only.
+Parity snapshots keep their stricter default and do not infer this exclusion.
+
+This capacity correction does not clear `legacy_reference_compatibility`: the
+10 unresolved current L1 legacy inputs still block release until an explicit,
+evidence-backed user decision resolves them. It also does not authorize cutover,
+service pauses, a different backup destination, or runtime deletion.
 
 ## Safe parity
 
