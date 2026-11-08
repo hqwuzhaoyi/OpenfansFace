@@ -12,6 +12,7 @@ export function sourceCandidates(vid: string, stored: string | null | undefined,
 }
 export function chooseSource(vid:string,stored:string|null|undefined,mediaRoot:string,isFile:(path:string)=>boolean):string|null {
   const candidates=sourceCandidates(vid,stored,mediaRoot)
+  if(candidates.length<=1)return candidates[0]||null
   return candidates.find(isFile)||candidates[0]||null
 }
 

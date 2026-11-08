@@ -18,3 +18,21 @@ export function useWorkspaceScroll(key:string,ready:boolean){
   const onScroll=useCallback((event:React.UIEvent<HTMLDivElement>)=>{if(!ready)return;scrollPositions.set(key,event.currentTarget.scrollTop);if(scrollPositions.size>100)scrollPositions.delete(scrollPositions.keys().next().value!)},[key,ready])
   return {ref,onScroll}
 }
+
+const workbenchCache=new Map<string,unknown>()
+export function readWorkbenchCache<T>(key:string):T|undefined{
+  return workbenchCache.get(key) as T|undefined
+}
+export function writeWorkbenchCache<T>(key:string,value:T):T{
+  if(!workbenchCache.has(key)&&workbenchCache.size>=200){
+    const oldest=workbenchCache.keys().next().value
+    if(oldest!==undefined)workbenchCache.delete(oldest)
+  }
+  workbenchCache.set(key,value)
+  return value
+}
+export function deleteWorkbenchCache(prefix:string){
+  for(const key of workbenchCache.keys()){
+    if(key===prefix||key.startsWith(prefix))workbenchCache.delete(key)
+  }
+}

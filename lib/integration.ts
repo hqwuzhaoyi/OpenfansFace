@@ -2,7 +2,7 @@ import fs from "fs"
 import path from "path"
 import os from "os"
 import { BASE, CREATORS, MYTG, STAGE } from "./env"
-import { readJson, loadQueue, saveQueue, loadDecisions, saveDecisions, loadOverride, saveOverride } from "./jsonio"
+import { readJson, readCanonicalJson, loadQueue, saveQueue, loadDecisions, saveDecisions, loadOverride, saveOverride } from "./jsonio"
 
 export { loadQueue, saveQueue, loadDecisions, saveDecisions, loadOverride, saveOverride }
 import { copyPeachLedger } from "./peach"
@@ -107,10 +107,10 @@ export function stagingStats() {
 
 export interface Report { stats: any; identities: any[] }
 export function loadReport(): Report {
-  return canonicalPersonFields(readJson<Report>(path.join(BASE, "report.json"), { stats: {}, identities: [] }))
+  return readCanonicalJson<Report>(path.join(BASE, "report.json"), { stats: {}, identities: [] })
 }
 export function loadClaims(): any[] {
-  return canonicalPersonFields(readJson<any[]>(path.join(BASE, "claims-detail.json"), []))
+  return readCanonicalJson<any[]>(path.join(BASE, "claims-detail.json"), [])
 }
 export function loadClusters(): any[] {
   return readJson<any[]>(path.join(BASE, "clusters.json"), [])

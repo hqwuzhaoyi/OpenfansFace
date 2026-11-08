@@ -16,7 +16,7 @@ import { Button as NavigationButton } from '@/components/ui/button'
 import { WorkspaceButton as Button, WorkspaceSelect, WorkspaceField, WorkspaceCard, WorkspacePath } from '@/components/workbench/inner'
 import { EvidencePanel } from '@/components/review/evidence-panel'
 import { ReferencePanel } from '@/components/review/reference-panel'
-import { useWorkspaceQuery, useWorkspaceScroll } from '@/components/workbench/state'
+import { useWorkspaceQuery, useWorkspaceScroll, readWorkbenchCache, writeWorkbenchCache, deleteWorkbenchCache } from '@/components/workbench/state'
 import { InputGroupButton } from '@/components/ui/input-group'
 import { Checkbox } from '@/components/beui/motion/checkbox'
 import { useReviewActivity } from '@/components/workbench/review-activity'
@@ -29,7 +29,7 @@ type Data={has_updates?:boolean;session?:string;session_at?:number;expires_at?:n
 const views=[{value:'all',label:'全部'},{value:'suggested',label:'有候选'},{value:'conflict',label:'证据冲突'},{value:'none',label:'无候选'},{value:'manual',label:'人工接管'},{value:'deferred',label:'暂缓'}]
 
 export default function Review() {
-  const [data,setData]=useState<Data|null>(null),[error,setError]=useState(''),[loading,setLoading]=useState(true),[busy,setBusy]=useState(false)
+  const [data,setData]=useState<Data|null>(()=>readWorkbenchCache<Data>('review:lastData')??null),[error,setError]=useState(''),[loading,setLoading]=useState(()=>!readWorkbenchCache<Data>('review:lastData')),[busy,setBusy]=useState(false)
   const {values:filters,ready:initialized,update:updateFilters}=useWorkspaceQuery({view:'all',group:'',q:'',folder:'',page:'0',person:'',cluster:'',vid:''},{view:views.map(v=>v.value)})
   const {view,group,q:query,folder,person:personScope,cluster:clusterScope,vid:linkFocus}=filters,page=Number(filters.page)
   const [search,setSearch]=useState('')
@@ -44,11 +44,11 @@ export default function Review() {
   const [drafts,setDrafts]=useState<Record<string,{creator:string;watermarkKey:string}>>({}),[notes,setNotes]=useState<Record<string,string>>({}),[submitError,setSubmitError]=useState('')
   const [pickerSearch,setPickerSearch]=useState<Record<string,string>>({})
   const [reference,setReference]=useState<{name:string;returnTo:'video'|'selection';scroll:number}|null>(null)
-  const [people,setPeople]=useState<PersonChoice[]>([]),[peopleError,setPeopleError]=useState(''),[receipt,setReceipt]=useState<{vids:string[];creator:string;session:string}|null>(null)
+  const [people,setPeople]=useState<PersonChoice[]>(()=>readWorkbenchCache<PersonChoice[]>('review:people')??[]),[peopleError,setPeopleError]=useState(''),[receipt,setReceipt]=useState<{vids:string[];creator:string;session:string}|null>(null)
   const pendingMutations=useRef(new Map<string,string>())
   const mutate=async<T=any>(path:string,body:Record<string,unknown>,method='POST'):Promise<T>=>{const key=JSON.stringify([path,method,body]),id=pendingMutations.current.get(key)||crypto.randomUUID();pendingMutations.current.set(key,id);try{const result=await api<T>(path,{method,body:JSON.stringify({...body,operation_id:id})});pendingMutations.current.delete(key);return result}catch(error:any){if(!error.resultUnknown)pendingMutations.current.delete(key);else error.message+=`（操作 ${id}，重试将查询同一回执）`;throw error}}
   const refreshFocus=useRef<HTMLElement|null>(null)
-  const returnFocus=useRef<HTMLElement|null>(null),session=useRef<string|undefined>(undefined),noteBaseline=useRef<Record<string,string>>({}),notesRef=useRef(notes),polling=useRef(false),scrollAnchor=useRef<{vid:string;offset:number}[]|null>(null)
+  const returnFocus=useRef<HTMLElement|null>(null),session=useRef<string|undefined>(readWorkbenchCache<string>('review:session')),noteBaseline=useRef<Record<string,string>>({}),notesRef=useRef(notes),polling=useRef(false),scrollAnchor=useRef<{vid:string;offset:number}[]|null>(null)
   notesRef.current=notes
   const [updates,setUpdates]=useState<{has_updates:boolean;refreshing:number;blocked:number;waiting?:number}|null>(null),[refreshConfirm,setRefreshConfirm]=useState(false),[sessionExpired,setSessionExpired]=useState(false)
   const hasSelections=Object.values(selections).some(rows=>rows.length>0),hasDrafts=Object.values(drafts).some(d=>!!d.creator||!!d.watermarkKey)||Object.entries(notes).some(([id,note])=>note!==noteBaseline.current[id])
@@ -69,19 +69,27 @@ export default function Review() {
   const load=useCallback(async(options:{refresh?:boolean;automatic?:boolean;preservePosition?:boolean}={})=>{
     if(!initialized)return null
     if(options.preservePosition&&listScroll.ref.current){const area=listScroll.ref.current,top=area.getBoundingClientRect().top;scrollAnchor.current=[...area.querySelectorAll<HTMLElement>('[data-vid]')].filter(e=>e.getBoundingClientRect().bottom>top).map(e=>({vid:e.dataset.vid!,offset:e.getBoundingClientRect().top-top}))}
+    const cacheKey='review:page:'+JSON.stringify([view,group,search,folder,page,linkFocus,personScope,clusterScope])
+    const cachedPage=!options.refresh&&!options.preservePosition?readWorkbenchCache<Data>(cacheKey):undefined
+    if(cachedPage){setData(cachedPage);setLoading(false)}
     const token=++sequence.current,activityAtStart=activityVersion()
-    if(!options.automatic)setLoading(true)
+    if(!options.automatic&&(options.refresh||!cachedPage&&!data))setLoading(true)
     try{
       const params=new URLSearchParams({view,group,q:search,folder,page:String(page),vid:linkFocus,person:personScope,cluster:clusterScope,...(!options.refresh&&session.current?{session:session.current}:{snapshot:'1'})})
       const next=await api<Data>('/api/review?'+params)
       if(token!==sequence.current)return null
       if(options.automatic&&!canAutoApply(activityAtStart)||options.refresh&&activityAtStart!==activityVersion()){setUpdates({has_updates:true,refreshing:0,blocked:0});return null}
-      session.current=next.session;setData(next);setUpdates(previous=>({has_updates:next.has_updates??false,refreshing:previous?.refreshing||0,blocked:previous?.blocked||0,waiting:next.waiting}));setSelections(current=>Object.fromEntries(Object.entries(current).map(([key,tasks])=>[key,tasks.map(t=>next.rows.find(r=>r.vid===t.vid)||t)])));setInspected(current=>Object.fromEntries(Object.entries(current).map(([key,t])=>[key,next.rows.find(r=>r.vid===t.vid)||t])));setError('');setSessionExpired(false)
+      session.current=next.session
+      if(options.refresh||options.preservePosition)deleteWorkbenchCache('review:page:')
+      if(next.session)writeWorkbenchCache('review:session',next.session)
+      writeWorkbenchCache(cacheKey,next);writeWorkbenchCache('review:lastData',next)
+      if(next.group?.key&&next.group.key!==group)writeWorkbenchCache('review:page:'+JSON.stringify([view,next.group.key,search,folder,next.page,linkFocus,personScope,clusterScope]),next)
+      setData(next);setUpdates(previous=>({has_updates:next.has_updates??false,refreshing:previous?.refreshing||0,blocked:previous?.blocked||0,waiting:next.waiting}));setSelections(current=>Object.fromEntries(Object.entries(current).map(([key,tasks])=>[key,tasks.map(t=>next.rows.find(r=>r.vid===t.vid)||t)])));setInspected(current=>Object.fromEntries(Object.entries(current).map(([key,t])=>[key,next.rows.find(r=>r.vid===t.vid)||t])));setError('');setSessionExpired(false)
       for(const row of next.rows)if(notesRef.current[row.vid]===undefined)noteBaseline.current[row.vid]=row.note
       if(options.refresh){setSelections({});setDrafts({});setNotes({});setPickerSearch({});noteBaseline.current={};setInspected({});setReference(null);setDetailMode('video');setPreviewOpen(false);setSubmitError('');setUpdates(null)}
       if((!group&&next.group)||page!==next.page||options.refresh&&next.group?.key!==group)updateFilters({group:next.group?.key||group,page:String(next.page)})
       return next
-    }catch(e:any){if(token===sequence.current){if(options.automatic)setUpdates(previous=>({...previous,has_updates:true,refreshing:previous?.refreshing||0,blocked:previous?.blocked||0}));else setError(e.message);if(/核对已过期|核对会话|本次核对已过期/.test(e.message))setSessionExpired(true)}return null}
+    }catch(e:any){if(token===sequence.current){if(options.automatic)setUpdates(previous=>({...previous,has_updates:true,refreshing:previous?.refreshing||0,blocked:previous?.blocked||0}));else setError(e.message);if(/核对已过期|核对会话|本次核对已过期/.test(e.message)){deleteWorkbenchCache('review:session');setSessionExpired(true)}}return null}
     finally{if(token===sequence.current&&!options.automatic)setLoading(false)}
   },[initialized,view,group,search,folder,page,linkFocus,personScope,clusterScope,updateFilters,activityVersion,canAutoApply])
   useLayoutEffect(()=>{
@@ -89,7 +97,7 @@ export default function Review() {
     const area=listScroll.ref.current,top=area.getBoundingClientRect().top,anchors=scrollAnchor.current;scrollAnchor.current=null
     for(const anchor of anchors){const row=[...area.querySelectorAll<HTMLElement>('[data-vid]')].find(e=>e.dataset.vid===anchor.vid);if(row){area.scrollTop+=row.getBoundingClientRect().top-top-anchor.offset;break}}
   },[data,loading,listScroll.ref])
-  const loadPeople=useCallback(async()=>{try{setPeople((await api<{persons:PersonChoice[]}>('/api/persons?picker=1')).persons);setPeopleError('')}catch(e:any){setPeopleError(e.message)}},[])
+  const loadPeople=useCallback(async()=>{try{const list=(await api<{persons:PersonChoice[]}>('/api/persons?picker=1')).persons;writeWorkbenchCache('review:people',list);setPeople(list);setPeopleError('')}catch(e:any){setPeopleError(e.message)}},[])
   useEffect(()=>{void load();return()=>{sequence.current++}},[load])
   useEffect(()=>{void loadPeople()},[loadPeople])
 

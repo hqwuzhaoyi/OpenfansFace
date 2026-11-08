@@ -8,10 +8,11 @@ import { loadQueue, loadArchive } from './review-store'
 import { readVideoSources, videoSource } from './video-sources'
 import { ReviewError } from './review-logic'
 import { loadClusters } from './integration'
-import { canonicalPersonFields } from './person-names'
+import { canonicalPersonFields, personRenamesStamp } from './person-names'
 import { type ProcessingTask, type ProcessingStage, groupReviewTasks, reviewBucket, reviewGroup } from './processing-model'
 
 const FILE = path.join(BASE, 'processing/processing.db')
+const taskDataCache = new Map<string, { raw: string; stamp: string; parsed: any }>()
 export function processingDb(write = false) {
   if (!fs.existsSync(FILE)) return null
   const db = new Database(FILE, { readonly: !write, fileMustExist: true })
@@ -28,8 +29,21 @@ export function processingState() {
     const queue = loadQueue(), handled = [...queue, ...loadArchive()]
     const ids = new Set(handled.map(v => v.vid)), sources = readVideoSources()
     const paths = new Set(queue.map(v => videoSource(v.vid, sources)).filter(Boolean))
+    let stamp = 'raw'
+    try { stamp = personRenamesStamp() } catch {}
+    if (taskDataCache.size > 12000) taskDataCache.clear()
     const tasks = (db.prepare("SELECT * FROM tasks WHERE stage!='excluded' ORDER BY priority DESC,is_new DESC,created_at DESC,vid").all() as any[])
-      .filter(v => !ids.has(v.vid) && !paths.has(v.path)).map(v => ({ ...v, data: canonicalPersonFields(JSON.parse(v.data)) }) as ProcessingTask)
+      .filter(v => !ids.has(v.vid) && !paths.has(v.path)).map(v => {
+        const hit = taskDataCache.get(v.vid)
+        let data: any
+        if (hit && hit.raw === v.data && hit.stamp === stamp) {
+          data = hit.parsed
+        } else {
+          data = canonicalPersonFields(JSON.parse(v.data))
+          taskDataCache.set(v.vid, { raw: v.data, stamp, parsed: data })
+        }
+        return { ...v, data } as ProcessingTask
+      })
     return { online: age >= -30 && age < 90, paused: !!settings.paused, last_discovery: settings.last_discovery || null,
       references: settings.references || null, tasks, events: db.prepare('SELECT * FROM events ORDER BY id DESC LIMIT 12').all() as any[] }
   } finally { db.close() }

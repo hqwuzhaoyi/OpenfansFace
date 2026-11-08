@@ -1,13 +1,12 @@
 import fs from 'fs'
 import path from 'path'
 import { BASE } from './env'
-import { readJson, writeJson, loadQueue, loadDecisions } from './jsonio'
+import { readJson, readCanonicalJson, writeJson, loadQueue, loadDecisions } from './jsonio'
 import { ReviewError, type ArchivedItem, type QueueItem } from './review-logic'
 import { loadClusters, loadReport } from './integration'
-import { canonicalPersonFields } from './person-names'
 
 export const ARCHIVE_F = path.join(BASE, 'archive-history.json')
-export const loadArchive = () => canonicalPersonFields(readJson<ArchivedItem[]>(ARCHIVE_F, []))
+export const loadArchive = () => readCanonicalJson<ArchivedItem[]>(ARCHIVE_F, [])
 export const saveArchive = (items: ArchivedItem[]) => writeJson(ARCHIVE_F, items)
 
 /** Shared across workers and production/shadow instances. Never silently discard a live lock. */
@@ -34,10 +33,16 @@ export function queuedWithOrigin(): QueueItem[] {
 export function resolvedVids(): Set<string> {
   return new Set([...loadQueue(), ...loadArchive()].map(v => v.vid))
 }
+let videoInfoCache: { reportRef: any; clustersRef: any; map: Map<string, any> } | null = null
 export function videoInfo(): Map<string, any> {
+  const report = loadReport(), clusters = loadClusters()
+  if (videoInfoCache && videoInfoCache.reportRef === report && videoInfoCache.clustersRef === clusters) {
+    return videoInfoCache.map
+  }
   const out = new Map<string, any>()
-  for (const i of loadReport().identities || []) for (const v of i.vids || []) out.set(v.vid, v)
-  for (const c of loadClusters()) for (const v of c.vids || []) out.set(v.vid, v)
+  for (const i of report.identities || []) for (const v of i.vids || []) out.set(v.vid, v)
+  for (const c of clusters) for (const v of c.vids || []) out.set(v.vid, v)
+  videoInfoCache = { reportRef: report, clustersRef: clusters, map: out }
   return out
 }
 export { loadQueue, loadDecisions }

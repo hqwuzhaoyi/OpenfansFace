@@ -8,7 +8,7 @@ import { api } from '@/lib/face-api'
 import { stageLabel, type ProcessingTask } from '@/lib/processing-model'
 import { Button as NavigationButton } from '@/components/ui/button'
 import { WorkspaceButton as Button, WorkspaceSelect, WorkspaceField, WorkspaceMedia, WorkspacePath, WorkspaceSection, WorkspaceMessage } from '@/components/workbench/inner'
-import { useWorkspaceQuery, useWorkspaceScroll } from '@/components/workbench/state'
+import { useWorkspaceQuery, useWorkspaceScroll, readWorkbenchCache, writeWorkbenchCache } from '@/components/workbench/state'
 import * as Popover from '@radix-ui/react-popover'
 import { InputGroupButton } from '@/components/ui/input-group'
 import { WorkspaceSearch, WorkspaceTabs, useWideWorkspace } from '@/components/workbench/controls'
@@ -25,19 +25,19 @@ const date = (n?:number) => n ? new Date(n*1000).toLocaleString('zh-CN',{month:'
 const elapsed = (seconds:number) => seconds < 60 ? `${Math.floor(seconds)} 秒` : `${Math.floor(seconds/60)} 分 ${Math.floor(seconds%60)} 秒`
 
 export default function ProcessingTaskQueue() {
-  const [data,setData]=useState<Data|null>(null),[error,setError]=useState(''),[busy,setBusy]=useState(false)
   const {values:filters,ready:initialized,update:updateFilters}=useWorkspaceQuery({stage:'',batch:'',q:'',page:'0'},{stage:['','queued','text','face','review','error']})
   const {stage,batch,q:query}=filters,page=Number(filters.page)
   const [search,setSearch]=useState(''),[actionError,setActionError]=useState(''),[loadedQuery,setLoadedQuery]=useState('')
+  const requestKey=JSON.stringify([stage,batch,search,page])
+  const [data,setData]=useState<Data|null>(()=>readWorkbenchCache<Data>('operations:tasks:'+requestKey)??readWorkbenchCache<Data>('operations:tasks:last')??null),[error,setError]=useState(''),[busy,setBusy]=useState(false)
   const setQuery=(q:string)=>updateFilters({q,page:'0'})
   const setBatch=(batch:string)=>updateFilters({batch,page:'0'})
   const setPage=(page:number)=>updateFilters({page:String(page)})
-  const [live,setLive]=useState<HomeTasks|null>(null),[progressError,setProgressError]=useState(''),[now,setNow]=useState(Date.now()/1000)
+  const [live,setLive]=useState<HomeTasks|null>(()=>readWorkbenchCache<HomeTasks>('home:tasks')??null),[progressError,setProgressError]=useState(''),[now,setNow]=useState(Date.now()/1000)
   const [instantEntry,setInstantEntry]=useState(false)
   const [focused,setFocused]=useState<ProcessingTask|null>(null),[detailOpen,setDetailOpen]=useState(false)
   const wide=useWideWorkspace(),returnFocus=useRef<HTMLElement|null>(null)
   const focusId=focused?.vid||''
-  const requestKey=JSON.stringify([stage,batch,search,page])
   const listScroll=useWorkspaceScroll('operations:'+JSON.stringify([stage,batch,search,data?.page??page]),!!data&&query===search&&loadedQuery===requestKey)
   const sequence=useRef(0)
   useEffect(()=>{const timer=setInterval(()=>setNow(Date.now()/1000),1000);return()=>clearInterval(timer)},[])
@@ -46,12 +46,15 @@ export default function ProcessingTaskQueue() {
   useEffect(()=>{const timer=setTimeout(()=>{setSearch(query)},300);return()=>clearTimeout(timer)},[query])
   const load=useCallback(async()=>{
     if(!initialized)return
+    const key=JSON.stringify([stage,batch,search,page])
+    const cached=readWorkbenchCache<Data>('operations:tasks:'+key)
+    if(cached){setData(cached);setLoadedQuery(key)}
     const token=++sequence.current
     const params=new URLSearchParams({stage,batch,q:search,page:String(page),...(focusId?{vid:focusId}:{})})
     const [queue,progress]=await Promise.allSettled([api<Data>('/api/processing?'+params,{signal:AbortSignal.timeout(10000)}),api<HomeTasks>('/api/home/tasks',{signal:AbortSignal.timeout(10000)})])
     if(token!==sequence.current)return
-    if(queue.status==='fulfilled'){setData(queue.value);setLoadedQuery(JSON.stringify([stage,batch,search,page]));setError('');if(page!==queue.value.page)updateFilters({page:String(queue.value.page)});setFocused(previous=>previous?queue.value.task===undefined?queue.value.rows.find(t=>t.vid===previous.vid)||previous:queue.value.task:null)}else setError(queue.reason?.message||'任务状态读取失败')
-    if(progress.status==='fulfilled'){setLive(progress.value);setProgressError('')}else setProgressError(progress.reason?.message||'实时进度读取失败')
+    if(queue.status==='fulfilled'){writeWorkbenchCache('operations:tasks:'+key,queue.value);writeWorkbenchCache('operations:tasks:last',queue.value);setData(queue.value);setLoadedQuery(key);setError('');if(page!==queue.value.page)updateFilters({page:String(queue.value.page)});setFocused(previous=>previous?queue.value.task===undefined?queue.value.rows.find(t=>t.vid===previous.vid)||previous:queue.value.task:null)}else setError(queue.reason?.message||'任务状态读取失败')
+    if(progress.status==='fulfilled'){writeWorkbenchCache('home:tasks',progress.value);setLive(progress.value);setProgressError('')}else setProgressError(progress.reason?.message||'实时进度读取失败')
   },[initialized,stage,batch,search,page,focusId,updateFilters])
   useEffect(()=>{let stop=false;let timer:ReturnType<typeof setTimeout>;const run=async()=>{await load();if(!stop)timer=setTimeout(run,5000)};run();return()=>{stop=true;sequence.current++;clearTimeout(timer)}},[load])
   const act=async(action:string,vid?:string)=>{

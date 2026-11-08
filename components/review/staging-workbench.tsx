@@ -11,6 +11,7 @@ import type { StagedFile, StagingList, RestorePlan, DeletePlan, DeleteResult } f
 import type { PersonFileResult } from '@/lib/person-file-model'
 import type { ReviewVideo } from '@/lib/review-ui'
 import { WorkspaceSearch, WorkspaceTabs, useWideWorkspace } from '@/components/workbench/controls'
+import { readWorkbenchCache, writeWorkbenchCache } from '@/components/workbench/state'
 import { WorkspaceButton as Button, WorkspaceCard, WorkspaceField, WorkspaceInput, WorkspaceMessage, WorkspacePath, WorkspaceSection, WorkspaceSelect } from '@/components/workbench/inner'
 import { Checkbox } from '@/components/beui/motion/checkbox'
 import { Dialog, DialogDescription, DialogTitle } from '@/components/ui/dialog'
@@ -43,8 +44,8 @@ function savedPlan(value: unknown): value is Plan {
 }
 
 export function StagingWorkbench() {
-  const [health, setHealth] = useState(false), [list, setList] = useState<StagingList | null>(null), [query, setQuery] = useState('')
-  const [loading, setLoading] = useState(true), [selecting, setSelecting] = useState(false), [error, setError] = useState('')
+  const [health, setHealth] = useState(false), [list, setList] = useState<StagingList | null>(() => readWorkbenchCache<StagingList>('staging:list:0:') ?? null), [query, setQuery] = useState('')
+  const [loading, setLoading] = useState(() => !readWorkbenchCache<StagingList>('staging:list:0:')), [selecting, setSelecting] = useState(false), [error, setError] = useState('')
   const [selected, setSelected] = useState<Map<string, StagedFile>>(new Map()), [focused, setFocused] = useState<StagedFile | null>(null)
   const [playing, setPlaying] = useState<ReviewVideo | null>(null), [instant, setInstant] = useState(false)
   const [open, setOpen] = useState(false), [action, setAction] = useState<Action>('restore-files'), [restoreFile, setRestoreFile] = useState<StagedFile | null>(null)
@@ -57,11 +58,16 @@ export function StagingWorkbench() {
   const busy = submitting || uncertain || (sent && !!status && !terminal(status.status) && status.status !== 'not_started')
   const setCurrentPlan = (value: Plan | null) => { planRef.current = value; setPlan(value) }
   const load = useCallback(async (offset = 0, search = queryRef.current) => {
-    const sequence = ++requestSequence.current; setLoading(true)
+    const cacheKey = `staging:list:${offset}:${search}`
+    const cached = readWorkbenchCache<StagingList>(cacheKey)
+    if (cached) setList(cached)
+    const sequence = ++requestSequence.current
+    if (!cached) setLoading(true)
     try {
       let next = await api<StagingList>(`/api/staging?offset=${offset}&q=${encodeURIComponent(search)}`)
       if (!next.rows.length && next.matched > 0 && offset > 0) next = await api<StagingList>(`/api/staging?offset=${Math.floor((next.matched - 1) / 100) * 100}&q=${encodeURIComponent(search)}`)
       if (sequence !== requestSequence.current) return
+      writeWorkbenchCache(`staging:list:${next.offset}:${search}`, next)
       offsetRef.current = next.offset; setList(next); setError('')
       setFocused(previous => previous ? next.rows.find(row => row.path === previous.path) || previous : null)
     } catch (cause) { if (sequence === requestSequence.current) setError((cause as Error).message) }

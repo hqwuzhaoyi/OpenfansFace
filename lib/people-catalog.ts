@@ -1,18 +1,18 @@
 import path from 'path'
 import { BASE } from './env'
 import { loadReport } from './integration'
-import { loadQueue,readJson,writeJson } from './jsonio'
+import { loadQueue,readJson,readCanonicalJson,writeJson } from './jsonio'
 import { loadArchive } from './review-store'
 import { validateCreator } from './review-logic'
 import { savePerson,mergePeople,type SavedPerson } from './people-model'
-import { canonicalPersonName, canonicalPersonFields } from './person-names'
+import { canonicalPersonName } from './person-names'
 
 export const PEOPLE_F=path.join(BASE,'people-manual.json')
-export const loadSavedPeople=()=>canonicalPersonFields(readJson<SavedPerson[]>(PEOPLE_F,[]))
+export const loadSavedPeople=()=>readCanonicalJson<SavedPerson[]>(PEOPLE_F,[])
 /** Caller holds the review write lock. Person existence is independent of a naming batch. */
 export function rememberPerson(name:string,thumb?:string|null) {
   const valid=canonicalPersonName(validateCreator(name))
-  const deleted=readJson<Record<string,unknown>>(path.join(BASE,'people-deleted.json'),{})
+  const deleted={...readJson<Record<string,unknown>>(path.join(BASE,'people-deleted.json'),{})}
   if(Object.hasOwn(deleted,valid)){delete deleted[valid];writeJson(path.join(BASE,'people-deleted.json'),deleted)}
   writeJson(PEOPLE_F,savePerson(loadSavedPeople(),valid,new Date().toISOString(),thumb))
 }
