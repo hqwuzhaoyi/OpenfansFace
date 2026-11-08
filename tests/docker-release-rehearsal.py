@@ -103,6 +103,35 @@ def inside(root):
  m['release_id']='bootstrap'
  print('PASS unresolved legacy journal retains durable owned fence; explicit exact-owner recovery after stopped peers',flush=True)
  print('PASS active legacy timer blocks before fencing; held legacy lock timeout leaves web alive and foreign lock untouched',flush=True)
+ # Exercise the real scalar gate with exactly ten marked unsupported inputs.
+ # Only the operator authorization/peer services are simulated; audit and backup
+ # operate on real isolated files. No model/vector payload exists in these caches.
+ import zipfile
+ import legacy_reference_audit as audit
+ def scalar(value):
+  value=str(value);header=repr({'descr':'<U'+str(len(value)),'fortran_order':False,'shape':()}).encode()+b'\n'
+  return b'\x93NUMPY\x01\x00'+len(header).to_bytes(2,'little')+header+value.encode('utf-32-le')
+ cache_dir=base/'processing/faces';cache_dir.mkdir(exist_ok=True)
+ old_history=json.loads((base/'archive-history.json').read_text())
+ for index in range(10):
+  stable='marked-unsupported-'+str(index);missing=media/('missing-'+str(index)+'.mp4')
+  old_history.append({'vid':stable,'creator':'marked unsupported person'})
+  with sqlite3.connect(base/'faces.db') as db:db.execute('INSERT INTO videos(vid,path) VALUES(?,?)',(stable,str(missing)))
+  with zipfile.ZipFile(cache_dir/(hashlib.sha256(stable.encode()).hexdigest()+'.npz'),'w') as archive:
+   for key,value in {'version':audit.VERSION,'path':str(missing),'size':1,'mtime_ns':'1'}.items():archive.writestr(key+'.npy',scalar(value))
+ write(base/'archive-history.json',old_history)
+ references=base/'processing/references.npz';references.write_bytes(b'marked prior reference backup sentinel')
+ os.chown(references,1000,1000)
+ diagnostic=root/'actual-legacy-audit.json';write(diagnostic,audit.audit(base,media));assert json.loads(diagnostic.read_text())['counts']['unresolved']==10
+ simulated_evidence=m['evidence']['legacy_reference_compatibility']
+ m['evidence']['legacy_reference_compatibility']={**ref(diagnostic),'passed':True}
+ control('fence-peers',m,False);assert inspect(prefix+'web')['State']['Running'] and not (base/'.review-write.lock').exists()
+ decision=root/'marked-legacy-exclusion.json'
+ write(decision,{'version':1,'simulated':True,'purpose':'exclude_from_reference_build','release_id':m['release_id'],
+  'reason':'Marked rehearsal: exclude precisely these ten unsupported synthetic inputs', 'reviewed_by':'isolated rehearsal operator',
+  'reviewed_at':'2026-01-01T00:00:00Z','authorization_reference':ref(proof),'preserve_original_bytes':True,
+  'worker_policy':'source_unresolved_skipped_before_cache_read_v1','reviewed_cases':json.loads(diagnostic.read_text())['cases']})
+ m['legacy_reference_exclusion']=ref(decision)
  control('fence-peers',m);m=activate(m);identity=m['authority_identity'];assert native('/v1/readiness')['schema']==9
  snapshot=root/'evidence/bootstrap-replace'
  policy=json.loads((snapshot/'backup-policy.json').read_text())
@@ -111,7 +140,14 @@ def inside(root):
  assert json.loads((snapshot/'preserved-runtime-inventory.json').read_text())==runtime_before
  assert (snapshot/'backup-complete.json').is_file() and ctl.runtime_inventory(base)==runtime_before
  print('PASS frozen retained runtime inventory, shared capacity/snapshot policy and backup receipts; runtime bytes/links unchanged',flush=True)
+ assert (snapshot/'base/processing/references.npz').read_bytes()==references.read_bytes()
+ gate=json.loads((snapshot/'legacy-reference-gate.json').read_text())
+ assert gate['status']=='passed_with_approved_exclusions' and gate['counts']['unresolved']==10 and gate['counts']['approved_excluded']==10 and gate['counts']['native_proven']==0
+ assert (snapshot/'legacy-reference-backup.json').is_file() and (snapshot/'legacy-reference-decision.json').is_file()
  control('open',m)
+ print('PASS exact ten-input decision: real scalar gate blocks before pause without approval; normal backup preserves reference before actual candidate startup',flush=True)
+ # Remaining controller fault scenarios retain their explicitly simulated gate.
+ del m['legacy_reference_exclusion'];m['evidence']['legacy_reference_compatibility']=simulated_evidence
  stat=source.stat();fingerprint=hashlib.sha256(json.dumps([str(source),str(stat.st_dev),str(stat.st_ino),str(stat.st_size),str(stat.st_mtime_ns)],separators=(',',':'),ensure_ascii=False).encode()).hexdigest()
  request={'id':str(uuid.uuid4()),'action':'rename-file','person':'甲','files':[{'vid':vid,'path':str(source),'version':fingerprint}],'filename':'renamed.mp4'}
  plan=native('/v1/person-files',{'mode':'preview','request':request});receipt=native('/v1/person-files',{'mode':'apply','request':request,'version':plan['version']});assert receipt['ok'];assert source.with_name('renamed.mp4').read_bytes()==b'marked isolated synthetic video bytes'

@@ -1,0 +1,116 @@
+{
+  "version": 1,
+  "purpose": "exclude_from_reference_build",
+  "release_id": "FREEZE_SAME_RELEASE_ID",
+  "reason": "REPLACE_WITH_EXPLICIT_USER_APPROVED_DISPOSITION",
+  "reviewed_by": "REPLACE_OPERATOR",
+  "reviewed_at": "REPLACE_WITH_TIMEZONE_AWARE_REVIEW_TIME",
+  "authorization_reference": {
+    "path": "/PRIVATE/user-authorization.json",
+    "sha256": "FREEZE_AUTHORIZATION_SHA256"
+  },
+  "preserve_original_bytes": true,
+  "worker_policy": "source_unresolved_skipped_before_cache_read_v1",
+  "reviewed_cases": [
+    {
+      "vid_hash": "COPY_FULL_SHA256_FROM_FRESH_AUDIT_CASE_1",
+      "person_hash": "COPY_FULL_SHA256",
+      "cache_fingerprint": "COPY_FULL_SHA256",
+      "assignment_fingerprint": "COPY_FULL_SHA256",
+      "source_fingerprint": "COPY_FULL_SHA256",
+      "input_fingerprint": "COPY_FULL_SHA256",
+      "status": "unresolved",
+      "reason": "source_unresolved"
+    },
+    {
+      "vid_hash": "COPY_FULL_SHA256_FROM_FRESH_AUDIT_CASE_2",
+      "person_hash": "COPY_FULL_SHA256",
+      "cache_fingerprint": "COPY_FULL_SHA256",
+      "assignment_fingerprint": "COPY_FULL_SHA256",
+      "source_fingerprint": "COPY_FULL_SHA256",
+      "input_fingerprint": "COPY_FULL_SHA256",
+      "status": "unresolved",
+      "reason": "source_unresolved"
+    },
+    {
+      "vid_hash": "COPY_FULL_SHA256_FROM_FRESH_AUDIT_CASE_3",
+      "person_hash": "COPY_FULL_SHA256",
+      "cache_fingerprint": "COPY_FULL_SHA256",
+      "assignment_fingerprint": "COPY_FULL_SHA256",
+      "source_fingerprint": "COPY_FULL_SHA256",
+      "input_fingerprint": "COPY_FULL_SHA256",
+      "status": "unresolved",
+      "reason": "source_unresolved"
+    },
+    {
+      "vid_hash": "COPY_FULL_SHA256_FROM_FRESH_AUDIT_CASE_4",
+      "person_hash": "COPY_FULL_SHA256",
+      "cache_fingerprint": "COPY_FULL_SHA256",
+      "assignment_fingerprint": "COPY_FULL_SHA256",
+      "source_fingerprint": "COPY_FULL_SHA256",
+      "input_fingerprint": "COPY_FULL_SHA256",
+      "status": "unresolved",
+      "reason": "source_unresolved"
+    },
+    {
+      "vid_hash": "COPY_FULL_SHA256_FROM_FRESH_AUDIT_CASE_5",
+      "person_hash": "COPY_FULL_SHA256",
+      "cache_fingerprint": "COPY_FULL_SHA256",
+      "assignment_fingerprint": "COPY_FULL_SHA256",
+      "source_fingerprint": "COPY_FULL_SHA256",
+      "input_fingerprint": "COPY_FULL_SHA256",
+      "status": "unresolved",
+      "reason": "source_unresolved"
+    },
+    {
+      "vid_hash": "COPY_FULL_SHA256_FROM_FRESH_AUDIT_CASE_6",
+      "person_hash": "COPY_FULL_SHA256",
+      "cache_fingerprint": "COPY_FULL_SHA256",
+      "assignment_fingerprint": "COPY_FULL_SHA256",
+      "source_fingerprint": "COPY_FULL_SHA256",
+      "input_fingerprint": "COPY_FULL_SHA256",
+      "status": "unresolved",
+      "reason": "source_unresolved"
+    },
+    {
+      "vid_hash": "COPY_FULL_SHA256_FROM_FRESH_AUDIT_CASE_7",
+      "person_hash": "COPY_FULL_SHA256",
+      "cache_fingerprint": "COPY_FULL_SHA256",
+      "assignment_fingerprint": "COPY_FULL_SHA256",
+      "source_fingerprint": "COPY_FULL_SHA256",
+      "input_fingerprint": "COPY_FULL_SHA256",
+      "status": "unresolved",
+      "reason": "source_unresolved"
+    },
+    {
+      "vid_hash": "COPY_FULL_SHA256_FROM_FRESH_AUDIT_CASE_8",
+      "person_hash": "COPY_FULL_SHA256",
+      "cache_fingerprint": "COPY_FULL_SHA256",
+      "assignment_fingerprint": "COPY_FULL_SHA256",
+      "source_fingerprint": "COPY_FULL_SHA256",
+      "input_fingerprint": "COPY_FULL_SHA256",
+      "status": "unresolved",
+      "reason": "source_unresolved"
+    },
+    {
+      "vid_hash": "COPY_FULL_SHA256_FROM_FRESH_AUDIT_CASE_9",
+      "person_hash": "COPY_FULL_SHA256",
+      "cache_fingerprint": "COPY_FULL_SHA256",
+      "assignment_fingerprint": "COPY_FULL_SHA256",
+      "source_fingerprint": "COPY_FULL_SHA256",
+      "input_fingerprint": "COPY_FULL_SHA256",
+      "status": "unresolved",
+      "reason": "source_unresolved"
+    },
+    {
+      "vid_hash": "COPY_FULL_SHA256_FROM_FRESH_AUDIT_CASE_10",
+      "person_hash": "COPY_FULL_SHA256",
+      "cache_fingerprint": "COPY_FULL_SHA256",
+      "assignment_fingerprint": "COPY_FULL_SHA256",
+      "source_fingerprint": "COPY_FULL_SHA256",
+      "input_fingerprint": "COPY_FULL_SHA256",
+      "status": "unresolved",
+      "reason": "source_unresolved"
+    }
+  ]
+}

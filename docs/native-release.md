@@ -378,8 +378,9 @@ parity. The observed pre-Rust audit has 189 assigned legacy caches: 179 direct
 metadata matches and 10 unproven archived inputs. One current reference name is
 affected, but it also has eight scalar-eligible face rows. Numerical survival is
 unknown; these counts neither prove template loss nor establish compatibility.
-The gate remains unresolved until a separately reviewed migration disposition
-supplies adequate evidence. Old `complete` manifests/history cannot become native
+The strict default remains unresolved until a separately reviewed migration
+disposition supplies adequate evidence; the narrowly scoped exclusion procedure
+below is available for the current delivery. Old `complete` manifests/history cannot become native
 inode/digest proof, and no automatic adoption or rescan is authorized.
 
 Run the bounded diagnostic using explicit local paths or `FACES_BASE` and
@@ -404,8 +405,9 @@ for writes or ignore missing WAL state.
 Save and review the diagnostic JSON privately, then reference its exact hash in
 the named manifest evidence entry. A `passed:true` wrapper is insufficient:
 `fence-peers`, `replace`/`rollback` and `open` require a complete passed diagnostic,
-rerun the current scalar audit, require zero unresolved/unknown inputs and match
-its input version/counts to the frozen evidence. Failure occurs before the first
+rerun the current scalar audit, require zero unresolved/unknown inputs by default
+and match its relevant input version/counts to the frozen evidence. The explicit
+ten-input decision below is the only exception; a passed flag never creates it. Failure occurs before the first
 service pause/stop/replacement/open operation. The separate two-file rename
 comparison cannot satisfy this gate. A changed source set requires a new audit;
 the controller never changes worker state or reference artifacts to make it pass.
@@ -427,3 +429,81 @@ Only a strictly marked isolated controller rehearsal may use a named simulated
 passed legacy gate. Such evidence is rejected outside the existing fixture
 path/container/network ownership guard. Passing this metadata gate does not
 replace numerical/model acceptance or clear the unresolved real-data/GPU gates.
+
+
+### Current-delivery ten-input exclusion decision
+
+The user-approved disposition is to **retain the original video/cache bytes and
+exclude precisely the ten reviewed unsupported legacy cache inputs from reference
+construction**. It is not proof of their origin, adoption, numerical compatibility,
+or permission to remove a person or their other valid reference material. The
+operator must prepare the actual private decision; this repository's example is
+intentionally invalid and contains no production authorization.
+
+Capture a new scalar report with this implementation. Prior reports with shortened
+IDs and no fingerprints cannot authorize exclusions. Default inventory budgets
+are 5,000 cache files and 10,000 directory entries, covering the observed 1,605
+files without sampling. To use a different bounded inventory, pass
+`--cache-files-limit N --directory-entries-limit M` and freeze exactly those values
+in `legacy_reference_inventory_limits` in the manifest. Hard caps are 20,000 and
+40,000 respectively; both must be positive integers and M >= N. Catalog, stat,
+scalar, proof and 90-second wall budgets remain unchanged. Exceeding any budget
+or encountering unreadable input returns incomplete/unknown, never an empty pass.
+The audit opens scalar members only for assigned caches.
+
+Prepare `deployment/legacy-reference-exclusion.review.example.json` privately:
+provide the same release ID, reason, reviewer, timezone-aware review time, exact
+SHA-256-bound authorization file, and all ten complete `cases` objects from the
+fresh audit. Each case binds the full stable-video ID hash, effective assignment
+and alias chain, cache inode/size/mtime plus scalar metadata, and current source
+path resolution. Only `status=unresolved, reason=source_unresolved` is eligible.
+The worker already skips those inputs before reading cache/features because no
+current source is a regular file. No persisted filter, Python business mutation,
+path rewrite, cache adoption or rescan is introduced. An input the worker could
+consume cannot be authorized through this policy.
+
+Bind the private decision explicitly in the release manifest:
+
+```json
+"legacy_reference_exclusion": {
+  "path": "/PRIVATE/legacy-reference-exclusion.json",
+  "sha256": "FREEZE_REVIEW_SHA256"
+},
+"legacy_reference_inventory_limits": {
+  "cache_files": 5000,
+  "directory_entries": 10000
+}
+```
+
+The existing `evidence.legacy_reference_compatibility` entry must hash-bind the
+**raw complete audit** (which truthfully retains `status=failed` and ten unresolved
+inputs); its `passed:true` envelope means the operator submitted this gate for
+validation, not that origin was proven. The controller validates the decision,
+repeats the scalar audit, then emits `passed_with_approved_exclusions`, retaining
+`unresolved=10`, `native_proven` unchanged, `approved_excluded=10`,
+`remaining_unresolved=0` and `numerical_reference_effect=not_evaluated`. Missing
+or mismatched decisions, changed assignments/cache/source metadata, resolved or
+now-direct inputs, new failures, read errors and proof-service errors still block
+before service mutation. Arbitrary passed/rename evidence cannot satisfy L1.
+
+The frozen input version covers relevant assigned caches and the existing
+reference artifact identity. Unassigned cache arrival and unrelated progress
+rows do not invalidate it. A relevant input change requires a new raw audit and
+review; if controlled draining completes unrelated work, recapture the audit
+before replacement. The **same** ten-case decision may be reused only when its
+exact case fingerprints remain unchanged; it cannot approve future unknowns.
+A recovered source is assessed normally and requires a fresh disposition, never
+inherits an exclusion. In-audit source or file drift still fails conservatively.
+
+Replacement takes the existing normal business snapshot, including all legacy
+caches and `processing/references.npz`, before any candidate worker starts. It
+then rechecks the scalar gate and saves `legacy-reference-decision.json`,
+`legacy-reference-gate.json` and `legacy-reference-backup.json` before the
+`backup-complete.json` receipt and service replacement. Workers stay paused and
+native admission stays closed until the normal opening gate. The original
+reference artifact is not silently overwritten by preflight; its backed-up bytes
+remain available for compatible recovery under the normal rollback policy.
+This exception clears only these ten unsupported inputs. GPU/model/coexistence,
+prepared peer, old inflight work, journal, schema, capacity and final runtime
+acceptance gates all remain mandatory. A different release or rollback requires
+a decision bound to its release ID.
