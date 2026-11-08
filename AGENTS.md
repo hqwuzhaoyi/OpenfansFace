@@ -43,6 +43,7 @@ This block is written and re-added by `next dev` — verify at `node_modules/nex
 - UI 改动验证桌面与窄屏、键盘、焦点恢复和 reduced motion；涉及视频时实际验证播放，涉及批量操作时验证同名保留、失败恢复和状态刷新。文案与低影响样式修改不添加镜像实现的测试。
 - 写入测试使用标记过的隔离夹具，正式媒体库不作为测试对象。交付时区分代码已实现、测试预览可用与正式部署；部署范围按用户本次指令执行。
 - 隔离预览同步页面依赖的共享组件、主题、全局样式与外壳，避免只复制页面而漏掉依赖。构建与正在服务的输出隔离，完成后再切换预览进程；验证页面和静态资源实际可访问后再交付链接。
+- 远端构建与发布优先使用 `maintenance/fast_deploy.py` 的增量构建与薄层叠加：基础镜像与依赖未变化时，禁止通过 `docker save | ssh` 传输整包镜像（250–300MB）。Web 发布上传精简源码上下文并复用远端 `face-admin-next:build-deps-<hash>` 与现有运行层（本地已通过 `tsc --noEmit` 时启用 `NEXT_SKIP_TYPECHECK=1`）；Rust 与 Python 服务在系统/依赖层未变化时仅上传编译后的 ELF 二进制或脚本，在远端基于现有镜像叠层构建并校验 SHA-256。
 
 ## 人工确认连续操作
 
