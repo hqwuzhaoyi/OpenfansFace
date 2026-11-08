@@ -2,10 +2,11 @@ import path from 'node:path'
 import { BASE } from './env'
 import { readJson } from './jsonio'
 import { loadQueue,loadArchive } from './review-store'
-import { processingDb,processingState,processingAction } from './processing'
+import { processingDb,processingState } from './processing'
 import { isReviewAvailable } from './review-continuity-model'
 import { ReviewError } from './review-logic'
-import { buildProcessingBatches,batchTotals,validateConcurrency,type CohortItem } from './processing-dashboard-model'
+import { nativeJsonRequest } from './native-json-transport'
+import { buildProcessingBatches,batchTotals,type CohortItem } from './processing-dashboard-model'
 import { readRunProgress,type ProcessingRun } from './processing-progress'
 export interface ProcessingHeartbeat {at?:number;protocol?:number;max_concurrency?:number;concurrency?:number;active?:number;inference?:{backend?:string;available?:boolean;name?:string;error?:string}}
 function heartbeat(){return readJson<ProcessingHeartbeat>(path.join(BASE,'processing/heartbeat.json'),{})}
@@ -18,17 +19,8 @@ export function processingSettings(){
   const maximum=Math.max(1,Math.min(4,Number.isInteger(beat.max_concurrency)?beat.max_concurrency!:1))
   return {schema_version:1 as const,requested,maximum,effective:Math.min(requested,maximum),supported:(beat.protocol||0)>=2,online:fresh(beat),last_seen:beat.at||null}
 }
-export function setProcessingConcurrency(value:unknown){
-  const settings=processingSettings()
-  if(!settings.supported||!settings.online)throw new ReviewError('当前后台尚未连接或未升级，暂不能修改并发',503)
-  let requested:number
-  try{requested=validateConcurrency(value,settings.maximum)}catch(e){throw new ReviewError((e as Error).message)}
-  const db=processingDb(true);if(!db)throw new ReviewError('分析服务尚未初始化',503)
-  try{db.transaction(()=>{
-    db.prepare("INSERT INTO settings(key,value) VALUES('concurrency',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(JSON.stringify(requested))
-    db.prepare('INSERT INTO events(at,kind,message) VALUES(?,?,?)').run(Date.now()/1000,'concurrency',`并发设置为 ${requested} 路；在途任务继续完成`)
-  })()}finally{db.close()}
-  return {...settings,requested,effective:requested}
+export async function setProcessingConcurrency(value:unknown){
+  return nativeJsonRequest<ReturnType<typeof processingSettings>>('v1/metadata',{command:'processing-concurrency',body:{concurrency:value}},{label:'自动分析并发设置',completion:'required',error:(message,status)=>new ReviewError(message,status)})
 }
 export function processingDashboard(){
   const state=processingState(),beat=heartbeat(),settings=processingSettings(),db=processingDb()
@@ -57,10 +49,8 @@ export function processingDashboard(){
   if(!jobs.length)for(const t of state.tasks.filter(t=>['text','face'].includes(t.stage)))jobs.push({id:t.vid,kind:t.stage==='face'?'face':'text',title:t.stage==='face'?'人脸分析':'提取水印',status:state.online?'running':'offline',stage:'处理中',current:t.name,vid:t.vid,done:null,total:null,unit:'',failed:0,started_at:t.updated_at,updated_at:t.updated_at,heartbeat_at:beat.at||null,href:'/operations/tasks?vid='+encodeURIComponent(t.vid)})
   return {schema_version:1 as const,preview:process.env.PROCESSING_PREVIEW==='1',preview_id:process.env.PROCESSING_PREVIEW==='1'?process.env.PROCESSING_PREVIEW_ID:undefined,at:Date.now()/1000,online:state.online,paused:state.paused,ledger_ready:ledgerReady,batches,totals,current,jobs,history,history_source:runs.length?'stage_runs':'legacy_events',settings,media_issue:mediaIssue,discovery:state.last_discovery,references:state.references,inference:beat.inference?{...beat.inference,available:fresh(beat)&&beat.inference.available===true}:{backend:'unknown',available:false,name:'处理来源未知',error:'后台未提供推理来源'},events:state.events}
 }
-export function retryProcessingErrors(batch?:string){
+export async function retryProcessingErrors(batch?:string){
   if(batch!==undefined&&(typeof batch!=='string'||!batch||batch.length>128))throw new ReviewError('批次格式无效')
-  const tasks=processingState().tasks.filter(t=>t.stage==='error'&&!t.manual&&(!batch||t.batch_id===batch))
-  if(tasks.length)processingAction('retry',tasks.map(t=>t.vid))
-  return {schema_version:1 as const,retried:tasks.length}
+  return nativeJsonRequest<{schema_version:1;retried:number}>('v1/metadata',{command:'processing-retry-errors',body:batch===undefined?{}:{batch}},{label:'自动分析异常重试',completion:'required',error:(message,status)=>new ReviewError(message,status)})
 }
 export type ProcessingDashboardData=ReturnType<typeof processingDashboard>
