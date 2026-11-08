@@ -1,7 +1,8 @@
 'use client'
 import Link from 'next/link'
-import {useCallback,useEffect,useRef,useState} from 'react'
-import {Activity,ArrowRight,ChevronRight,CirclePause,CirclePlay,Info,Layers3,RotateCcw,ScanFace,ScanText,Server,Settings2,TriangleAlert} from 'lucide-react'
+import {useRef,useState} from 'react'
+import {useQuery,useQueryClient} from '@tanstack/react-query'
+import {Activity,ArrowRight,ChevronRight,CirclePause,CirclePlay,Info,Layers3,RefreshCw,RotateCcw,ScanFace,ScanText,Server,Settings2,TriangleAlert} from 'lucide-react'
 import * as Popover from '@radix-ui/react-popover'
 import {workspaceToast as toast} from '@/components/workbench/feedback'
 import {CardContent} from '@/components/beui/motion/card'
@@ -11,7 +12,6 @@ import {Progress} from '@/components/ui/progress'
 import {Dialog,DialogContent,DialogDescription,DialogTitle} from '@/components/ui/dialog'
 import {WorkspaceSearch,WorkspaceTabs} from '@/components/workbench/controls'
 import {useWorkspaceQuery} from '@/components/workbench/state'
-import {useReviewActivity} from '@/components/workbench/review-activity'
 import {api} from '@/lib/face-api'
 import {jobPercent} from '@/lib/home-model'
 import type {ProcessingDashboardData} from '@/lib/processing-dashboard'
@@ -22,46 +22,47 @@ const number=(n:number)=>n.toLocaleString('zh-CN')
 const percent=(done:number,total:number)=>total>0?Math.round(done/total*1000)/10:null
 const date=(at:number|null|undefined)=>at?new Date(at*1000).toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}):'未知'
 const elapsed=(seconds:number)=>seconds<60?`${Math.floor(seconds)} 秒`:`${Math.floor(seconds/60)} 分 ${Math.floor(seconds%60)} 秒`
-function signature(d:ProcessingDashboardData){return JSON.stringify([d.totals,d.current,d.batches,d.jobs.map(j=>[j.id,j.status,j.stage,j.done,j.total,j.error]),d.history.map(h=>[h.id,h.status]),d.settings.requested,d.settings.maximum,d.paused,d.online,d.media_issue,d.inference])}
 function batchStatus(b:ProcessingBatch){return b.running?'运行中':b.refreshing?'复核中':b.completed+b.excluded===b.total?(b.excluded?'已结束':'已完成'):b.error?'有异常':'排队中'}
 export default function ProcessingDashboard(){
- const [data,setData]=useState<ProcessingDashboardData|null>(null),[pending,setPending]=useState(false),[error,setError]=useState(''),[busy,setBusy]=useState(false),[follow,setFollow]=useState(false)
+ const [busy,setBusy]=useState(false)
+ const queryClient=useQueryClient()
+ const status=useQuery({
+   queryKey:['processing','dashboard'],
+   queryFn:async({signal})=>{
+     const next=await api<ProcessingDashboardData>('/api/processing/dashboard',{signal:AbortSignal.any([signal,AbortSignal.timeout(12000)]),cache:'no-store'})
+     if(next?.schema_version!==1||next.settings?.schema_version!==1)throw new Error('后台接口版本不兼容，已暂停操作；请更新应用后重试读取')
+     return next
+   },
+   refetchInterval:5000,
+   refetchIntervalInBackground:false,
+   staleTime:3000,
+   refetchOnWindowFocus:true,
+   refetchOnReconnect:true,
+   retry:false,
+ })
+ const data=status.data,error=status.error?.message||'',compatible=!!data&&!error
+ const refreshAfterAction=()=>queryClient.invalidateQueries({queryKey:['processing']})
  const {values:filters,update:updateFilters}=useWorkspaceQuery({batchQ:'',batchState:'all',batchPage:'0'},{batchState:['all','running','error','complete']})
  const query=filters.batchQ,filter=filters.batchState,parsedPage=Number(filters.batchPage),page=Number.isFinite(parsedPage)?Math.max(0,Math.floor(parsedPage)):0
  const setQuery=(value:string)=>updateFilters({batchQ:value,batchPage:'0'}),setFilter=(value:string)=>updateFilters({batchState:value,batchPage:'0'}),setPage=(value:number)=>updateFilters({batchPage:String(value)})
  const [detail,setDetail]=useState<string|null>(null),[draft,setDraft]=useState(1),[instant,setInstant]=useState(false)
- const current=useRef<ProcessingDashboardData|null>(null),latest=useRef<ProcessingDashboardData|null>(null),origin=useRef<HTMLElement|null>(null),sequence=useRef(0),followRef=useRef(false),protectedRef=useRef(false)
- const [connection,setConnection]=useState<{online:boolean;at:number}|null>(null)
- const [compatible,setCompatible]=useState(false),compatibleRef=useRef(false)
- followRef.current=follow;protectedRef.current=!!detail||!!query||busy
- const {version,canApply}=useReviewActivity(protectedRef.current)
- const apply=useCallback((value:ProcessingDashboardData)=>{current.current=value;setData(value);setPending(false)},[])
- const load=useCallback(async(explicit=false)=>{const request=++sequence.current,activity=version();try{
-   const next=await api<ProcessingDashboardData>('/api/processing/dashboard',{signal:AbortSignal.timeout(12000)})
-   if(request!==sequence.current)return
-   if(next?.schema_version!==1||next.settings?.schema_version!==1){compatibleRef.current=false;setCompatible(false);latest.current=null;setPending(false);throw new Error('后台接口版本不兼容，已暂停操作；请更新应用后重试读取')}
-   compatibleRef.current=true;setCompatible(true)
-   latest.current=next;setConnection({online:next.online,at:Date.now()});setError('')
-   if(!current.current||explicit||(followRef.current&&!protectedRef.current&&version()===activity)||canApply(activity))apply(next)
-   else if(signature(next)!==signature(current.current))setPending(true)
- }catch(e:any){if(request===sequence.current)setError(e.message)}},[apply,canApply,version])
- useEffect(()=>{let stop=false,timer:ReturnType<typeof setTimeout>;const run=async()=>{await load();if(!stop)timer=setTimeout(run,5000)};void run();return()=>{stop=true;sequence.current++;clearTimeout(timer)}},[load])
+ const origin=useRef<HTMLElement|null>(null)
  const open=(id:string)=>{origin.current=document.activeElement as HTMLElement;setInstant(!!document.activeElement?.matches(':focus-visible')||matchMedia('(prefers-reduced-motion: reduce)').matches);if(id==='settings')setDraft(Math.min(data?.settings.requested||1,data?.settings.maximum||1));setDetail(id)}
- const act=async(action:'pause'|'resume'|'retry',batch?:string)=>{if(!compatibleRef.current)return;setBusy(true);try{
+ const act=async(action:'pause'|'resume'|'retry',batch?:string)=>{if(!compatible)return;setBusy(true);try{
    if(action==='retry'){const result=await api<{retried:number}>('/api/processing/dashboard',{method:'POST',body:JSON.stringify({action,batch})});toast.success(`${result.retried} 个异常任务已重新排队`)}
    else{await api('/api/processing',{method:'POST',body:JSON.stringify({action})});toast.success(action==='pause'?'已暂停接单，在途任务继续完成':'已恢复自动分析')}
-   await load(true);setDetail(null)
- }catch(e:any){toast.error(e.message);await load(true)}finally{setBusy(false)}}
- const saveConcurrency=async()=>{if(!compatibleRef.current)return;setBusy(true);try{const result=await api<{requested:number}>('/api/processing/settings',{method:'PUT',body:JSON.stringify({concurrency:draft})});toast.success(`并发上限已设为 ${result.requested} 路`);await load(true);setDetail(null)}catch(e:any){toast.error(e.message);await load(true)}finally{setBusy(false)}}
- const b=data?.totals,online=!!connection?.online&&!error
+   await refreshAfterAction();setDetail(null)
+ }catch(e:any){toast.error(e.message);await refreshAfterAction()}finally{setBusy(false)}}
+ const saveConcurrency=async()=>{if(!compatible)return;setBusy(true);try{const result=await api<{requested:number}>('/api/processing/settings',{method:'PUT',body:JSON.stringify({concurrency:draft})});toast.success(`并发上限已设为 ${result.requested} 路`);await refreshAfterAction();setDetail(null)}catch(e:any){toast.error(e.message);await refreshAfterAction()}finally{setBusy(false)}}
+ const b=data?.totals,online=!!data?.online&&!error
  const rows=(data?.batches||[]).filter(row=>(!query||`${row.id} ${date(row.started_at)} ${row.legacy?'既有批次':'自动发现'}`.toLowerCase().includes(query.trim().toLowerCase()))&&(filter==='all'||filter==='running'&&(row.running+row.refreshing>0)||filter==='error'&&(row.error+row.refresh_error>0)||filter==='complete'&&row.completed+row.excluded===row.total))
  const lastPage=Math.max(0,Math.ceil(rows.length/10)-1),shown=rows.slice(Math.min(page,lastPage)*10,(Math.min(page,lastPage)+1)*10)
  const selected=data?.batches.find(row=>row.id===detail)
  const history:StatusBarDatum[]=(data?.history||[]).map(h=>({id:h.id,label:h.label,status:['done','running','retry','error','interrupted'].includes(h.status)?h.status:['cancelled','superseded'].includes(h.status)?'cancelled':h.status==='waiting'?'retry':'unknown',description:`${h.stage==='text'?'文字提取':h.stage==='face'?'人脸分析':'处理记录'} · ${h.execution?.backend==='gpu-detection'?'GPU 检测 + CPU 识别':h.execution?.backend==='cpu'?'CPU':h.execution?.backend==='cache'?'已验证缓存':'来源未知'} · ${date(h.at)}${h.error?' · '+h.error:''}`}))
  const historyLabel=data?.history_source==='stage_runs'?'阶段执行':'处理事件'
  const settings=data?.settings
- return <main className="bm-page pd-dashboard" aria-label="批量处理操作台"><header className="bm-header"><div><h1>处理操作台</h1>{data?.preview&&<span className="bm-demo">隔离测试</span>}<span className="bm-online" data-offline={!online}><i/>{!data?'读取状态':online?'扫描服务在线':'扫描服务未连接'}</span></div><div className="bm-header-actions"><Button variant="ghost" size="sm" aria-pressed={follow} onClick={()=>{setFollow(!follow);if(!follow&&latest.current)apply(latest.current)}}>{follow?'实时跟随中':'实时跟随'}</Button><Button variant="outline" size="sm" disabled={!compatible||!data||busy} onClick={()=>open('settings')}><Settings2 size={14}/>并发 {settings?.requested??'—'}</Button><Button variant="outline" size="sm" disabled={!compatible||!data||busy} onClick={()=>act(data!.paused?'resume':'pause')}>{data?.paused?<CirclePlay size={14}/>:<CirclePause size={14}/>}<span>{data?.paused?'恢复分析':'暂停接单'}</span></Button><NavigationButton size="sm" asChild><Link href="/review">人工确认 {data?number(data.current.review):'—'}<ArrowRight size={14}/></Link></NavigationButton></div></header>
- <div className="bm-content">{pending&&<div className="pd-pending" role="status"><span>有新任务状态，当前视图已保留</span><Button size="sm" variant="outline" onClick={()=>latest.current&&apply(latest.current)}>更新状态</Button></div>}{error&&<p className="ws-error" role="alert">{error}<Button size="sm" variant="ghost" onClick={()=>load(true)}>重试读取</Button></p>}{!!data?.media_issue&&<p className="ws-error" role="alert">媒体挂载不可读，任务已保留。恢复后继续处理。</p>}{data?.discovery?.error&&<p className="ws-error" role="alert">发现新文件失败：{data.discovery.error}</p>}
+ return <main className="bm-page pd-dashboard" aria-label="批量处理操作台"><header className="bm-header"><div><h1>处理操作台</h1>{data?.preview&&<span className="bm-demo">隔离测试</span>}<span className="bm-online" data-offline={!online}><i/>{!data?'读取状态':online?'扫描服务在线':'扫描服务未连接'}</span></div><div className="bm-header-actions"><Button variant="ghost" size="sm" aria-label="刷新处理状态" title="每 5 秒自动刷新" disabled={status.isFetching} onClick={()=>void status.refetch()}><RefreshCw size={14}/>刷新</Button><Button variant="outline" size="sm" disabled={!compatible||!data||busy} onClick={()=>open('settings')}><Settings2 size={14}/>并发 {settings?.requested??'—'}</Button><Button variant="outline" size="sm" disabled={!compatible||!data||busy} onClick={()=>act(data!.paused?'resume':'pause')}>{data?.paused?<CirclePlay size={14}/>:<CirclePause size={14}/>}<span>{data?.paused?'恢复分析':'暂停接单'}</span></Button><NavigationButton size="sm" asChild><Link href="/review">人工确认 {data?number(data.current.review):'—'}<ArrowRight size={14}/></Link></NavigationButton></div></header>
+ <div className="bm-content">{error&&<p className="ws-error" role="alert">{error}<Button size="sm" variant="ghost" onClick={()=>void status.refetch()}>重试读取</Button></p>}{!!data?.media_issue&&<p className="ws-error" role="alert">媒体挂载不可读，任务已保留。恢复后继续处理。</p>}{data?.discovery?.error&&<p className="ws-error" role="alert">发现新文件失败：{data.discovery.error}</p>}
  <div className="bm-title-line"><div><h2>批量处理进度</h2><span>{data?`${data.batches.length} 个批次 · 更新于 ${date(data.at)}`:'正在读取任务状态'}</span></div><div className="pd-title-actions"><NavigationButton variant="outline" size="sm" asChild><Link href="/operations/tasks">任务列表<ChevronRight size={14}/></Link></NavigationButton><Popover.Root><Popover.Trigger asChild><Button variant="ghost" size="sm" aria-label="查看统计口径" title="查看统计口径"><Info size={15}/></Button></Popover.Trigger><Popover.Portal><Popover.Content className="bm-popover" align="end" sideOffset={8}><strong>统计口径</strong><p>每批按登记时的文件指纹固定范围。累计分析完成不会因确认、归档或参考刷新而回退。</p><p>参考更新触发的复核单列；人工接管和移出不计为机器分析成功。历史迁入记录的首次完成时间可能未知。</p><p>人脸分母仅含进入该阶段的条目。没有采集真实速度或预计耗时，不显示推算曲线。</p></Popover.Content></Popover.Portal></Popover.Root></div></div>
  {!data?<p className="bm-empty">正在连接后台…</p>:!data.ledger_ready?<p className="bm-empty">批次账本尚未就绪，现有任务继续保留。可先查看任务列表。</p>:<><section className="bm-kpis" aria-label="批量任务概况"><Card size="compact" className="bm-kpi bm-kpi-main"><CardContent><div className="bm-card-label"><Layers3 size={16}/><span>批次累计</span><strong>{number(b!.total)} 条</strong></div>{b!.total?<TaskDistribution complete={b!.completed} running={b!.running} waiting={b!.waiting} errors={b!.error} excluded={b!.excluded} total={b!.total}/>:<p className="bm-empty">暂无已登记任务</p>}</CardContent></Card><Card size="compact" className="bm-kpi bm-kpi-runtime"><CardContent><div className="bm-card-label"><Activity size={16}/><span>当前运行</span></div><div className="bm-value">{online?data.jobs.length:'—'}<span>/ {settings?.effective??1} 路</span></div><div className="bm-slot"><span data-on={online&&!data.paused}/><span>{!online?'保留最后状态':data.paused?(data.jobs.length?'在途任务完成后暂停':'已暂停领取'):data.jobs.length>(settings?.effective||1)?`在途完成后降至 ${settings?.effective} 路`:data.jobs.length?'自动分析中':'等待任务'}</span></div>{b!.refreshing+b!.refresh_waiting>0&&<p className="pd-refresh-count">参考复核：运行 {b!.refreshing} · 排队 {number(b!.refresh_waiting)}</p>}<div className="bm-recent-runs"><span>最近 {history.length} 次{historyLabel}</span>{history.length?<RunHistory data={history} compact/>:<p className="bm-empty">暂无执行记录</p>}</div></CardContent></Card><Card size="compact" className="bm-kpi bm-kpi-error"><CardContent><div className="bm-card-label"><TriangleAlert size={16}/><span>待处理异常</span></div><div className="bm-value">{data.current.error}<span>个任务</span></div><dl className="bm-error-breakdown"><dt>其中复核异常</dt><dd>{b!.refresh_error}</dd><dt>已移出批次</dt><dd>{b!.excluded}</dd></dl><NavigationButton variant="ghost" size="sm" className="bm-card-link" asChild><Link href="/operations/tasks?stage=error">查看异常<ChevronRight size={14}/></Link></NavigationButton></CardContent></Card></section>
  <div className="bm-main-grid"><Card className="bm-batches" size="compact"><CardContent><div className="bm-section-heading"><div><h3>处理批次</h3><span>{data.batches.length} 个批次</span></div><Button variant="outline" size="sm" disabled={!compatible||busy||!data.current.error} onClick={()=>act('retry')}><RotateCcw size={14}/>重试异常</Button></div><div className="bm-tools"><WorkspaceTabs value={filter} onChange={value=>{setFilter(value);setPage(0)}} label="筛选批次状态" items={[{value:'all',label:'全部',count:data.batches.length},{value:'running',label:'运行中',count:data.batches.filter(b=>b.running+b.refreshing>0).length},{value:'error',label:'异常',count:data.batches.filter(b=>b.error+b.refresh_error>0).length},{value:'complete',label:'已结束',count:data.batches.filter(b=>b.completed+b.excluded===b.total).length}]}/><WorkspaceSearch value={query} onChange={value=>{setQuery(value);setPage(0)}} label="搜索处理批次" placeholder="搜索批次或发现时间…"/></div><StackLegend/><div className="bm-batch-table"><div className="bm-table-head"><span>批次</span><span>累计分析进度</span><span>异常</span><span>状态</span><span/></div>{shown.map(row=><div className="bm-batch-row" key={row.id}><div className="bm-batch-name"><span className="bm-batch-icon"><Layers3 size={18}/></span><div><strong>{date(row.started_at)}</strong><small>{row.legacy?'既有批次':'自动发现'} · {number(row.total)} 条</small>{row.refresh_waiting>0&&<small>待复核 {row.refresh_waiting}</small>}</div></div><div className="bm-row-progress"><div><strong>{percent(row.completed,row.total)??'—'}%</strong><span>{number(row.completed)} / {number(row.total)}</span></div><BatchStack name={row.id} total={row.total} complete={row.completed} running={row.running} errors={row.error} excluded={row.excluded}/></div>{row.error+row.refresh_error>0?<NavigationButton variant="ghost" size="sm" className="bm-error-count" data-error aria-label={`查看批次 ${row.id} 的异常`} asChild><Link href={`/operations/tasks?stage=error&batch=${encodeURIComponent(row.id)}`}>{row.error+row.refresh_error}</Link></NavigationButton>:<span className="bm-error-count" aria-label="无异常">—</span>}<span className="bm-state" data-state={batchStatus(row)}>{batchStatus(row)}</span><Button variant="ghost" size="sm" aria-label={`查看批次 ${row.id}`} title={`查看批次 ${row.id}`} onClick={()=>open(row.id)}><ChevronRight size={16}/></Button></div>)}{!shown.length&&<p className="bm-empty">当前筛选没有批次</p>}</div><div className="bm-table-footer"><span>人工确认和归档不改变累计完成数</span><span>第 {Math.min(page,lastPage)+1} / {lastPage+1} 页</span>{lastPage>0&&<div><Button size="sm" variant="ghost" disabled={page<=0} onClick={()=>setPage(Math.min(page,lastPage)-1)}>上一页</Button><Button size="sm" variant="ghost" disabled={page>=lastPage} onClick={()=>setPage(Math.min(page,lastPage)+1)}>下一页</Button></div>}</div></CardContent></Card>

@@ -53,3 +53,9 @@
 新增表：processing_runs（尝试历史）、batch_items（累计成员）；tasks 仅新增 run_id，旧 data.ready、证据与文件指纹兼容。每个阶段进度写 `jobs/stages/sha256(run_id).json`，防止同类并发互相覆盖。
 
 涉及共享记录：自动处理不再由 Python 写 faces.db 的 videos 或 watermarks/results.json。结果、OCR 合并、人物相似组与首次批次完成均提交原生 processing-result 操作。尝试级临时素材只在原生接受回执后可见。完整契约、恢复顺序与未完成验收见 [GPU / VM 工作流](../processing-gpu-worker.md)。
+
+## 看板自动刷新
+
+`/operations` 使用 TanStack Query 缓存统计，前台每 5 秒刷新，切回窗口或恢复网络时按过期状态重新读取；后台页签不持续轮询。刷新失败保留最后有效数据并显示读取错误，下一次成功读取自动恢复。搜索、分页、打开的详情和并发设置草稿独立保存，暂停/恢复、重试、保存设置后使相关查询失效并重新读取。接口版本不兼容时保留已有画面但禁用写操作。
+
+看板不再使用人工确认的两分钟快照保护，也不再要求点击“更新状态”；`/review` 的连续核对保护保持原约定。`discovery.error` 属于后台扫描结果，成功刷新页面不等于扫描恢复，只有后台后续成功扫描清除此错误时才移除提示。
