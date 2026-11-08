@@ -458,7 +458,44 @@ impl Engine {
         self.require_resolved_mutation(&plan.id, Some(cause))?;
         let (domain, selected) = self.commit_scope(plan, accepted)?;
         let snapshot = &domain.metadata;
-        let ledger_state = self.ledger_state(plan, &domain)?;
+        let mut retained_indexes = vec![];
+        let ledger_state = match self.ledger_state(plan, &domain) {
+            Ok(state) => state,
+            Err(error) if plan.action == "archive" => {
+                retained_indexes = crate::archive_cancel::inspect(
+                    &self.config,
+                    plan,
+                    domain
+                        .ledger
+                        .as_ref()
+                        .ok_or_else(|| Error::conflict("缺少归档账本取消依据"))?,
+                )
+                .map_err(|_| error)?;
+                "prepared".into()
+            }
+            Err(error) => return Err(error),
+        };
+        if let Some(saved) = self
+            .store
+            .latest_step(&plan.id, "archive_external_indexes_retained")?
+        {
+            if plan.action != "archive" {
+                return Err(Error::conflict("取消索引依据不属于归档操作"));
+            }
+            if retained_indexes.is_empty() {
+                retained_indexes = crate::archive_cancel::inspect(
+                    &self.config,
+                    plan,
+                    domain
+                        .ledger
+                        .as_ref()
+                        .ok_or_else(|| Error::conflict("缺少归档账本取消依据"))?,
+                )?;
+            }
+            if saved["rows"] != json!(retained_indexes) {
+                return Err(Error::conflict("归档回退期间外部索引已变化"));
+            }
+        }
         if writes_faces(plan) {
             metadata::inspect_domain(&self.config, plan, snapshot, false)?;
         }
@@ -488,7 +525,17 @@ impl Engine {
             None
         };
         let cause = persisted_cause.as_ref().unwrap_or(cause);
-        let rollback = rollback || failed_rollback;
+        let rollback = rollback || failed_rollback || !retained_indexes.is_empty();
+        let external_cause = Error::new(
+            409,
+            "archive_external_index_retained",
+            "发现外部新增目标索引；仅回退本次文件与队列变更，外部索引原样保留，请核对冲突后刷新预览",
+        );
+        let cause = if retained_indexes.is_empty() {
+            cause
+        } else {
+            &external_cause
+        };
         let directory_cleanup = self
             .store
             .latest_step(&plan.id, "source_directory_cleanup_intent")?
@@ -537,7 +584,22 @@ impl Engine {
                 json!({"cause":cause}),
             )?;
             crate::fault::checkpoint(&self.config, "compensation_intent")?;
-            self.ledger_cancel(plan, &domain)?;
+            if retained_indexes.is_empty() {
+                self.ledger_cancel(plan, &domain)?;
+            } else {
+                self.store.step(
+                    &plan.id,
+                    "rolling_back",
+                    "archive_external_indexes_retained",
+                    json!({"rows":retained_indexes}),
+                )?;
+                crate::archive_cancel::cancel(
+                    &self.config,
+                    plan,
+                    domain.ledger.as_ref().unwrap(),
+                    &retained_indexes,
+                )?;
+            }
             crate::fault::checkpoint(&self.config, "compensation_ledger_fenced")?;
             for doc in snapshot.documents.iter().rev() {
                 if doc.before == doc.after {
@@ -563,6 +625,15 @@ impl Engine {
             }
             crate::fault::checkpoint(&self.config, "compensation_faces_restored")?;
             for (index, file) in plan.files.iter().enumerate().rev() {
+                if !retained_indexes.is_empty()
+                    && crate::archive_cancel::inspect(
+                        &self.config,
+                        plan,
+                        domain.ledger.as_ref().unwrap(),
+                    )? != retained_indexes
+                {
+                    return Err(Error::conflict("归档回退期间外部索引已变化"));
+                }
                 if failures.iter().any(|f| f["file_index"] == index) {
                     continue;
                 }
@@ -593,6 +664,15 @@ impl Engine {
                         self.checkpoint(&plan.id, phase, json!({"directory":proof}))
                     })?;
                 }
+            }
+            if !retained_indexes.is_empty()
+                && crate::archive_cancel::inspect(
+                    &self.config,
+                    plan,
+                    domain.ledger.as_ref().unwrap(),
+                )? != retained_indexes
+            {
+                return Err(Error::conflict("归档回退期间外部索引已变化"));
             }
             self.store.rolled_back(&plan.id, cause)?;
             Ok(None)

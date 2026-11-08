@@ -120,6 +120,7 @@ pub fn execute(engine: &mut Engine, command: &str, mut body: Value) -> Result<Va
                     &record.status,
                     cause,
                     &engine.store.failures(&id)?,
+                    &retained_indexes(&engine.store.db, &id)?,
                 );
                 // Keep the terminal operation state; only its compatibility receipt is published.
                 // An uncertain/recovery-needed operation must never gain a final result that
@@ -142,6 +143,7 @@ fn failure_result(
     status: &str,
     error: &str,
     skipped: &[Value],
+    retained: &[Value],
 ) -> Value {
     // All accepted files are still unfinished after an aggregate failure. Keep the
     // original per-file skip reason instead of replacing it with the ledger error.
@@ -167,7 +169,7 @@ fn failure_result(
     if let Some(rows) = result["failures"].as_array_mut() {
         rows.retain(|row| seen.insert(row["vid"].as_str().unwrap_or("").to_owned()));
         for row in rows {
-            row["retryable"] = json!(status != "recovery_needed");
+            row["retryable"] = json!(status != "recovery_needed" && retained.is_empty());
         }
     }
     let errors = result["errors"].as_array_mut().unwrap();
@@ -177,7 +179,21 @@ fn failure_result(
     result["ok"] = json!(false);
     result["rolled_back"] = json!(status == "rolled_back");
     result["recovery_needed"] = json!(status == "recovery_needed");
+    if !retained.is_empty() {
+        result["external_index_conflicts"] = json!(retained.iter().map(|row| json!({
+            "asset_id":row["id"]["$integer"], "path":row["path"], "disposition":"retained_unchanged"
+        })).collect::<Vec<_>>());
+        result["own_changes_rolled_back"] = json!(status == "rolled_back");
+    }
     result
+}
+fn retained_indexes(db: &rusqlite::Connection, id: &str) -> Result<Vec<Value>> {
+    let raw: Option<String> = db.query_row("SELECT evidence FROM steps WHERE operation_id=? AND phase='archive_external_indexes_retained' ORDER BY revision DESC LIMIT 1", [id], |r|r.get(0)).optional()?;
+    let Some(raw) = raw else {
+        return Ok(vec![]);
+    };
+    let value: Value = serde_json::from_str(&raw)?;
+    serde_json::from_value(value["rows"].clone()).map_err(Into::into)
 }
 fn journal_failures(db: &rusqlite::Connection, id: &str) -> Result<Vec<Value>> {
     db::rows(
@@ -264,6 +280,7 @@ pub fn progress(config: &Config, id: Option<&str>) -> Result<Value> {
             state,
             status["error"].as_str().unwrap_or("归档未完成"),
             &journal_failures(&db, &id)?,
+            &retained_indexes(&db, &id)?,
         );
     }
     if state == "cancelled" {

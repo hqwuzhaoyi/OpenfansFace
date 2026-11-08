@@ -243,6 +243,14 @@ pub fn preview_queue(config: &Config, queue: &Value) -> Result<Value> {
             row["record_version"] = json!(hash(
                 &json!({"videos":scoped_videos,"destination_videos":destination_videos,"jobs":scoped_jobs,"source_assets":src_assets,"destination_assets":dst_assets,"entities":creators,"links":links,"documents":documents})
             ));
+            if row["operation"] != "stage-duplicate" && !dst_assets.is_empty() {
+                return Err(Error::new(
+                    409,
+                    "ledger_conflict",
+                    "目标路径已有 Peach 账本记录，请先核对；此项未移动",
+                )
+                .at(dst.to_string_lossy()));
+            }
             let actual = if row["operation"] == "stage-duplicate" {
                 config
                     .media
