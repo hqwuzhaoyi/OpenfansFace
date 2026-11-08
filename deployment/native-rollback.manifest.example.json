@@ -245,5 +245,9 @@
     "service": "face-video-health.service"
   },
   "legacy_terminal_acknowledgements": {},
-  "media_root": "/PRIVATE/media"
+  "media_root": "/PRIVATE/media",
+  "legacy_reference_inventory_limits": {
+    "cache_files": 5000,
+    "directory_entries": 10000
+  }
 }

@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -181,30 +182,89 @@ def validate(manifest, release=False):
             fail('candidate must start with workers paused and native admission closed')
 
 
+def legacy_reference_decision(manifest, report):
+    """Only an exact reviewed ten-input omission; never origin/model acceptance."""
+    reference = manifest.get('legacy_reference_exclusion')
+    if reference is None:
+        return report
+    decision = evidence_json(reference)
+    if decision.get('simulated') is True and not rehearsal_guard(manifest):
+        fail('simulated legacy exclusion decision requires a marked isolated rehearsal')
+    from datetime import datetime, timezone
+    try:
+        reviewed = datetime.fromisoformat(decision['reviewed_at'].replace('Z', '+00:00'))
+        valid_time = reviewed.tzinfo is not None and reviewed <= datetime.now(timezone.utc)
+    except (KeyError, TypeError, ValueError):
+        valid_time = False
+    if (decision.get('version') != 1 or decision.get('purpose') != 'exclude_from_reference_build'
+            or decision.get('release_id') != manifest.get('release_id')
+            or decision.get('worker_policy') != 'source_unresolved_skipped_before_cache_read_v1'
+            or decision.get('preserve_original_bytes') is not True
+            or not valid_time or not isinstance(decision.get('reason'), str) or not decision['reason'].strip()
+            or not isinstance(decision.get('reviewed_by'), str) or not decision['reviewed_by'].strip()):
+        fail('legacy reference exclusion decision is incomplete or wrong release')
+    authorization = decision.get('authorization_reference', {})
+    raw, _ = read_control(authorization.get('path', '/nonexistent'))
+    if hashlib.sha256(raw).hexdigest() != authorization.get('sha256'):
+        fail('legacy reference exclusion authorization changed')
+    fields = {'vid_hash', 'person_hash', 'cache_fingerprint', 'assignment_fingerprint',
+              'source_fingerprint', 'input_fingerprint', 'status', 'reason'}
+    reviewed_cases = decision.get('reviewed_cases')
+    if (not isinstance(reviewed_cases, list) or len(reviewed_cases) != 10
+            or any(not isinstance(case, dict) or set(case) != fields for case in reviewed_cases)):
+        fail('legacy reference exclusion requires exactly ten complete reviewed inputs')
+    for case in reviewed_cases:
+        if (case['status'] != 'unresolved' or case['reason'] != 'source_unresolved'
+                or any(not isinstance(case[key], str) or not re.fullmatch('[a-f0-9]{64}', case[key])
+                       for key in fields - {'status', 'reason'})):
+            fail('legacy reference exclusion cannot approve consumable or unknown inputs')
+    counts = report.get('counts', {})
+    if (report.get('fingerprint_schema') != 1 or report.get('complete') is not True
+            or report.get('status') != 'failed' or counts.get('unknown') != 0
+            or counts.get('unresolved') != 10 or len({c['vid_hash'] for c in reviewed_cases}) != 10
+            or sorted(reviewed_cases, key=lambda c:c['vid_hash']) != sorted(report.get('cases', []), key=lambda c:c['vid_hash'])):
+        fail('legacy reference exclusion inputs changed or include unapproved failures')
+    return {**report, 'status':'passed_with_approved_exclusions',
+            'counts':{**counts, 'approved_excluded':10, 'remaining_unresolved':0},
+            'exclusion_decision_sha256':reference['sha256'],
+            'numerical_reference_effect':'not_evaluated'}
+
+
 def legacy_reference_gate(manifest, proof, rehearsal=False):
-    """A frozen flag cannot overrule a current failed/unknown scalar audit."""
+    """Reaudit before mutation; only a hash-bound exact omission decision may pass L1."""
     name='legacy_reference_compatibility'
-    if not isinstance(proof,dict) or proof.get('audit_schema')!=1 or proof.get('complete') is not True or proof.get('status')!='passed' or proof.get('metadata_only') is not True:
+    if not isinstance(proof,dict) or proof.get('audit_schema')!=1 or proof.get('complete') is not True or proof.get('metadata_only') is not True:
         fail('release gate unresolved: '+name)
     if proof.get('simulated') is True:
-        if not rehearsal or proof.get('gate')!=name or not rehearsal_guard(manifest):
+        if proof.get('status') != 'passed' or not rehearsal or proof.get('gate')!=name or not rehearsal_guard(manifest):
             fail('simulated legacy reference gate requires a marked isolated rehearsal')
         return proof
-    counts=proof.get('counts')
-    if not isinstance(counts,dict) or counts.get('unresolved')!=0 or counts.get('unknown')!=0 or not isinstance(proof.get('input_version'),str):
-        fail('release gate incomplete: '+name)
+    if proof.get('status') not in (('passed', 'failed') if manifest.get('legacy_reference_exclusion') else ('passed',)):
+        fail('release gate unresolved: '+name)
     import importlib.util
     spec=importlib.util.spec_from_file_location('legacy_reference_audit',Path(__file__).with_name('legacy_reference_audit.py'))
     audit_module=importlib.util.module_from_spec(spec);spec.loader.exec_module(audit_module)
+    inventory=manifest.get('legacy_reference_inventory_limits')
+    limits=audit_module.audit_limits(inventory)
+    if proof.get('limits') != limits:
+        fail('legacy reference audit limits changed; freeze and review the bounded inventory')
+    counts=proof.get('counts')
+    if not isinstance(counts,dict) or counts.get('unknown')!=0 or not isinstance(proof.get('input_version'),str):
+        fail('release gate incomplete: '+name)
+    # Verify the reviewed failed evidence and decision before the fresh scalar read.
+    approved=legacy_reference_decision(manifest, proof)
+    if approved['status'] not in ('passed', 'passed_with_approved_exclusions') or (approved['status']=='passed' and counts.get('unresolved')!=0):
+        fail('release gate unresolved: '+name)
     token=os.environ.get(manifest['native_token_env'])
     prover=audit_module.origin_client(manifest['native_url'],token)
-    current=audit_module.audit(manifest['base'],manifest.get('media_root',''),prover)
-    if current.get('status')!='passed' or current.get('complete') is not True:
-        # Diagnostics are scalar aggregates/hashed IDs only. Existing references
-        # and service/worker state have not been changed by this validation.
+    current=audit_module.audit(manifest['base'],manifest.get('media_root',''),prover,inventory)
+    if current.get('complete') is not True or current.get('status')=='unknown':
         fail('release gate blocked: '+name+' '+json.dumps(current,ensure_ascii=False,sort_keys=True))
     if current['input_version']!=proof['input_version'] or current['counts']!=counts:
-        fail('legacy reference audit inputs changed; rerun and review the scalar audit before release')
+        fail('release gate blocked: legacy reference audit inputs changed; rerun and review the scalar audit before release')
+    current=legacy_reference_decision(manifest,current)
+    if current['status'] not in ('passed','passed_with_approved_exclusions'):
+        fail('release gate blocked: '+name)
     return current
 
 
@@ -805,6 +865,18 @@ def replace(manifest, directory):
     snapshot_tree(manifest['base'], directory / 'base', preserved=retained)
     backup_database(manifest['ledger'], directory / 'ledger.db')
     if preserved_runtime(manifest) != retained: fail('preserved runtime changed during snapshot')
+    if manifest.get('legacy_reference_exclusion'):
+        frozen = evidence_json(manifest['evidence']['legacy_reference_compatibility'])
+        result = legacy_reference_gate(manifest, frozen)
+        private_json(directory / 'legacy-reference-decision.json', evidence_json(manifest['legacy_reference_exclusion']))
+        private_json(directory / 'legacy-reference-gate.json', result)
+        original_reference = Path(manifest['base']) / 'processing/references.npz'
+        saved_reference = directory / 'base/processing/references.npz'
+        if original_reference.exists() and (not saved_reference.is_file() or saved_reference.stat().st_size != original_reference.stat().st_size):
+            fail('existing reference artifact missing from normal business backup')
+        private_json(directory / 'legacy-reference-backup.json', {
+            'relative_path':'processing/references.npz', 'present':original_reference.exists(),
+            'normal_business_snapshot':True, 'restore_policy':'compatible recovery only; never overwrite newer user state'})
     private_json(directory / 'backup-complete.json', {'at':time.time(),'preserved_runtime':retained,'business_snapshot_complete':True})
     # Lock inode remains on its original mount. Backup is evidence, never the live authority.
     for role in ROLES:

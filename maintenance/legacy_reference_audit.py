@@ -23,9 +23,26 @@ import zipfile
 VERSION = 'buffalo_l-det-rec-8frames-v1'
 MODELS = {'det_10g.onnx': '5838f7fe053675b1c7a08b633df49e7af5495cee0493c7dcf6697200b85b5b91',
           'w600k_r50.onnx': '4c06341c33c2ca1f86781dab0e829f88ad5b64be9fba56e56bc9ebdefc619e43'}
-LIMITS = {'cache_files': 1500, 'catalog_rows': 50000, 'stat_calls': 5000,
-          'directory_entries': 5000, 'json_bytes': 32 * 1024**2, 'zip_bytes': 64 * 1024**2,
+LIMITS = {'cache_files': 5000, 'catalog_rows': 50000, 'stat_calls': 5000,
+          'directory_entries': 10000, 'json_bytes': 32 * 1024**2, 'zip_bytes': 64 * 1024**2,
           'scalar_bytes': 16384, 'proof_calls': 128, 'wall_seconds': 90}
+INVENTORY_CAPS = {'cache_files': 20000, 'directory_entries': 40000}
+
+
+def audit_limits(inventory=None):
+    result = dict(LIMITS)
+    if inventory is not None:
+        if not isinstance(inventory, dict) or set(inventory) != set(INVENTORY_CAPS):
+            raise ValueError('inventory_limits_shape')
+        for key, value in inventory.items():
+            if type(value) is not int or not 1 <= value <= INVENTORY_CAPS[key]:
+                raise ValueError('inventory_limits_bound')
+            result[key] = value
+        if result['directory_entries'] < result['cache_files']:
+            raise ValueError('inventory_limits_order')
+    return result
+
+
 SCALARS = frozenset(('version.npy', 'path.npy', 'size.npy', 'mtime_ns.npy', 'model_hashes.npy'))
 
 
@@ -84,23 +101,24 @@ def origin_client(url, token=None):
 
 
 class Audit:
-    def __init__(self, base, media, prover):
+    def __init__(self, base, media, prover, inventory=None):
         self.base, self.media, self.prover = Path(base), Path(media), prover
+        self.limits = audit_limits(inventory)
         self.started = time.monotonic()
         self.stats = self.proofs = 0
-        self.inputs, self.files, self.databases = [], {}, []
+        self.files, self.databases = {}, []
         self.counts = collections.Counter(assigned_caches=0, direct=0, native_proven=0, unresolved=0, unknown=0)
         self.cases = []
 
     def deadline(self):
-        remaining = LIMITS['wall_seconds'] - (time.monotonic() - self.started)
+        remaining = self.limits['wall_seconds'] - (time.monotonic() - self.started)
         if remaining <= 0:
             raise ValueError('wall_budget')
         return remaining
 
     def observe(self, path, optional=False):
         self.deadline(); self.stats += 1
-        if self.stats > LIMITS['stat_calls']:
+        if self.stats > self.limits['stat_calls']:
             raise ValueError('stat_budget')
         try:
             item = Path(path).lstat()
@@ -122,18 +140,17 @@ class Audit:
         path = self.base / name
         before = self.observe(path, optional=True)
         if before is None:
-            self.inputs.append([name, None]); return default
-        if not stat.S_ISREG(before.st_mode) or before.st_size > LIMITS['json_bytes']:
+            return default
+        if not stat.S_ISREG(before.st_mode) or before.st_size > self.limits['json_bytes']:
             raise ValueError('document_bound_or_type')
         fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
         with os.fdopen(fd, 'rb') as source:
-            raw = source.read(LIMITS['json_bytes'] + 1)
-            if identity(os.fstat(source.fileno())) != identity(before) or len(raw) > LIMITS['json_bytes']:
+            raw = source.read(self.limits['json_bytes'] + 1)
+            if identity(os.fstat(source.fileno())) != identity(before) or len(raw) > self.limits['json_bytes']:
                 raise ValueError('document_changed')
         result = json.loads(raw)
         if type(result) is not type(default):
             raise ValueError('document_shape')
-        self.inputs.append([name, hashlib.sha256(raw).hexdigest()])
         return result
 
     def rows(self, name, table, optional=False, record=True):
@@ -145,17 +162,16 @@ class Audit:
             raise ValueError('database_type')
         with sqlite3.connect(path.as_uri() + '?mode=ro', uri=True, timeout=2) as db:
             db.execute('PRAGMA query_only=ON')
-            db.set_progress_handler(lambda: int(time.monotonic() - self.started > LIMITS['wall_seconds']), 1000)
+            db.set_progress_handler(lambda: int(time.monotonic() - self.started > self.limits['wall_seconds']), 1000)
             # Closed table set. No embedding column is selected, even for counts.
             if table not in ('videos', 'tasks'):
                 raise ValueError('forbidden_table')
-            result = db.execute('SELECT vid,path FROM ' + table + ' LIMIT ?', (LIMITS['catalog_rows'] + 1,)).fetchall()
-        if len(result) > LIMITS['catalog_rows'] or any(not isinstance(v, str) or not isinstance(p, str) for v, p in result):
+            result = db.execute('SELECT vid,path FROM ' + table + ' LIMIT ?', (self.limits['catalog_rows'] + 1,)).fetchall()
+        if len(result) > self.limits['catalog_rows'] or any(not isinstance(v, str) or not isinstance(p, str) for v, p in result):
             raise ValueError('catalog_bound_or_shape')
         self.files.pop(str(path),None)  # Progress-only SQLite writes are not source changes.
         if record:
             self.databases.append((name,table,sorted(result)))
-            self.inputs.append([name, sorted(result)])
         return result
 
     def mapped(self, value):
@@ -176,7 +192,7 @@ class Audit:
         history = self.document('archive-history.json', [])
         aliases = self.document('person-renames.json', {})
         overrides = self.document('video-path-overrides.json', {})
-        if max(len(queue), len(history), len(aliases), len(overrides)) > LIMITS['catalog_rows']:
+        if max(len(queue), len(history), len(aliases), len(overrides)) > self.limits['catalog_rows']:
             raise ValueError('assignment_bound')
         assigned = {}
         for row in queue + history:
@@ -184,6 +200,7 @@ class Audit:
                 raise ValueError('assignment_shape')
             if row.get('file_state') != 'staged':
                 assigned[row['vid']] = row['creator']
+        explicit_assignments = set(assigned)
         sources = dict(self.rows('faces.db', 'videos'))
         if any(not isinstance(k, str) or not isinstance(v, str) for k, v in overrides.items()):
             raise ValueError('override_shape')
@@ -206,25 +223,34 @@ class Audit:
             with os.scandir(cache_dir) as entries:
                 for index, entry in enumerate(entries):
                     self.deadline()
-                    if index >= LIMITS['directory_entries']:
+                    if index >= self.limits['directory_entries']:
                         raise ValueError('directory_budget')
                     if entry.name.endswith('.npz'):
                         files.append(Path(entry.path))
-                        if len(files) > LIMITS['cache_files']:
+                        if len(files) > self.limits['cache_files']:
                             raise ValueError('cache_inventory_bound')
         except FileNotFoundError:
             pass
-        self.inputs.append(['cache_inventory', sorted(p.name for p in files)])
-        self.observe(self.base / 'processing/references.npz', optional=True)
+        # Unassigned cache arrival and progress-only rows do not change reference inputs.
+        relevant_inputs = []
+        reference = self.observe(self.base / 'processing/references.npz', optional=True)
+        relevant_inputs.append(['reference_artifact', identity(reference) if reference else None])
         for cache in sorted(files):
             vid = by_hash.get(cache.stem)
             if vid is None:
                 continue
             self.counts['assigned_caches'] += 1
-            case = {'vid_hash': hashlib.sha256(vid.encode()).hexdigest()[:20], 'person_hash': hashlib.sha256(assigned[vid].encode()).hexdigest()[:20]}
+            name = assigned[vid]
+            chain, seen = [], set()
+            while vid in explicit_assignments and isinstance(aliases.get(name), str) and name not in seen:
+                self.deadline(); seen.add(name)
+                chain.append(name); name = aliases[name]
+            case = {'vid_hash': hashlib.sha256(vid.encode()).hexdigest(),
+                    'person_hash': hashlib.sha256(name.encode()).hexdigest()}
+            source_observations = []
             try:
                 before = self.observe(cache)
-                if not stat.S_ISREG(before.st_mode) or before.st_size > LIMITS['zip_bytes']:
+                if not stat.S_ISREG(before.st_mode) or before.st_size > self.limits['zip_bytes']:
                     raise ValueError('cache_bound_or_type')
                 fd = os.open(cache, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
                 with os.fdopen(fd, 'rb') as source, zipfile.ZipFile(source) as archive:
@@ -234,14 +260,19 @@ class Audit:
                     model = scalar(archive, 'model_hashes.npy') if 'model_hashes.npy' in archive.namelist() else None
                     if identity(os.fstat(source.fileno())) != identity(before):
                         raise ValueError('cache_changed')
-                self.inputs.append([cache.name, meta, model])
+                case['cache_fingerprint'] = digest([identity(before), meta, model])
+                case['assignment_fingerprint'] = digest([assigned[vid], chain, name])
                 current = source_stat = None
                 for value in (sources.get(vid), vid):
                     candidate = self.mapped(value)
                     if candidate:
                         candidate_stat = self.observe(candidate, optional=True)
+                        source_observations.append([candidate, identity(candidate_stat) if candidate_stat else None])
                         if candidate_stat is not None and stat.S_ISREG(candidate_stat.st_mode):
                             current, source_stat = candidate, candidate_stat; break
+                case['source_fingerprint'] = digest([sources.get(vid), vid, source_observations])
+                case['input_fingerprint'] = digest(case)
+                relevant_inputs.append(dict(case))
                 if current is None:
                     reason = 'source_unresolved'
                 elif str(meta['version']) != VERSION or (model is not None and json.loads(model) != MODELS):
@@ -254,7 +285,7 @@ class Audit:
                     reason = 'native_origin_unproven'
                 else:
                     self.proofs += 1
-                    if self.proofs > LIMITS['proof_calls']:
+                    if self.proofs > self.limits['proof_calls']:
                         raise ValueError('proof_budget')
                     body = {'vid': vid, 'source': current, 'origin': {'path': str(meta['path']), 'size': str(meta['size']), 'mtime_ns': str(meta['mtime_ns'])}, 'current_identity': identity(source_stat)}
                     try:
@@ -265,7 +296,7 @@ class Audit:
                         else:
                             raise
                     if isinstance(proof, dict) and proof.get('metadata_only') is True and proof.get('verified') is True and proof.get('current_identity') == identity(source_stat) and re.fullmatch('[a-f0-9]{64}', str(proof.get('version', ''))):
-                        self.inputs.append(['origin_proof', case['vid_hash'], proof['version']])
+                        relevant_inputs.append(['origin_proof', case['vid_hash'], proof['version']])
                         self.counts['native_proven'] += 1; continue
                     reason = 'native_origin_unproven'
                 case.update(status='unresolved', reason=reason); self.counts['unresolved'] += 1
@@ -283,29 +314,34 @@ class Audit:
             if (identity(item) if item else None) != old:
                 raise ValueError('inputs_changed')
         return {'audit_schema': 1, 'complete': True, 'status': 'failed' if self.counts['unresolved'] else 'unknown' if self.counts['unknown'] else 'passed',
-                'input_version': digest([self.inputs, sorted(self.files.items())]), 'counts': dict(self.counts), 'cases': self.cases,
-                'limits': LIMITS, 'stat_calls': self.stats, 'metadata_only': True, 'numerical_reference_effect': 'not_evaluated'}
+                'input_version': digest(relevant_inputs), 'counts': dict(self.counts), 'cases': self.cases,
+                'limits': self.limits, 'inventory': {'cache_files': len(files)}, 'fingerprint_schema': 1, 'stat_calls': self.stats, 'metadata_only': True, 'numerical_reference_effect': 'not_evaluated'}
 
 
-def audit(base, media, prover=None):
+def audit(base, media, prover=None, inventory=None):
+    limits = None
     try:
+        limits = audit_limits(inventory)
         base, media = Path(base), Path(media)
         if not base.is_absolute() or not media.is_absolute():
             raise ValueError('absolute_roots_required')
-        return Audit(base, media, prover).run()
+        return Audit(base, media, prover, inventory).run()
     except Exception as error:
         return {'audit_schema': 1, 'complete': False, 'status': 'unknown', 'metadata_only': True,
-                'reason': type(error).__name__, 'counts': None, 'numerical_reference_effect': 'not_evaluated'}
+                'reason': type(error).__name__, 'limits': limits, 'counts': None, 'numerical_reference_effect': 'not_evaluated'}
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--base', default=os.environ.get('FACES_BASE'))
     parser.add_argument('--media-root', default=os.environ.get('MEDIA2_ROOT'))
+    parser.add_argument('--cache-files-limit', type=int, default=LIMITS['cache_files'])
+    parser.add_argument('--directory-entries-limit', type=int, default=LIMITS['directory_entries'])
     args = parser.parse_args()
     if not args.base or not args.media_root:
         parser.error('provide --base/--media-root or FACES_BASE/MEDIA2_ROOT')
     url = os.environ.get('FILE_OPERATIONS_RUST_URL')
-    report = audit(args.base, args.media_root, origin_client(url, os.environ.get('FILE_OPERATIONS_RUST_TOKEN')) if url else None)
+    report = audit(args.base, args.media_root, origin_client(url, os.environ.get('FILE_OPERATIONS_RUST_TOKEN')) if url else None,
+                   {'cache_files': args.cache_files_limit, 'directory_entries': args.directory_entries_limit})
     print(json.dumps(report, ensure_ascii=False, indent=2))
     raise SystemExit(0 if report['status'] == 'passed' else 1)
