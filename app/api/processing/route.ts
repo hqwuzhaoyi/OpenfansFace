@@ -3,7 +3,7 @@ import { processingAction, processingOverview } from '@/lib/processing'
 import { validateVids, ReviewError } from '@/lib/review-logic'
 
 export async function GET(req: NextRequest) {
-  try { return NextResponse.json(processingOverview(req.nextUrl.searchParams)) }
+  try { return NextResponse.json(await processingOverview(req.nextUrl.searchParams)) }
   catch (e: any) { return NextResponse.json({error:e.message},{status:e.status || 500}) }
 }
 export async function POST(req: NextRequest) {

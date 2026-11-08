@@ -197,7 +197,16 @@ try:
     retried = meta(x, 'processing-retry-errors', {'batch': 'batch-err'})
     assert retried['retried'] == 1
 
-    # 7. Verify Python processing_store / processing_worker integration with FILE_OPERATIONS_RUST_URL
+    # 7. Verify overview, dashboard, and home-tasks queries in Rust
+    ov = meta(x, 'processing-overview', {'vid': err_vid})
+    assert ov['all_count'] >= 1 and ov['task']['vid'] == err_vid
+    dash = meta(x, 'processing-dashboard', {})
+    assert dash['schema_version'] == 1 and dash['ledger_ready'] is True
+    assert dash['totals']['total'] >= 3 and len(dash['history']) >= 1
+    ht = meta(x, 'processing-home-tasks', {})
+    assert ht['initialized'] is True and ht['total'] >= 1 and len(ht['jobs']) >= 2
+
+    # 8. Verify Python processing_store / processing_worker integration with FILE_OPERATIONS_RUST_URL
     old_env = os.environ.get('FILE_OPERATIONS_RUST_URL'), os.environ.get('FILE_OPERATIONS_RUST_TOKEN')
     os.environ['FILE_OPERATIONS_RUST_URL'] = x.url
     os.environ['FILE_OPERATIONS_RUST_TOKEN'] = 'fixture-token'

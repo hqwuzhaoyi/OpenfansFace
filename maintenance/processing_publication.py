@@ -52,12 +52,14 @@ def prepare(task, base, people, keys):
     return task
 
 
-def publish_result(task, base, data, next_stage):
+def publish_result(task, base, data, next_stage=None):
     material = task['_material']
     body = {'operation_id': str(uuid.UUID(task['run_id'])),
             **material,
             'task': {key: task[key] for key in ('vid', 'path', 'size', 'mtime_ns', 'stage', 'run_id', 'batch_id', 'lease_expires_at', 'coordinator_generation')},
-            'data': data, 'next_stage': next_stage}
+            'data': data}
+    if next_stage is not None:
+        body['next_stage'] = next_stage
     if task['stage'] == 'face':
         body['reference_input_version'] = task['_reference_input_version']
     # Durable exact body allows recovery to replay the SAME operation after a lost response.

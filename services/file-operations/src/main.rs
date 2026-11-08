@@ -204,6 +204,19 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         }
         return Ok(());
     }
+    if args.get(1).map(String::as_str) == Some("--evaluate-rules") {
+        let body: Value = serde_json::from_str(args.get(2).ok_or("missing rule input")?)?;
+        match processing_result::evaluate_rules(&body) {
+            Ok(out) => {
+                println!("{}", serde_json::to_string(&out)?);
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("{}", e.error);
+                std::process::exit(1);
+            }
+        }
+    }
     serve()
 }
 
