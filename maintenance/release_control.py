@@ -140,12 +140,159 @@ def rehearsal_guard(manifest):
     return True
 
 
+def inference_backend(manifest):
+    # Older manifests retain the strict external-GPU contract, never opt into CPU.
+    backend = manifest.get('inference_backend', 'gpu-detection')
+    if backend not in ('cpu', 'gpu-detection'):
+        fail('unknown release inference backend')
+    return backend
+
+
+def release_gates(manifest):
+    return tuple(g for g in GATES if inference_backend(manifest) != 'cpu' or g != 'gpu_full_640_coexistence')
+
+
+def cpu_worker_configuration(manifest):
+    worker = manifest['services']['worker']; args = worker['create_args']
+    if not args or args[-1] != worker['candidate_image']: fail('CPU worker must use its frozen image command')
+    frozen = candidate_runtime_configuration({'services':{'worker':worker}})['worker']
+    image = json.loads(run('docker','image','inspect',worker['candidate_image']))[0]
+    env = dict(item.split('=',1) for item in image.get('Config',{}).get('Env',[]))
+    explicit = []
+    for index, arg in enumerate(args[:-1]):
+        if arg == '--env-file':
+            raw, _ = read_control(args[index+1])
+            for line in raw.decode().splitlines():
+                if not line.strip() or line.lstrip().startswith('#'): continue
+                if '=' not in line: fail('CPU release forbids inherited environment values')
+                key, value = line.split('=',1); env[key] = value
+        elif arg in ('--env','-e'):
+            if '=' not in args[index+1]: fail('CPU release forbids inherited environment values')
+            explicit.append(args[index+1].split('=',1))
+        elif ((arg.startswith('-e') and arg != '-e') or arg.startswith('-m') or arg.startswith(('--env=', '--env-file=', '-e=', '--cpus=', '--memory='))
+              or arg in ('--cpu-quota','--cpu-period','--cpu-shares','--gpus','--device','--privileged','--runtime','--entrypoint')
+              or arg.startswith(('--cpu-quota=', '--cpu-period=', '--gpus=', '--device=', '--runtime=', '--entrypoint='))):
+            fail('CPU release requires unambiguous CPU-only Docker arguments')
+    env.update(explicit)
+    def flag(name):
+        if args.count(name) != 1: fail('CPU release requires exactly one '+name)
+        return args[args.index(name)+1]
+    if flag('--cpus') != '1' or flag('--memory').lower() not in ('1536m','1610612736'):
+        fail('CPU release requires --cpus 1 --memory 1536m')
+    if env.get('PROCESSING_FACE_BACKEND') != 'cpu' or env.get('PROCESSING_MAX_CONCURRENCY') != '1':
+        fail('CPU release worker must explicitly select CPU and concurrency 1')
+    return {**frozen, 'cpu_limit':1, 'memory_bytes':1610612736, 'concurrency':1,
+            'backend':'cpu', 'effective_environment_sha256':canonical_digest(env)}
+
+
+def cpu_worker_live(manifest, state, candidate=False):
+    env = dict(item.split('=',1) for item in state.get('Config',{}).get('Env',[]))
+    host = state.get('HostConfig',{})
+    if (env.get('PROCESSING_FACE_BACKEND', None if candidate else 'cpu') != 'cpu'
+            or env.get('PROCESSING_MAX_CONCURRENCY', None if candidate else '1') != '1'
+            or host.get('NanoCpus') != 1000000000 or host.get('Memory') != 1610612736
+            or host.get('DeviceRequests') or host.get('Devices') or host.get('Privileged')):
+        fail('CPU release live worker backend/resource budget differs from retained CPU contract')
+
+
+def cpu_release_gate(manifest):
+    reference = manifest.get('cpu_release')
+    if not isinstance(reference,dict): fail('CPU release requires a hash-bound operator review')
+    review = evidence_json(reference)
+    if review.get('version') != 1 or review.get('purpose') != 'retain-production-cpu' or review.get('release_id') != manifest.get('release_id') or review.get('simulated') is True:
+        fail('CPU release review is not valid for this release')
+    decision = evidence_json(review['user_decision'])
+    runtime = decision.get('runtime',{})
+    if (not decision.get('user_instruction') or runtime.get('cpu_limit') != 1
+            or runtime.get('memory_bytes') != 1610612736 or runtime.get('concurrency') != 1
+            or runtime.get('ocr_device') != 'cpu' or runtime.get('face_provider') != 'CPUExecutionProvider'
+            or runtime.get('candidate_env',{}).get('PROCESSING_FACE_BACKEND') != 'cpu'
+            or runtime.get('candidate_env',{}).get('PROCESSING_MAX_CONCURRENCY') != '1'):
+        fail('CPU release user decision does not authorize the retained budget/backend')
+    proof = evidence_json(review['verification']); source = evidence_json(review['source_manifest'])
+    config, checks = proof.get('configuration',{}), proof.get('checks',{})
+    ocr, face = checks.get('ocr',{}), checks.get('face',{})
+    execution = face.get('execution',{})
+    if (proof.get('simulated') is True or proof.get('status') != 'retained_cpu_isolated_validation_passed'
+            or proof.get('source_head') != source.get('head') or not re.fullmatch('[a-f0-9]{40}',str(source.get('head','')))
+            or not source.get('files') or config.get('backend') != 'cpu' or config.get('cpu_limit') != 1
+            or config.get('memory_mib') != 1536 or config.get('concurrency') != 1
+            or config.get('network') != 'none' or config.get('production_media_mounted') is not False
+            or ocr.get('sampled_frames') != 8 or ocr.get('expected_watermark_found') is not True
+            or face.get('sampled_frames') != 8 or face.get('face_count') != 8 or face.get('dimension') != 512
+            or not .99 <= face.get('norm_min',0) <= face.get('norm_max',0) <= 1.01
+            or execution.get('model_hashes') != {'det_10g.onnx':'5838f7fe053675b1c7a08b633df49e7af5495cee0493c7dcf6697200b85b5b91',
+                                               'w600k_r50.onnx':'4c06341c33c2ca1f86781dab0e829f88ad5b64be9fba56e56bc9ebdefc619e43'}
+            or execution.get('backend') != 'cpu' or execution.get('detection_provider') != 'CPUExecutionProvider'
+            or execution.get('recognition_provider') != 'CPUExecutionProvider'
+            or checks.get('processing_tests',0) < 40 or checks.get('dashboard_model_tests',0) < 5
+            or not str(checks.get('native_worker_review_joint','')).startswith('passed; mocked model stages')):
+        fail('CPU release requires actual isolated CPU model evidence and separately labeled native joint evidence')
+    required_sources=('processing_worker.py','processing_faces.py','processing_gpu.py','watermark_worker.py','processing_publication.py')
+    if review.get('verified_worker_sources') != {name:source['files'].get('source/'+name) for name in required_sources} or any(not re.fullmatch('[a-f0-9]{64}',str(source['files'].get('source/'+name,''))) for name in required_sources):
+        fail('CPU release needs reviewed candidate worker source hashes matching CPU verification')
+    if review.get('worker_configuration') != cpu_worker_configuration(manifest):
+        fail('CPU release worker configuration changed since review')
+    return {'backend':'cpu', 'verification_sha256':review['verification']['sha256'],
+            'actual_cpu_models':'isolated_8_frames', 'native_joint_models':'mocked',
+            'cpu_limit':1, 'memory_bytes':1610612736, 'concurrency':1}
+
+
+def cpu_worker_heartbeat(manifest, allow_waiting=True, not_before=None):
+    try:
+        raw, _ = read_control(Path(manifest['base'])/'processing/heartbeat.json')
+    except FileNotFoundError:
+        return None
+    heartbeat = json.loads(raw)
+    stamp=heartbeat.get('at',0)
+    if type(stamp) not in (int,float):
+        fail('CPU worker heartbeat has invalid timestamp')
+    age = time.time() - stamp
+    if not -30 <= age < 90 or (not_before is not None and stamp <= not_before):
+        return None
+    if heartbeat.get('protocol') != 3: fail('CPU worker heartbeat has invalid protocol')
+    if heartbeat.get('waiting_native_admission') is True:
+        if heartbeat.get('native_ready') is not False or heartbeat.get('active') != 0:
+            fail('CPU worker waiting heartbeat has inconsistent readiness')
+        return heartbeat if allow_waiting else None
+    inference = heartbeat.get('inference',{})
+    if heartbeat.get('native_ready') is not True or inference.get('backend') != 'cpu' or inference.get('fallback') is not False:
+        fail('CPU worker runtime did not confirm explicit CPU backend without fallback')
+    return heartbeat
+
+
+def wait_cpu_worker_ready(manifest, *, not_before=None, allow_waiting=False):
+    deadline=time.monotonic()+max(0,min(float(manifest.get('startup_timeout',30)),120))
+    while True:
+        state=inspect(manifest['services']['worker']['name'])
+        if state['Id'] != manifest['services']['worker']['expected_id'] or state['Image'] != manifest['services']['worker']['candidate_image']:
+            fail('CPU worker changed during opening')
+        if state.get('State',{}).get('Running') is not True: fail('CPU worker is not running after opening')
+        cpu_worker_live(manifest,state,candidate=True)
+        from datetime import datetime
+        try:
+            value=state['State']['StartedAt']
+            parts=re.fullmatch(r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:\d{2})',value)
+            if parts is None: raise ValueError('invalid start')
+            started=datetime.fromisoformat(parts[1]+parts[3].replace('Z','+00:00')).timestamp()
+            started+=int((parts[2] or '0').ljust(9,'0'))/1000000000
+            if started <= 0: raise ValueError('invalid start')
+        except (KeyError,AttributeError,TypeError,ValueError):
+            fail('CPU worker start identity is missing or invalid')
+        boundary=max(started,not_before or 0)
+        if cpu_worker_heartbeat(manifest,allow_waiting=allow_waiting,not_before=boundary) is not None: return
+        if time.monotonic()>=deadline: fail('CPU worker has no fresh current-container acknowledgement; keep claims paused')
+        time.sleep(.2)
+
+
 def validate(manifest, release=False):
     rehearsal=rehearsal_guard(manifest)
     if manifest.get('version') != 1 or set(manifest.get('services', {})) != set(ROLES):
         fail('manifest version or four local service roles are invalid')
+    backend=inference_backend(manifest)
     gpu=manifest.get('gpu_peer',{})
-    if gpu.get('adapter')!='external-systemd' or not gpu.get('unit') or not gpu.get('url') or not gpu.get('expected_health'):
+    if backend=='cpu' and gpu: fail('CPU release must remove the deferred GPU peer contract')
+    if backend=='gpu-detection' and (gpu.get('adapter')!='external-systemd' or not gpu.get('unit') or not gpu.get('url') or not gpu.get('expected_health')):
         fail('GPU requires a frozen external systemd peer contract')
     if manifest.get('native_schema') != 9:
         fail('this controller requires schema 9 admission persistence')
@@ -161,11 +308,14 @@ def validate(manifest, release=False):
         if any('FILE_OPERATIONS_FIXTURE_ROOT' in a or 'FILE_OPERATIONS_PARITY_ROOT' in a for a in args):
             fail(f'{role}: fixture/parity configuration is forbidden in production')
     if release:
-        remote=manifest['gpu_peer'].get('prepared_receipt',{})
-        receipt=Path(remote.get('path','/nonexistent'))
-        if not receipt.is_file() or hashlib.sha256(receipt.read_bytes()).hexdigest()!=remote.get('sha256'):
-            fail('remote GPU prepare receipt missing or changed')
-        for gate in GATES:
+        if backend=='cpu':
+            cpu_release_gate(manifest)
+        else:
+            remote=manifest['gpu_peer'].get('prepared_receipt',{})
+            receipt=Path(remote.get('path','/nonexistent'))
+            if not receipt.is_file() or hashlib.sha256(receipt.read_bytes()).hexdigest()!=remote.get('sha256'):
+                fail('remote GPU prepare receipt missing or changed')
+        for gate in release_gates(manifest):
             evidence = manifest.get('evidence', {}).get(gate, {})
             path = Path(evidence.get('path', '/nonexistent'))
             if evidence.get('passed') is not True or not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != evidence.get('sha256'):
@@ -269,6 +419,8 @@ def legacy_reference_gate(manifest, proof, rehearsal=False):
 
 
 def gpu_probe(manifest):
+    if inference_backend(manifest)=='cpu':
+        return cpu_release_gate(manifest)
     peer=manifest['gpu_peer']
     headers={}
     if peer.get('token_env'):
@@ -315,9 +467,24 @@ def legacy_journals(manifest):
         directory=base/folder
         if directory.exists(): paths.update(directory.glob(pattern))
     if (base/'jobs/archive.json').exists(): paths.add(base/'jobs/archive.json')
+    reclassification=base/'reclassification-operations'
+    if os.path.lexists(reclassification):
+        if reclassification.is_symlink() or not reclassification.is_dir(): fail('reclassification journal directory has invalid type')
+        with os.scandir(reclassification) as entries:
+            for index, entry in enumerate(entries):
+                if index>=1000: fail('reclassification journal inventory bound exceeded')
+                if entry.is_symlink(): fail('reclassification journal directory is a symlink')
+                if not entry.is_dir(follow_symlinks=False): continue
+                try: uuid.UUID(entry.name)
+                except ValueError: fail('unclassified reclassification journal directory')
+                result_path=Path(entry.path)/'result.json'
+                if not os.path.lexists(result_path): fail('reclassification journal remains unresolved: missing result')
+                paths.add(result_path)
     for path in sorted(paths):
         if path.is_symlink(): fail('legacy journal is a symlink')
-        raw=path.read_bytes();record=json.loads(raw);relative=str(path.relative_to(base));digest=hashlib.sha256(raw).hexdigest()
+        relative=str(path.relative_to(base))
+        raw=read_control(path)[0] if relative.startswith('reclassification-operations/') else path.read_bytes()
+        record=json.loads(raw);digest=hashlib.sha256(raw).hexdigest()
         if not isinstance(record,dict): fail('legacy journal is not an object: '+relative)
         result=record.get('result') or {};job=record.get('job') or record
         if not isinstance(result,dict) or not isinstance(job,dict): fail('legacy journal has invalid state objects: '+relative)
@@ -738,6 +905,8 @@ def baseline(manifest):
         state = inspect(service['name'])
         if state['Id'] != service['expected_id'] or state['Image'] != service['expected_image']:
             fail(f'{role}: container changed since inspection')
+        if role=='worker' and inference_backend(manifest)=='cpu':
+            cpu_worker_live(manifest,state,candidate=state['Image']==service['candidate_image'])
         observed[role] = state
     peach = inspect(manifest['peach']['name'])
     if peach['Id'] != manifest['peach']['expected_id'] or peach['Image'] != manifest['peach']['expected_image']:
@@ -822,7 +991,10 @@ def await_available(action, seconds):
 
 def probes(manifest):
     gpu_probe(manifest)
+    if inference_backend(manifest)=='cpu': wait_cpu_worker_ready(manifest,allow_waiting=True)
     for probe in manifest['probes']:
+        if inference_backend(manifest)=='cpu' and probe['kind']=='gpu':
+            fail('CPU release must remove the deferred GPU probe')
         def read_probe():
             request = urllib.request.Request(probe['url'], headers=probe.get('headers', {}))
             with urllib.request.urlopen(request, timeout=5) as response:
@@ -835,7 +1007,9 @@ def probes(manifest):
                     fail('playback probe lacks Content-Range')
         await_available(read_probe,manifest.get('startup_timeout',30))
     kinds = {p['kind'] for p in manifest['probes']}
-    if not {'web', 'static', 'playback-range', 'legacy-receipt', 'native-receipt', 'gpu', 'worker', 'calibrator'}.issubset(kinds):
+    required={'web', 'static', 'playback-range', 'legacy-receipt', 'native-receipt', 'worker', 'calibrator'}
+    if inference_backend(manifest)=='gpu-detection': required.add('gpu')
+    if not required.issubset(kinds):
         fail('probe coverage incomplete')
 
 
@@ -893,6 +1067,7 @@ def replace(manifest, directory):
         candidate = run('docker', 'create', *service['create_args']).strip()
         private_json(directory / (role + '-created.json'), {'id': candidate, 'image': service['candidate_image']})
         created = inspect(candidate)
+        if role=='worker' and inference_backend(manifest)=='cpu': cpu_worker_live(manifest,created,candidate=True)
         env = dict(item.split('=',1) for item in created['Config'].get('Env',[]) if '=' in item)
         if any(key in env for key in ('FILE_OPERATIONS_FIXTURE_ROOT','FILE_OPERATIONS_PARITY_ROOT')): fail('candidate env file includes fixture/parity mode')
         if role == 'native':
@@ -964,7 +1139,14 @@ def main():
             state = api(manifest, '/v1/readiness')
             if not state.get('drained') or state.get('schema') != manifest['native_schema'] or state.get('authority') != {key:str(manifest['authority_identity'][key]) for key in ('dev','ino')}:
                 fail('native state not ready to open')
-            print(json.dumps(api(manifest, '/v1/admission', {'accepting': True}))); return
+            opening_started=time.time()
+            opened=api(manifest, '/v1/admission', {'accepting': True})
+            if inference_backend(manifest)=='cpu':
+                try: wait_cpu_worker_ready(manifest,not_before=opening_started)
+                except Exception:
+                    api(manifest, '/v1/admission', {'accepting': False})
+                    raise
+            print(json.dumps(opened)); return
         if args.action == 'rollback' and manifest.get('purpose') != 'compatible-native-rollback':
             fail('rollback requires its own compatible native manifest; legacy writer toggle is forbidden')
         directory = Path(manifest['evidence_dir']) / (manifest['release_id'] + '-' + args.action)
