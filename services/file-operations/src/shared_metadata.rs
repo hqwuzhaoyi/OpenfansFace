@@ -67,6 +67,23 @@ fn names(value: &Value) -> Result<Vec<String>> {
         })
         .collect()
 }
+fn evidence_names(value: &Value) -> Result<Vec<String>> {
+    if value.is_null() {
+        return Ok(vec![]);
+    }
+    let rows = value.as_array().ok_or_else(|| bad("范围必须是列表"))?;
+    if rows.len() > 5000 {
+        return Err(bad("范围过大"));
+    }
+    rows.iter()
+        .map(|v| {
+            v.as_str()
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .ok_or_else(|| bad("范围编号无效"))
+        })
+        .collect()
+}
 fn canonical(config: &Config, name: &str) -> Result<String> {
     review::creator(config, &json!(name))
 }
@@ -77,10 +94,13 @@ fn relevant_using(
     canonical: impl Fn(&str) -> Result<String>,
 ) -> Result<bool> {
     for key in ["creator", "person", "name"] {
-        if let Some(name) = row[key].as_str()
-            && people.contains(&canonical(name)?)
-        {
-            return Ok(true);
+        if let Some(name) = row[key].as_str() {
+            match canonical(name) {
+                Ok(c) if people.contains(&c) => return Ok(true),
+                Ok(_) => {}
+                Err(e) if e.status == 400 => {}
+                Err(e) => return Err(e),
+            }
         }
     }
     Ok(row["vid"].as_str().is_some_and(|v| vids.contains(v)))
@@ -94,6 +114,15 @@ fn file_guard_from(
     vid: &str,
     sources: &std::collections::BTreeMap<String, String>,
 ) -> Result<Value> {
+    let mut dir_cache = BTreeMap::new();
+    file_guard_cached(config, vid, sources, &mut dir_cache)
+}
+fn file_guard_cached(
+    config: &Config,
+    vid: &str,
+    sources: &std::collections::BTreeMap<String, String>,
+    dir_cache: &mut BTreeMap<std::path::PathBuf, bool>,
+) -> Result<Value> {
     let Some(path) = review::source(config, vid, sources) else {
         return Ok(json!({"vid":vid,"missing":true}));
     };
@@ -101,9 +130,14 @@ fn file_guard_from(
     if !p.starts_with(config.media.join("pikpak")) {
         return Err(changed());
     }
-    match fs::metadata(p) {
-        Ok(stat) if stat.is_file() => {
-            if fs::canonicalize(p)? != p {
+    match fs::symlink_metadata(p) {
+        Ok(stat) if stat.is_file() && !stat.file_type().is_symlink() => {
+            let parent_ok = p.parent().is_some_and(|parent| {
+                *dir_cache
+                    .entry(parent.to_path_buf())
+                    .or_insert_with(|| fs::canonicalize(parent).ok().as_deref() == Some(parent))
+            });
+            if !parent_ok {
                 return Err(changed());
             }
             Ok(json!({"vid":vid,"path":path,"fingerprint":files::fingerprint(&path,&stat)}))
@@ -113,6 +147,47 @@ fn file_guard_from(
             Ok(json!({"vid":vid,"path":path,"missing":true}))
         }
         Err(e) => Err(e.into()),
+    }
+}
+#[derive(Default)]
+struct ReferenceGuards {
+    assigned: BTreeSet<String>,
+    embedded: BTreeSet<String>,
+    anchored: BTreeSet<String>,
+}
+fn reference_file_guard_from(
+    config: &Config,
+    vid: &str,
+    sources: &BTreeMap<String, String>,
+    scope: &ReferenceGuards,
+    dir_cache: &mut BTreeMap<std::path::PathBuf, bool>,
+) -> Result<Value> {
+    let Some(path) = review::source(config, vid, sources) else {
+        return Ok(json!({"vid":vid,"missing":true}));
+    };
+    let p = Path::new(&path);
+    if !p.starts_with(config.media.join("pikpak")) {
+        if !scope.assigned.contains(vid) && !scope.anchored.contains(vid) {
+            return Ok(json!({"vid":vid,"path":path,"outside_scope":true}));
+        }
+        return Err(changed());
+    }
+    match fs::symlink_metadata(p) {
+        Ok(stat) if stat.file_type().is_symlink() => Err(changed()),
+        Ok(stat) if !stat.is_file() => {
+            if scope.embedded.contains(vid)
+                && (scope.assigned.contains(vid)
+                    || scope.anchored.contains(vid)
+                    || p.starts_with(config.creators()))
+            {
+                return Err(changed());
+            }
+            if fs::canonicalize(p)? != p {
+                return Err(changed());
+            }
+            Ok(json!({"vid":vid,"path":path,"non_regular":true}))
+        }
+        _ => file_guard_cached(config, vid, sources, dir_cache),
     }
 }
 /// #18 calls this under its admission gate. Analysis ranks, stages and retries excluded.
@@ -125,6 +200,9 @@ pub struct MaterialReader {
     documents: BTreeMap<&'static str, Value>,
     arrays: BTreeMap<&'static str, VideoRows>,
     manual: Option<BTreeMap<String, Value>>,
+    canonical_cache: std::cell::RefCell<BTreeMap<String, Result<String>>>,
+    file_guards: std::cell::RefCell<BTreeMap<String, Result<Value>>>,
+    canonical_dirs: std::cell::RefCell<BTreeMap<std::path::PathBuf, bool>>,
 }
 impl MaterialReader {
     pub fn new(config: &Config) -> Result<Self> {
@@ -182,23 +260,79 @@ impl MaterialReader {
             documents,
             arrays,
             manual,
+            canonical_cache: std::cell::RefCell::new(BTreeMap::new()),
+            file_guards: std::cell::RefCell::new(BTreeMap::new()),
+            canonical_dirs: std::cell::RefCell::new(BTreeMap::new()),
         })
     }
-    fn canonical(&self, name: &str) -> Result<String> {
-        review::creator_with_aliases(&json!(name), &self.aliases)
+    pub(crate) fn canonical(&self, name: &str) -> Result<String> {
+        if let Some(cached) = self.canonical_cache.borrow().get(name) {
+            return cached.clone();
+        }
+        let result = review::creator_with_aliases(&json!(name), &self.aliases);
+        self.canonical_cache
+            .borrow_mut()
+            .insert(name.to_owned(), result.clone());
+        result
+    }
+    pub(crate) fn aliases(&self) -> &Value {
+        &self.aliases
+    }
+    fn evidence_alias_chain(&self, name: &str) -> Result<Value> {
+        let mut current = name.to_owned();
+        let mut seen = BTreeSet::new();
+        let mut chain = vec![];
+        loop {
+            if !seen.insert(current.clone()) {
+                return Err(Error::conflict("人物别名包含循环"));
+            }
+            let next = self.aliases[&current].as_str();
+            chain.push(json!([current, next]));
+            match next {
+                Some(value) => current = value.to_owned(),
+                None => break,
+            }
+        }
+        Ok(json!(chain))
+    }
+    fn file_guard(&self, config: &Config, vid: &str) -> Result<Value> {
+        if let Some(cached) = self.file_guards.borrow().get(vid) {
+            return cached.clone();
+        }
+        let result = file_guard_cached(
+            config,
+            vid,
+            &self.sources,
+            &mut self.canonical_dirs.borrow_mut(),
+        );
+        self.file_guards
+            .borrow_mut()
+            .insert(vid.to_owned(), result.clone());
+        result
     }
     pub fn state(&self, config: &Config, scope: &Value) -> Result<Value> {
         if !scope.is_object() {
             return Err(bad("缺少核对范围"));
         }
         let raw_people = names(&scope["people"])?;
+        let aliases: BTreeSet<_> = evidence_names(&scope["alias_inputs"])?
+            .into_iter()
+            .collect();
         let vids: BTreeSet<_> = names(&scope["vids"])?.into_iter().collect();
         let keys: BTreeSet<_> = names(&scope["watermark_keys"])?.into_iter().collect();
         let people: BTreeSet<_> = raw_people
             .iter()
             .map(|s| self.canonical(s))
             .collect::<Result<_>>()?;
-        let mut material = json!({"names":raw_people.iter().map(|s|Ok(json!([s,canonical(config,s)?]))).collect::<Result<Vec<_>>>()?,"files":vids.iter().map(|id|file_guard_from(config,id,&self.sources)).collect::<Result<Vec<_>>>()?});
+        let mut material = json!({"names":raw_people.iter().map(|s|Ok(json!([s,self.canonical(s)?]))).collect::<Result<Vec<_>>>()?,"files":vids.iter().map(|id|self.file_guard(config,id)).collect::<Result<Vec<_>>>()?});
+        if !aliases.is_empty() {
+            material["candidate_alias_chains"] = json!(
+                aliases
+                    .iter()
+                    .map(|name| self.evidence_alias_chain(name))
+                    .collect::<Result<Vec<_>>>()?
+            );
+        }
         for (name, array) in BUSINESS {
             if [
                 "person-renames.json",
@@ -255,7 +389,11 @@ impl MaterialReader {
                         v["vid"].as_str().is_some_and(|id| vids.contains(id))
                             && relevant_using(v, &people, &vids, |n| self.canonical(n))?
                     } else {
-                        people.contains(&self.canonical(k)?)
+                        match self.canonical(k) {
+                            Ok(c) => people.contains(&c),
+                            Err(e) if e.status == 400 => false,
+                            Err(e) => return Err(e),
+                        }
                     };
                     if keep {
                         out.insert(k.clone(), v.clone());
@@ -294,6 +432,27 @@ pub fn analysis_state(config: &Config) -> Result<Value> {
         let raw = files::read_optional(&config.base.join(name))?;
         input.insert(name.into(), json!(raw));
     }
+    let mut reference = ReferenceGuards::default();
+    for name in ["integration-queue.json", "archive-history.json"] {
+        for row in input[name].as_array().into_iter().flatten() {
+            if row["file_state"] != "staged"
+                && let Some(vid) = row["vid"].as_str()
+            {
+                reference.assigned.insert(vid.to_owned());
+            }
+        }
+    }
+    let report = input["report.json"]
+        .as_str()
+        .map(serde_json::from_str::<Value>)
+        .transpose()?
+        .unwrap_or_else(|| json!({}));
+    let thumbnails: BTreeSet<_> = report["identities"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|p| p["rep_thumb"].as_str().map(str::to_owned))
+        .collect();
     let path = config.base.join("faces.db");
     if path.exists() {
         let conn = db::open(&path)?;
@@ -306,15 +465,45 @@ pub fn analysis_state(config: &Config) -> Result<Value> {
             "faces".into(),
             json!(table_digest(&tx, "SELECT * FROM faces ORDER BY rowid")?),
         );
+        let columns = db::columns(&tx, "faces")?;
+        if columns.iter().any(|column| column == "emb") {
+            let thumb = if columns.iter().any(|column| column == "thumb") {
+                "thumb"
+            } else {
+                "NULL AS thumb"
+            };
+            for row in db::rows(
+                &tx,
+                &format!("SELECT DISTINCT vid,{thumb} FROM faces WHERE length(emb)=2048"),
+                [],
+            )? {
+                if let Some(vid) = row["vid"].as_str() {
+                    reference.embedded.insert(vid.to_owned());
+                    if row["thumb"]
+                        .as_str()
+                        .is_some_and(|thumb| thumbnails.contains(thumb))
+                    {
+                        reference.anchored.insert(vid.to_owned());
+                    }
+                }
+            }
+        }
         tx.commit()?;
     }
     let sources = review::indexed_sources(config)?;
+    let mut dir_cache = BTreeMap::new();
     input.insert(
         "files".into(),
         json!(
             sources
                 .keys()
-                .map(|vid| file_guard_from(config, vid, &sources))
+                .map(|vid| reference_file_guard_from(
+                    config,
+                    vid,
+                    &sources,
+                    &reference,
+                    &mut dir_cache
+                ))
                 .collect::<Result<Vec<_>>>()?
         ),
     );

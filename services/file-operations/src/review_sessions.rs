@@ -50,14 +50,30 @@ fn public(mut t: Value) -> Result<Value> {
     t["data"] = review::task_data(&t)?;
     Ok(t)
 }
-fn tasks(config: &Config) -> Result<Vec<Value>> {
+fn candidate_names(data: &Value) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for candidate in data["candidates"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .chain(data["folder"].as_array().into_iter().flatten())
+    {
+        if let Some(name) = candidate["name"].as_str().filter(|name| !name.is_empty()) {
+            names.insert(name.to_owned());
+        }
+    }
+    if let Some(name) = data["suggested"].as_str().filter(|name| !name.is_empty()) {
+        names.insert(name.to_owned());
+    }
+    names
+}
+fn tasks(config: &Config, aliases: &Value) -> Result<Vec<Value>> {
     let path = config.base.join("processing/processing.db");
     if !path.exists() {
         return Ok(vec![]);
     }
     let queue = review::read(config, "integration-queue.json", json!([]))?.1;
     let history = review::read(config, "archive-history.json", json!([]))?.1;
-    let aliases = review::read(config, "person-renames.json", json!({}))?.1;
     let sources = review::sources(config)?;
     let paths: BTreeSet<_> = queue
         .as_array()
@@ -69,25 +85,26 @@ fn tasks(config: &Config) -> Result<Vec<Value>> {
                 .and_then(|v| review::source(config, v, &sources))
         })
         .collect();
+    let excluded_vids: BTreeSet<String> = queue
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(history.as_array().unwrap())
+        .filter_map(|r| r["vid"].as_str().map(str::to_owned))
+        .collect();
     let mut out = vec![];
     for row in db::rows(
         &db::open(&path)?,
         "SELECT * FROM tasks WHERE stage!='excluded' ORDER BY priority DESC,is_new DESC,created_at DESC,vid",
         [],
     )? {
-        let mut t = public(row)?;
-        canonical_fields(&mut t["data"], "", &aliases)?;
-        let id = t["vid"].as_str().unwrap_or("");
-        if queue
-            .as_array()
-            .unwrap()
-            .iter()
-            .chain(history.as_array().unwrap())
-            .any(|r| r["vid"] == id)
-            || paths.contains(t["path"].as_str().unwrap_or(""))
-        {
+        let id = row["vid"].as_str().unwrap_or("");
+        if excluded_vids.contains(id) || paths.contains(row["path"].as_str().unwrap_or("")) {
             continue;
         }
+        let mut t = public(row)?;
+        t["__review_raw_people"] = json!(candidate_names(&t["data"]));
+        canonical_fields(&mut t["data"], "", aliases)?;
         out.push(t)
     }
     Ok(out)
@@ -256,11 +273,23 @@ fn evidence(
         .chain(t["data"]["folder"].as_array().unwrap_or(&vec![]))
     {
         if let Some(n) = c["name"].as_str() {
-            names.insert(n.to_owned());
+            match material.canonical(n) {
+                Ok(_) => {
+                    names.insert(n.to_owned());
+                }
+                Err(e) if e.status == 400 => {}
+                Err(e) => return Err(e),
+            }
         }
     }
     if let Some(n) = t["data"]["suggested"].as_str() {
-        names.insert(n.to_owned());
+        match material.canonical(n) {
+            Ok(_) => {
+                names.insert(n.to_owned());
+            }
+            Err(e) if e.status == 400 => {}
+            Err(e) => return Err(e),
+        }
     }
     let keys: Vec<_> = t["data"]["watermark"]["candidates"]
         .as_array()
@@ -268,9 +297,20 @@ fn evidence(
         .iter()
         .filter_map(|c| c["key"].as_str().map(str::to_owned))
         .collect();
-    let scope = json!({"vids":[t["vid"]],"people":names,"watermark_keys":keys});
+    let mut scope = json!({"vids":[t["vid"]],"people":names,"watermark_keys":keys});
+    if t["__review_raw_people"]
+        .as_array()
+        .is_some_and(|rows| !rows.is_empty())
+    {
+        scope["alias_inputs"] = t["__review_raw_people"].clone();
+    }
+    let mut displayed = t.clone();
+    displayed
+        .as_object_mut()
+        .unwrap()
+        .remove("__review_raw_people");
     Ok(
-        json!({"task":t,"group":group(t),"scope":scope,"material":material.state(config,&scope)?["material"],"text":text_evidence(t),"health":health.state(config,t)?,"disposition":dispositions.get(t["vid"].as_str().unwrap_or("")),"pending_seen":review::number(&t["deferred"]).unwrap_or(0)==0,"deferred_seen":review::number(&t["deferred"]).unwrap_or(0)!=0}),
+        json!({"task":displayed,"group":group(t),"scope":scope,"material":material.state(config,&scope)?["material"],"text":text_evidence(t),"health":health.state(config,t)?,"disposition":dispositions.get(t["vid"].as_str().unwrap_or("")),"pending_seen":review::number(&t["deferred"]).unwrap_or(0)==0,"deferred_seen":review::number(&t["deferred"]).unwrap_or(0)!=0}),
     )
 }
 fn read(config: &Config, id: &str) -> Result<Value> {
@@ -383,8 +423,8 @@ pub fn validate(config: &Config, body: &Value) -> Result<Vec<Value>> {
     let ids = review::vids(&body["vids"])?;
     let conn = schema(config)?;
     let mut rows = vec![];
-    let current = tasks(config)?;
     let material = shared_metadata::MaterialReader::new(config)?;
+    let current = tasks(config, material.aliases())?;
     let health = HealthReader::new(config)?;
     let dispositions = dispositions(config)?;
     for vid in ids {
@@ -446,10 +486,11 @@ pub fn execute(engine: &mut Engine, command: &str, body: Value) -> Result<Value>
         .as_str()
         .filter(|v| !v.is_empty())
         .map(str::to_owned);
-    let live = tasks(config)?;
     let material = shared_metadata::MaterialReader::new(config)?;
+    let live = tasks(config, material.aliases())?;
     let health = HealthReader::new(config)?;
     let dispositions = dispositions(config)?;
+    let created = id.is_none();
     let id = match id {
         Some(id) => id,
         None => {
@@ -483,7 +524,7 @@ pub fn execute(engine: &mut Engine, command: &str, body: Value) -> Result<Value>
             conn.execute("DELETE FROM review_sessions WHERE expires<=unixepoch()", [])?;
             conn.execute(
                 "INSERT INTO review_sessions VALUES(?,?,?)",
-                params![id, now(&conn)? + TTL, serde_json::to_string(&snapshot)?],
+                params![id, now(&conn)? + TTL, raw],
             )?;
             id
         }
@@ -495,38 +536,40 @@ pub fn execute(engine: &mut Engine, command: &str, body: Value) -> Result<Value>
         .filter(|e| e["completed"] != true)
         .map(|e| e["task"].clone())
         .collect();
-    let visible_by_id: BTreeMap<_, _> = visible
-        .iter()
-        .map(|t| (t["vid"].as_str().unwrap_or(""), t))
-        .collect();
-    let live_ids: BTreeSet<_> = live
-        .iter()
-        .map(|t| t["vid"].as_str().unwrap_or(""))
-        .collect();
     let mut changed_count = 0;
-    for t in &live {
-        if available(t)
-            && health.state(config, t)?["hidden"] != true
-            && !visible_by_id
-                .get(t["vid"].as_str().unwrap_or(""))
-                .is_some_and(|v| {
-                    v["data"] == t["data"]
-                        && v["path"] == t["path"]
-                        && v["size"] == t["size"]
-                        && v["mtime_ns"] == t["mtime_ns"]
-                        && v["deferred"] == t["deferred"]
-                        && v["note"] == t["note"]
-                })
-        {
-            changed_count += 1
+    if !created {
+        let visible_by_id: BTreeMap<_, _> = visible
+            .iter()
+            .map(|t| (t["vid"].as_str().unwrap_or(""), t))
+            .collect();
+        let live_ids: BTreeSet<_> = live
+            .iter()
+            .map(|t| t["vid"].as_str().unwrap_or(""))
+            .collect();
+        for t in &live {
+            if available(t)
+                && health.state(config, t)?["hidden"] != true
+                && !visible_by_id
+                    .get(t["vid"].as_str().unwrap_or(""))
+                    .is_some_and(|v| {
+                        v["data"] == t["data"]
+                            && v["path"] == t["path"]
+                            && v["size"] == t["size"]
+                            && v["mtime_ns"] == t["mtime_ns"]
+                            && v["deferred"] == t["deferred"]
+                            && v["note"] == t["note"]
+                    })
+            {
+                changed_count += 1
+            }
         }
-    }
-    for e in evidence.iter().filter(|e| e["completed"] != true) {
-        if !live_ids.contains(e["task"]["vid"].as_str().unwrap_or(""))
-            || material.state(config, &e["scope"])?["material"] != e["material"]
-            || health.state(config, &e["task"])? != e["health"]
-        {
-            changed_count += 1
+        for e in evidence.iter().filter(|e| e["completed"] != true) {
+            if !live_ids.contains(e["task"]["vid"].as_str().unwrap_or(""))
+                || material.state(config, &e["scope"])?["material"] != e["material"]
+                || health.state(config, &e["task"])? != e["health"]
+            {
+                changed_count += 1
+            }
         }
     }
     let waiting = live
@@ -702,4 +745,67 @@ pub fn execute(engine: &mut Engine, command: &str, body: Value) -> Result<Value>
     Ok(
         json!({"session":id,"counts":counts,"groups":groups,"group":selected,"rows":delivered,"total":rows.len(),"remaining":rows.iter().filter(|e|is_remaining(e)).count(),"page":page,"limit":limit,"next_page":next,"previous_page":previous,"waiting":waiting,"online":(-30.0..90.0).contains(&age),"folders":folders,"focus_missing":focus_missing,"has_updates":changed_count>0}),
     )
+}
+
+#[cfg(test)]
+mod alias_snapshot_tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn task_names_and_material_share_one_alias_snapshot() {
+        let root = fs::canonicalize("/tmp")
+            .unwrap()
+            .join(format!("face-review-alias-{}", uuid::Uuid::new_v4()));
+        let base = root.join("base");
+        let media = root.join("media");
+        fs::create_dir_all(base.join("processing")).unwrap();
+        fs::create_dir_all(&media).unwrap();
+        let config = Config {
+            base: base.clone(),
+            media,
+            ledger: root.join("ledger.db"),
+            bind: "127.0.0.1:0".into(),
+            token: None,
+            fixture: None,
+            parity_root: None,
+        };
+        let faces = rusqlite::Connection::open(base.join("faces.db")).unwrap();
+        faces
+            .execute_batch("CREATE TABLE videos(vid TEXT PRIMARY KEY,path TEXT);")
+            .unwrap();
+        let jobs = rusqlite::Connection::open(base.join("processing/processing.db")).unwrap();
+        jobs.execute_batch("CREATE TABLE tasks(vid TEXT PRIMARY KEY,path TEXT,stage TEXT,priority INTEGER,is_new INTEGER,created_at REAL,data TEXT,manual INTEGER,deferred INTEGER,note TEXT);").unwrap();
+        jobs.execute(
+            "INSERT INTO tasks VALUES('v','/fixture/video.mp4','review',0,0,0,?,0,0,'')",
+            [json!({"ready":true,"candidates":[{"name":"Alias"}]}).to_string()],
+        )
+        .unwrap();
+        fs::write(
+            base.join("person-renames.json"),
+            json!({"Alias":"OldName"}).to_string(),
+        )
+        .unwrap();
+        let material = shared_metadata::MaterialReader::new(&config).unwrap();
+        fs::write(
+            base.join("person-renames.json"),
+            json!({"Alias":"NewName"}).to_string(),
+        )
+        .unwrap();
+        let task = tasks(&config, material.aliases()).unwrap().remove(0);
+        assert_eq!(task["data"]["candidates"][0]["name"], "OldName");
+        assert_eq!(task["__review_raw_people"][0], "Alias");
+        let scope =
+            json!({"people":["Alias"],"alias_inputs":["Alias"],"vids":[],"watermark_keys":[]});
+        let frozen = material.state(&config, &scope).unwrap();
+        assert_eq!(frozen["material"]["names"][0][1], "OldName");
+        let changed = shared_metadata::MaterialReader::new(&config)
+            .unwrap()
+            .state(&config, &scope)
+            .unwrap();
+        assert_ne!(frozen["version"], changed["version"]);
+        drop(jobs);
+        drop(faces);
+        fs::remove_dir_all(root).unwrap();
+    }
 }

@@ -179,6 +179,9 @@ pub fn source(config: &Config, id: &str, sources: &BTreeMap<String, String>) -> 
             candidates.push(path)
         }
     }
+    if candidates.len() <= 1 {
+        return candidates.into_iter().next();
+    }
     candidates
         .iter()
         .find(|p| Path::new(p).is_file())

@@ -4,6 +4,7 @@ node_modules
 .local
 .agents
 *.log
+tsconfig.tsbuildinfo
 
 .env*
 __pycache__

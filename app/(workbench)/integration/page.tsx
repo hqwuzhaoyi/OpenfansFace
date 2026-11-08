@@ -24,6 +24,7 @@ import { ArchiveResolutionDialog } from '@/components/review/archive-resolution'
 import { ArchiveCheckbox, ArchiveFolderList, type ArchiveListItem } from '@/components/review/archive-folder-list'
 import { PathText } from '@/components/review/video'
 import { Button } from '@/components/ui/button'
+import { readWorkbenchCache, writeWorkbenchCache } from '@/components/workbench/state'
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from '@/components/ui/alert-dialog'
 import '@/components/review/archive-workbench.css'
 
@@ -44,8 +45,8 @@ function Integration() {
   const watchRef=useRef<string|null>(null),runStatus=useRef<HTMLDivElement>(null),archiveTrigger=useRef<HTMLButtonElement>(null)
   const archiving=!!watchedId
   const router = useRouter()
-  const [plan, setPlan] = useState<Plan | null>(null)
-  const [error, setError] = useState(''), [loading, setLoading] = useState(true), [busy, setBusy] = useState(false)
+  const [plan, setPlan] = useState<Plan | null>(() => readWorkbenchCache<Plan>('integration:plan') ?? null)
+  const [error, setError] = useState(''), [loading, setLoading] = useState(() => !readWorkbenchCache<Plan>('integration:plan')), [busy, setBusy] = useState(false)
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [filter, setFilter] = useState<BatchFilter>('all'), [query, setQuery] = useState(''), [history, setHistory] = useState(false)
   const [active, setActive] = useState<string | null>(null), [collapsed, setCollapsed] = useState<Set<string>>(new Set())
@@ -58,12 +59,14 @@ function Integration() {
   const scrollList = useRef<HTMLDivElement>(null), scrollDetail = useRef<HTMLDivElement>(null)
   const confirmButton = useRef<HTMLButtonElement>(null)
 
-  const load = async () => {
+  const load = async (forceSpinner = false) => {
     const sequence = ++requestSequence.current
-    setLoading(true); setError('')
+    if (forceSpinner || !readWorkbenchCache<Plan>('integration:plan')) setLoading(true)
+    setError('')
     try {
       const data = await api<Plan>('/api/plan/preview')
       if (sequence !== requestSequence.current) return null
+      writeWorkbenchCache('integration:plan', data)
       setPlan(data)
       setSelected(previous => retainArchiveSelection(previous, data.rows))
       return data

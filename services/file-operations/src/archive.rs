@@ -80,6 +80,15 @@ pub fn preview_queue(config: &Config, queue: &Value) -> Result<Value> {
     }
     let mut rows = vec![];
     let mut targets = BTreeSet::new();
+    let aliases = review::read(config, "person-renames.json", json!({}))?.1;
+    let health_report = review::read(
+        config,
+        "video-health.json",
+        json!({"records":{},"status":"never_run"}),
+    )
+    .ok()
+    .map(|(_, v)| v);
+    let mut permission_cache = BTreeMap::new();
     for item in queue.as_array().unwrap() {
         let vid = item["vid"]
             .as_str()
@@ -117,7 +126,7 @@ pub fn preview_queue(config: &Config, queue: &Value) -> Result<Value> {
         let mut row = item.clone();
         for(k,v)in json!({"name":name,"thumb":thumb,"src":src,"dst":null,"size":0,"size_gb":0,"mtime":0,"status":"ok","reason":"可以归档","operation":"archive"}).as_object().unwrap(){row[k]=v.clone()}
         let checked = (|| -> Result<()> {
-            let creator = review::creator(config, &item["creator"])?;
+            let creator = review::creator_with_aliases(&item["creator"], &aliases)?;
             row["creator"] = json!(creator);
             let src = src
                 .as_deref()
@@ -130,7 +139,13 @@ pub fn preview_queue(config: &Config, queue: &Value) -> Result<Value> {
                 row["status"] = json!("empty");
                 return Err(Error::conflict("源文件为 0 字节，无法归档"));
             }
-            if review::health_hidden(config, vid, src, &stat)? {
+            let check_health = match &health_report {
+                Some(r) if r.get("records").is_none_or(Value::is_object) => {
+                    r["records"][vid]["hidden"] == true
+                }
+                _ => true,
+            };
+            if check_health && review::health_hidden(config, vid, src, &stat)? {
                 row["status"] = json!("corrupt");
                 return Err(Error::conflict("视频体检连续确认异常，请查看回收站记录"));
             }
@@ -258,7 +273,11 @@ pub fn preview_queue(config: &Config, queue: &Value) -> Result<Value> {
             } else {
                 dst
             };
-            permissions::require_move_permissions(Path::new(src), &actual)?;
+            permissions::require_move_permissions_cached(
+                Path::new(src),
+                &actual,
+                &mut permission_cache,
+            )?;
             Ok(())
         })();
         if let Err(error) = checked {

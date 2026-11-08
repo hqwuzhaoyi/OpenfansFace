@@ -65,16 +65,34 @@ pub fn writable_directory(path: &Path, step: &str) -> Result<PathBuf> {
 }
 
 pub fn require_move_permissions(src: &Path, dst: &Path) -> Result<()> {
-    writable_directory(
-        src.parent()
-            .ok_or_else(|| Error::new(400, "invalid_request", "源目录无效"))?,
-        "source_directory",
-    )?;
-    writable_directory(
-        dst.parent()
-            .ok_or_else(|| Error::new(400, "invalid_request", "目标目录无效"))?,
-        "destination_directory",
-    )?;
+    let mut cache = std::collections::BTreeMap::new();
+    require_move_permissions_cached(src, dst, &mut cache)
+}
+
+pub fn require_move_permissions_cached(
+    src: &Path,
+    dst: &Path,
+    cache: &mut std::collections::BTreeMap<(PathBuf, &'static str), Result<PathBuf>>,
+) -> Result<()> {
+    for (dir, step) in [
+        (
+            src.parent()
+                .ok_or_else(|| Error::new(400, "invalid_request", "源目录无效"))?,
+            "source_directory",
+        ),
+        (
+            dst.parent()
+                .ok_or_else(|| Error::new(400, "invalid_request", "目标目录无效"))?,
+            "destination_directory",
+        ),
+    ] {
+        let key = (dir.to_path_buf(), step);
+        let result = cache
+            .entry(key)
+            .or_insert_with(|| writable_directory(dir, step))
+            .clone();
+        result?;
+    }
     // Do not wait for a writer if an external actor replaces a regular file with a FIFO.
     let source = open(
         src,
