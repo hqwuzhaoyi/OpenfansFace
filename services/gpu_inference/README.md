@@ -87,7 +87,11 @@ exact manifest; a policy change requires a new version and validation.
   behind the preceding request. The head checks counters at most once per second
   after each sample. Telemetry subprocess timeout is at most 3 seconds, clipped to
   the remaining wait/request budget; cancellation/deadline is checked again after
-  sampling. Model execution never begins after an exhausted wait budget.
+  sampling. A separate bounded deadline monitor expires never-started queued
+  admissions even while the lane is occupied by a long-running kernel. Expiry and
+  cancellation remove the pending entry immediately under the admission lock;
+  its sealed receipt remains in the bounded cache. They never release a running
+  kernel. Model execution never begins after an exhausted wait budget.
 - Exhausted pre-execution waiting returns `resource_busy`. Only an identical
   cached request with `execution_started=false`, no cancellation, and that exact
   terminal reason may rearm, at most **2** times. Rearm joins the FIFO tail and
@@ -108,7 +112,9 @@ exact manifest; a policy change requires a new version and validation.
   No attempt refund or new SQL writer is introduced.
 - Auth, model/version, material/source, attempt/lease, drain and model-fault errors
   are not blindly retried. Lost responses replay the exact ID/body, never a newly
-  generated request ID. The cache is process-local; restart can recompute, so only
+  generated request ID. A short Content-Length body or incomplete chunked body
+  is transport uncertainty, including truncated HTTP error responses. Complete
+  malformed JSON/context stays nonretryable. The cache is process-local; restart can recompute, so only
   the existing native accepted receipt authorizes business completion.
 - Drain refuses new admissions/rearms and lets already owned work finish within
   its existing budget. Close/cancel wake resource waits. A disconnected caller or

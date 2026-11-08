@@ -26,7 +26,7 @@ from services.gpu_inference.protocol import (
     Binding, Fingerprint, MAX_BODY_BYTES, ProtocolError, Request, Result, canonical,
     decode_json, now_ms, Clock, RESOURCE_WAIT_SECONDS, RESOURCE_REARMS, CLIENT_MAX_SENDS,
 )
-from services.gpu_inference.server import Server
+from services.gpu_inference.server import Server, Handler
 
 HASH = 'a' * 64
 TOKEN = 'isolated-test-token-' + 'x' * 32
@@ -347,6 +347,55 @@ class BrokerTests(unittest.TestCase):
         self.assertEqual(job.error.code, 'resource_busy')
         self.assertEqual(self.model.calls, 0)
 
+    def test_expired_sampling_head_cannot_finish_a_rearmed_admission_twice(self):
+        clock = VirtualClock()
+        self.broker.close()
+        self.broker = Broker(self.model, self.resources, clock=clock)
+        sampling, release_sample = threading.Event(), threading.Event()
+        def held_sample(timeout=3):
+            sampling.set()
+            release_sample.wait(2)
+            return {'available': True, 'busy': False}
+        self.resources.sample = held_sample
+        req = request(deadline_ms=clock.epoch+60_000)
+        first = self.broker.submit(req)
+        try:
+            self.assertTrue(sampling.wait(1))
+            with self.broker.changed:
+                clock.elapsed = 20
+                self.broker.changed.notify_all()
+            self.assertTrue(first.done.wait(1))
+            self.assertEqual(first.error.code, 'resource_busy')
+            self.assertEqual(self.broker.inflight, 0)
+            second = self.broker.submit(req)
+            self.assertIsNot(first, second)
+            self.broker.cancel(req.request_id, req.binding.attempt_id)
+            self.assertTrue(second.done.is_set())
+            release_sample.set()
+            self.broker.close()  # join the stale head before checking its finalizer
+            self.assertEqual((self.broker.inflight, self.broker.running, len(self.broker.queue)), (0, 0, 0))
+            self.assertEqual(first.error.code, 'resource_busy')
+            self.assertEqual(second.error.code, 'cancelled')
+            self.assertIs(self.broker.jobs[req.request_id], second)
+            self.assertEqual(self.model.calls, 0)
+        finally:
+            release_sample.set()
+
+    def test_repeated_queued_cancels_do_not_accumulate_tombstones(self):
+        self.model.release.clear()
+        first = self.broker.submit(request())
+        self.assertTrue(self.model.entered.wait(1))
+        for _ in range(30):
+            req = request()
+            job = self.broker.submit(req)
+            self.broker.cancel(req.request_id, req.binding.attempt_id)
+            self.assertTrue(job.done.is_set())
+            self.assertEqual((self.broker.inflight, self.broker.running, len(self.broker.queue)), (1, 1, 0))
+        self.model.release.set()
+        self.broker.wait(first)
+        self.assertEqual(self.model.calls, 1)
+        self.assertEqual(self.broker.inflight, 0)
+
     def test_model_error_disables_session_and_drops_queued_work(self):
         self.model.release.clear(); self.model.error = RuntimeError('private CUDA details')
         first = self.broker.submit(request()); self.assertTrue(self.model.entered.wait(1))
@@ -411,6 +460,147 @@ class HTTPTests(unittest.TestCase):
             con.request(method,path,body=body,headers=headers or {})
             response=con.getresponse(); return response.status,response.read()
         finally: con.close()
+
+    def test_wire_truncated_response_replays_same_request_once(self):
+        original_send, original_body = Handler._send, Handler._body
+        responses, bodies = [], []
+        def capture(handler):
+            body = original_body(handler)
+            if handler.path == '/v1/detect':
+                bodies.append(copy.deepcopy(body))
+            return body
+        def truncate_first(handler, status, value, retryable=False):
+            if status == 200 and 'context' in value:
+                responses.append(value)
+                if len(responses) == 1:
+                    data = canonical(value)
+                    handler.send_response(200)
+                    handler.send_header('Content-Type', 'application/json')
+                    handler.send_header('Content-Length', str(len(data)))
+                    handler.send_header('Connection', 'close')
+                    handler.end_headers()
+                    handler.wfile.write(data[:20])
+                    handler.wfile.flush()
+                    handler.close_connection = True
+                    return
+            return original_send(handler, status, value, retryable)
+        req = request()
+        with patch.object(Handler, '_send', truncate_first), patch.object(Handler, '_body', capture):
+            self.assertEqual(self.client.detect(req).request_hash, req.request_hash)
+        self.assertEqual(bodies, [req.wire(), req.wire()])
+        self.assertEqual(self.model.calls, 1)
+
+    def test_wire_incomplete_chunked_and_error_responses_retry_same_id(self):
+        original = Handler._send
+        for mode in ('chunked', 'error'):
+            sends = []
+            def broken(handler, status, value, retryable=False):
+                if status == 200 and 'context' in value:
+                    sends.append(value['request_hash'])
+                    if len(sends) == 1:
+                        handler.send_response(200 if mode == 'chunked' else 503)
+                        handler.send_header('Content-Type', 'application/json')
+                        handler.send_header('Connection', 'close')
+                        if mode == 'chunked':
+                            handler.send_header('Transfer-Encoding', 'chunked')
+                            data = b'100\r\n{"schema_version":'
+                        else:
+                            handler.send_header('Content-Length', '100')
+                            data = b'{"error":'
+                        handler.end_headers()
+                        handler.wfile.write(data)
+                        handler.wfile.flush()
+                        handler.close_connection = True
+                        return
+                return original(handler, status, value, retryable)
+            with self.subTest(mode=mode), patch.object(Handler, '_send', broken):
+                req = request()
+                self.assertEqual(self.client.detect(req).request_hash, req.request_hash)
+                self.assertEqual(sends, [req.request_hash, req.request_hash])
+        self.assertEqual(self.model.calls, 2)
+
+    def test_wire_complete_malformed_json_is_not_transport_retry(self):
+        original = Handler._send
+        sends = []
+        def malformed(handler, status, value, retryable=False):
+            if status == 200 and 'context' in value:
+                sends.append(value['request_hash'])
+                data = b'{"schema_version":'
+                handler.send_response(200)
+                handler.send_header('Content-Type', 'application/json')
+                handler.send_header('Content-Length', str(len(data)))
+                handler.end_headers()
+                handler.wfile.write(data)
+                handler.close_connection = True
+                return
+            return original(handler, status, value, retryable)
+        with patch.object(Handler, '_send', malformed):
+            with self.assertRaisesRegex(ProtocolError, 'invalid_json'):
+                self.client.detect(request())
+        self.assertEqual(len(sends), 1)
+        self.assertEqual(self.model.calls, 1)
+
+    def test_queued_http_request_expires_at_20s_behind_running_kernel(self):
+        self.model.release.clear()
+        seen, first_outcome, second_outcome, rearm_outcome = [], [], [], []
+        def held(req):
+            self.model.calls += 1
+            seen.append(req.request_id)
+            self.model.entered.set()
+            if not self.model.release.wait(35):
+                raise RuntimeError('synthetic held kernel timed out')
+            return []
+        self.model.infer = held
+        first_req, second_req = request(deadline_ms=now_ms()+60_000), request(deadline_ms=now_ms()+60_000)
+        def call(req, outcome):
+            started = time.monotonic()
+            try:
+                outcome.append((self.client._call('/v1/detect', req.wire(), 60), time.monotonic()-started))
+            except ProtocolError as error:
+                outcome.append((error.code, time.monotonic()-started))
+        first = threading.Thread(target=call, args=(first_req, first_outcome))
+        second = threading.Thread(target=call, args=(second_req, second_outcome))
+        rearm = None
+        first.start()
+        try:
+            self.assertTrue(self.model.entered.wait(1))
+            second.start()
+            second.join(21.5)
+            self.assertFalse(second.is_alive(), 'queued admission exceeded its 20-second budget')
+            self.assertEqual(second_outcome[0][0], 'resource_busy')
+            self.assertGreaterEqual(second_outcome[0][1], 19.8)
+            self.assertLess(second_outcome[0][1], 21.5)
+            old = self.broker.jobs[second_req.request_id]
+            self.assertFalse(old.execution_started)
+            self.assertIsNone(old.request)
+            health = self.client.ready()
+            self.assertEqual((health['running'], health['queued']), (1, 0))
+            # Same immutable intent may rearm while the actual kernel still owns
+            # its slot; cancelling that new queued admission releases only it.
+            rearm = threading.Thread(target=call, args=(second_req, rearm_outcome))
+            rearm.start()
+            until = time.monotonic()+1
+            while self.broker.jobs[second_req.request_id] is old and time.monotonic() < until:
+                time.sleep(.005)
+            self.client.cancel(second_req.request_id, second_req.binding.attempt_id)
+            rearm.join(1)
+            self.assertEqual(rearm_outcome[0][0], 'cancelled')
+            self.assertEqual(old.error.code, 'resource_busy')
+            self.assertEqual(self.broker.inflight, 1)
+            self.assertEqual(len(self.broker.queue), 0)
+            self.assertFalse(self.client.drain()['drained'])
+            with self.assertRaisesRegex(ProtocolError, 'service_draining'):
+                self.client.detect(request())
+            self.assertEqual(seen, [first_req.request_id])
+        finally:
+            self.model.release.set()
+            first.join(2)
+            if second.ident is not None:
+                second.join(2)
+            if rearm:
+                rearm.join(2)
+        self.assertTrue(self.client.ready()['drained'])
+        self.assertEqual(self.model.calls, 1)
 
     def test_busy_then_available_waits_in_admitted_queue(self):
         self.resources.busy = True
@@ -636,7 +826,7 @@ class HTTPTests(unittest.TestCase):
         until = time.monotonic()+1
         while self.broker.inflight == 0 and time.monotonic() < until:
             time.sleep(.005)
-        self.assertFalse(self.client.cancel(req.request_id, req.binding.attempt_id)['execution_finished'])
+        self.assertTrue(self.client.cancel(req.request_id, req.binding.attempt_id)['execution_finished'])
         worker.join(1)
         self.assertEqual(errors, ['cancelled'])
         self.assertFalse(worker.is_alive())

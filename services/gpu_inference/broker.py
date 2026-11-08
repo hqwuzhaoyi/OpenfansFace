@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import collections
 import logging
-import queue
 import threading
 import uuid
 from dataclasses import dataclass, field
@@ -15,7 +14,7 @@ from .protocol import (Clock, ProtocolError, Request, Result, SCHEMA,
 LOG = logging.getLogger(__name__)
 
 
-@dataclass
+@dataclass(eq=False)
 class Job:
     request: Request | None
     request_hash: str
@@ -29,6 +28,7 @@ class Job:
     waiting_reason: str | None = None
     done: threading.Event = field(default_factory=threading.Event)
     cancelled: threading.Event = field(default_factory=threading.Event)
+    wake: threading.Event = field(default_factory=threading.Event)
     result: dict | None = None
     error: ProtocolError | None = None
     finished: float | None = None
@@ -45,17 +45,21 @@ class Broker:
         self.cache_entries, self.cache_ttl = cache_entries, cache_ttl
         self.jobs = collections.OrderedDict()
         self.lock = threading.RLock()
-        self.queue = queue.Queue(maxsize=self.capacity)
+        self.changed = threading.Condition(self.lock)
+        self.queue = collections.deque()
         self.inflight = 0
         self.running = 0
         self.resource_waiting = 0
         self.waiting_reason = None
+        self.waiting_job = None
         self.fault = None
         self.closed = False
         self.draining = False
         self.release = {'managed': False}
         self.thread = threading.Thread(target=self._run, name='gpu-single-lane', daemon=True)
         self.thread.start()
+        self.expirer = threading.Thread(target=self._expire_waiting, name='gpu-queue-deadlines', daemon=True)
+        self.expirer.start()
 
     def _prune(self):
         now = self.clock.monotonic()
@@ -125,10 +129,12 @@ class Broker:
             job = Job(request, request.request_hash, request.binding.attempt_id, deadline_ms,
                       previous.submitted if previous else now, expires,
                       min(now + RESOURCE_WAIT_SECONDS, expires),
-                      rearms=previous.rearms + 1 if previous else 0)
+                      rearms=previous.rearms + 1 if previous else 0,
+                      waiting_reason='execution_lane_busy' if self.inflight else None)
             self.jobs[request.request_id] = job
             self.inflight += 1
-            self.queue.put_nowait(job)
+            self.queue.append(job)
+            self.changed.notify_all()
             return job
 
     def begin_drain(self):
@@ -147,14 +153,73 @@ class Broker:
             if job.attempt_id != attempt_id:
                 raise ProtocolError('attempt_mismatch', 409)
             job.cancelled.set()
+            job.wake.set()
+            if not job.execution_started:
+                self._finish(job, error=ProtocolError('cancelled', 409))
             return {'cancel_requested': True, 'execution_finished': job.done.is_set()}
+
+    def _finish(self, job, *, result=None, error=None):
+        """Called under the ownership lock; every admission is released once.
+
+        The expirer/canceller may finish only never-started work. The model lane
+        alone finishes execution_started jobs, after infer has actually returned.
+        Removed deque entries leave no accumulating tombstones behind a kernel.
+        """
+        if job.done.is_set():
+            return
+        job.result, job.error = result, error
+        job.request = None
+        job.finished = self.clock.monotonic()
+        self.inflight -= 1
+        if job.execution_started:
+            self.running = 0
+        try:
+            self.queue.remove(job)
+        except ValueError:
+            pass  # the lane already owns this head
+        if self.waiting_job is job:
+            self.waiting_job = None
+            self.resource_waiting, self.waiting_reason = 0, None
+        if error:
+            LOG.info('gpu_request_end hash=%s reason=%s executed=%s waiting_reason=%s',
+                     job.request_hash[:16], error.code, job.execution_started, job.waiting_reason)
+        job.done.set()
+        job.wake.set()
+        self.changed.notify_all()
+
+    def _expire_waiting(self):
+        # One independent timer, not a thread/timer per request. It never touches
+        # running kernel ownership. Admission and the infer transition use this
+        # same lock, so a timed-out/cancelled admission cannot begin execution.
+        with self.changed:
+            while not self.closed:
+                delay = RESOURCE_POLL_SECONDS
+                pending = False
+                for job in list(self.jobs.values()):
+                    if job.done.is_set() or job.execution_started:
+                        continue
+                    pending = True
+                    try:
+                        self._check_current(job)
+                        self._check_resource_budget(job)
+                    except ProtocolError as error:
+                        self._finish(job, error=error)
+                        continue
+                    delay = min(delay, self._remaining(job),
+                                job.resource_expires - self.clock.monotonic())
+                self.changed.wait(max(.001, delay) if pending else None)
 
     def _remaining(self, job):
         return min(job.expires - self.clock.monotonic(), (job.deadline_ms - self.clock.now_ms()) / 1000)
 
     def wait(self, job):
         if not self.clock.wait(job.done, max(0, self._remaining(job))):
-            job.cancelled.set()
+            with self.lock:
+                if not job.done.is_set():
+                    job.cancelled.set()
+                    job.wake.set()
+                    if not job.execution_started:
+                        self._finish(job, error=ProtocolError('deadline_exceeded', 504, True))
             raise ProtocolError('deadline_exceeded', 504, True)
         if job.cancelled.is_set():
             raise ProtocolError('cancelled', 409)
@@ -165,6 +230,8 @@ class Broker:
         return job.result
 
     def _check_current(self, job):
+        if job.done.is_set():
+            raise job.error or ProtocolError('cancelled', 409)
         if job.cancelled.is_set() or self.closed:
             raise ProtocolError('cancelled', 409)
         if self._remaining(job) <= 0:
@@ -196,6 +263,8 @@ class Broker:
                 if reason not in ('telemetry_unavailable', 'memory_low', 'utilization_high'):
                     reason = 'telemetry_unavailable' if resource.get('available') is not True else 'resource_busy'
                 with self.lock:
+                    self._check_current(job)
+                    self.waiting_job = job
                     self.resource_waiting, self.waiting_reason = 1, reason
                     job.waiting_reason = reason
                 if not waiting_started:
@@ -207,23 +276,25 @@ class Broker:
                 if remaining <= 0:
                     code = 'resource_busy' if job.rearms < RESOURCE_REARMS else 'resource_wait_exhausted'
                     raise ProtocolError(code, 503, code == 'resource_busy')
-                self.clock.resource_wait(job.cancelled, min(RESOURCE_POLL_SECONDS, remaining))
+                self.clock.resource_wait(job.wake, min(RESOURCE_POLL_SECONDS, remaining))
         finally:
             if waiting_started:
                 LOG.info('gpu_wait_end hash=%s reason=%s outcome=%s queue_ms=%.1f', job.request_hash[:16],
                          job.waiting_reason, outcome, (self.clock.monotonic()-job.submitted)*1000)
             with self.lock:
-                self.resource_waiting, self.waiting_reason = 0, None
+                if self.waiting_job is job:
+                    self.waiting_job = None
+                    self.resource_waiting, self.waiting_reason = 0, None
 
     def _run(self):
         while True:
-            try:
-                job = self.queue.get(timeout=.2)
-            except queue.Empty:
+            with self.changed:
+                while not self.queue and not self.closed:
+                    self.changed.wait()
                 if self.closed:
                     return
-                continue
-            request = job.request
+                job = self.queue.popleft()
+            result, error = None, None
             try:
                 self._await_resources(job)
                 with self.lock:
@@ -231,6 +302,7 @@ class Broker:
                     self._check_resource_budget(job)
                     self.running = 1
                     job.execution_started = True
+                    request = job.request
                 started = self.clock.monotonic()
                 faces = self.model.infer(request)
                 elapsed = (self.clock.monotonic() - started) * 1000
@@ -241,25 +313,20 @@ class Broker:
                             'timing': {'queue_ms': (started-job.submitted)*1000, 'inference_ms': elapsed,
                                        'total_ms': (self.clock.monotonic()-job.submitted)*1000}}
                 Result.parse(response, request)
-                job.result = response
+                result = response
             except ProtocolError as exc:
-                job.error = exc
-                LOG.info('gpu_request_end hash=%s reason=%s executed=%s waiting_reason=%s',
-                         job.request_hash[:16], exc.code, job.execution_started, job.waiting_reason)
+                error = exc
             except Exception:
-                job.error = ProtocolError('inference_failed', 503, True)
+                error = ProtocolError('inference_failed', 503, True)
                 with self.lock:
-                    self.fault = 'inference_failed'
-                LOG.warning('gpu_request_end hash=%s reason=inference_failed executed=%s',
-                            job.request_hash[:16], job.execution_started)
+                    if not job.done.is_set():
+                        self.fault = 'inference_failed'
             finally:
                 with self.lock:
-                    job.request = None  # never retain images in the replay cache
-                    job.finished = self.clock.monotonic()
-                    self.inflight -= 1
-                    self.running = 0
-                    job.done.set()
-                self.queue.task_done()
+                    # If the timer already finished a never-started admission,
+                    # preserve that immutable receipt and its released counter.
+                    self._finish(job, result=result, error=error)
+                request = None
 
     def close(self):
         with self.lock:
@@ -269,5 +336,10 @@ class Broker:
             for job in self.jobs.values():
                 if not job.done.is_set():
                     job.cancelled.set()
+                    job.wake.set()
+                    if not job.execution_started:
+                        self._finish(job, error=ProtocolError('cancelled', 409))
+            self.changed.notify_all()
+        self.expirer.join(timeout=1)
         # Never overlap replacement until the old process actually exits infer().
         self.thread.join(timeout=5)

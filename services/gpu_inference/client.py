@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import email.utils
 import ipaddress
+import http.client
 import random
 import urllib.error
 import urllib.parse
@@ -39,6 +40,31 @@ class Client:
         self.clock, self.jitter, self.on_wait = clock or Clock(), jitter or random.uniform, on_wait
         self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect())
 
+    def _read_response(self, response):
+        # read(limit) can return EOF-short bytes without IncompleteRead. Only
+        # framing-proven truncation is transport uncertainty; complete invalid
+        # JSON/context remains a nonretryable protocol error.
+        lengths = response.headers.get_all('Content-Length', [])
+        if len(lengths) > 1 or (lengths and response.headers.get('Transfer-Encoding')):
+            raise ProtocolError('invalid_response_framing', 502)
+        expected = None
+        if lengths:
+            length = lengths[0]
+            if not length.isascii() or not length.isdigit():
+                raise ProtocolError('invalid_response_framing', 502)
+            if len(length) > 10 or int(length) > MAX_RESPONSE_BYTES:
+                raise ProtocolError('response_too_large', 502)
+            expected = int(length)
+        try:
+            payload = response.read(MAX_RESPONSE_BYTES + 1)
+        except (http.client.IncompleteRead, OSError):
+            raise ProtocolError('transport_unavailable', 503, True) from None
+        if len(payload) > MAX_RESPONSE_BYTES:
+            raise ProtocolError('response_too_large', 502)
+        if expected is not None and len(payload) < expected:
+            raise ProtocolError('transport_unavailable', 503, True)
+        return payload
+
     def _call(self, path, body=None, timeout=None):
         data = canonical(body) if body is not None else None
         if data is not None and len(data) > MAX_BODY_BYTES:
@@ -47,14 +73,15 @@ class Client:
         request = urllib.request.Request(self.base_url + path, data=data, headers=headers)
         try:
             with self.opener.open(request, timeout=timeout or self.timeout) as response:
-                payload = response.read(MAX_RESPONSE_BYTES + 1)
-                if len(payload) > MAX_RESPONSE_BYTES:
-                    raise ProtocolError('response_too_large', 502)
+                payload = self._read_response(response)
                 if response.headers.get_content_type() != 'application/json':
                     raise ProtocolError('invalid_response_type', 502)
                 return decode_json(payload)
         except urllib.error.HTTPError as exc:
-            payload = exc.read(MAX_RESPONSE_BYTES + 1)
+            try:
+                payload = self._read_response(exc)
+            finally:
+                exc.close()
             try:
                 value = decode_json(payload)
                 if path == '/health/ready' and exc.code == 503 and type(value.get('model_ready')) is bool and type(value.get('accepting')) is bool:
@@ -80,7 +107,7 @@ class Client:
                 except (ValueError, TypeError, OverflowError):
                     pass
             raise ProtocolError(code, exc.code, retryable, retry_after=retry_after) from None
-        except (urllib.error.URLError, TimeoutError, OSError):
+        except (urllib.error.URLError, http.client.IncompleteRead, TimeoutError, OSError):
             # Execution is unknown: detect may only replay the SAME frozen request.
             # This never authorizes a new frame/attempt or a business-state write.
             raise ProtocolError('transport_unavailable', 503, True) from None
