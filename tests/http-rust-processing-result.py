@@ -23,9 +23,15 @@ class Fixture(f.Fixture):
     def body(self,stage='text',ready=False):
         with self.db() as db:
             db.row_factory=sqlite3.Row;t=dict(db.execute('SELECT * FROM tasks WHERE vid=?',(self.vid,)).fetchone())
-        scope={'vids':[self.vid],'people':[],'watermark_keys':[],'all_watermark_rules':stage=='text'}
+        if stage=='text' and ready:
+            f.write(self.base/'watermarks/mappings.json',{'f'*64:{'kind':'person','creator':'Confirmed'}})
+        scope={'vids':[self.vid],'people':['Confirmed'] if ready else [],'watermark_keys':['f'*64] if ready else [],'all_watermark_rules':stage=='text'}
         data=json.loads(t['data'])
-        if stage=='text':data={'watermark':{'vid':self.vid,'path':str(self.video),'size':self.video.stat().st_size,'mtime_ns':str(self.video.stat().st_mtime_ns),'status':'done','pipeline':'ocr-v1','artifact_attempt':t['run_id'],'candidates':[],'execution':{'backend':'cpu','stage':'ocr'}},'folder':[],'text_candidates':[],'text_complete':True,'face_skipped':ready,'ready':ready,'kind':'none','candidates':[],'suggested':None}
+        if stage=='text':
+            cands=[{'key':'f'*64,'text':'@confirmed','token':'confirmed','platform':'X','kind':'account'}] if ready else []
+            text_cands=[{'name':'Confirmed','source':'watermark','confirmed':True,'key':'f'*64,'detail':'@confirmed'}] if ready else []
+            resolved_cands=[{'name':'Confirmed','sources':['watermark'],'evidence':text_cands,'score':None}] if ready else []
+            data={'watermark':{'vid':self.vid,'path':str(self.video),'size':self.video.stat().st_size,'mtime_ns':str(self.video.stat().st_mtime_ns),'status':'done','pipeline':'ocr-v1','artifact_attempt':t['run_id'],'candidates':cands,'execution':{'backend':'cpu','stage':'ocr'}},'folder':[],'text_candidates':text_cands,'text_complete':True,'face_skipped':ready,'ready':ready,'kind':'suggested' if ready else 'none','candidates':resolved_cands,'suggested':'Confirmed' if ready else None}
         else:data.update(face={'matches':[],'face_count':2,'version':'face-v1','reference_version':'reference-v1','unknown_group':'untrusted-id','unknown_group_input':{'id':'provisional','version':'face-v1','embedding':[1.]+[0.]*511},'thumbs':[],'feature_cache':None,'execution':{'backend':'cpu','recognition_provider':'CPUExecutionProvider'}},face_complete=True,ready=True)
         result={'operation_id':t['run_id'],'scope':scope,'version':self.meta('state',{'scope':scope})['version'],'task':{k:t[k] for k in ['vid','path','size','mtime_ns','stage','run_id','batch_id','lease_expires_at','coordinator_generation']},'data':data,'next_stage':'review' if ready or stage=='face' else 'face_queued'}
         if stage=='face':result['reference_input_version']=self.meta('analysis-state')['version']
@@ -234,5 +240,48 @@ def rule_change_between_stages():
             print('PASS rule edit requeues stale text interpretation and fences',stage)
         finally:x.stop()
 
+def authoritative_business_rules_and_raw_submission():
+    x=Fixture()
+    try:
+        key='c'*64
+        f.write(x.base/'people-manual.json',[{'name':'Telegram'}])
+        f.write(x.base/'person-renames.json',{'OldAlias':'CanonicalFace'})
+        with x.db() as db:
+            db.row_factory=sqlite3.Row;t=dict(db.execute('SELECT * FROM tasks WHERE vid=?',(x.vid,)).fetchone())
+        scope={'vids':[x.vid],'people':['Telegram'],'watermark_keys':[key],'all_watermark_rules':True}
+        raw_text={
+            'operation_id':t['run_id'],
+            'scope':scope,
+            'version':x.meta('state',{'scope':scope})['version'],
+            'task':{k:t[k] for k in ['vid','path','size','mtime_ns','stage','run_id','batch_id','lease_expires_at','coordinator_generation']},
+            'data':{'watermark':{'vid':x.vid,'path':str(x.video),'size':x.video.stat().st_size,'mtime_ns':str(x.video.stat().st_mtime_ns),'status':'done','pipeline':'ocr-v1','artifact_attempt':t['run_id'],'candidates':[{'key':key,'text':'@unconfirmed_acct','token':'@unconfirmed_acct','platform':'X','kind':'account'}],'execution':{'backend':'cpu','stage':'ocr'}}},
+        }
+        res1=x.meta('processing-result',raw_text)
+        assert res1['next_stage']=='face_queued'
+        assert res1['data']['face_skipped'] is False and res1['data']['ready'] is False
+        assert res1['data']['kind']=='conflict' and res1['data']['suggested'] is None
+        assert [c['name'] for c in res1['data']['candidates']]==['unconfirmed_acct','Telegram']
+
+        run2=str(uuid.uuid4())
+        with x.db() as db:
+            db.execute("UPDATE tasks SET stage='face',run_id=?,face_attempts=1 WHERE vid=?",(run2,x.vid))
+            db.execute("INSERT INTO processing_runs(id,vid,name,batch_id,stage,started_at,status) VALUES(?,?,?,?,?,?,?)",(run2,x.vid,x.video.name,x.batch,'face',time.time(),'running'))
+            db.row_factory=sqlite3.Row;t2=dict(db.execute('SELECT * FROM tasks WHERE vid=?',(x.vid,)).fetchone())
+        scope2={'vids':[x.vid],'people':['Telegram','CanonicalFace'],'watermark_keys':[key],'all_watermark_rules':False}
+        raw_face={
+            'operation_id':run2,
+            'scope':scope2,
+            'version':x.meta('state',{'scope':scope2})['version'],
+            'reference_input_version':x.meta('analysis-state')['version'],
+            'task':{k:t2[k] for k in ['vid','path','size','mtime_ns','stage','run_id','batch_id','lease_expires_at','coordinator_generation']},
+            'data':{'face':{'matches':[{'name':'OldAlias','source':'face','score':0.88,'support':5,'detail':'人脸匹配'}],'face_count':1,'version':'face-v1','reference_version':'reference-v1','thumbs':[],'feature_cache':None,'execution':{'backend':'cpu','recognition_provider':'CPUExecutionProvider'}}},
+        }
+        res2=x.meta('processing-result',raw_face)
+        assert res2['next_stage']=='review' and res2['data']['ready'] is True and res2['data']['face_complete'] is True
+        assert res2['data']['kind']=='conflict'
+        assert [c['name'] for c in res2['data']['candidates']]==['unconfirmed_acct','CanonicalFace','Telegram']
+        print('PASS raw OCR/face submission evaluated authoritatively in Rust with folder/watermark/face/rename rules')
+    finally:x.stop()
+
 if __name__=='__main__':
-    for test in [text_and_replay,stale_inputs,face_groups,interrupted,json_failure_and_foreign,cache_integrity_and_schema,task_only_source,rule_change_between_stages]:test()
+    for test in [text_and_replay,stale_inputs,face_groups,interrupted,json_failure_and_foreign,cache_integrity_and_schema,task_only_source,rule_change_between_stages,authoritative_business_rules_and_raw_submission]:test()

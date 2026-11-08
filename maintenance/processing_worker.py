@@ -19,7 +19,6 @@ from task_progress import TaskProgress, stage_progress
 from processing_store import connect, setting, set_setting, event, reconcile, claim, fail, recover, release_task, effective_concurrency
 from processing_publication import prepare, publish_result, recover_publications, attempt_directory, PublicationError, native
 from processing_gpu import inference_status
-from processing_logic import folder_hints, candidates_from_text, can_skip_face, resolve_candidates
 from processing_faces import mapped, build_references, analyze, canonical_person, FACE_VERSION, capture_references
 from watermark_worker import PIPELINE, PaddleEngine, read_json, publish, scan_video, same_file, validate_source, now
 
@@ -242,25 +241,16 @@ def process_one(base, root, runner=stage_subprocess, capacity=1, publisher=publi
                 reference_loader(task, base, root)
             if task['stage'] == 'text':
                 watermark = runner(task, base, root)
-                folder = folder_hints(task['path'], catalog(base))
-                mapping = read_json(base / 'watermarks/mappings.json', {})
-                text_candidates = candidates_from_text(watermark, mapping, folder)
-                legacy = [p['name'] for p in read_json(base / 'report.json', {}).get('identities', []) if any(v['vid'] == task['vid'] for v in p.get('vids', []))]
-                skip = can_skip_face(text_candidates, legacy)
-                data.pop('face', None); data.pop('face_complete', None)
-                data.update(watermark=watermark, folder=folder, text_candidates=text_candidates, text_complete=True,
-                            face_skipped=skip, ready=skip, **resolve_candidates(text_candidates))
-                next_stage = 'review' if skip else 'face_queued'
+                raw = {'watermark': watermark}
             else:
                 face = runner(task, base, root)
-                data.update(face=face, face_complete=True, ready=True, **resolve_candidates(data.get('text_candidates', []) + face['matches']))
-                next_stage = 'review'
+                raw = {'face': face}
             if was_handled(base, task['vid']):
                 release_task(con, task, '分析期间已由人工处理', excluded=True)
                 progress.finish()
                 return True
             validate_source(task, root)
-            publisher(task, base, data, next_stage)
+            publisher(task, base, raw, None)
             progress.finish()
         except Exception as error:
             if isinstance(error, PublicationError) and error.uncertain:

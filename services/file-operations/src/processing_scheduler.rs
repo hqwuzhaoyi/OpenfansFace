@@ -442,11 +442,7 @@ pub fn media_available(conn: &Connection, root: &Path) -> Result<bool> {
                     "media_unavailable",
                     &format!("媒体挂载不可读，暂停领取任务：{msg}"),
                 )?;
-                set_setting(
-                    conn,
-                    "media_unavailable",
-                    &json!({"at": now, "error": msg}),
-                )?;
+                set_setting(conn, "media_unavailable", &json!({"at": now, "error": msg}))?;
             }
             Ok(false)
         }
@@ -1081,7 +1077,13 @@ pub fn heartbeat(config: &Config, body: &Value) -> Result<Value> {
     }))
 }
 
-fn close_run(conn: &Connection, run_id: &str, status: &str, error: Option<&str>, now: f64) -> Result<()> {
+fn close_run(
+    conn: &Connection,
+    run_id: &str,
+    status: &str,
+    error: Option<&str>,
+    now: f64,
+) -> Result<()> {
     if run_id.is_empty() {
         return Ok(());
     }
@@ -1226,11 +1228,7 @@ pub fn release_task(config: &Config, body: &Value) -> Result<Value> {
         )?;
     }
     let run_status = if updated > 0 {
-        if excluded {
-            "cancelled"
-        } else {
-            "waiting"
-        }
+        if excluded { "cancelled" } else { "waiting" }
     } else {
         "superseded"
     };
@@ -1560,6 +1558,1174 @@ pub fn retry_errors(config: &Config, body: &Value) -> Result<Value> {
     }))
 }
 
+fn read_json_fallback(path: &Path, fallback: Value) -> Value {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or(fallback)
+}
+
+fn now_wall() -> Result<f64> {
+    Ok(Connection::open_in_memory()?
+        .query_row("SELECT unixepoch('now','subsec')", [], |r| r.get(0))?)
+}
+
+fn canonical_person_fields(value: Value, key: &str, aliases: &Value) -> Value {
+    match value {
+        Value::String(s) if matches!(key, "name" | "creator" | "suggested") => {
+            json!(crate::processing_result::canonical_person(&s, aliases))
+        }
+        Value::Array(arr) => Value::Array(
+            arr.into_iter()
+                .map(|v| canonical_person_fields(v, "", aliases))
+                .collect(),
+        ),
+        Value::Object(map) => Value::Object(
+            map.into_iter()
+                .map(|(k, v)| {
+                    let next = canonical_person_fields(v, &k, aliases);
+                    (k, next)
+                })
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+fn is_review_available(task: &Value) -> bool {
+    let stage = task["stage"].as_str().unwrap_or("");
+    let manual = task["manual"].as_i64().unwrap_or(0) != 0;
+    let ready = task["data"]["ready"] == true;
+    let retry_stage = task["retry_stage"].as_str().unwrap_or("");
+    stage == "review"
+        || manual
+        || (ready
+            && (stage == "face"
+                || stage == "face_queued"
+                || ((stage == "retry" || stage == "error") && retry_stage == "face")))
+}
+
+struct ActiveState {
+    online: bool,
+    paused: bool,
+    last_discovery: Value,
+    references: Value,
+    tasks: Vec<Value>,
+    events: Vec<Value>,
+}
+
+fn load_active_state(config: &Config, conn: &Connection, now: f64) -> Result<ActiveState> {
+    let beat = read_json_fallback(&config.base.join("processing/heartbeat.json"), json!({}));
+    let beat_at = beat["at"]
+        .as_f64()
+        .or_else(|| beat["at"].as_i64().map(|n| n as f64))
+        .unwrap_or(0.0);
+    let age = now - beat_at;
+    let online = (-30.0..90.0).contains(&age);
+    let paused = setting(conn, "paused")?
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let last_discovery = setting(conn, "last_discovery")?.unwrap_or(Value::Null);
+    let references = setting(conn, "references")?.unwrap_or(Value::Null);
+    let eligible = eligible_vids(config, conn)?;
+    let aliases = review::read(config, "person-renames.json", json!({}))?.1;
+    let raw_tasks = db::rows(
+        conn,
+        "SELECT * FROM tasks WHERE stage!='excluded' ORDER BY priority DESC,is_new DESC,created_at DESC,vid",
+        [],
+    )?;
+    let mut tasks = Vec::new();
+    for raw in raw_tasks {
+        let Some(vid) = raw["vid"].as_str() else {
+            continue;
+        };
+        if !eligible.contains(vid) {
+            continue;
+        }
+        let mut row = plain_row(raw);
+        let parsed_data = row["data"]
+            .as_str()
+            .and_then(|s| serde_json::from_str::<Value>(s).ok())
+            .unwrap_or_else(|| json!({}));
+        row["data"] = canonical_person_fields(parsed_data, "", &aliases);
+        tasks.push(row);
+    }
+    let events = db::rows(conn, "SELECT * FROM events ORDER BY id DESC LIMIT 12", [])?
+        .into_iter()
+        .map(plain_row)
+        .collect();
+    Ok(ActiveState {
+        online,
+        paused,
+        last_discovery,
+        references,
+        tasks,
+        events,
+    })
+}
+
+fn read_run_progress(config: &Config, run: &Value, online: bool) -> Value {
+    use sha2::{Digest, Sha256};
+    let run_id = run["id"].as_str().unwrap_or("");
+    let run_vid = run["vid"].as_str().unwrap_or("");
+    let run_name = run["name"].as_str().unwrap_or("");
+    let run_stage = run["stage"].as_str().unwrap_or("text");
+    let run_status = run["status"].as_str().unwrap_or("");
+    let started_at = run["started_at"]
+        .as_f64()
+        .or_else(|| run["started_at"].as_i64().map(|n| n as f64))
+        .unwrap_or(0.0);
+    let finished_at = run["finished_at"]
+        .as_f64()
+        .or_else(|| run["finished_at"].as_i64().map(|n| n as f64))
+        .filter(|v| *v != 0.0);
+    let error = run["error"].as_str().filter(|s| !s.is_empty());
+
+    let digest = format!("{:x}", Sha256::digest(run_id.as_bytes()));
+    let stage_path = config
+        .base
+        .join("jobs/stages")
+        .join(format!("{digest}.json"));
+    let raw = read_json_fallback(&stage_path, Value::Null);
+    let same = raw.is_object()
+        && raw["id"].as_str() == Some(run_id)
+        && raw["vid"].as_str() == Some(run_vid);
+    let kind = if run_stage == "face" { "face" } else { "text" };
+    let status = if run_status == "running" {
+        if online { "running" } else { "offline" }
+    } else if run_status == "done" {
+        "complete"
+    } else if matches!(run_status, "error" | "interrupted") {
+        "error"
+    } else {
+        "waiting"
+    };
+    let stage_text = if run_status == "retry" {
+        "等待自动重试".to_owned()
+    } else if run_status == "waiting" {
+        "等待资源恢复".to_owned()
+    } else if same {
+        raw["stage"].as_str().unwrap_or("").to_owned()
+    } else if status == "running" {
+        "准备中".to_owned()
+    } else if status == "complete" {
+        "阶段完成".to_owned()
+    } else {
+        error.unwrap_or("阶段已结束").to_owned()
+    };
+    let done = if same {
+        raw["done"]
+            .as_f64()
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .map(|_| json!(raw["done"]))
+            .unwrap_or(Value::Null)
+    } else {
+        Value::Null
+    };
+    let total = if same {
+        raw["total"]
+            .as_f64()
+            .filter(|v| v.is_finite() && *v >= 0.0)
+            .map(|_| json!(raw["total"]))
+            .unwrap_or(Value::Null)
+    } else {
+        Value::Null
+    };
+    let unit = if same {
+        raw["unit"].as_str().unwrap_or("")
+    } else {
+        ""
+    };
+    let updated_at = if same && !raw["updated_at"].is_null() {
+        raw["updated_at"].clone()
+    } else if let Some(f) = finished_at {
+        json!(f)
+    } else {
+        json!(started_at)
+    };
+    let heartbeat_at = if same && !raw["heartbeat_at"].is_null() {
+        raw["heartbeat_at"].clone()
+    } else {
+        Value::Null
+    };
+    let mut job = json!({
+        "id": run_id,
+        "kind": kind,
+        "title": if kind == "text" { "提取水印" } else { "人脸分析" },
+        "status": status,
+        "stage": stage_text,
+        "current": run_name,
+        "vid": run_vid,
+        "done": done,
+        "total": total,
+        "unit": unit,
+        "failed": if status == "error" { 1 } else { 0 },
+        "started_at": started_at,
+        "updated_at": updated_at,
+        "heartbeat_at": heartbeat_at,
+        "href": format!("/operations/tasks?vid={}", review::percent(run_vid)),
+    });
+    if let Some(f) = finished_at {
+        job["finished_at"] = json!(f);
+    }
+    if let Some(err) = error {
+        job["error"] = json!(err);
+    }
+    job
+}
+
+pub fn overview(config: &Config, body: &Value) -> Result<Value> {
+    let has_vid = body.as_object().is_some_and(|m| m.contains_key("vid"));
+    let requested_vid = body["vid"].as_str();
+    if !db_path(config).exists() {
+        let mut out = json!({
+            "online": false,
+            "paused": false,
+            "last_discovery": null,
+            "references": null,
+            "events": [],
+            "counts": { "review": 0 },
+            "total": 0,
+            "page": 0,
+            "limit": 25,
+            "all_count": 0,
+            "rows": [],
+            "batches": [],
+        });
+        if has_vid {
+            out["task"] = Value::Null;
+        }
+        return Ok(out);
+    }
+    let conn = open_existing(config, "分析服务尚未初始化")?;
+    let now = now_sec(&conn)?;
+    let state = load_active_state(config, &conn, now)?;
+    let mut counts = serde_json::Map::new();
+    for task in &state.tasks {
+        let stage = if task["manual"].as_i64().unwrap_or(0) != 0 {
+            "review"
+        } else {
+            task["stage"].as_str().unwrap_or("")
+        };
+        let next = counts.get(stage).and_then(Value::as_u64).unwrap_or(0) + 1;
+        counts.insert(stage.to_owned(), json!(next));
+    }
+    let review_count = state
+        .tasks
+        .iter()
+        .filter(|t| is_review_available(t))
+        .count();
+    counts.insert("review".into(), json!(review_count));
+
+    let stage_filter = body["stage"].as_str().unwrap_or("");
+    let batch_filter = body["batch"].as_str().unwrap_or("");
+    let query = body["q"].as_str().unwrap_or("").to_lowercase();
+
+    let filtered: Vec<&Value> = state
+        .tasks
+        .iter()
+        .filter(|t| {
+            let t_stage = t["stage"].as_str().unwrap_or("");
+            let t_manual = t["manual"].as_i64().unwrap_or(0) != 0;
+            let stage_ok = if stage_filter.is_empty() {
+                true
+            } else if stage_filter == "review" {
+                is_review_available(t)
+            } else if stage_filter == "error" {
+                t_stage == "error" && !t_manual
+            } else if stage_filter == "face" {
+                matches!(t_stage, "face" | "face_queued")
+            } else if stage_filter == "queued" {
+                matches!(t_stage, "queued" | "retry")
+            } else {
+                t_stage == stage_filter
+            };
+            let batch_ok = batch_filter.is_empty() || t["batch_id"].as_str() == Some(batch_filter);
+            let query_ok = query.is_empty() || {
+                let text = format!(
+                    "{} {}",
+                    t["name"].as_str().unwrap_or(""),
+                    t["path"].as_str().unwrap_or("")
+                )
+                .to_lowercase();
+                text.contains(&query)
+            };
+            stage_ok && batch_ok && query_ok
+        })
+        .collect();
+
+    let limit = 25usize;
+    let total = filtered.len();
+    let raw_page = body["page"]
+        .as_str()
+        .and_then(|s| s.parse::<f64>().ok())
+        .or_else(|| body["page"].as_f64())
+        .filter(|v| v.is_finite())
+        .unwrap_or(0.0);
+    let max_page = if total == 0 {
+        0
+    } else {
+        total.div_ceil(limit) - 1
+    };
+    let page = (raw_page.max(0.0) as usize).min(max_page);
+    let rows: Vec<Value> = filtered
+        .into_iter()
+        .skip(page * limit)
+        .take(limit)
+        .map(|t| {
+            let mut copy = t.clone();
+            let mut slim_data = serde_json::Map::new();
+            for key in ["kind", "suggested", "face_skipped"] {
+                if let Some(v) = t["data"].get(key) {
+                    slim_data.insert(key.to_owned(), v.clone());
+                }
+            }
+            copy["data"] = Value::Object(slim_data);
+            copy
+        })
+        .collect();
+
+    struct BatchSummary {
+        id: String,
+        total: usize,
+        ready: usize,
+        error: usize,
+        running: usize,
+    }
+    let mut batches_map: BTreeMap<String, BatchSummary> = BTreeMap::new();
+    for task in &state.tasks {
+        let id = task["batch_id"].as_str().unwrap_or("").to_owned();
+        let entry = batches_map.entry(id.clone()).or_insert(BatchSummary {
+            id,
+            total: 0,
+            ready: 0,
+            error: 0,
+            running: 0,
+        });
+        entry.total += 1;
+        entry.ready += usize::from(is_review_available(task));
+        entry.error += usize::from(
+            task["stage"].as_str() == Some("error") && task["manual"].as_i64().unwrap_or(0) == 0,
+        );
+        entry.running += usize::from(matches!(task["stage"].as_str(), Some("text" | "face")));
+    }
+    let mut batches: Vec<BatchSummary> = batches_map.into_values().collect();
+    batches.sort_by(|a, b| b.id.cmp(&a.id));
+    let batches_json: Vec<Value> = batches
+        .into_iter()
+        .take(20)
+        .map(|b| {
+            json!({
+                "id": b.id,
+                "total": b.total,
+                "ready": b.ready,
+                "error": b.error,
+                "running": b.running,
+            })
+        })
+        .collect();
+
+    let mut out = json!({
+        "online": state.online,
+        "paused": state.paused,
+        "last_discovery": state.last_discovery,
+        "references": state.references,
+        "events": state.events,
+        "counts": counts,
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "all_count": state.tasks.len(),
+        "rows": rows,
+        "batches": batches_json,
+    });
+    if has_vid {
+        out["task"] = requested_vid
+            .and_then(|vid| state.tasks.iter().find(|t| t["vid"].as_str() == Some(vid)))
+            .cloned()
+            .unwrap_or(Value::Null);
+    }
+    Ok(out)
+}
+
+pub fn dashboard(config: &Config, body: &Value) -> Result<Value> {
+    let conn = open_existing(config, "处理账本尚未初始化，当前数量未知")?;
+    let tx = conn.unchecked_transaction()?;
+    let now = now_sec(&tx)?;
+    let settings = settings_with_conn(config, &tx)?;
+    let state = load_active_state(config, &tx, now)?;
+    let beat = read_json_fallback(&config.base.join("processing/heartbeat.json"), json!({}));
+
+    let queue = review::read(config, "integration-queue.json", json!([]))?.1;
+    let history_doc = review::read(config, "archive-history.json", json!([]))?.1;
+    let mut handled = BTreeSet::new();
+    for row in queue
+        .as_array()
+        .into_iter()
+        .flatten()
+        .chain(history_doc.as_array().into_iter().flatten())
+    {
+        if let Some(vid) = row["vid"].as_str() {
+            handled.insert(vid.to_owned());
+        }
+    }
+
+    let tables: BTreeSet<String> =
+        db::rows(&tx, "SELECT name FROM sqlite_master WHERE type='table'", [])?
+            .into_iter()
+            .filter_map(|r| r["name"].as_str().map(str::to_owned))
+            .collect();
+    let ledger_version = setting(&tx, "batch_ledger_version")?
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
+    let ledger_ready = tables.contains("batch_items") && ledger_version >= 1;
+
+    struct BatchAgg {
+        id: String,
+        started_at: f64,
+        total: usize,
+        completed: usize,
+        running: usize,
+        waiting: usize,
+        error: usize,
+        excluded: usize,
+        text_done: usize,
+        face_required: usize,
+        face_done: usize,
+        face_skipped: usize,
+        legacy: bool,
+        refreshing: usize,
+        refresh_waiting: usize,
+        refresh_error: usize,
+    }
+    let mut groups: BTreeMap<String, BatchAgg> = BTreeMap::new();
+    if ledger_ready {
+        let items = db::rows(
+            &tx,
+            "SELECT b.batch_id,b.vid,b.added_at,b.completed,b.text_done,b.face_required,b.face_done,b.face_skipped,b.excluded,b.legacy,
+            CASE WHEN t.batch_id=b.batch_id AND t.path=b.path AND t.size=b.size AND t.mtime_ns=b.mtime_ns THEN 1 ELSE 0 END AS current,t.stage,t.manual
+            FROM batch_items b LEFT JOIN tasks t ON t.vid=b.vid",
+            [],
+        )?;
+        for raw in items {
+            let item = plain_row(raw);
+            let batch_id = item["batch_id"].as_str().unwrap_or("").to_owned();
+            let vid = item["vid"].as_str().unwrap_or("");
+            let added_at = item["added_at"]
+                .as_f64()
+                .or_else(|| item["added_at"].as_i64().map(|n| n as f64))
+                .unwrap_or(0.0);
+            let completed = item["completed"].as_i64().unwrap_or(0) != 0;
+            let text_done = item["text_done"].as_i64().unwrap_or(0) != 0;
+            let face_required = item["face_required"].as_i64();
+            let face_done = item["face_done"].as_i64().unwrap_or(0) != 0;
+            let face_skipped = item["face_skipped"].as_i64().unwrap_or(0) != 0;
+            let excluded = item["excluded"].as_i64().unwrap_or(0) != 0;
+            let legacy = item["legacy"].as_i64().unwrap_or(0) != 0;
+            let current = item["current"].as_i64().unwrap_or(0) != 0;
+            let stage = item["stage"].as_str();
+            let manual = item["manual"].as_i64().unwrap_or(0) != 0;
+            let is_handled = handled.contains(vid);
+
+            let b = groups.entry(batch_id.clone()).or_insert(BatchAgg {
+                id: batch_id,
+                started_at: added_at,
+                total: 0,
+                completed: 0,
+                running: 0,
+                waiting: 0,
+                error: 0,
+                excluded: 0,
+                text_done: 0,
+                face_required: 0,
+                face_done: 0,
+                face_skipped: 0,
+                legacy: false,
+                refreshing: 0,
+                refresh_waiting: 0,
+                refresh_error: 0,
+            });
+            if added_at < b.started_at {
+                b.started_at = added_at;
+            }
+            b.total += 1;
+            if completed {
+                b.completed += 1;
+            } else if excluded || !current || is_handled || manual || stage == Some("excluded") {
+                b.excluded += 1;
+            } else if stage == Some("error") {
+                b.error += 1;
+            } else if matches!(stage, Some("text" | "face")) {
+                b.running += 1;
+            } else {
+                b.waiting += 1;
+            }
+            b.text_done += usize::from(text_done);
+            b.face_required += usize::from(face_required == Some(1));
+            b.face_done += usize::from(face_done);
+            b.face_skipped += usize::from(face_skipped);
+            b.legacy |= legacy;
+            if completed && current && !is_handled && !manual {
+                if matches!(stage, Some("text" | "face")) {
+                    b.refreshing += 1;
+                }
+                if matches!(stage, Some("queued" | "face_queued" | "retry")) {
+                    b.refresh_waiting += 1;
+                }
+                if stage == Some("error") {
+                    b.refresh_error += 1;
+                }
+            }
+        }
+    }
+
+    let mut batch_list: Vec<BatchAgg> = groups.into_values().collect();
+    batch_list.sort_by(|a, b| {
+        b.started_at
+            .total_cmp(&a.started_at)
+            .then_with(|| b.id.cmp(&a.id))
+    });
+
+    let mut totals = json!({
+        "total": 0,
+        "completed": 0,
+        "running": 0,
+        "waiting": 0,
+        "error": 0,
+        "excluded": 0,
+        "text_done": 0,
+        "face_required": 0,
+        "face_done": 0,
+        "face_skipped": 0,
+        "refreshing": 0,
+        "refresh_waiting": 0,
+        "refresh_error": 0,
+    });
+    let batches_json: Vec<Value> = batch_list
+        .into_iter()
+        .map(|b| {
+            totals["total"] = json!(totals["total"].as_u64().unwrap() + b.total as u64);
+            totals["completed"] = json!(totals["completed"].as_u64().unwrap() + b.completed as u64);
+            totals["running"] = json!(totals["running"].as_u64().unwrap() + b.running as u64);
+            totals["waiting"] = json!(totals["waiting"].as_u64().unwrap() + b.waiting as u64);
+            totals["error"] = json!(totals["error"].as_u64().unwrap() + b.error as u64);
+            totals["excluded"] = json!(totals["excluded"].as_u64().unwrap() + b.excluded as u64);
+            totals["text_done"] = json!(totals["text_done"].as_u64().unwrap() + b.text_done as u64);
+            totals["face_required"] =
+                json!(totals["face_required"].as_u64().unwrap() + b.face_required as u64);
+            totals["face_done"] = json!(totals["face_done"].as_u64().unwrap() + b.face_done as u64);
+            totals["face_skipped"] =
+                json!(totals["face_skipped"].as_u64().unwrap() + b.face_skipped as u64);
+            totals["refreshing"] =
+                json!(totals["refreshing"].as_u64().unwrap() + b.refreshing as u64);
+            totals["refresh_waiting"] =
+                json!(totals["refresh_waiting"].as_u64().unwrap() + b.refresh_waiting as u64);
+            totals["refresh_error"] =
+                json!(totals["refresh_error"].as_u64().unwrap() + b.refresh_error as u64);
+            json!({
+                "id": b.id,
+                "started_at": b.started_at,
+                "total": b.total,
+                "completed": b.completed,
+                "running": b.running,
+                "waiting": b.waiting,
+                "error": b.error,
+                "excluded": b.excluded,
+                "text_done": b.text_done,
+                "face_required": b.face_required,
+                "face_done": b.face_done,
+                "face_skipped": b.face_skipped,
+                "legacy": b.legacy,
+                "refreshing": b.refreshing,
+                "refresh_waiting": b.refresh_waiting,
+                "refresh_error": b.refresh_error,
+            })
+        })
+        .collect();
+
+    let (active_runs, mut runs) = if tables.contains("processing_runs") {
+        let active: Vec<Value> = db::rows(
+            &tx,
+            "SELECT * FROM processing_runs WHERE status='running' ORDER BY started_at,id",
+            [],
+        )?
+        .into_iter()
+        .map(plain_row)
+        .collect();
+        let recent: Vec<Value> = db::rows(
+            &tx,
+            "SELECT * FROM processing_runs ORDER BY started_at DESC,id DESC LIMIT 24",
+            [],
+        )?
+        .into_iter()
+        .map(plain_row)
+        .collect();
+        (active, recent)
+    } else {
+        (Vec::new(), Vec::new())
+    };
+
+    let (history, history_source) = if !runs.is_empty() {
+        runs.reverse();
+        let items: Vec<Value> = runs
+            .into_iter()
+            .map(|r| {
+                let execution = r["execution"]
+                    .as_str()
+                    .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                    .unwrap_or(Value::Null);
+                json!({
+                    "id": r["id"],
+                    "label": r["name"],
+                    "status": r["status"],
+                    "stage": r["stage"],
+                    "at": r["started_at"],
+                    "finished_at": r["finished_at"],
+                    "error": r["error"],
+                    "batch": r["batch_id"],
+                    "execution": execution,
+                })
+            })
+            .collect();
+        (items, "stage_runs")
+    } else {
+        let mut legacy_events: Vec<Value> = db::rows(
+            &tx,
+            "SELECT e.*,t.name FROM events e LEFT JOIN tasks t ON t.vid=e.vid WHERE kind IN ('ready','stage_complete','retry','error') ORDER BY e.id DESC LIMIT 24",
+            [],
+        )?
+        .into_iter()
+        .map(plain_row)
+        .collect();
+        legacy_events.reverse();
+        let items: Vec<Value> = legacy_events
+            .into_iter()
+            .map(|e| {
+                let kind = e["kind"].as_str().unwrap_or("");
+                let status = if matches!(kind, "ready" | "stage_complete") {
+                    "done"
+                } else {
+                    kind
+                };
+                let stage = if kind == "stage_complete" {
+                    "text"
+                } else {
+                    "unknown"
+                };
+                let label = e["name"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| e["vid"].as_str().filter(|s| !s.is_empty()))
+                    .unwrap_or("处理记录");
+                let error = if matches!(kind, "error" | "retry") {
+                    e["message"].clone()
+                } else {
+                    Value::Null
+                };
+                json!({
+                    "id": format!("event-{}", e["id"].as_i64().unwrap_or(0)),
+                    "label": label,
+                    "status": status,
+                    "stage": stage,
+                    "at": e["at"],
+                    "finished_at": e["at"],
+                    "error": error,
+                    "batch": Value::Null,
+                    "execution": Value::Null,
+                })
+            })
+            .collect();
+        (items, "legacy_events")
+    };
+
+    let media_issue = setting(&tx, "media_unavailable")?.unwrap_or(Value::Null);
+    tx.commit()?;
+
+    let current = json!({
+        "running": state.tasks.iter().filter(|t| matches!(t["stage"].as_str(), Some("text" | "face"))).count(),
+        "waiting": state.tasks.iter().filter(|t| matches!(t["stage"].as_str(), Some("queued" | "face_queued" | "retry"))).count(),
+        "error": state.tasks.iter().filter(|t| t["stage"].as_str() == Some("error") && t["manual"].as_i64().unwrap_or(0) == 0).count(),
+        "review": state.tasks.iter().filter(|t| is_review_available(t)).count(),
+    });
+
+    let mut jobs: Vec<Value> = active_runs
+        .iter()
+        .map(|r| read_run_progress(config, r, state.online))
+        .collect();
+    if jobs.is_empty() {
+        let heartbeat_at = beat.get("at").cloned().unwrap_or(Value::Null);
+        for t in state
+            .tasks
+            .iter()
+            .filter(|t| matches!(t["stage"].as_str(), Some("text" | "face")))
+        {
+            let vid = t["vid"].as_str().unwrap_or("");
+            let is_face = t["stage"].as_str() == Some("face");
+            jobs.push(json!({
+                "id": vid,
+                "kind": if is_face { "face" } else { "text" },
+                "title": if is_face { "人脸分析" } else { "提取水印" },
+                "status": if state.online { "running" } else { "offline" },
+                "stage": "处理中",
+                "current": t["name"],
+                "vid": vid,
+                "done": Value::Null,
+                "total": Value::Null,
+                "unit": "",
+                "failed": 0,
+                "started_at": t["updated_at"],
+                "updated_at": t["updated_at"],
+                "heartbeat_at": heartbeat_at,
+                "href": format!("/operations/tasks?vid={}", review::percent(vid)),
+            }));
+        }
+    }
+
+    let inference = if let Some(inf) = beat["inference"].as_object() {
+        let mut copy = inf.clone();
+        let avail = state.online && inf.get("available").and_then(Value::as_bool) == Some(true);
+        copy.insert("available".into(), json!(avail));
+        Value::Object(copy)
+    } else {
+        json!({
+            "backend": "unknown",
+            "available": false,
+            "name": "处理来源未知",
+            "error": "后台未提供推理来源",
+        })
+    };
+
+    let preview = body["preview"].as_bool().unwrap_or(false);
+    let mut out = json!({
+        "schema_version": 1,
+        "preview": preview,
+        "at": now,
+        "online": state.online,
+        "paused": state.paused,
+        "ledger_ready": ledger_ready,
+        "batches": batches_json,
+        "totals": totals,
+        "current": current,
+        "jobs": jobs,
+        "history": history,
+        "history_source": history_source,
+        "settings": settings,
+        "media_issue": media_issue,
+        "discovery": state.last_discovery,
+        "references": state.references,
+        "inference": inference,
+        "events": state.events,
+    });
+    if preview && let Some(preview_id) = body["preview_id"].as_str() {
+        out["preview_id"] = json!(preview_id);
+    }
+    Ok(out)
+}
+
+fn normalize_home_job(mut job: Value, now: f64, heartbeat: Option<f64>) -> Value {
+    let active = job["status"].as_str() == Some("running");
+    let online = heartbeat.is_some_and(|hb| hb <= now + 30.0 && now - hb < 90.0);
+    job["heartbeat_at"] = heartbeat.map(|h| json!(h)).unwrap_or(Value::Null);
+    if active && !online {
+        job["status"] = json!("offline");
+    }
+    let valid_num = |v: &Value| {
+        v.as_f64()
+            .filter(|n| n.is_finite() && *n >= 0.0)
+            .map(|_| v.clone())
+            .unwrap_or(Value::Null)
+    };
+    job["done"] = valid_num(&job["done"]);
+    job["total"] = valid_num(&job["total"]);
+    job
+}
+
+fn reconcile_processing_job(mut job: Value, owner: Option<&Value>, online: bool) -> Value {
+    let kind = job["kind"].as_str().unwrap_or("").to_owned();
+    if !online
+        || job["status"].as_str() != Some("running")
+        || !matches!(kind.as_str(), "text" | "face")
+        || owner.and_then(|o| o["stage"].as_str()) == Some(kind.as_str())
+    {
+        return job;
+    }
+    if let Some(fin) = owner
+        .and_then(|o| o.get("updated_at"))
+        .filter(|v| !v.is_null())
+        .or_else(|| job.get("updated_at").filter(|v| !v.is_null()))
+        .cloned()
+    {
+        job["finished_at"] = fin;
+    }
+    if let Some(o) = owner {
+        let o_stage = o["stage"].as_str().unwrap_or("");
+        if matches!(o_stage, "retry" | "error") {
+            job["status"] = json!("error");
+            job["stage"] = json!(if o_stage == "retry" {
+                "等待重试"
+            } else {
+                "处理失败"
+            });
+            if !o["error"].is_null() {
+                job["error"] = o["error"].clone();
+            }
+            return job;
+        }
+        if o_stage == "review" || (kind == "text" && o_stage == "face_queued") {
+            job["status"] = json!("complete");
+            job["stage"] = json!("阶段完成");
+            return job;
+        }
+    }
+    job["status"] = json!("waiting");
+    job["stage"] = json!("已离开当前阶段");
+    job
+}
+
+pub fn home_tasks(config: &Config, body: &Value) -> Result<Value> {
+    let now = now_wall()?;
+    let beat_doc = read_json_fallback(&config.base.join("processing/heartbeat.json"), json!({}));
+    let heartbeat = beat_doc["at"]
+        .as_f64()
+        .or_else(|| beat_doc["at"].as_i64().map(|n| n as f64))
+        .filter(|v| v.is_finite());
+    let online = heartbeat.is_some_and(|hb| (-30.0..90.0).contains(&(now - hb)));
+    let initialized = db_path(config).exists();
+
+    let mut jobs: Vec<Value> = Vec::new();
+    let mut counts = serde_json::Map::new();
+    let mut stage_runs: Vec<Value> = Vec::new();
+    let mut parallel_progress = false;
+    let mut tasks: Vec<Value> = Vec::new();
+    let mut paused = false;
+    let mut events: Vec<Value> = Vec::new();
+
+    if initialized {
+        let conn = open_existing(config, "分析服务尚未初始化")?;
+        paused = setting(&conn, "paused")?
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let queue = review::read(config, "integration-queue.json", json!([]))?.1;
+        let history = review::read(config, "archive-history.json", json!([]))?.1;
+        let mut handled = BTreeSet::new();
+        for row in queue
+            .as_array()
+            .into_iter()
+            .flatten()
+            .chain(history.as_array().into_iter().flatten())
+        {
+            if let Some(vid) = row["vid"].as_str() {
+                handled.insert(vid.to_owned());
+            }
+        }
+        let raw_tasks = db::rows(
+            &conn,
+            "SELECT vid,name,path,stage,batch_id,updated_at,priority,error,manual,next_retry FROM tasks WHERE stage!='excluded' ORDER BY priority DESC,is_new DESC,created_at DESC,vid",
+            [],
+        )?;
+        for raw in raw_tasks {
+            let row = plain_row(raw);
+            let Some(vid) = row["vid"].as_str() else {
+                continue;
+            };
+            if handled.contains(vid) {
+                continue;
+            }
+            let key = if row["manual"].as_i64().unwrap_or(0) != 0 {
+                "review"
+            } else {
+                row["stage"].as_str().unwrap_or("")
+            };
+            let next = counts.get(key).and_then(Value::as_u64).unwrap_or(0) + 1;
+            counts.insert(key.to_owned(), json!(next));
+            tasks.push(row);
+        }
+        parallel_progress = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='processing_runs')",
+            [],
+            |r| r.get(0),
+        )?;
+        if parallel_progress {
+            stage_runs = db::rows(
+                &conn,
+                "SELECT * FROM processing_runs WHERE status='running' ORDER BY started_at",
+                [],
+            )?
+            .into_iter()
+            .map(plain_row)
+            .collect();
+            for kind in ["text", "face"] {
+                if !stage_runs.iter().any(|r| r["stage"].as_str() == Some(kind))
+                    && let Some(latest) = db::rows(
+                        &conn,
+                        "SELECT * FROM processing_runs WHERE stage=? ORDER BY started_at DESC LIMIT 1",
+                        [kind],
+                    )?
+                    .into_iter()
+                    .next()
+                {
+                    stage_runs.push(plain_row(latest));
+                }
+            }
+        }
+        events = db::rows(
+            &conn,
+            "SELECT id,at,kind,message FROM events ORDER BY id DESC LIMIT 10",
+            [],
+        )?
+        .into_iter()
+        .map(plain_row)
+        .collect();
+    }
+
+    if parallel_progress {
+        for run in &stage_runs {
+            jobs.push(read_run_progress(config, run, online));
+        }
+    }
+
+    for kind in ["text", "face", "discovery", "archive", "watermark"] {
+        if parallel_progress && matches!(kind, "text" | "face") {
+            continue;
+        }
+        let raw = read_json_fallback(
+            &config.base.join("jobs").join(format!("{kind}.json")),
+            Value::Null,
+        );
+        let finished_ok = !raw["finished_at"]
+            .as_f64()
+            .filter(|v| *v != 0.0)
+            .is_some_and(|f| now - f >= 86400.0);
+        if raw.is_object()
+            && raw["kind"].as_str() == Some(kind)
+            && raw["id"].as_str().is_some_and(|s| !s.is_empty())
+            && finished_ok
+        {
+            let beat = if kind == "archive" {
+                raw["heartbeat_at"]
+                    .as_f64()
+                    .or_else(|| raw["heartbeat_at"].as_i64().map(|n| n as f64))
+                    .filter(|v| v.is_finite())
+            } else if kind == "watermark" {
+                let worker =
+                    read_json_fallback(&config.base.join("watermarks/worker.json"), json!({}));
+                worker["at"]
+                    .as_str()
+                    .and_then(|s| review::timestamp(s).ok())
+                    .filter(|v| v.is_finite())
+            } else {
+                heartbeat
+            };
+            let owner = raw["vid"]
+                .as_str()
+                .and_then(|vid| tasks.iter().find(|t| t["vid"].as_str() == Some(vid)));
+            let reconciled = reconcile_processing_job(raw, owner, online);
+            jobs.push(normalize_home_job(reconciled, now, beat));
+        }
+    }
+
+    if !jobs.iter().any(|j| j["kind"].as_str() == Some("watermark")) {
+        let request = read_json_fallback(&config.base.join("watermarks/job.json"), Value::Null);
+        let progress_path = config.base.join("watermarks/progress.json");
+        let progress = read_json_fallback(&progress_path, Value::Null);
+        if request.is_object()
+            && !request["id"].is_null()
+            && progress["job_id"] == request["id"]
+            && progress["status"].as_str() == Some("running")
+        {
+            let worker = read_json_fallback(&config.base.join("watermarks/worker.json"), json!({}));
+            let beat = worker["at"]
+                .as_str()
+                .and_then(|s| review::timestamp(s).ok())
+                .filter(|v| v.is_finite());
+            let started_at = request["created_at"]
+                .as_str()
+                .and_then(|s| review::timestamp(s).ok())
+                .filter(|v| v.is_finite())
+                .map(|v| json!(v))
+                .unwrap_or(Value::Null);
+            let updated_at = fs::metadata(&progress_path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| json!(d.as_secs_f64()))
+                .unwrap_or(Value::Null);
+            let stage_str = progress["stage"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("提取水印");
+            let wm_job = json!({
+                "id": request["id"],
+                "kind": "watermark",
+                "title": "水印批次",
+                "status": "running",
+                "stage": stage_str,
+                "done": progress.get("processed").cloned().unwrap_or(Value::Null),
+                "total": progress.get("total").cloned().unwrap_or(Value::Null),
+                "unit": "个视频",
+                "failed": progress["failed"].as_i64().unwrap_or(0),
+                "started_at": started_at,
+                "updated_at": updated_at,
+                "heartbeat_at": beat.map(|b| json!(b)).unwrap_or(Value::Null),
+                "href": "/watermarks",
+            });
+            jobs.push(normalize_home_job(wm_job, now, beat));
+        }
+    }
+
+    for kind in ["text", "face"] {
+        let current = tasks.iter().find(|t| t["stage"].as_str() == Some(kind));
+        let old_idx = jobs.iter().position(|j| j["kind"].as_str() == Some(kind));
+        if parallel_progress && old_idx.is_some() {
+            continue;
+        }
+        let should_replace = if let Some(curr) = current {
+            match old_idx.map(|i| &jobs[i]) {
+                None => true,
+                Some(old) => {
+                    old["vid"] != curr["vid"]
+                        || matches!(old["status"].as_str(), Some("complete" | "error"))
+                }
+            }
+        } else {
+            false
+        };
+        if let (true, Some(curr)) = (should_replace, current) {
+            if let Some(i) = old_idx {
+                jobs.remove(i);
+            }
+            let vid = curr["vid"].as_str().unwrap_or("");
+            jobs.push(json!({
+                "id": format!("{kind}:{vid}"),
+                "kind": kind,
+                "title": if kind == "text" { "提取水印" } else { "人脸分析" },
+                "status": if online { "running" } else { "offline" },
+                "stage": if kind == "text" { "提取文字线索" } else { "分析人脸" },
+                "current": curr["name"],
+                "vid": vid,
+                "done": Value::Null,
+                "total": Value::Null,
+                "unit": "",
+                "failed": 0,
+                "started_at": curr["updated_at"],
+                "updated_at": curr["updated_at"],
+                "heartbeat_at": heartbeat.map(|h| json!(h)).unwrap_or(Value::Null),
+                "href": format!("/review?vid={}", review::percent(vid)),
+            }));
+        } else if old_idx.is_none() {
+            jobs.push(json!({
+                "id": kind,
+                "kind": kind,
+                "title": if kind == "text" { "提取水印" } else { "人脸分析" },
+                "status": if !online { "offline" } else if paused { "paused" } else { "waiting" },
+                "stage": if paused {
+                    "已暂停领取新任务"
+                } else if kind == "text" {
+                    "等待视频进入队列"
+                } else {
+                    "等待文字线索完成"
+                },
+                "done": Value::Null,
+                "total": Value::Null,
+                "unit": "",
+                "failed": 0,
+                "started_at": Value::Null,
+                "updated_at": Value::Null,
+                "heartbeat_at": heartbeat.map(|h| json!(h)).unwrap_or(Value::Null),
+                "href": "/#task-queue",
+            }));
+        }
+    }
+
+    let stage_filter = body["stage"].as_str().unwrap_or("");
+    let q = body["q"].as_str().unwrap_or("").trim().to_lowercase();
+    let filtered: Vec<Value> = tasks
+        .into_iter()
+        .filter(|t| {
+            let actual = if t["manual"].as_i64().unwrap_or(0) != 0 {
+                "review"
+            } else {
+                t["stage"].as_str().unwrap_or("")
+            };
+            let stage_ok = if stage_filter.is_empty() {
+                true
+            } else if stage_filter == "queued" {
+                matches!(actual, "queued" | "retry")
+            } else if stage_filter == "face" {
+                matches!(actual, "face" | "face_queued")
+            } else {
+                actual == stage_filter
+            };
+            let q_ok = q.is_empty() || {
+                let text = format!(
+                    "{} {}",
+                    t["name"].as_str().unwrap_or(""),
+                    t["path"].as_str().unwrap_or("")
+                )
+                .to_lowercase();
+                text.contains(&q)
+            };
+            stage_ok && q_ok
+        })
+        .collect();
+
+    let limit = 20usize;
+    let total = filtered.len();
+    let raw_page = body["page"]
+        .as_str()
+        .and_then(|s| s.parse::<f64>().ok())
+        .or_else(|| body["page"].as_f64())
+        .filter(|v| v.is_finite())
+        .unwrap_or(0.0);
+    let max_page = if total == 0 {
+        0
+    } else {
+        total.div_ceil(limit) - 1
+    };
+    let page = (raw_page.floor().max(0.0) as usize).min(max_page);
+    let rows: Vec<Value> = filtered
+        .into_iter()
+        .skip(page * limit)
+        .take(limit)
+        .collect();
+
+    let kind_rank = |k: &str| match k {
+        "face" => 0,
+        "text" => 1,
+        "discovery" => 2,
+        "archive" => 3,
+        "watermark" => 4,
+        _ => 5,
+    };
+    jobs.sort_by(|a, b| {
+        let a_run = a["status"].as_str() == Some("running");
+        let b_run = b["status"].as_str() == Some("running");
+        let a_err = a["status"].as_str() == Some("error");
+        let b_err = b["status"].as_str() == Some("error");
+        b_run
+            .cmp(&a_run)
+            .then_with(|| b_err.cmp(&a_err))
+            .then_with(|| {
+                kind_rank(a["kind"].as_str().unwrap_or(""))
+                    .cmp(&kind_rank(b["kind"].as_str().unwrap_or("")))
+            })
+    });
+
+    Ok(json!({
+        "at": now,
+        "initialized": initialized,
+        "online": online,
+        "paused": paused,
+        "counts": counts,
+        "jobs": jobs,
+        "rows": rows,
+        "total": total,
+        "page": page,
+        "limit": limit,
+        "events": events,
+    }))
+}
+
 pub fn execute(engine: &mut Engine, command: &str, body: Value) -> Result<Value> {
     if engine.store.blocked()? {
         return Err(Error::new(
@@ -1568,10 +2734,22 @@ pub fn execute(engine: &mut Engine, command: &str, body: Value) -> Result<Value>
             "存在未核对操作，已暂停新写入",
         ));
     }
-    if matches!(command, "processing-settings" | "processing-inventory") {
+    if matches!(
+        command,
+        "processing-settings"
+            | "processing-inventory"
+            | "processing-overview"
+            | "processing-dashboard"
+            | "processing-home-tasks"
+            | "processing-evaluate-rules"
+    ) {
         return match command {
             "processing-settings" => settings(&engine.config),
             "processing-inventory" => Ok(json!({"assets": read_ledger_assets(&engine.config)?})),
+            "processing-overview" => overview(&engine.config, &body),
+            "processing-dashboard" => dashboard(&engine.config, &body),
+            "processing-home-tasks" => home_tasks(&engine.config, &body),
+            "processing-evaluate-rules" => crate::processing_result::evaluate_rules(&body),
             _ => unreachable!(),
         };
     }
@@ -1784,7 +2962,8 @@ mod tests {
         let res2 = discover(&env.config, &json!({"assets": many_assets})).unwrap();
         assert_eq!(res2["eligible"], 23);
 
-        let drop_err = discover(&env.config, &json!({"assets": [many_assets[0].clone()]})).unwrap_err();
+        let drop_err =
+            discover(&env.config, &json!({"assets": [many_assets[0].clone()]})).unwrap_err();
         assert_eq!(drop_err.status, 503);
         assert!(drop_err.error.contains("媒体可读数量突然下降"));
     }
@@ -1825,11 +3004,7 @@ mod tests {
         assert_eq!(updated["effective"], 1);
 
         // Renew c1 via heartbeat
-        let hb = heartbeat(
-            &env.config,
-            &json!({"run_id": c1["run_id"], "capacity": 2}),
-        )
-        .unwrap();
+        let hb = heartbeat(&env.config, &json!({"run_id": c1["run_id"], "capacity": 2})).unwrap();
         assert_eq!(hb["active"], 2);
         assert_eq!(hb["concurrency"], 1);
 
@@ -1951,5 +3126,68 @@ mod tests {
                 .remove(0),
         );
         assert_eq!(row["manual"], 1);
+    }
+
+    #[test]
+    fn overview_dashboard_and_home_tasks_preserve_cohort_invariants() {
+        let env = TestEnv::new();
+        // Before DB exists: overview and home_tasks do not create DB, dashboard fails closed with 503
+        let ov0 = overview(&env.config, &json!({})).unwrap();
+        assert_eq!(ov0["all_count"], 0);
+        let ht0 = home_tasks(&env.config, &json!({})).unwrap();
+        assert_eq!(ht0["initialized"], false);
+        assert!(!db_path(&env.config).exists());
+        assert_eq!(dashboard(&env.config, &json!({})).unwrap_err().status, 503);
+
+        let conn = open_or_init(&env.config).unwrap();
+        reconcile(
+            &conn,
+            &[
+                json!({"vid": "done-archived", "path": "/m/1.mp4", "name": "1.mp4", "size": 10, "mtime_ns": "1"}),
+                json!({"vid": "manual-takeover", "path": "/m/2.mp4", "name": "2.mp4", "size": 10, "mtime_ns": "1"}),
+                json!({"vid": "queued-unknown-face", "path": "/m/3.mp4", "name": "3.mp4", "size": 10, "mtime_ns": "1"}),
+            ],
+            "batch-x",
+            false,
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET stage='review',data='{\"ready\":true,\"text_complete\":true,\"face_skipped\":true,\"kind\":\"suggested\",\"suggested\":\"Alice\"}' WHERE vid='done-archived'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE batch_items SET text_done=1,face_required=0,face_skipped=1,completed=1,completed_at=100 WHERE vid='done-archived'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tasks SET stage='error',manual=1 WHERE vid='manual-takeover'",
+            [],
+        )
+        .unwrap();
+        fs::write(
+            env.config.base.join("archive-history.json"),
+            serde_json::to_vec(&json!([{"vid": "done-archived", "creator": "Alice"}])).unwrap(),
+        )
+        .unwrap();
+        drop(conn);
+
+        let dash = dashboard(&env.config, &json!({})).unwrap();
+        assert_eq!(dash["totals"]["total"], 3);
+        assert_eq!(dash["totals"]["completed"], 1);
+        assert_eq!(dash["totals"]["excluded"], 1);
+        assert_eq!(dash["totals"]["waiting"], 1);
+        assert_eq!(dash["totals"]["face_required"], 0);
+
+        let ov = overview(&env.config, &json!({})).unwrap();
+        assert_eq!(ov["all_count"], 2);
+        assert_eq!(ov["counts"]["review"], 1);
+
+        let ht = home_tasks(&env.config, &json!({})).unwrap();
+        assert_eq!(ht["initialized"], true);
+        assert_eq!(ht["total"], 2);
+        assert_eq!(ht["counts"]["review"], 1);
+        assert_eq!(ht["counts"]["queued"], 1);
     }
 }
