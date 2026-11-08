@@ -1,6 +1,7 @@
 mod admission;
 mod archive;
 mod archive_api;
+mod archive_cancel;
 mod archive_ledger;
 mod archive_resolution;
 mod config;

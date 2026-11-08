@@ -547,7 +547,7 @@ pub fn inspect(conn: &Connection, delta: &Delta, after: bool) -> Result<()> {
 /// Reject any parent-key mutation which would implicitly mutate surviving child
 /// rows. Explicit child deletions run first. Unknown Peach relationship tables
 /// are checked too, so ON DELETE CASCADE cannot silently erase their evidence.
-fn protect_references(
+pub(crate) fn protect_references(
     conn: &Connection,
     table: Table,
     before: &Value,
