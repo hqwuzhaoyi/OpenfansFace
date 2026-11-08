@@ -65,6 +65,24 @@ class Client:
             raise ProtocolError('transport_unavailable', 503, True)
         return payload
 
+    def _retry_after(self, response):
+        # Headers remain authoritative when the response body is truncated. Parse
+        # this before reading the body so transport recovery cannot bypass a known
+        # minimum delay or the bounded-policy stop for a hint above ten seconds.
+        retry_after, allowed = None, True
+        if response.code in (429, 503):
+            header = response.headers.get('Retry-After', '')
+            try:
+                seconds = int(header) if header.isascii() and header.isdigit() else (
+                    email.utils.parsedate_to_datetime(header).timestamp() - self.clock.now_ms() / 1000)
+                if seconds > CLIENT_RETRY_AFTER_CAP_SECONDS:
+                    allowed = False
+                else:
+                    retry_after = max(0, seconds)
+            except (ValueError, TypeError, OverflowError):
+                pass
+        return retry_after, allowed
+
     def _call(self, path, body=None, timeout=None):
         data = canonical(body) if body is not None else None
         if data is not None and len(data) > MAX_BODY_BYTES:
@@ -78,8 +96,18 @@ class Client:
                     raise ProtocolError('invalid_response_type', 502)
                 return decode_json(payload)
         except urllib.error.HTTPError as exc:
+            retry_after, header_allows_retry = self._retry_after(exc)
             try:
                 payload = self._read_response(exc)
+            except ProtocolError as error:
+                if error.code != 'transport_unavailable':
+                    raise
+                # Only known transient statuses can recover an incomplete error
+                # body. In particular, body loss cannot turn 401/403 into retry.
+                transient = exc.code in (429, 503)
+                raise ProtocolError('transport_unavailable' if transient else 'remote_unavailable',
+                                    exc.code, transient and header_allows_retry,
+                                    retry_after=retry_after) from None
             finally:
                 exc.close()
             try:
@@ -90,22 +118,8 @@ class Client:
                 code = token(error.get('code'))
                 retryable = error.get('retryable') is True
             except (ProtocolError, AttributeError):
-                code, retryable = 'remote_unavailable', exc.code in (429, 503, 504)
-            retry_after = None
-            if exc.code in (429, 503):
-                header = exc.headers.get('Retry-After', '')
-                try:
-                    seconds = int(header) if header.isascii() and header.isdigit() else (
-                        email.utils.parsedate_to_datetime(header).timestamp() - self.clock.now_ms() / 1000)
-                    # Do not silently retry earlier than an unbounded server delay.
-                    # An excessive hint ends this retry loop, leaving the task owner
-                    # to its existing bounded stage retry policy.
-                    if seconds > CLIENT_RETRY_AFTER_CAP_SECONDS:
-                        retryable = False
-                    else:
-                        retry_after = max(0, seconds)
-                except (ValueError, TypeError, OverflowError):
-                    pass
+                code, retryable = 'remote_unavailable', False
+            retryable = retryable and header_allows_retry and exc.code not in (401, 403)
             raise ProtocolError(code, exc.code, retryable, retry_after=retry_after) from None
         except (urllib.error.URLError, http.client.IncompleteRead, TimeoutError, OSError):
             # Execution is unknown: detect may only replay the SAME frozen request.

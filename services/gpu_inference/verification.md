@@ -59,6 +59,25 @@ thresholds, execution concurrency and business retry count are unchanged.
 No GPU inference, production service change, NAS write, deployment or TTS change
 occurred. Hardware acceptance remains pending; TTS stays OFF.
 
+## Retry-After survives truncated error bodies — Q3
+
+A further real-wire regression confirmed that truncated HTTP 429/503 responses
+lost their already-received Retry-After policy. Before correction, a 10-second hint
+retried after about **0.524 seconds**; hints above the ten-second cap also resent.
+The client now parses known header constraints before reading the body and carries
+them into framing-unknown transport errors. Known 401/403 status remains
+nonretryable even when its body is truncated; complete malformed JSON also remains
+nonretryable.
+
+The unshortened real HTTP test waits at least **10 seconds**, then replays the exact
+request body/ID/hash/deadline and observes two sends but one computation. Truncated
+429/503 with Retry-After11, truncated 401/403, and complete malformed503 JSON each
+send once only. **54** full contract/HTTP tests pass, and the actual VM/native joint
+still reports eight frames/nine sends/eight computes and one completion.
+[Sanitized Q3 evidence](../../tests/evidence/gpu-queue-header-retry-20261108.json)
+contains the log digests. The fixed v1 policy and all resource/concurrency/deadline
+limits are unchanged. No hardware, production, deployment or TTS action occurred.
+
 ## Initial contract and HTTP checks (historical)
 
 `python3 -m unittest discover -s tests -p test_gpu_inference.py -v`: **19 tests pass**. Includes actual loopback HTTP transport using a clearly synthetic model fixture. No GPU claim comes from those mock-model tests. Compile check and `git diff --check` also pass.

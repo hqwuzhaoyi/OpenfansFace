@@ -519,6 +519,63 @@ class HTTPTests(unittest.TestCase):
                 self.assertEqual(sends, [req.request_hash, req.request_hash])
         self.assertEqual(self.model.calls, 2)
 
+    def test_wire_truncated_error_honors_real_ten_second_retry_after(self):
+        original_send, original_body = Handler._send, Handler._body
+        bodies, times, replies = [], [], []
+        def capture(handler):
+            body = original_body(handler)
+            if handler.path == '/v1/detect':
+                bodies.append(copy.deepcopy(body))
+                times.append(time.monotonic())
+            return body
+        def truncated(handler, status, value, retryable=False):
+            if status == 200 and 'context' in value:
+                replies.append(value)
+                if len(replies) == 1:
+                    handler.send_response(503)
+                    handler.send_header('Content-Type', 'application/json')
+                    handler.send_header('Content-Length', '100')
+                    handler.send_header('Retry-After', '10')
+                    handler.end_headers()
+                    handler.wfile.write(b'{"error":')
+                    handler.wfile.flush()
+                    handler.close_connection = True
+                    return
+            return original_send(handler, status, value, retryable)
+        req = request()
+        with patch.object(Handler, '_send', truncated), patch.object(Handler, '_body', capture):
+            self.assertEqual(self.client.detect(req).request_hash, req.request_hash)
+        self.assertEqual(bodies, [req.wire(), req.wire()])
+        self.assertGreaterEqual(times[1]-times[0], 10)
+        self.assertEqual(self.model.calls, 1)
+
+    def test_wire_truncated_error_cannot_bypass_header_stop_or_auth_status(self):
+        original = Handler._send
+        for error_status, hint, complete in [(429, '11', False), (503, '11', False),
+                                             (401, '10', False), (403, '10', False),
+                                             (503, '10', True)]:
+            sends = []
+            def bad_response(handler, status, value, retryable=False):
+                if status == 200 and 'context' in value:
+                    sends.append(value['request_hash'])
+                    if len(sends) == 1:
+                        data = b'{"error":'
+                        handler.send_response(error_status)
+                        handler.send_header('Content-Type', 'application/json')
+                        handler.send_header('Content-Length', str(len(data)) if complete else '100')
+                        handler.send_header('Retry-After', hint)
+                        handler.end_headers()
+                        handler.wfile.write(data)
+                        handler.wfile.flush()
+                        handler.close_connection = True
+                        return
+                return original(handler, status, value, retryable)
+            with self.subTest(status=error_status, complete=complete), patch.object(Handler, '_send', bad_response):
+                with self.assertRaises(ProtocolError) as failure:
+                    self.client.detect(request())
+                self.assertFalse(failure.exception.retryable)
+                self.assertEqual(len(sends), 1)
+
     def test_wire_complete_malformed_json_is_not_transport_retry(self):
         original = Handler._send
         sends = []

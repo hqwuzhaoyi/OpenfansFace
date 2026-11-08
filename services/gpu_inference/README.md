@@ -103,6 +103,8 @@ exact manifest; a policy change requires a new version and validation.
   retryable. Backoff starts at **0.5 s**, doubles to **4 s**, with **0.8–1.2** jitter
   (maximum **4.8 s**). HTTP 429/503 `Retry-After` seconds or date is a minimum delay
   when <=**10 s**; a larger hint ends this loop instead of retrying too early.
+  These known header constraints also apply when the error body is truncated;
+  truncation never turns a known 401/403 into a retryable transport error.
   An insufficient remaining deadline also ends retry. Cancellation is checked
   before sending, after receiving and during backoff; it never frees a GPU slot.
 - VM frames keep **60 seconds total**, clipped to the unchanged **600-second**
