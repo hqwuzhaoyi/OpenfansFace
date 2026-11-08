@@ -42,6 +42,14 @@ def late_case(kind='pure',crash=None,after_crash=None):
                 elif kind=='field_owner':db.execute("UPDATE asset SET field_owners='{\"name\":\"manual\"}' WHERE id=1001")
                 elif kind=='unexpected_reference':
                     db.execute('CREATE TABLE asset_search_manual_notes(asset_id INTEGER, note TEXT)');db.execute("INSERT INTO asset_search_manual_notes VALUES(1001,'keep user note')")
+                elif kind in ('uppercase_reference','mixed_reference','plural_reference'):
+                    column={'uppercase_reference':'ASSET_ID','mixed_reference':'Acquired_Asset_Id','plural_reference':'Asset_Ids'}[kind]
+                    db.execute(f'CREATE TABLE external_manual_notes("{column}" TEXT, note TEXT)')
+                    db.execute(f'INSERT INTO external_manual_notes("{column}",note) VALUES(?,?)',('1001','keep user evidence'))
+                elif kind=='fake_fts_reference':
+                    db.execute('DROP TABLE asset_search')
+                    db.execute('CREATE TABLE asset_search(asset_id INTEGER, name TEXT, code TEXT, entities TEXT, search_terms TEXT, note TEXT)')
+                    db.execute("INSERT INTO asset_search(asset_id,note) SELECT id,CASE WHEN id=1001 THEN 'keep user evidence' END FROM asset")
                 elif kind=='source_links':db.execute("INSERT INTO asset_entity(asset_id,entity_id,role,source) VALUES(1,7,'creator','new external link')")
                 elif kind=='receipt_signature':db.execute("UPDATE _face_admin_person_ops SET signature='changed' WHERE id=?",(op,))
                 elif kind=='foreign_key':db.execute("INSERT INTO asset_tag(asset_id,tag,source) VALUES(1001,'manual','user')")
@@ -91,7 +99,7 @@ def late_case(kind='pure',crash=None,after_crash=None):
 if __name__=='__main__':
     preview_isolates_one_collision()
     late_case()
-    for kind in ('manual','field_owner','foreign_key','non_fk','unexpected_reference','source_links','receipt_signature','source_changed','missing_receipt','committed_receipt','file_identity','before_reserve'):late_case(kind)
+    for kind in ('manual','field_owner','foreign_key','non_fk','unexpected_reference','uppercase_reference','mixed_reference','plural_reference','fake_fts_reference','source_links','receipt_signature','source_changed','missing_receipt','committed_receipt','file_identity','before_reserve'):late_case(kind)
     for phase in ('compensation_intent','compensation_ledger_fenced','compensation_file_restored'):late_case(crash=phase)
 
     for changed in ('remove_index','manual_reference'):late_case(crash='compensation_ledger_fenced',after_crash=changed)

@@ -55,7 +55,7 @@ fn index_only(
     // derived FTS index for a user reference; never write any of these tables.
     let tables = db::rows(
         conn,
-        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+        "SELECT name,sql FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
         [],
     )?;
     if tables.len() > 512 {
@@ -63,16 +63,19 @@ fn index_only(
     }
     for table in tables {
         let name = table["name"].as_str().ok_or_else(conflict)?;
-        if [
-            "asset_search",
-            "asset_search_data",
-            "asset_search_idx",
-            "asset_search_content",
-            "asset_search_docsize",
-            "asset_search_config",
-        ]
-        .contains(&name)
-        {
+        let definition = table["sql"]
+            .as_str()
+            .unwrap_or("")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_ascii_lowercase();
+        let is_derived_fts = name.eq_ignore_ascii_case("asset_search")
+            && definition.starts_with("create virtual table ")
+            && definition.split_once(" using ").is_some_and(|(_, module)| {
+                module.starts_with("fts5(") || module.starts_with("fts5 (")
+            });
+        if is_derived_fts {
             continue;
         }
         let columns = db::rows(conn, &format!("PRAGMA table_info({})", quoted(name)), [])?;
@@ -81,7 +84,8 @@ fn index_only(
         }
         for column in columns {
             let col = column["name"].as_str().ok_or_else(conflict)?;
-            if col == "asset_id" || col.ends_with("_asset_id") {
+            let semantic = col.to_ascii_lowercase();
+            if semantic == "asset_id" || semantic.ends_with("_asset_id") {
                 let exists: bool = conn.query_row(
                     &format!(
                         "SELECT EXISTS(SELECT 1 FROM {} c JOIN asset p ON p.id=c.{} WHERE p.id=?)",
@@ -94,7 +98,7 @@ fn index_only(
                 if exists {
                     return Err(conflict());
                 }
-            } else if col.contains("asset_ids") {
+            } else if semantic.contains("asset_ids") {
                 // An unfamiliar plural/JSON reference format is not absence proof.
                 return Err(conflict());
             }
