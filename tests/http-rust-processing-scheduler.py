@@ -222,6 +222,21 @@ try:
             fail(con, claimed_py2, '测试失败')
         finally:
             con.close()
+
+        # 9. Verify pure compute reference staging + Rust validation/publication + artifact check & GC
+        from processing_faces import build_references
+        ref_meta = build_references(x.base, x.media)
+        assert ref_meta['version'] and (x.base / 'processing/references.npz').is_file()
+
+        unaccepted_run = '99999999-9999-4999-8999-999999999999'
+        unaccepted_dir = x.base / 'processing/attempts' / unaccepted_run / 'thumbs'
+        unaccepted_dir.mkdir(parents=True, exist_ok=True)
+        (unaccepted_dir / 'leak.jpg').write_bytes(b'unaccepted')
+        chk = meta(x, 'processing-artifact-check', {'attempt': unaccepted_run, 'relative': 'thumbs/leak.jpg'})
+        assert chk['accepted'] is False
+        evicted = meta(x, 'processing-evict-artifacts', {'grace_seconds': 0})
+        assert unaccepted_run in evicted['evicted_attempts']
+        assert not (x.base / 'processing/attempts' / unaccepted_run).exists()
     finally:
         if old_env[0] is None:
             os.environ.pop('FILE_OPERATIONS_RUST_URL', None)

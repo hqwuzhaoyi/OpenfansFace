@@ -8,12 +8,14 @@ import sqlite3
 import shutil
 import subprocess
 import tempfile
+import uuid
 
 from watermark_worker import read_json, sample_times, validate_source
 from processing_store import connect
 from task_progress import stage_progress
 from processing_publication import attempt_directory, native, PublicationError
 from processing_gpu import backend, Detector, DETECTOR_SHA
+from processing_compute import RUNTIME, compute_write_guard
 
 FACE_VERSION = 'buffalo_l-det-rec-8frames-v1'
 MODEL_HASHES = {'det_10g.onnx': DETECTOR_SHA, 'w600k_r50.onnx': '4c06341c33c2ca1f86781dab0e829f88ad5b64be9fba56e56bc9ebdefc619e43'}
@@ -45,6 +47,9 @@ def cache_path(base, vid):
 
 def cached_features(base, task):
     import numpy as np
+    cache_check = task.get('_cache_check')
+    if isinstance(cache_check, dict) and cache_check.get('face_feature_valid') is False:
+        return None
     previous = json.loads(task.get('data', '{}')).get('face', {}).get('feature_cache')
     if not previous:
         return None
@@ -83,7 +88,7 @@ def save_npz(file, **data):
             os.unlink(temporary)
 
 
-def reference_features(base, vid, source):
+def reference_features(base, vid, source, accepted_receipts=None):
     """Only current legacy bytes or immutable, accepted same-file attempt features."""
     import numpy as np
     source = Path(source)
@@ -94,25 +99,36 @@ def reference_features(base, vid, source):
     except OSError:
         return []
     candidates = []
-    database = Path(base) / 'processing/processing.db'
-    if database.exists():
-        con = sqlite3.connect('file:' + str(database) + '?mode=ro', uri=True)
-        try:
-            if con.execute("SELECT 1 FROM sqlite_master WHERE name='_face_admin_processing_results'").fetchone():
-                for (raw,) in con.execute('SELECT result FROM _face_admin_processing_results ORDER BY rowid DESC'):
-                    receipt = json.loads(raw)
-                    if receipt.get('ok') is not True or receipt.get('accepted') is not True or receipt.get('vid') != vid:
-                        continue
-                    face = receipt.get('data', {}).get('face', {})
-                    cache = face.get('feature_cache')
-                    if not cache or not face.get('feature_cache_sha256'):
-                        continue
-                    file = Path(cache)
-                    if file.name != 'features.npz' or not file.resolve().is_relative_to((Path(base) / 'processing/attempts').resolve()):
-                        continue
-                    candidates.append((file, face['feature_cache_sha256'], face.get('source_identity') or receipt.get('source_identity') or {}))
-        finally:
-            con.close()
+    if isinstance(accepted_receipts, dict):
+        for item in accepted_receipts.get(vid, []):
+            cache = item.get('feature_cache')
+            expected = item.get('feature_cache_sha256')
+            if not cache or not expected:
+                continue
+            file = Path(cache)
+            if file.name != 'features.npz' or not file.resolve().is_relative_to((Path(base) / 'processing/attempts').resolve()):
+                continue
+            candidates.append((file, expected, item.get('source_identity') or {}))
+    else:
+        database = Path(base) / 'processing/processing.db'
+        if database.exists():
+            con = sqlite3.connect('file:' + str(database) + '?mode=ro', uri=True)
+            try:
+                if con.execute("SELECT 1 FROM sqlite_master WHERE name='_face_admin_processing_results'").fetchone():
+                    for (raw,) in con.execute('SELECT result FROM _face_admin_processing_results ORDER BY rowid DESC'):
+                        receipt = json.loads(raw)
+                        if receipt.get('ok') is not True or receipt.get('accepted') is not True or receipt.get('vid') != vid:
+                            continue
+                        face = receipt.get('data', {}).get('face', {})
+                        cache = face.get('feature_cache')
+                        if not cache or not face.get('feature_cache_sha256'):
+                            continue
+                        file = Path(cache)
+                        if file.name != 'features.npz' or not file.resolve().is_relative_to((Path(base) / 'processing/attempts').resolve()):
+                            continue
+                        candidates.append((file, face['feature_cache_sha256'], face.get('source_identity') or receipt.get('source_identity') or {}))
+            finally:
+                con.close()
     candidates.append((cache_path(base, vid), None, None))
     for file, expected, receipt_identity in candidates:
         accepted = receipt_identity is not None
@@ -159,30 +175,43 @@ def reference_features(base, vid, source):
     return []
 
 
-def build_references(base, root):
-    """Use unambiguous existing representative faces and coherent confirmed-video faces."""
+def compute_staged_references(base, root, state=None):
+    """Pure computation of reference templates staged into `processing/tmp/references-<uuid>.npz`."""
     import numpy as np
     base = Path(base)
-    input_version = native('analysis-state', {})['version']
-    report = read_json(base / 'report.json', {})
-    renames = read_json(base / 'person-renames.json', {})
-    assigned = {v['vid']: canonical_person(v['creator'], renames) for v in read_json(base / 'integration-queue.json', []) + read_json(base / 'archive-history.json', []) if v.get('file_state') != 'staged'}
+    root = Path(root)
+    state = state or {}
+    input_version = state.get('input_version')
+    report = state.get('report') if isinstance(state.get('report'), dict) else read_json(base / 'report.json', {})
+    renames = state.get('renames') if isinstance(state.get('renames'), dict) else read_json(base / 'person-renames.json', {})
+    if isinstance(state.get('assigned'), dict):
+        assigned = dict(state['assigned'])
+    else:
+        assigned = {
+            v['vid']: canonical_person(v['creator'], renames)
+            for v in read_json(base / 'integration-queue.json', []) + read_json(base / 'archive-history.json', [])
+            if v.get('file_state') != 'staged'
+        }
     con = sqlite3.connect('file:' + str(base / 'faces.db') + '?mode=ro', uri=True)
     try:
-        sources = dict(con.execute('SELECT vid,path FROM videos'))
-        sources.update(read_json(base / 'video-path-overrides.json', {}))
+        if isinstance(state.get('sources'), dict):
+            sources = dict(state['sources'])
+        else:
+            sources = dict(con.execute('SELECT vid,path FROM videos'))
+            sources.update(read_json(base / 'video-path-overrides.json', {}))
         columns = {row[1] for row in con.execute('PRAGMA table_info(faces)')}
         rows = con.execute('SELECT vid,score,emb,thumb FROM faces ORDER BY score DESC').fetchall() if 'emb' in columns else []
     finally:
         con.close()
-    processing_path = base / 'processing/processing.db'
-    if processing_path.exists():
-        queue = sqlite3.connect('file:' + str(processing_path) + '?mode=ro', uri=True)
-        try:
-            for vid, path in queue.execute('SELECT vid,path FROM tasks'):
-                sources.setdefault(vid, path)
-        finally:
-            queue.close()
+    if not isinstance(state.get('sources'), dict):
+        processing_path = base / 'processing/processing.db'
+        if processing_path.exists():
+            queue = sqlite3.connect('file:' + str(processing_path) + '?mode=ro', uri=True)
+            try:
+                for vid, path in queue.execute('SELECT vid,path FROM tasks'):
+                    sources.setdefault(vid, path)
+            finally:
+                queue.close()
     for vid, path in sources.items():
         file = mapped(path, root) or mapped(vid, root)
         prefix = str(root) + '/pikpak/creators/'
@@ -201,10 +230,11 @@ def build_references(base, root):
         name = assigned.get(vid)
         if name and score >= .7 and len(by_name.get(name, [])) < 200:
             by_name.setdefault(name, []).append(vector)
+    accepted_receipts = state.get('accepted_receipts') if isinstance(state.get('accepted_receipts'), dict) else None
     for vid, name in assigned.items():
         source = next((p for value in (sources.get(vid), vid) if (p := mapped(value, root)) and Path(p).is_file()), None)
         if source:
-            by_name.setdefault(name, []).extend(reference_features(base, vid, source))
+            by_name.setdefault(name, []).extend(reference_features(base, vid, source, accepted_receipts=accepted_receipts))
     anchors = {}
     for person in report.get('identities', []):
         vectors = by_thumb.get(person.get('rep_thumb'), [])
@@ -230,10 +260,58 @@ def build_references(base, root):
             names.append(name); vectors.append(center)
     matrix = np.stack(vectors).astype(np.float32) if vectors else np.zeros((0, 512), np.float32)
     version = hashlib.sha256(json.dumps(names, ensure_ascii=False).encode() + matrix.tobytes()).hexdigest()
-    if native('analysis-state', {})['version'] != input_version:
-        raise PublicationError('人物参考资料已变化，等待重新建立参考', 409)
-    save_npz(base / 'processing/references.npz', names=np.asarray(names, dtype=str), embeddings=matrix, version=version, input_version=input_version)
-    return dict(version=version, input_version=input_version, people=len(set(names)), templates=len(names))
+    staged_file = base / 'processing/tmp' / f'references-{uuid.uuid4()}.npz'
+    save_npz(staged_file, names=np.asarray(names, dtype=str), embeddings=matrix, version=version, input_version=input_version)
+    staged_sha256 = hashlib.sha256(staged_file.read_bytes()).hexdigest()
+    return dict(
+        staged_path=str(staged_file),
+        sha256=staged_sha256,
+        version=version,
+        input_version=input_version,
+        people=len(set(names)),
+        templates=len(names),
+    )
+
+
+def build_references(base, root):
+    """Use unambiguous existing representative faces and coherent confirmed-video faces."""
+    base = Path(base)
+    root = Path(root)
+    if os.environ.get('FILE_OPERATIONS_RUST_URL'):
+        state_resp = native('processing-reference-state', {})
+    else:
+        state_resp = native('analysis-state', {})
+
+    if isinstance(state_resp, dict) and 'assigned' in state_resp and 'input_version' in state_resp:
+        with compute_write_guard(base, root):
+            staged = compute_staged_references(base, root, state=state_resp)
+        published = native('processing-publish-references', staged)
+        return dict(
+            version=published['version'],
+            input_version=published['input_version'],
+            people=published['people'],
+            templates=published['templates'],
+        )
+
+    input_version = state_resp['version']
+    with compute_write_guard(base, root):
+        staged = compute_staged_references(base, root, state={'input_version': input_version})
+    staged_file = Path(staged['staged_path'])
+    try:
+        if native('analysis-state', {})['version'] != input_version:
+            raise PublicationError('人物参考资料已变化，等待重新建立参考', 409)
+        target = base / 'processing/references.npz'
+        target.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(staged_file, target)
+    finally:
+        if staged_file.exists():
+            staged_file.unlink()
+    return dict(
+        version=staged['version'],
+        input_version=input_version,
+        people=staged['people'],
+        templates=staged['templates'],
+    )
 
 
 
@@ -259,29 +337,19 @@ def capture_references(task, base, root):
 def extract_features(task, base, root, progress=None):
     import cv2
     import numpy as np
-    import onnxruntime as ort
-    from insightface.app import FaceAnalysis
     file = validate_source(task, root)
     existing = cached_features(base, task)
     if existing is not None:
         return existing, True, None
     if progress:
         progress.update(stage='加载人脸模型', done=None, total=None)
-    options = ort.SessionOptions(); options.intra_op_num_threads = 1; options.inter_op_num_threads = 1
     model_home = Path(os.environ.get('INSIGHTFACE_HOME', '/root/.insightface')) / 'models/buffalo_l'
-    model_hashes = {name: hashlib.sha256((model_home / name).read_bytes()).hexdigest() for name in ('det_10g.onnx', 'w600k_r50.onnx')}
-    if model_hashes != MODEL_HASHES:
-        raise ValueError('人脸模型内容与已登记版本不符，暂停该次分析')
-    remote = Detector(task, progress=progress) if backend() == 'gpu-detection' else None
-    if remote:
-        from insightface.model_zoo import get_model
-        recognition_path = Path(os.environ.get('INSIGHTFACE_HOME', '/root/.insightface')) / 'models/buffalo_l/w600k_r50.onnx'
-        recognizer = get_model(str(recognition_path), providers=['CPUExecutionProvider'], sess_options=options)
-        recognizer.prepare(ctx_id=-1)
-    else:
-        engine = FaceAnalysis(name='buffalo_l', root=os.environ.get('INSIGHTFACE_HOME', '/root/.insightface'),
-                              allowed_modules=['detection', 'recognition'], providers=['CPUExecutionProvider'], sess_options=options)
-        engine.prepare(ctx_id=-1, det_size=(640, 640))
+    mode = backend()
+    runtime = RUNTIME.get_face_runtime(mode, model_home, MODEL_HASHES)
+    model_hashes = runtime['model_hashes']
+    remote = Detector(task, progress=progress) if mode == 'gpu-detection' else None
+    recognizer = runtime['recognizer']
+    engine = runtime['engine']
     probe = subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'json', str(file)],
                            capture_output=True, text=True, timeout=30, check=True)
     duration = float(json.loads(probe.stdout)['format']['duration'])
@@ -344,6 +412,8 @@ def extract_features(task, base, root, progress=None):
     task['_feature_cache'] = str(feature_cache)
     task['_execution'] = remote.execution if remote else {'backend': 'cpu', 'detection_provider': 'CPUExecutionProvider', 'recognition_provider': 'CPUExecutionProvider'}
     task['_execution']['model_hashes'] = model_hashes
+    task['_execution']['resident_load_count'] = RUNTIME.face_load_count
+    task['_execution']['resident_tasks_run'] = RUNTIME.face_tasks_run
     if remote:
         task['_execution']['frames'] = remote.timings
     return result, False, successful
@@ -375,25 +445,36 @@ def analyze(task, base, root):
         coherent = vectors[similarities[seed] >= .55]
         if len(coherent) >= 2:
             center = coherent.mean(axis=0); center /= np.linalg.norm(center) + 1e-9
-            con = connect(base)
-            try:
-                con.execute('BEGIN IMMEDIATE')
-                handled = {r['vid'] for r in read_json(Path(base) / 'integration-queue.json', []) + read_json(Path(base) / 'archive-history.json', [])}
-                active = {json.loads(r['data']).get('face', {}).get('unknown_group') for r in con.execute("SELECT vid,data FROM tasks WHERE stage IN ('review','face') AND json_extract(data,'$.kind')='none'") if r['vid'] not in handled}
-                best = .60
-                for row in con.execute('SELECT * FROM face_groups WHERE version=?', (FACE_VERSION,)):
-                    if row['id'] not in active:
+            best = .60
+            active_groups = task.get('_active_face_groups')
+            if isinstance(active_groups, list):
+                for row in active_groups:
+                    emb = np.asarray(row.get('embedding', []), dtype=np.float32)
+                    if emb.shape != (512,):
                         continue
-                    score = float(center @ np.frombuffer(row['embedding'], np.float32))
+                    score = float(center @ emb)
                     if score >= best:
                         best, unknown_group = score, row['id']
-                if unknown_group is None:
-                    unknown_group = hashlib.sha256((task['vid'] + task['mtime_ns'] + FACE_VERSION).encode()).hexdigest()[:16]
-                # Group insertion and evidence visibility belong to native acceptance.
-                task['_unknown_group'] = {'id': unknown_group, 'version': FACE_VERSION, 'embedding': center.astype(np.float32).tolist()}
-                con.commit()
-            finally:
-                con.close()
+            else:
+                db_path = Path(base) / 'processing/processing.db'
+                if db_path.exists():
+                    con = sqlite3.connect('file:' + str(db_path) + '?mode=ro', uri=True)
+                    con.row_factory = sqlite3.Row
+                    try:
+                        handled = {r['vid'] for r in read_json(Path(base) / 'integration-queue.json', []) + read_json(Path(base) / 'archive-history.json', [])}
+                        active = {json.loads(r['data']).get('face', {}).get('unknown_group') for r in con.execute("SELECT vid,data FROM tasks WHERE stage IN ('review','face') AND json_extract(data,'$.kind')='none'") if r['vid'] not in handled}
+                        for row in con.execute('SELECT * FROM face_groups WHERE version=?', (FACE_VERSION,)):
+                            if row['id'] not in active:
+                                continue
+                            score = float(center @ np.frombuffer(row['embedding'], np.float32))
+                            if score >= best:
+                                best, unknown_group = score, row['id']
+                    finally:
+                        con.close()
+            if unknown_group is None:
+                unknown_group = hashlib.sha256((task['vid'] + task['mtime_ns'] + FACE_VERSION).encode()).hexdigest()[:16]
+            # Group insertion and evidence visibility belong to native acceptance.
+            task['_unknown_group'] = {'id': unknown_group, 'version': FACE_VERSION, 'embedding': center.astype(np.float32).tolist()}
     return dict(matches=matches[:5], face_count=len(features['embeddings']), cache_reused=reused,
                 sampled_frames=sampled, reference_version=version, reference_people=len(set(names)), version=FACE_VERSION,
                 unknown_group=unknown_group, unknown_group_input=task.get('_unknown_group'),

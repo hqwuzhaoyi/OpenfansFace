@@ -18,7 +18,7 @@ export async function GET(req: NextRequest) {
     const candidate = record?.candidates.find(c => c.key === key)
     if (!candidate || !/^[a-f0-9-]+\.jpg$/.test(candidate.evidence)) return new NextResponse(null, { status: 404 })
     const attempt=(record as typeof record & {artifact_attempt?:string})?.artifact_attempt
-    const file = attempt?acceptedAttemptFile(attempt,path.join('watermarks/evidence',candidate.evidence)):path.join(WATERMARK_DIR,'evidence',candidate.evidence)
+    const file = attempt?await acceptedAttemptFile(attempt,path.join('watermarks/evidence',candidate.evidence)):path.join(WATERMARK_DIR,'evidence',candidate.evidence)
     if(!file)return new NextResponse(null,{status:404})
     if (!attempt&&!fs.realpathSync(file).startsWith(fs.realpathSync(path.join(WATERMARK_DIR, 'evidence')) + path.sep)) return new NextResponse(null, { status: 404 })
     return new NextResponse(fs.readFileSync(file), { headers: { 'Content-Type': 'image/jpeg', 'Cache-Control': 'private, no-store' } })
