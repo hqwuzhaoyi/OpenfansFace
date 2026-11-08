@@ -939,6 +939,10 @@ pub struct DirectoryProof {
     pub temp: String,
     pub identity: serde_json::Value,
     pub parent: serde_json::Value,
+    /// Some means the filesystem lacks exclusive directory rename. The final
+    /// directory is observed for path stability, but is never ours to remove.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retained_destination: Option<serde_json::Value>,
 }
 /// Publish an owned empty directory without replacing a late arrival. Persist ownership
 /// before publication so restart can distinguish our directory from an external one.
@@ -946,6 +950,24 @@ pub fn create_directory(
     path: &str,
     previous: Option<DirectoryProof>,
     record: &mut impl FnMut(&str, &DirectoryProof) -> Result<()>,
+) -> Result<DirectoryProof> {
+    create_directory_with_publish(path, previous, record, &mut |parent, temp, name| {
+        rustix::fs::renameat_with(
+            parent,
+            temp,
+            parent,
+            name,
+            rustix::fs::RenameFlags::NOREPLACE,
+        )
+        .map_err(std::io::Error::from)
+    })
+}
+
+fn create_directory_with_publish(
+    path: &str,
+    previous: Option<DirectoryProof>,
+    record: &mut impl FnMut(&str, &DirectoryProof) -> Result<()>,
+    publish: &mut impl FnMut(&File, &str, &std::ffi::OsStr) -> std::io::Result<()>,
 ) -> Result<DirectoryProof> {
     let path = Path::new(path);
     let parent: File = directory(
@@ -964,10 +986,23 @@ pub fn create_directory(
             temp: format!(".face-dir-{}", uuid::Uuid::new_v4()),
             identity: serde_json::Value::Null,
             parent: identity(&parent.metadata()?),
+            retained_destination: None,
         };
         record("directory_create_intent", &proof)?;
         proof
     };
+    if let Some(observed) = &proof.retained_destination {
+        // Never turn an existing, unrecorded mkdir result into owned state on
+        // restart. Compensation may retain it, but execution cannot adopt it.
+        if observed.is_null() {
+            return Err(Error::conflict("目录创建结果尚未确认，保留目录并等待核对"));
+        }
+        require_retained_directory(&parent, path, observed)?;
+        inspect_owned_directory(&proof)?;
+        cleanup_directory_temp(&parent, &proof, record)?;
+        record("directory_published", &proof)?;
+        return Ok(proof);
+    }
     if proof.identity.is_null() {
         let owned = mutation(
             None,
@@ -1017,27 +1052,121 @@ pub fn create_directory(
                 return Err(Error::conflict("临时目录被替换"));
             }
             record("directory_publish_intent", &proof)?;
-            mutation(
+            let renamed = mutation(
                 None,
                 &proof.path,
                 "directory_publish",
                 &mut |phase| record(phase, &proof),
-                || {
-                    rustix::fs::renameat_with(
-                        &parent,
-                        proof.temp.as_str(),
-                        &parent,
-                        path.file_name().unwrap(),
-                        rustix::fs::RenameFlags::NOREPLACE,
-                    )?;
-                    parent.sync_all()
+                || match publish(&parent, proof.temp.as_str(), path.file_name().unwrap()) {
+                    Ok(()) => {
+                        parent.sync_all()?;
+                        Ok(true)
+                    }
+                    Err(error)
+                        if [
+                            rustix::io::Errno::INVAL.raw_os_error(),
+                            rustix::io::Errno::OPNOTSUPP.raw_os_error(),
+                            rustix::io::Errno::NOSYS.raw_os_error(),
+                        ]
+                        .contains(&error.raw_os_error().unwrap_or(0)) =>
+                    {
+                        Ok(false)
+                    }
+                    Err(error) => Err(error),
                 },
             )?;
+            if !renamed {
+                // mkdir is atomic and refuses any existing entry. Ordinary
+                // rename would overwrite a late empty directory and is unsafe.
+                proof.retained_destination = Some(serde_json::Value::Null);
+                record("directory_mkdir_retained_intent", &proof)?;
+                let observed = mutation(
+                    None,
+                    &proof.path,
+                    "directory_publish_mkdir",
+                    &mut |phase| record(phase, &proof),
+                    || {
+                        rustix::fs::mkdirat(
+                            &parent,
+                            path.file_name().unwrap(),
+                            Mode::from_raw_mode(0o777),
+                        )?;
+                        let dir: File = openat(
+                            &parent,
+                            path.file_name().unwrap(),
+                            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                            Mode::empty(),
+                        )?
+                        .into();
+                        dir.sync_all()?;
+                        parent.sync_all()?;
+                        Ok(dir)
+                    },
+                )?;
+                proof.retained_destination = Some(identity(&observed.metadata()?));
+                record("directory_mkdir_observed", &proof)?;
+                require_retained_directory(
+                    &parent,
+                    path,
+                    proof.retained_destination.as_ref().unwrap(),
+                )?;
+                inspect_owned_directory(&proof)?;
+                cleanup_directory_temp(&parent, &proof, record)?;
+            }
         }
         Err(e) => return Err(e.into()),
     }
     record("directory_published", &proof)?;
     Ok(proof)
+}
+
+fn require_retained_directory(
+    parent: &File,
+    path: &Path,
+    expected: &serde_json::Value,
+) -> Result<()> {
+    let current: File = openat(
+        parent,
+        path.file_name().unwrap(),
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?
+    .into();
+    if !same_inode(&identity(&current.metadata()?), expected) {
+        return Err(Error::conflict("兼容创建的目录已被替换，停止执行"));
+    }
+    Ok(())
+}
+
+fn cleanup_directory_temp(
+    parent: &File,
+    proof: &DirectoryProof,
+    record: &mut impl FnMut(&str, &DirectoryProof) -> Result<()>,
+) -> Result<()> {
+    let owned: File = match openat(
+        parent,
+        proof.temp.as_str(),
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd.into(),
+        Err(rustix::io::Errno::NOENT) => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    if !same_inode(&identity(&owned.metadata()?), &proof.identity) {
+        return Err(Error::conflict("临时目录被替换"));
+    }
+    mutation(
+        None,
+        &proof.path,
+        "directory_temp_remove",
+        &mut |phase| record(phase, proof),
+        || match unlinkat(parent, proof.temp.as_str(), AtFlags::REMOVEDIR) {
+            Ok(()) => parent.sync_all(),
+            Err(rustix::io::Errno::NOTEMPTY) => Ok(()),
+            Err(e) => Err(e.into()),
+        },
+    )
 }
 pub fn remove_owned_directory(
     proof: &DirectoryProof,
@@ -1049,6 +1178,11 @@ pub fn remove_owned_directory(
         return Err(Error::conflict("清理目录的父目录已变化"));
     }
     for name in [path.file_name().unwrap(), std::ffi::OsStr::new(&proof.temp)] {
+        if proof.retained_destination.is_some() && name == path.file_name().unwrap() {
+            // mkdir cannot supply a pre-publication inode proof. Never delete
+            // this directory, even when it appears empty after compensation.
+            continue;
+        }
         match openat(
             &parent,
             name,
@@ -1091,6 +1225,15 @@ pub fn inspect_owned_directory(proof: &DirectoryProof) -> Result<()> {
         return Err(Error::conflict("创建目录的父目录已变化"));
     }
     for name in [path.file_name().unwrap(), std::ffi::OsStr::new(&proof.temp)] {
+        let expected = if name == path.file_name().unwrap() {
+            match &proof.retained_destination {
+                Some(observed) if observed.is_null() => continue,
+                Some(observed) => observed,
+                None => &proof.identity,
+            }
+        } else {
+            &proof.identity
+        };
         match openat(
             &parent,
             name,
@@ -1099,9 +1242,7 @@ pub fn inspect_owned_directory(proof: &DirectoryProof) -> Result<()> {
         ) {
             Ok(fd) => {
                 let file: File = fd.into();
-                if proof.identity.is_null()
-                    || !same_inode(&identity(&file.metadata()?), &proof.identity)
-                {
+                if expected.is_null() || !same_inode(&identity(&file.metadata()?), expected) {
                     return Err(Error::conflict("创建目录缺少所有权证据或已变化"));
                 }
             }
@@ -1406,6 +1547,190 @@ impl PinnedDelete {
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn directory_fixture() -> std::path::PathBuf {
+        let root = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!("face-directory-{}", uuid::Uuid::new_v4()));
+        fs::create_dir(&root).unwrap();
+        root
+    }
+    fn unsupported_directory_publish(
+        _: &File,
+        _: &str,
+        _: &std::ffi::OsStr,
+    ) -> std::io::Result<()> {
+        Err(std::io::Error::from_raw_os_error(
+            rustix::io::Errno::INVAL.raw_os_error(),
+        ))
+    }
+    #[test]
+    fn directory_unsupported_rename_uses_atomic_mkdir_and_retains_final() {
+        let root = directory_fixture();
+        let target = root.join("new-person");
+        let proof = create_directory_with_publish(
+            target.to_str().unwrap(),
+            None,
+            &mut |_, _| Ok(()),
+            &mut unsupported_directory_publish,
+        )
+        .unwrap();
+        assert!(target.is_dir());
+        assert!(
+            proof
+                .retained_destination
+                .as_ref()
+                .is_some_and(|x| !x.is_null())
+        );
+        assert!(!root.join(&proof.temp).exists());
+        inspect_owned_directory(&proof).unwrap();
+        let resumed = create_directory_with_publish(
+            target.to_str().unwrap(),
+            Some(proof.clone()),
+            &mut |_, _| Ok(()),
+            &mut |_, _, _| panic!("must not republish"),
+        )
+        .unwrap();
+        assert_eq!(resumed.retained_destination, proof.retained_destination);
+        remove_owned_directory(&proof, &mut |_, _| Ok(())).unwrap();
+        assert!(target.is_dir());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn directory_fallback_never_replaces_late_empty_directory_or_symlink() {
+        for symlink in [false, true] {
+            let root = directory_fixture();
+            let target = root.join("new-person");
+            let foreign = root.join("foreign");
+            fs::create_dir(&foreign).unwrap();
+            let mut saved = None;
+            let result = create_directory_with_publish(
+                target.to_str().unwrap(),
+                None,
+                &mut |_, p| {
+                    saved = Some(p.clone());
+                    Ok(())
+                },
+                &mut |_, _, _| {
+                    if symlink {
+                        std::os::unix::fs::symlink(&foreign, &target).unwrap();
+                    } else {
+                        fs::create_dir(&target).unwrap();
+                    }
+                    unsupported_directory_publish(
+                        &File::open(&root).unwrap(),
+                        "",
+                        std::ffi::OsStr::new(""),
+                    )
+                },
+            );
+            assert!(result.is_err());
+            let before = fs::symlink_metadata(&target).unwrap().ino();
+            remove_owned_directory(&saved.unwrap(), &mut |_, _| Ok(())).unwrap();
+            assert_eq!(before, fs::symlink_metadata(&target).unwrap().ino());
+            assert_eq!(
+                fs::symlink_metadata(&target)
+                    .unwrap()
+                    .file_type()
+                    .is_symlink(),
+                symlink
+            );
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+    #[test]
+    fn directory_fallback_crash_gap_never_adopts_or_removes_unproved_final() {
+        let root = directory_fixture();
+        let target = root.join("new-person");
+        let mut saved = None;
+        let result = create_directory_with_publish(
+            target.to_str().unwrap(),
+            None,
+            &mut |phase, p| {
+                saved = Some(p.clone());
+                if phase == "filesystem_mutation_resolved"
+                    && p.retained_destination.as_ref().is_some_and(|x| x.is_null())
+                {
+                    return Err(Error::conflict("fixture journal interruption"));
+                }
+                Ok(())
+            },
+            &mut unsupported_directory_publish,
+        );
+        assert!(result.is_err());
+        assert!(target.is_dir());
+        let proof = saved.unwrap();
+        assert!(
+            create_directory(
+                target.to_str().unwrap(),
+                Some(proof.clone()),
+                &mut |_, _| Ok(())
+            )
+            .is_err()
+        );
+        inspect_owned_directory(&proof).unwrap();
+        remove_owned_directory(&proof, &mut |_, _| Ok(())).unwrap();
+        assert!(target.is_dir());
+        assert!(!root.join(&proof.temp).exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn directory_io_uncertainty_does_not_enable_fallback() {
+        let root = directory_fixture();
+        let target = root.join("new-person");
+        let mut saved = None;
+        let error = create_directory_with_publish(
+            target.to_str().unwrap(),
+            None,
+            &mut |_, p| {
+                saved = Some(p.clone());
+                Ok(())
+            },
+            &mut |_, _, _| {
+                Err(std::io::Error::from_raw_os_error(
+                    rustix::io::Errno::IO.raw_os_error(),
+                ))
+            },
+        )
+        .unwrap_err();
+        assert!(error.mutation_outcome.is_some());
+        assert!(saved.unwrap().retained_destination.is_none());
+        assert!(!target.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+    #[test]
+    fn directory_retained_resume_rejects_missing_or_replaced_destination() {
+        let root = directory_fixture();
+        let target = root.join("new-person");
+        let proof = create_directory_with_publish(
+            target.to_str().unwrap(),
+            None,
+            &mut |_, _| Ok(()),
+            &mut unsupported_directory_publish,
+        )
+        .unwrap();
+        fs::rename(&target, root.join("original")).unwrap();
+        assert!(
+            create_directory(
+                target.to_str().unwrap(),
+                Some(proof.clone()),
+                &mut |_, _| Ok(())
+            )
+            .is_err()
+        );
+        fs::create_dir(&target).unwrap();
+        fs::write(target.join("foreign"), b"preserve").unwrap();
+        assert!(
+            create_directory(
+                target.to_str().unwrap(),
+                Some(proof.clone()),
+                &mut |_, _| Ok(())
+            )
+            .is_err()
+        );
+        remove_owned_directory(&proof, &mut |_, _| Ok(())).unwrap();
+        assert_eq!(fs::read(target.join("foreign")).unwrap(), b"preserve");
+        fs::remove_dir_all(root).unwrap();
+    }
     fn fixture() -> (Config, FileMove, MoveScope) {
         let root = fs::canonicalize("/tmp").unwrap().join(format!(
             "face-admin-person-fileops-shared-{}",
