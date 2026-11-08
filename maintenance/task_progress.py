@@ -1,4 +1,5 @@
 """Atomic, restart-visible progress records; separate from evidence and task decisions."""
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -8,11 +9,13 @@ import uuid
 
 
 class TaskProgress:
-    def __init__(self, base, kind, title, current=None, vid=None, job_id=None, attach=False):
-        self.file = Path(base) / 'jobs' / (kind + '.json')
+    def __init__(self, base, kind, title, current=None, vid=None, job_id=None, attach=False, isolated=False):
+        identifier = job_id or str(uuid.uuid4())
+        self.file = (Path(base) / 'jobs' / 'stages' / (hashlib.sha256(identifier.encode()).hexdigest() + '.json')
+                     if isolated else Path(base) / 'jobs' / (kind + '.json'))
         self.file.parent.mkdir(parents=True, exist_ok=True)
         now = time.time()
-        self.data = dict(id=job_id or str(uuid.uuid4()), kind=kind, title=title, status='running',
+        self.data = dict(id=identifier, kind=kind, title=title, status='running',
                          stage='准备中', current=current, vid=vid, done=None, total=None, unit='', failed=0,
                          started_at=now, updated_at=now, heartbeat_at=now, href='/')
         if attach:
@@ -54,4 +57,5 @@ class TaskProgress:
 def stage_progress(task, base, attach=True):
     kind = task['stage']
     return TaskProgress(base, kind, '提取水印' if kind == 'text' else '人脸分析',
-                        current=task.get('name'), vid=task['vid'], job_id=task.get('_progress_id'), attach=attach)
+                        current=task.get('name'), vid=task['vid'], job_id=task.get('_progress_id') or task.get('run_id'), attach=attach,
+                        isolated=bool(task.get('_progress_id') or task.get('run_id')))

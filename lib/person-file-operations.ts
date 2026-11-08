@@ -18,6 +18,7 @@ import { personLedger } from './person-file-ledger'
 import { mergedDirectoryPaths } from './person-merge-paths'
 import { personVideoExtension } from './person-library-stats'
 import { requireMovePermissions, requireWritableDirectory } from './file-permissions'
+import { claimFileOperation } from './file-operation-routing'
 import type { PersonFileRequest, PersonFilePlan, PersonFileMove, PersonFileResult } from './person-file-model'
 
 const operationsRoot=path.join(BASE,'person-operations')
@@ -69,6 +70,7 @@ export async function previewPersonFiles(body:PersonFileRequest):Promise<PersonF
   if(!['rename-file','move-files','delete-files','rename-person','merge-person','delete-person'].includes(body.action))throw new ReviewError('请选择文件操作')
   const id=body.id||randomUUID()
   if(!/^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/i.test(id))throw new ReviewError('操作编号无效')
+  claimFileOperation(BASE,id,body.action,'legacy')
   const person=canonicalPersonName(validName(body.person)),sourceRoot=guardedPath(personDirectory(person),CREATORS,true)
   guardedPath(CREATORS,MEDIA2)
   const catalog=await libraryPeople()
@@ -205,6 +207,7 @@ function applyDatabase(db:Database.Database,plan:PersonFilePlan){
 
 export async function applyPersonFiles(request:PersonFileRequest,version:string,lockHeld=false):Promise<PersonFileResult> {
   if(!request||!request.id||!/^[a-f0-9-]{36}$/i.test(request.id)||typeof version!=='string')throw new ReviewError('请先预览操作')
+  claimFileOperation(BASE,request.id,request.action,'legacy')
   const journal=path.join(operationsRoot,request.id,'operation.json')
   const release=lockHeld?()=>{}:acquireReviewLock();let keepLock=false,db:Database.Database|undefined
   let moved:{file:PersonFileMove;after:string}[]=[],created:string[]=[],written:{file:string;before:string|null;after:string}[]=[],plan:PersonFilePlan|undefined,ledgerState='absent'

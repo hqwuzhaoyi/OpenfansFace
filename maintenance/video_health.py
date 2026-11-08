@@ -1,4 +1,4 @@
-"""Scheduled, read-only media inspection. Only publishes reversible UI visibility metadata."""
+"""Read-only historical policy helpers. Publishing and the old timer are retired."""
 import argparse, collections, datetime as dt, fcntl, json, os, sqlite3, stat, subprocess, tempfile, time
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -17,14 +17,9 @@ def read_json(path, fallback):
     try: return json.loads(path.read_text())
     except FileNotFoundError: return fallback
 
-def publish(path, value):
-    fd, tmp = tempfile.mkstemp(prefix='.'+path.name+'-', dir=path.parent)
-    try:
-        with os.fdopen(fd, 'w') as out:
-            json.dump(value, out, ensure_ascii=False); out.flush(); os.fsync(out.fileno())
-        os.chmod(tmp, 0o644); os.replace(tmp, path)
-    finally:
-        if os.path.exists(tmp): os.unlink(tmp)
+def publish(*args, **kwargs):
+    raise RuntimeError('Native Rust owns video health; legacy publication is disabled')
+
 
 def next_run(now):
     local = now.astimezone(ZoneInfo('Asia/Shanghai'))
@@ -118,74 +113,9 @@ def inventory(base):
     ids=set(sources)|review|{v['vid'] for v in queue+history}
     return sources, review, archived, ids
 
-def run(base, root, expected_source, budget=300, fixture=False, now=None, seconds=1200):
-    now=now or dt.datetime.now(UTC)
-    deadline=time.monotonic()+seconds
-    target=base/'video-health.json'; previous=read_json(target,{'schema':1,'records':{}})
-    summary={**previous, 'schema':1, 'started_at':timestamp(now), 'completed_at':None, 'next_run_at':next_run(now),
-             'schedule':'每天 03:30（北京时间）', 'status':'running', 'policy':dict(checks=3, minimum_hours=40, delete_files=False)}
-    publish(target,summary)
-    try:
-        check_mount(root,expected_source,fixture)
-        sources, review, archived, ids=inventory(base)
-        reports=read_json(base/'video-health-reports.json',{})
-        current={vid:resolve(vid,sources.get(vid),archived.get(vid,{}).get('win_dst'),root) for vid in sorted(ids)}
-        missing=sum(r['status'] in DEFINITIVE for r in current.values())
-        if ids and missing > max(50,len(ids)*.2): raise RuntimeError('异常数量突然偏多，本轮只记录检查失败，不自动收起')
-        old_records=previous.get('records',{}); records={}; candidates=[]
-        for vid, item in current.items():
-            before=old_records.get(vid,{})
-            same=all(before.get(k)==item.get(k) for k in ['path','size','mtime_ns'])
-            item.update(vid=vid,in_review=vid in review)
-            if item['status']=='present':
-                report=reports.get(vid,{})
-                reported=report.get('last_reported_at','') if not report.get('path') or report['path']==item['path'] else ''
-                fresh_report=parse_time(reported)>parse_time(before.get('last_probed_at'))
-                due=not same or before.get('status') in DEFINITIVE|{'unavailable','unmapped'} or (now-parse_time(before.get('last_probed_at'))).days>=30 or fresh_report
-                if due:
-                    # User-reported failures first, then current review videos, then older media.
-                    active=vid in review and not item['path'].startswith(str(root)+'/pikpak/creators/')
-                    candidates.append((0 if fresh_report else 1 if before.get('status') in DEFINITIVE else 2 if active else 3, before.get('last_probed_at',''),vid))
-                    if same and before.get('last_probed_at'):
-                        records[vid]={**before,'in_review':vid in review}
-                    else: records[vid]={**item,'status':'unchecked','hidden':False,'consecutive':0}
-                else: records[vid]={**before,'in_review':vid in review}
-            else: records[vid]=transition(before,item,now)
-        probed=0
-        for _,_,vid in sorted(candidates)[:budget]:
-            if time.monotonic()>=deadline: break
-            original=current[vid]; before=old_records.get(vid,{})
-            result=probe(original['path'])
-            # A concurrent archive/rename invalidates the probe; never quarantine that stale path.
-            after=resolve(vid,sources.get(vid),archived.get(vid,{}).get('win_dst'),root)
-            if any(original.get(k)!=after.get(k) for k in ['path','size','mtime_ns']):
-                result=dict(status='unavailable',detail='检查期间路径或文件发生变化，等待下次复查')
-            report=reports.get(vid,{})
-            if result['status']=='healthy' and report and (not report.get('path') or report['path']==original['path']) and (now-parse_time(report.get('last_reported_at'))).days<30:
-                result.update(status='playback_warning',detail='曾报告播放失败，本次视频结构检查通过；需核对网络或手机兼容性')
-            records[vid]=transition(before,{**original,**result,'last_probed_at':timestamp(now)},now)
-            probed+=1
-        check_mount(root,expected_source,fixture)
-        summary.update(status='complete',records=records,last_success_at=timestamp(now),probed=probed,
-            waiting=max(0,len(candidates)-probed),counts=dict(collections.Counter(r['status'] for r in records.values())),
-            hidden=sum(bool(r.get('hidden')) for r in records.values()),total=len(records))
-        summary.pop('error',None)
-    except Exception as error:
-        summary.update(status='skipped',error=str(error)[:500])
-    summary['completed_at']=timestamp()
-    publish(target,summary)
-    print(json.dumps({k:v for k,v in summary.items() if k!='records'},ensure_ascii=False))
-    return summary
+def run(*args, **kwargs):
+    raise RuntimeError('Native Rust owns video health; legacy publication is disabled')
+
 
 if __name__=='__main__':
-    parser=argparse.ArgumentParser();parser.add_argument('--base',type=Path,default=Path(os.environ.get('FACES_BASE','/data/base')))
-    parser.add_argument('--root',type=Path,default=Path(os.environ.get('MEDIA2_ROOT','/mnt/media2')));parser.add_argument('--budget',type=int,default=300)
-    parser.add_argument('--expected-source',default=os.environ.get('MEDIA_NFS_SOURCE',''));parser.add_argument('--fixture',action='store_true')
-    parser.add_argument('--seconds',type=int,default=1200)
-    args=parser.parse_args()
-    if args.budget<0 or args.budget>1000: parser.error('budget must be 0..1000')
-    with open(args.base/'.video-health.lock','w') as lock:
-        try: fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
-        except BlockingIOError: raise SystemExit('video health scan already running')
-        result=run(args.base,args.root,args.expected_source,args.budget,args.fixture,seconds=args.seconds)
-    raise SystemExit(0 if result['status']=='complete' else 1)
+    raise SystemExit('Native Rust owns video health. Disable the legacy timer; use VIDEO_HEALTH_ENABLED=1 on the Rust service.')

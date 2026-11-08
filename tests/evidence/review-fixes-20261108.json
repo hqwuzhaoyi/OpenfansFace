@@ -1,0 +1,37 @@
+{
+  "scope": "Code-review fixes only; marked isolated files, SQLite, HTTP and browser",
+  "reviewed_base": "0b7a0197d59dccf4b4e1483d270898bbb5056724",
+  "controller_base": "115d88c2ebe06b6660bfbb8c1bc3cb35f9d877b7",
+  "findings": {
+    "S1": "Unsupported dashboard schema immediately disables pause/retry/concurrency, including an already open settings dialog; prior snapshot retained; zero mutation requests observed",
+    "S2": "Closing dashboard dialog immediately inert, including shared close button; keyboard focus restored to trigger",
+    "S3": "Statistics and batch icon buttons retain matching accessible names and hover titles",
+    "S4": "Native HTTP mechanics shared; thin domain adapters retain policy/receipt validation; HTTP 202 cannot become synchronous completion; structured errors preserved",
+    "P1": "Real claim/fail transitions exhaust three face attempts; delivered confirm/note/defer remain valid; fresh snapshots retain ready face-error evidence; text-error/no-ready rows not revived; file/rule/manual/disposition changes still rejected",
+    "P2": "Browser confirmation followed by manual refresh and by 120-second idle refresh both undo through originating session; actual HTTP rejects old undo after another session confirms",
+    "P3": "Legacy rename and forced copy preserve cache-only reference; genuine accepted cache survives forced archive copy then another native rename; unrelated completed receipt leaves used proof version unchanged; pending/failed/recovery/rolled-back journals, wrong model, tampered cache and same-size/mtime inode replacement rejected",
+    "P4": "Legacy staging state and nested result/job states checked before acknowledgements; running/recovery/unknown outcomes remain blockers",
+    "S5": "Complete inode/token/hash ownership receipt durable before exclusive shared hard-link publication; receipt/link/directory interruption windows and post-unlink recovery verified",
+    "R1": "Marker and ownership-receipt FIFO/symlink/oversize/corruption fail within one second; foreign objects remain untouched"
+  },
+  "verification": {
+    "rust_tests": 72,
+    "node_targeted_tests": 15,
+    "controller_tests": 24,
+    "processing_tests": 36,
+    "health_retirement_tests": 3,
+    "watermark_tests": 7,
+    "http": ["rust-review-continuity", "rust-archive", "rust-shared-metadata", "rust-reference-relocation rename", "rust-reference-relocation forced-copy", "processing-native-worker joint forced-copy and chained rename"],
+    "typescript_and_production_build": "passed",
+    "browser": {
+      "served": "isolated optimized Next build and Rust service on 127.0.0.1",
+      "dashboard": "desktop plus 390px viewport with scrollWidth=390; keyboard and reduced-motion animationDuration=0s; focus restored; full dialog inert during exit",
+      "review": "actual 8-second fixture video playing, paused=false; confirmation after exhausted face retries; manual and idle refresh then successful origin-session Undo",
+      "raw_artifacts": "/tmp/openfansface-rust-implementation/context/review-fixes-browser-undo.json and review-fixes-dashboard-*.png"
+    },
+    "docker_controller": "Actual marked local Docker bootstrap, replacement, partial failure, owned-fence recovery, compatible rollback, historical receipt continuity and schema-downgrade refusal passed; protocol peers and GPU health simulated; cached native image source remains 13fc3bf"
+  },
+  "not_accepted": ["full 640 GPU benchmark and coexistence", "actual WSL worker isolation", "production host permissions/capacity", "final production read-only parity", "production cutover"],
+  "production_writes": false,
+  "pushed_or_deployed": false
+}

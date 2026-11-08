@@ -1,6 +1,6 @@
 'use client'
-import { createContext, useContext, useEffect, useState, type ReactNode } from 'react'
-import { MotionConfig, motion, useIsPresent, useReducedMotion } from 'motion/react'
+import { createContext, useContext, useEffect, useState, useSyncExternalStore, type ReactNode } from 'react'
+import { MotionConfig, motion, useIsPresent } from 'motion/react'
 import { EASE_OUT } from '@/lib/beui/ease'
 
 const InteractionContext=createContext(false)
@@ -14,8 +14,13 @@ export function WorkbenchMotion({children}:{children:ReactNode}){
   },[])
   return <InteractionContext.Provider value={keyboard}><MotionConfig reducedMotion="user">{children}</MotionConfig></InteractionContext.Provider>
 }
+function subscribeReducedMotion(onChange:()=>void){
+  const media=window.matchMedia('(prefers-reduced-motion: reduce)')
+  media.addEventListener('change',onChange)
+  return()=>media.removeEventListener('change',onChange)
+}
 export function useWorkbenchMotion(){
-  const keyboard=useContext(InteractionContext),reduce=useReducedMotion()
+  const keyboard=useContext(InteractionContext),reduce=useSyncExternalStore(subscribeReducedMotion,()=>window.matchMedia('(prefers-reduced-motion: reduce)').matches,()=>false)
   return {instant:keyboard||!!reduce,mode:keyboard?'keyboard':reduce?'reduced':'pointer'}
 }
 export function WorkbenchStep({children,phase,className}:{children:ReactNode;phase:string;className?:string}){

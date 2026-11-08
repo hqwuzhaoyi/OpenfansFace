@@ -15,9 +15,11 @@ export interface ConflictVideo extends ReviewVideo {
 }
 const sizeText = (n?: number) => n === undefined ? '未读取' : `${(n / 2**20).toFixed(2)} MiB`
 
-export function ArchiveResolutionDialog({ rows, version, onClose, onSaved }: {
+export function ArchiveResolutionDialog({ rows, version, onClose, onSaved, fallbackFocus }: {
   rows: ConflictVideo[]; version: string; onClose: () => void; onSaved: (vids: string[]) => Promise<void>
+  fallbackFocus?: React.RefObject<HTMLElement | null>
 }) {
+  const [trigger] = useState(() => typeof document !== 'undefined' && document.activeElement instanceof HTMLElement ? document.activeElement : null)
   const [kind, setKind] = useState(''), [name, setName] = useState(rows[0]?.resolution?.kind === 'rename' ? rows[0].resolution.name : rows[0]?.suggested_name || '')
   const [saving, setSaving] = useState(false), [error, setError] = useState('')
   const [playing, setPlaying] = useState<ReviewVideo | null>(null)
@@ -31,7 +33,7 @@ export function ArchiveResolutionDialog({ rows, version, onClose, onSaved }: {
     } catch(e) { setError((e as Error).message) } finally { setSaving(false) }
   }
   return <><Dialog open onOpenChange={open=>!open&&!saving&&onClose()}>
-    <ResponsiveDialogContent open className="flex max-h-[90dvh] flex-col gap-0 overflow-hidden p-0 sm:max-w-2xl sm:p-0" onInteractOutside={e=>saving&&e.preventDefault()} onEscapeKeyDown={e=>saving&&e.preventDefault()} showCloseButton={!saving}>
+    <ResponsiveDialogContent open onCloseAutoFocus={event => { event.preventDefault(); const target = trigger; requestAnimationFrame(() => { if (target?.isConnected && !target.matches(':disabled')) target.focus(); else fallbackFocus?.current?.focus() }) }} className="flex max-h-[90dvh] flex-col gap-0 overflow-hidden p-0 sm:max-w-2xl sm:p-0" onInteractOutside={e=>saving&&e.preventDefault()} onEscapeKeyDown={e=>saving&&e.preventDefault()} showCloseButton={!saving}>
       <DialogHeader className="shrink-0 border-b p-4 pr-14 text-left"><DialogTitle>处理同名文件 · {rows.length} 个</DialogTitle><DialogDescription>先选择处理方式，再回待归档执行。本步只保存选择，文件还不会移动。</DialogDescription></DialogHeader>
       <div data-sheet-scroll className="min-h-0 flex-1 space-y-5 overflow-y-auto p-4">
         <details className="rounded-xl border p-3"><summary className="min-h-11 cursor-pointer break-all text-sm font-medium">{rows.length===1?rows[0].name:`核对这 ${rows.length} 个视频的路径和内容`}<span className="mt-1 block text-xs font-normal text-muted-foreground">点开查看源文件和目标文件，也可以分别播放。</span></summary><div className="mt-3 space-y-3">{rows.map(r=><details key={r.vid} open={rows.length === 1} className="rounded-xl border p-3">

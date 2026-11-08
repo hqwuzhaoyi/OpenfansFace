@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "purpose": "retain-production-cpu",
+  "release_id": "FREEZE_SAME_RELEASE_ID",
+  "user_decision": {
+    "path": "/PRIVATE/retained-cpu-user-decision.json",
+    "sha256": "FREEZE_SHA256"
+  },
+  "verification": {
+    "path": "/PRIVATE/cpu-isolated-verification.json",
+    "sha256": "FREEZE_SHA256"
+  },
+  "source_manifest": {
+    "path": "/PRIVATE/cpu-source-manifest.json",
+    "sha256": "FREEZE_SHA256"
+  },
+  "verified_worker_sources": {
+    "processing_worker.py": "FREEZE_VERIFIED_SOURCE_SHA256",
+    "processing_faces.py": "FREEZE_VERIFIED_SOURCE_SHA256",
+    "processing_gpu.py": "FREEZE_VERIFIED_SOURCE_SHA256",
+    "watermark_worker.py": "FREEZE_VERIFIED_SOURCE_SHA256",
+    "processing_publication.py": "FREEZE_VERIFIED_SOURCE_SHA256"
+  },
+  "worker_configuration": {
+    "image": "sha256:FREEZE_CANDIDATE_IMAGE",
+    "image_config_sha256": "FREEZE_CONFIG_SHA256",
+    "create_args_sha256": "FREEZE_ARGS_SHA256",
+    "env_files": {
+      "/PRIVATE/cpu-worker.env": "FREEZE_ENV_FILE_SHA256"
+    },
+    "cpu_limit": 1,
+    "memory_bytes": 1610612736,
+    "concurrency": 1,
+    "backend": "cpu",
+    "effective_environment_sha256": "FREEZE_EFFECTIVE_ENV_SHA256"
+  }
+}

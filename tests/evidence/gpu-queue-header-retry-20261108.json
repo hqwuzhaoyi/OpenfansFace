@@ -1,0 +1,36 @@
+{
+  "date": "2026-11-08",
+  "scope": "Q3 response-header policy correction; isolated HTTP and native fixtures only",
+  "base_revision": "52e4b32eeeb04ba997cedf44ad90a24b9b6b6a35",
+  "before": {
+    "retry_after_seconds": 10,
+    "observed_retry_seconds": 0.5241367919999997,
+    "oversized_hint_and_auth_resends": true
+  },
+  "after": {
+    "real_http_retry_after_10_minimum_asserted": true,
+    "same_request_body_id_hash_deadline": true,
+    "sends": 2,
+    "computations": 1,
+    "truncated_429_and_503_with_retry_after_11": "no resend",
+    "truncated_401_and_403": "nonretryable; no resend",
+    "complete_malformed_503_json": "nonretryable; no resend"
+  },
+  "checks": {
+    "gpu_contract_http_tests": 54,
+    "q3_real_wire_regressions": 2,
+    "actual_worker_native_joint": "pass",
+    "compileall": "pass",
+    "diff_check": "pass"
+  },
+  "log_sha256": {
+    "gpu-queue-q3-contract.log": "f78ee6022316e6008aaa9b213545643d7c41d966a3b7cfb863dad47c9fd1b01b",
+    "gpu-queue-q3-before.log": "2ccdd25035a4ad850aee577bfe59b2397832733094f72ea4d1099555f3c5ff10",
+    "gpu-queue-q3-native.log": "511e23933aac9780746da79dc2fd55d6a29cfc2ab430cb02c077ff867e295ac5",
+    "gpu-queue-q3-after.log": "63516d9ce1458430d4111bca07911c01cc24a7c7194a77e982d432c38ca4518d"
+  },
+  "policy_changed": false,
+  "hardware_inference_run": false,
+  "production_changes": false,
+  "tts_changed": false
+}

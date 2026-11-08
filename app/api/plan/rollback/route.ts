@@ -1,32 +1,7 @@
-import { NextRequest, NextResponse } from "next/server"
-import fs from "fs"
-import { MANIFESTS_D } from "@/lib/env"
-import { peachExec } from "@/lib/peach"
+import { NextResponse } from 'next/server'
 
-export async function POST(req: NextRequest) {
-  const mf = ((await req.json()).manifest as string) || ""
-  if (!mf.startsWith(MANIFESTS_D) || !fs.existsSync(/*turbopackIgnore: true*/ mf)) return NextResponse.json({ error: "bad manifest" }, { status: 400 })
-  const m = JSON.parse(fs.readFileSync(/*turbopackIgnore: true*/ mf, "utf8"))
-  let undone = 0
-  for (const mv of [...(m.moves || [])].reverse()) {
-    if (fs.existsSync(/*turbopackIgnore: true*/ mv.dst)) {
-      try { fs.renameSync(/*turbopackIgnore: true*/ mv.dst, mv.src); undone++ } catch { }
-    }
-  }
-  if (m.ledger) {
-    const rows = m.ledger.map((x: any) => ({ from: x.to, to: x.from }))
-    const data = JSON.stringify(rows)
-    const script = `import json, sqlite3, pathlib
-rows = json.loads(pathlib.Path('/tmp/rr.json').read_text())
-con = sqlite3.connect('/data/database/ledger.db', timeout=120)
-n = 0
-for r in rows:
-    n += con.execute("UPDATE asset SET path=? WHERE path=?", (r['to'], r['from'])).rowcount
-con.commit()
-print(n)`
-    const b64 = Buffer.from(data).toString("base64")
-    const up = await peachExec(`import pathlib,base64; pathlib.Path('/tmp/rr.json').write_bytes(base64.b64decode('${b64}'))`)
-    if (up.code === 0) await peachExec(script)
-  }
-  return NextResponse.json({ ok: true, undone })
+// Old manifests lack the native before-image and ownership proof required to recover.
+// Historical receipts remain readable; never replay overwrite-capable legacy moves.
+export async function POST() {
+  return NextResponse.json({ error: '旧版回滚执行入口已退役；请按原操作编号核对回执并使用原生恢复流程', code: 'legacy_writer_retired' }, { status: 410 })
 }

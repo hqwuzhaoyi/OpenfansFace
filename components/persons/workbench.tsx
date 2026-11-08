@@ -20,8 +20,8 @@ import { WorkbenchButton as Button, WorkbenchInput as Input, WorkbenchBadge as B
 import { PersonSearch } from './person-search'
 import { PeopleActionDialog } from './people-actions'
 import type { PersonBatchAction, PersonBatchResult } from '@/lib/person-batch-model'
-import { FileActionDialog, type FileActionSelection } from './file-actions'
-import type { PersonFileAction, PersonFileResult } from '@/lib/person-file-model'
+import { FileActionDialog, FILE_OPERATION_STORAGE_KEY, type FileActionSelection } from './file-actions'
+import type { PersonFileAction, PersonFileResult, PersonFilePlan } from '@/lib/person-file-model'
 import { FolderInput, Merge } from 'lucide-react'
 import { sortedLibraryPeople, type PersonSort } from '@/lib/person-list-model'
 import './tokens.css'
@@ -46,7 +46,10 @@ function PersonWorkbenchContent({initialName=''}:{initialName?:string}) {
   const [tab,setTab]=useState<'owned'|'queued'>('owned'),[folder,setFolder]=useState('*'),[query,setQuery]=useState(''),[descending,setDescending]=useState(false)
   const [selected,setSelected]=useState<string[]>([]),[limit,setLimit]=useState(60),[recommendationLimit,setRecommendationLimit]=useState(20)
   const [later,setLater]=useState<string[]>([]),[mobile,setMobile]=useState<'people'|'library'|'suggestions'>('library')
-  const [fileAction,setFileAction]=useState<FileActionSelection|null>(null)
+  const [fileAction,setFileAction]=useState<FileActionSelection|null>(null),[pendingFilePlan,setPendingFilePlan]=useState<PersonFilePlan|null>(null)
+  useEffect(()=>{
+    try{const raw=localStorage.getItem(FILE_OPERATION_STORAGE_KEY);if(raw){const plan=JSON.parse(raw) as PersonFilePlan;if(plan.backend==='rust'&&plan.id&&plan.request?.id===plan.id){setPendingFilePlan(plan);setFileAction({action:plan.action,files:[],resumePlan:plan})}}}catch{/* A malformed browser record never triggers a submission. */}
+  },[])
   const [playing,setPlaying]=useState<ReviewVideo|null>(null),[busy,setBusy]=useState(false),[message,setMessage]=useState(''),[undo,setUndo]=useState<Undo|null>(null)
   const [confirmArchive,setConfirmArchive]=useState<{rows:PlanRow[];version:string;name:string}|null>(null)
   const { resolved: theme } = useTheme()
@@ -119,8 +122,13 @@ function PersonWorkbenchContent({initialName=''}:{initialName?:string}) {
     if(!confirmArchive||busy)return;const snapshot=confirmArchive;setConfirmArchive(null);setBusy(true);setUndo(null)
     try{const result=await api<{moved:number;errors?:string[]}>('/api/plan/apply',{method:'POST',body:JSON.stringify({vids:snapshot.rows.map(v=>v.vid),version:snapshot.version})});notify(`已归档 ${result.moved} 个。${result.errors?.length?result.errors.join('；'):'Peach 账本已同步。'}`);setSelected([]);await reloadAfterSave(snapshot.name)}catch(e){notify((e as Error).message);await loadPlan(snapshot.name).catch(()=>{})}finally{setBusy(false)}
   }
+  async function rolledBackFileAction(){
+    const current=nameRef.current
+    // Refresh observations after compensation without applying success-only selection or notice changes.
+    await Promise.allSettled([loadPeople(),loadStats(true),...(current?[refresh(current)]:[]),...(current&&tab==='queued'?[loadPlan(current)]:[])])
+  }
   async function savedFileAction(result:PersonFileResult){
-    setSelected([]);setUndo(null);setFileAction(null)
+    setSelected([]);setUndo(null)
     notify(result.warning|| (fileAction?.action==='merge-person'?`已将 ${name} 合并到 ${result.person}`:fileAction?.action==='rename-person'?`人物已重命名为 ${result.person}`:result.staged?`已将 ${result.changed} 个视频移入全局暂存区`:`已更新 ${result.changed} 个文件，路径和记录已同步`))
     await loadPeople();void loadStats(true)
     if(result.person!==name){setData(null);setPlan(null);setName(result.person);setTab('owned');history.replaceState(null,'',`/persons/${encodeURIComponent(result.person)}`)}
@@ -135,10 +143,10 @@ function PersonWorkbenchContent({initialName=''}:{initialName?:string}) {
     else {setName('');history.replaceState(null,'','/persons')}
     notify(result.ok?peopleAction==='merge'?`已合并 ${result.completed.length} 个人物，保留 ${result.target}`:`已删除 ${result.completed.length} 个人物，目录文件已移入暂存区`:`已完成 ${result.completed.length} 项，剩余 ${result.remaining.length} 项未完成`)
   }
-  const manageFiles=(action:PersonFileAction,files:PersonVideo[])=>{setMessage('');setUndo(null);setFileAction({action,files})}
+  const manageFiles=(action:PersonFileAction,files:PersonVideo[])=>{if(pendingFilePlan){setFileAction({action:pendingFilePlan.action,files:[],resumePlan:pendingFilePlan});return};setMessage('');setUndo(null);setFileAction({action,files})}
   const count=tab==='owned'?data?.files.length:plan?queueRows.length:data?.queued??person?.queued
   return <div className="pw pw-directory pw-live" data-theme={theme}>
-    <div className="pw-surface"><header className="pw-top"><div className="pw-brand"><strong>人物库</strong>{name&&<><span>/</span><span className="pw-current-person">{name}</span></>}</div><Button className="pw-icon pw-refresh" aria-label="刷新人物和视频" disabled={busy||loading||peopleLoading} onClick={()=>{void loadPeople();void loadStats(true);if(name){void refresh(name).catch(()=>{});if(tab==='queued')void loadPlan(name).catch(()=>{})}}}><RefreshCw size={15}/></Button></header>
+    <div className="pw-surface"><header className="pw-top"><div className="pw-brand"><strong>人物库</strong>{name&&<><span>/</span><span className="pw-current-person">{name}</span></>}</div>{pendingFilePlan&&<Button onClick={()=>setFileAction({action:pendingFilePlan.action,files:[],resumePlan:pendingFilePlan})}>查看文件操作</Button>}<Button className="pw-icon pw-refresh" aria-label="刷新人物和视频" disabled={busy||loading||peopleLoading} onClick={()=>{void loadPeople();void loadStats(true);if(name){void refresh(name).catch(()=>{});if(tab==='queued')void loadPlan(name).catch(()=>{})}}}><RefreshCw size={15}/></Button></header>
       <nav className="pw-mobile-nav" aria-label="人物工作区">{(['people','library','suggestions'] as const).map((section,i)=><Button key={section} data-active={mobile===section} onClick={()=>setMobile(section)}>{['人物','视频目录','推荐加入'][i]}</Button>)}</nav>
       <div className="pw-layout" data-mobile={mobile}>
         <aside className="pw-people"><div className="pw-panel-title"><h2>人物目录</h2><span><Count value={people.length}/></span></div><PersonSearch value={peopleQuery} onChange={setPeopleQuery} sort={peopleSort} onSortChange={setPeopleSort} theme={theme}/><div className="pw-people-select-all"><Checkbox label="全选" aria-label="选择当前搜索结果" checked={visiblePeople.length>0&&visiblePeople.every(p=>selectedPeople.includes(p.name))} indeterminate={visiblePeople.some(p=>selectedPeople.includes(p.name))&&!visiblePeople.every(p=>selectedPeople.includes(p.name))} disabled={busy||!visiblePeople.length} onCheckedChange={checked=>setSelectedPeople(current=>checked?[...new Set([...current,...visiblePeople.map(p=>p.name)])]:current.filter(name=>!visiblePeople.some(p=>p.name===name)))}/></div><div className="pw-person-list">
@@ -177,7 +185,7 @@ function PersonWorkbenchContent({initialName=''}:{initialName?:string}) {
     </div>
     <AnimatePresence initial={false}>{message&&<WorkbenchNotice><span>{message}</span>{undo&&<Button disabled={busy} onClick={()=>void undoLast()}><Undo2 size={13}/>撤销这次</Button>}<Button aria-label="关闭提示" onClick={()=>setMessage('')}><X size={14}/></Button></WorkbenchNotice>}</AnimatePresence>
     {peopleAction&&<PeopleActionDialog action={peopleAction} people={selectedPeople} theme={theme} onClose={()=>setPeopleAction(null)} onSaved={savedPeopleAction} onBusyChange={setBusy}/>}
-    {fileAction&&<FileActionDialog key={`${fileAction.action}:${fileAction.files.map(v=>v.vid).join()}`} selection={fileAction} person={name} people={people} theme={theme} onClose={()=>setFileAction(null)} onSaved={savedFileAction} onBusyChange={setBusy}/>}
+    {fileAction&&<FileActionDialog key={`${fileAction.action}:${fileAction.files.map(v=>v.vid).join()}`} selection={fileAction} person={fileAction.resumePlan?.person||name} people={people} theme={theme} onClose={()=>setFileAction(null)} onSaved={savedFileAction} onRolledBack={rolledBackFileAction} onBusyChange={setBusy} onSubmitted={setPendingFilePlan} onForget={()=>{localStorage.removeItem(FILE_OPERATION_STORAGE_KEY);setPendingFilePlan(null)}}/>}
     {accountPerson&&<AccountAssociation key={accountPerson} name={accountPerson} theme={theme} onClose={()=>setAccountPerson(null)} onChanged={()=>{setAccountsRevision(n=>n+1);void loadPeople()}}/>}
     <Player video={playing} close={()=>setPlaying(null)} theme={theme}/>
     <Dialog open={!!confirmArchive} onOpenChange={open=>!open&&setConfirmArchive(null)}><DialogContent className="pw-modal" data-theme={theme}><DialogTitle>归档选中的 {confirmArchive?.rows.length} 个视频？</DialogTitle><DialogDescription>这一步会移动文件到已确认人物的目录，并同步 Peach 账本。未选中的任务继续保留。</DialogDescription><div className="pw-archive-confirm">{confirmArchive?.rows.map(row=><div key={row.vid}><strong>{row.name}</strong><CopyPath value={row.dst||''} label="目标路径" notify={notify}/></div>)}</div><div className="pw-modal-actions"><Button onClick={()=>setConfirmArchive(null)}>返回检查</Button><Button className="pw-primary" onClick={()=>void applyArchive()}>确认移动并归档</Button></div></DialogContent></Dialog>

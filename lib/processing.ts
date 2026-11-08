@@ -1,3 +1,4 @@
+import {isReviewAvailable} from './review-continuity-model'
 import fs from 'fs'
 import path from 'path'
 import Database from 'better-sqlite3'
@@ -37,14 +38,15 @@ export function processingState() {
 export function processingOverview(params: URLSearchParams) {
   const state = processingState(), counts: Record<string, number> = {}
   for (const task of state.tasks) {const stage=task.manual?'review':task.stage;counts[stage] = (counts[stage] || 0) + 1}
+  counts.review=state.tasks.filter(isReviewAvailable).length
   const stage = params.get('stage') || '', batch = params.get('batch') || '', query = (params.get('q') || '').toLowerCase()
-  let rows = state.tasks.filter(t => (!stage || (stage === 'review' ? t.stage==='review'||!!t.manual : stage==='error' ? t.stage==='error'&&!t.manual : stage === 'face' ? ['face','face_queued'].includes(t.stage) : stage === 'queued' ? ['queued','retry'].includes(t.stage) : t.stage === stage)) && (!batch || t.batch_id === batch) && (!query || `${t.name} ${t.path}`.toLowerCase().includes(query)))
+  let rows = state.tasks.filter(t => (!stage || (stage === 'review' ? isReviewAvailable(t) : stage==='error' ? t.stage==='error'&&!t.manual : stage === 'face' ? ['face','face_queued'].includes(t.stage) : stage === 'queued' ? ['queued','retry'].includes(t.stage) : t.stage === stage)) && (!batch || t.batch_id === batch) && (!query || `${t.name} ${t.path}`.toLowerCase().includes(query)))
   const limit = 25, page = Math.min(Math.max(0, Number(params.get('page')) || 0), Math.max(0, Math.ceil(rows.length / limit) - 1)), total = rows.length
   rows = rows.slice(page * limit, (page + 1) * limit)
   const batches = new Map<string, { id: string; total: number; ready: number; error: number; running: number }>()
   for (const task of state.tasks) {
     const b = batches.get(task.batch_id) || { id: task.batch_id, total: 0, ready: 0, error: 0, running: 0 }
-    b.total++; b.ready += Number(task.stage === 'review'||!!task.manual); b.error += Number(task.stage === 'error'&&!task.manual); b.running += Number(['text','face'].includes(task.stage)); batches.set(b.id, b)
+    b.total++; b.ready += Number(isReviewAvailable(task)); b.error += Number(task.stage === 'error'&&!task.manual); b.running += Number(['text','face'].includes(task.stage)); batches.set(b.id, b)
   }
   const { tasks, ...summary } = state
   return { ...summary, counts, total, page, limit, all_count: tasks.length, task: params.has('vid') ? tasks.find(t=>t.vid===params.get('vid')) || null : undefined, rows: rows.map(t => ({ ...t, data: { kind: t.data.kind, suggested: t.data.suggested, face_skipped: t.data.face_skipped } })), batches: [...batches.values()].sort((a,b) => b.id.localeCompare(a.id)).slice(0,20) }
@@ -52,7 +54,7 @@ export function processingOverview(params: URLSearchParams) {
 
 export function reviewData(params: URLSearchParams) {
   const state = processingState(), view = params.get('view') || 'all', query = (params.get('q') || '').toLowerCase(), folder = params.get('folder') || ''
-  const ready = state.tasks.filter(t => t.stage === 'review' || t.manual)
+  const ready = state.tasks.filter(t => isReviewAvailable(t))
   const counts = { all: ready.filter(t => !t.deferred).length, suggested: 0, conflict: 0, none: 0, manual: 0, deferred: ready.filter(t => t.deferred).length }
   for (const t of ready.filter(t => !t.deferred)) counts[reviewBucket(t)]++
   let rows = ready.filter(t => view === 'deferred' ? !!t.deferred : !t.deferred && (view === 'all' || reviewBucket(t) === view))
@@ -68,7 +70,7 @@ export function reviewData(params: URLSearchParams) {
   const limit = 24, focusIndex = target ? rows.findIndex(t => t.vid === target.vid) : -1
   const page = focusIndex >= 0 ? Math.floor(focusIndex / limit) : Math.min(Math.max(0, Number(params.get('page')) || 0), Math.max(0, Math.ceil(rows.length / limit) - 1))
   return { counts, groups, group, total: rows.length, rows: rows.slice(page * limit, (page + 1) * limit), page, limit, focus_missing:!!focus&&!target,
-    waiting: state.tasks.filter(t => t.stage !== 'review' && !t.manual).length, online: state.online,
+    waiting: state.tasks.filter(t => t.stage!=='review'&&!t.manual).length, online: state.online,
     folders: [...new Set(ready.map(t => path.dirname(t.path)))].sort((a,b) => a.localeCompare(b,'zh-CN')) }
 }
 

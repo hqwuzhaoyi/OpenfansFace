@@ -1,0 +1,19 @@
+[package]
+name = "face-file-operations"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+
+[dependencies]
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal", "sync"] }
+rusqlite = { version = "0.41", features = ["bundled"] }
+rustix = { version = "1", features = ["fs", "process"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+sha2 = "0.10"
+uuid = { version = "1", features = ["v4", "serde"] }
+unicode-normalization = "0.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

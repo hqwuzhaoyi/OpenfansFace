@@ -49,25 +49,14 @@ class ScanTests(unittest.TestCase):
         (self.base/'report.json').write_text(json.dumps(dict(identities=[dict(vids=[dict(vid=self.good),dict(vid=self.missing)])])))
         self.original_db=(self.base/'faces.db').read_bytes();self.original_media=self.file.read_bytes()
     def tearDown(self):self.temp.cleanup()
-    def scan(self,now=NOW,budget=0):return health.run(self.base,self.root,'fixture',budget=budget,fixture=True,now=now)
-    def test_only_metadata_changes_and_returning_files_are_rechecked(self):
-        a=self.scan();self.assertEqual(a['records'][self.missing]['consecutive'],1)
-        self.scan(NOW+dt.timedelta(days=1));c=self.scan(NOW+dt.timedelta(days=2))
-        self.assertTrue(c['records'][self.missing]['hidden'])
-        (self.file.parent/'missing.mp4').write_bytes(b'recovered')
-        d=self.scan(NOW+dt.timedelta(days=3))
-        self.assertFalse(d['records'][self.missing]['hidden']);self.assertEqual(d['records'][self.missing]['status'],'unchecked')
+    def test_retired_publisher_cannot_write_even_without_native_environment(self):
+        with patch.dict('os.environ',{},clear=True):
+            with self.assertRaisesRegex(RuntimeError,'legacy publication is disabled'):
+                health.run(self.base,self.root,'fixture',fixture=True)
+            with self.assertRaisesRegex(RuntimeError,'legacy publication is disabled'):
+                health.publish(self.base/'video-health.json',{})
+        self.assertFalse((self.base/'video-health.json').exists())
         self.assertEqual((self.base/'faces.db').read_bytes(),self.original_db)
         self.assertEqual(self.file.read_bytes(),self.original_media)
-    def test_mount_failure_preserves_previous_result_without_new_quarantines(self):
-        before=self.scan()
-        with patch.object(health,'check_mount',side_effect=RuntimeError('NFS offline')):failed=self.scan(NOW+dt.timedelta(days=1))
-        self.assertEqual(failed['status'],'skipped');self.assertEqual(failed['records'],before['records'])
-    def test_user_report_is_probed_and_browser_failure_alone_never_hides_video(self):
-        (self.base/'video-health-reports.json').write_text(json.dumps({self.good:dict(last_reported_at=health.timestamp(NOW))}))
-        with patch.object(health,'probe',return_value=dict(status='healthy',detail='ok')):
-            result=self.scan(budget=1)
-        self.assertEqual(result['records'][self.good]['status'],'playback_warning')
-        self.assertFalse(result['records'][self.good]['hidden'])
 
 if __name__=='__main__':unittest.main()

@@ -237,7 +237,7 @@ function Integration() {
     }catch{if(watchRef.current===id)setConnection('连接中断，正在核对本次归档结果…')}
   }
   const progressPercent=job?jobPercent(job):null
-  const resultTitle=result?.recovery_needed?'需要核对恢复，已暂停写操作':result?.rolled_back?'归档失败，文件已恢复原位置':result?.moved?`已归档 ${result.moved} 个${result.errors.length?' · 部分项目未完成':''}`:'本轮未归档，任务已保留'
+  const resultTitle=result?.recovery_needed?'需要核对恢复，已暂停写操作':result?.rolled_back?'归档失败，本轮已移动的文件已恢复':result?.moved?`已归档 ${result.moved} 个${result.errors.length?' · 部分项目未完成':''}`:'本轮未归档，任务已保留'
 
 
   return <main className="archive-workbench">
@@ -312,7 +312,7 @@ function Integration() {
         <AlertDialogFooter><AlertDialogCancel>返回继续检查（Esc）</AlertDialogCancel><AlertDialogAction ref={confirmButton} onClick={apply}><Check className="mr-1 h-4 w-4" />确认归档 {validChosen.length} 个（Enter）</AlertDialogAction></AlertDialogFooter>
       </AlertDialogContent>
     </AlertDialog>
-    {resolving && plan && <ArchiveResolutionDialog key={resolving.map(row => row.vid).join()} rows={resolving} version={plan.version} onClose={() => setResolving(null)} onSaved={async () => {
+    {resolving && plan && <ArchiveResolutionDialog fallbackFocus={searchInput} key={resolving.map(row => row.vid).join()} rows={resolving} version={plan.version} onClose={() => setResolving(null)} onSaved={async () => {
       const data = await load()
       if (!data) { toast.warning('选择已保存，预览刷新失败，请点刷新后继续。', toastOptions); return }
       toast.success('处理方式已保存，所有仍在队列中的勾选已保留。点击归档才会移动文件。', toastOptions)

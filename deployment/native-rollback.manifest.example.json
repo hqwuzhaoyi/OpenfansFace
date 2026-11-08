@@ -1,0 +1,254 @@
+{
+  "version": 1,
+  "release_id": "REPLACE-compatible-rollback",
+  "purpose": "compatible-native-rollback",
+  "native_schema": 9,
+  "native_max_schema": 9,
+  "single_native_writer": true,
+  "workers_start_paused": true,
+  "native_starts_closed": true,
+  "deploy_lock": "/PRIVATE/deploy.lock",
+  "evidence_dir": "/PRIVATE/release-evidence",
+  "base": "/PRIVATE/local-metadata",
+  "ledger": "/PRIVATE/local-peach/ledger.db",
+  "authority_dir": "/PRIVATE/local-metadata/file-operations-rust",
+  "authority_identity": {
+    "dev": "0",
+    "ino": "0"
+  },
+  "native_url": "http://127.0.0.1:8930",
+  "native_token_env": "FILE_OPERATIONS_RUST_TOKEN",
+  "peach": {
+    "name": "REPLACE-peach",
+    "expected_id": "FREEZE_CONTAINER_ID",
+    "expected_image": "sha256:FREEZE_IMAGE_ID",
+    "schema_sha256": "FREEZE_SCHEMA_DIGEST"
+  },
+  "services": {
+    "native": {
+      "name": "REPLACE-native",
+      "expected_id": "FREEZE_CONTAINER_ID",
+      "expected_image": "sha256:FREEZE_IMAGE_ID",
+      "candidate_image": "sha256:PIN_CANDIDATE_ID",
+      "create_args": [
+        "--name",
+        "REPLACE-native",
+        "--network",
+        "host",
+        "--restart",
+        "unless-stopped",
+        "--env-file",
+        "/PRIVATE/native.env",
+        "sha256:PIN_CANDIDATE_ID"
+      ]
+    },
+    "worker": {
+      "name": "REPLACE-worker",
+      "expected_id": "FREEZE_CONTAINER_ID",
+      "expected_image": "sha256:FREEZE_IMAGE_ID",
+      "candidate_image": "sha256:PIN_CANDIDATE_ID",
+      "create_args": [
+        "--name",
+        "REPLACE-worker",
+        "--network",
+        "host",
+        "--restart",
+        "unless-stopped",
+        "--env-file",
+        "/PRIVATE/worker.env",
+        "sha256:PIN_CANDIDATE_ID"
+      ]
+    },
+    "calibrator": {
+      "name": "REPLACE-calibrator",
+      "expected_id": "FREEZE_CONTAINER_ID",
+      "expected_image": "sha256:FREEZE_IMAGE_ID",
+      "candidate_image": "sha256:PIN_CANDIDATE_ID",
+      "create_args": [
+        "--name",
+        "REPLACE-calibrator",
+        "--network",
+        "host",
+        "--restart",
+        "unless-stopped",
+        "--env-file",
+        "/PRIVATE/calibrator.env",
+        "sha256:PIN_CANDIDATE_ID"
+      ]
+    },
+    "web": {
+      "name": "REPLACE-web",
+      "expected_id": "FREEZE_CONTAINER_ID",
+      "expected_image": "sha256:FREEZE_IMAGE_ID",
+      "candidate_image": "sha256:PIN_CANDIDATE_ID",
+      "create_args": [
+        "--name",
+        "REPLACE-web",
+        "--network",
+        "host",
+        "--restart",
+        "unless-stopped",
+        "--env-file",
+        "/PRIVATE/web.env",
+        "sha256:PIN_CANDIDATE_ID"
+      ]
+    }
+  },
+  "evidence": {
+    "isolated_contracts": {
+      "passed": false,
+      "path": "/PRIVATE/evidence/isolated_contracts.json",
+      "sha256": "FREEZE_EVIDENCE_DIGEST"
+    },
+    "full_peach_schema": {
+      "passed": false,
+      "path": "/PRIVATE/evidence/full_peach_schema.json",
+      "sha256": "FREEZE_EVIDENCE_DIGEST"
+    },
+    "nfs_identity_permissions": {
+      "passed": false,
+      "path": "/PRIVATE/evidence/nfs_identity_permissions.json",
+      "sha256": "FREEZE_EVIDENCE_DIGEST"
+    },
+    "real_readonly_parity": {
+      "passed": false,
+      "path": "/PRIVATE/evidence/real_readonly_parity.json",
+      "sha256": "FREEZE_EVIDENCE_DIGEST"
+    },
+    "gpu_full_640_coexistence": {
+      "passed": false,
+      "path": "/PRIVATE/evidence/gpu_full_640_coexistence.json",
+      "sha256": "FREEZE_EVIDENCE_DIGEST"
+    },
+    "worker_native_joint": {
+      "passed": false,
+      "path": "/PRIVATE/evidence/worker_native_joint.json",
+      "sha256": "FREEZE_EVIDENCE_DIGEST"
+    },
+    "review_continuity": {
+      "passed": false,
+      "path": "/PRIVATE/evidence/review_continuity.json",
+      "sha256": "FREEZE_EVIDENCE_DIGEST"
+    },
+    "accepted_ui_baseline": {
+      "passed": false,
+      "path": "/PRIVATE/evidence/accepted_ui_baseline.json",
+      "sha256": "FREEZE_EVIDENCE_DIGEST"
+    },
+    "writer_retirement": {
+      "passed": false,
+      "path": "/PRIVATE/evidence/writer_retirement.json",
+      "sha256": "FREEZE_EVIDENCE_DIGEST"
+    },
+    "legacy_reference_compatibility": {
+      "passed": false,
+      "path": "/PRIVATE/evidence/legacy_reference_compatibility.json",
+      "sha256": "FREEZE_EVIDENCE_DIGEST",
+      "status": "unresolved"
+    }
+  },
+  "probes": [
+    {
+      "kind": "web",
+      "url": "http://127.0.0.1:REPLACE/EXACT_PATH",
+      "status": 200
+    },
+    {
+      "kind": "static",
+      "url": "http://127.0.0.1:REPLACE/EXACT_PATH",
+      "status": 200
+    },
+    {
+      "kind": "playback-range",
+      "url": "http://127.0.0.1:REPLACE/EXACT_PATH",
+      "status": 206,
+      "headers": {
+        "Range": "bytes=0-1023"
+      }
+    },
+    {
+      "kind": "legacy-receipt",
+      "url": "http://127.0.0.1:REPLACE/EXACT_PATH",
+      "status": 200
+    },
+    {
+      "kind": "native-receipt",
+      "url": "http://127.0.0.1:REPLACE/EXACT_PATH",
+      "status": 200
+    },
+    {
+      "kind": "gpu",
+      "url": "http://127.0.0.1:REPLACE/EXACT_PATH",
+      "status": 200
+    },
+    {
+      "kind": "worker",
+      "url": "http://127.0.0.1:REPLACE/EXACT_PATH",
+      "status": 200
+    },
+    {
+      "kind": "calibrator",
+      "url": "http://127.0.0.1:REPLACE/EXACT_PATH",
+      "status": 200
+    }
+  ],
+  "web_url": "http://127.0.0.1:REPLACE",
+  "calibrator_url": "http://127.0.0.1:REPLACE",
+  "gpu_peer": {
+    "adapter": "external-systemd",
+    "unit": "face-gpu.service",
+    "url": "http://GPU_PEER_TUNNEL:8921/health/ready",
+    "token_env": "GPU_INFERENCE_TOKEN",
+    "expected_health": {
+      "live": true,
+      "model_ready": true,
+      "accepting": true,
+      "draining": false,
+      "service_instance": "FREEZE_SERVICE_INSTANCE",
+      "execution": {
+        "stage": "detection",
+        "model_sha256": "5838f7fe053675b1c7a08b633df49e7af5495cee0493c7dcf6697200b85b5b91",
+        "preprocess_version": "scrfd-640-bgr8-det0.5-nms0.4-v1",
+        "runtime_version": "1.23.2",
+        "providers": [
+          "CUDAExecutionProvider",
+          "CPUExecutionProvider"
+        ],
+        "provider_proof": "startup_profile"
+      },
+      "release": {
+        "managed": true,
+        "release_id": "FREEZE_RELEASE",
+        "revision": "FREEZE_COMMIT",
+        "manifest_sha256": "FREEZE_CANONICAL_MANIFEST",
+        "code_sha256": "FREEZE_CODE",
+        "lock_sha256": "FREEZE_LOCK"
+      }
+    },
+    "prepared_receipt": {
+      "path": "/PRIVATE/gpu-prepared.json",
+      "sha256": "FREEZE_EVIDENCE_DIGEST"
+    },
+    "prepare": "Execute the reviewed WSL systemd install/start procedure separately on the GPU host after authorization; store unit/model/runtime hashes and instance health.",
+    "revert": "Use the frozen prior WSL systemd unit/config/model anchor after draining VM worker; never stop neighboring GPU services."
+  },
+  "native_uid": 1000,
+  "native_gid": 1000,
+  "permission_media_dirs": [
+    "/PRIVATE/media/pikpak/creators",
+    "/PRIVATE/media/pikpak/staging"
+  ],
+  "minimum_free_after_backup_bytes": 2147483648,
+  "legacy_health": {
+    "adapter": "systemd",
+    "timer": "face-video-health.timer",
+    "service": "face-video-health.service"
+  },
+  "legacy_terminal_acknowledgements": {},
+  "media_root": "/PRIVATE/media",
+  "legacy_reference_inventory_limits": {
+    "cache_files": 5000,
+    "directory_entries": 10000
+  },
+  "inference_backend": "gpu-detection"
+}

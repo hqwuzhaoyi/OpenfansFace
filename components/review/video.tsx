@@ -1,7 +1,7 @@
 'use client'
 import { WorkspacePath } from '@/components/workbench/inner'
 import { PrivateVideo } from '@/components/private-media'
-import { useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import Link from 'next/link'
 import { api } from '@/lib/face-api'
 import { ResponsiveDialogContent } from './responsive-dialog'
@@ -23,18 +23,26 @@ export function VideoThumbnail({ video, onPlay, className }: { video: ReviewVide
 export function VideoPlayer({ video, onClose }: { video: ReviewVideo | null; onClose: () => void }) {
   const [failed, setFailed] = useState(false)
   const [reported,setReported]=useState(false),reportSequence=useRef(0)
+  const trigger=useRef<HTMLElement|null>(null)
+  const guard=useRef<Promise<{fingerprint:string;path:string;material?:string}>|null>(null)
+  useEffect(()=>{
+    guard.current=video?api<{fingerprint:string;path:string;material?:string}>('/api/video-health?vid='+encodeURIComponent(video.vid)+(video.path?'&path='+encodeURIComponent(video.path):'')):null
+    guard.current?.catch(()=>{})
+    setFailed(false);setReported(false);reportSequence.current++
+  },[video?.vid,video?.path])
   const close=()=>{reportSequence.current++;onClose();setFailed(false);setReported(false)}
   const playbackError=(event:React.SyntheticEvent<HTMLVideoElement>)=>{
     setFailed(true)
     const code=event.currentTarget.error?.code
     if(!video||![2,3,4].includes(code||0))return
     const sequence=++reportSequence.current
-    api('/api/video-health/report',{method:'POST',body:JSON.stringify({vid:video.vid,path:video.path||video.vid,code})})
+    if(!guard.current)return
+    guard.current.then(identity=>api('/api/video-health/report',{method:'POST',body:JSON.stringify({vid:video.vid,path:identity.path,fingerprint:identity.fingerprint,material:identity.material,code})}))
       .then(()=>{if(reportSequence.current===sequence)setReported(true)}).catch(()=>{})
   }
   const src = video ? `/api/video?p=${encodeURIComponent(video.path || video.vid)}` : ''
   return <Dialog open={!!video} onOpenChange={o => { if (!o) close() }}>
-    <ResponsiveDialogContent open={!!video} className="flex max-h-[92dvh] flex-col gap-0 overflow-hidden p-0 sm:max-w-4xl sm:p-0">
+    <ResponsiveDialogContent open={!!video} onOpenAutoFocus={()=>{trigger.current=document.activeElement instanceof HTMLElement?document.activeElement:null}} onCloseAutoFocus={event=>{event.preventDefault();if(trigger.current?.isConnected)trigger.current.focus({preventScroll:true})}} className="flex max-h-[92dvh] flex-col gap-0 overflow-hidden p-0 sm:max-w-4xl sm:p-0">
       <DialogHeader className="shrink-0 border-b p-4 pr-14 text-left"><DialogTitle>视频预览</DialogTitle><DialogDescription>关闭后回到刚才的位置，勾选保持不变。</DialogDescription></DialogHeader>
       {video&&<div data-sheet-scroll className="min-h-0 flex-1 space-y-3 overflow-y-auto p-4"><p className="break-all text-sm font-medium">{video.name}</p><PrivateVideo key={src} src={src} controls autoPlay playsInline preload="metadata" onError={playbackError} className="max-h-[55dvh] w-full rounded-lg bg-black"/>
         {failed&&<div role="alert" className="space-y-3 rounded-lg border border-amber-500/30 p-3 text-sm text-amber-300"><p className="flex items-start gap-2"><AlertCircle className="mt-0.5 h-4 w-4 shrink-0"/>暂时无法播放，可能是路径变化、网络中断或手机不支持此编码。</p>{reported&&<p className="text-xs">已记下本次失败，下一次自动体检会优先复查。原文件保留。</p>}<Button asChild variant="outline" className="min-h-11"><Link href="/staging#video-health" onClick={close}>查看视频体检与失效记录</Link></Button></div>}<PathText value={video.path||video.vid}/></div>}

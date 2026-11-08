@@ -45,7 +45,7 @@ export function PeopleActionDialog({action,people:selection,theme,onClose,onSave
       if(saved.ok&&!merging)onClose()
     }catch(e){setError(`${(e as Error).message}。如连接中断，可再次确认以查询同一批次结果。`)}finally{setApplying(false);updateBusy(false)}
   }
-  return <Dialog open onOpenChange={open=>!open&&!busy&&onClose()}><DialogContent className={`pw-modal pw-file-dialog pw-merge-dialog pw-people-dialog${merging?' pw-merge-rich-dialog':''}`} data-theme={theme} showCloseButton={!busy} onEscapeKeyDown={e=>busy&&e.preventDefault()} onInteractOutside={e=>busy&&e.preventDefault()}>
+  return <Dialog open onOpenChange={open=>!open&&!busy&&onClose()}><DialogContent className={`pw-modal pw-file-dialog pw-merge-dialog pw-people-dialog${merging?' pw-merge-rich-dialog':''}`} data-theme={theme} onCloseAutoFocus={event=>{if(result){event.preventDefault();document.querySelector<HTMLButtonElement>('[aria-label="刷新人物和视频"]')?.focus()}}} showCloseButton={!busy} onEscapeKeyDown={e=>busy&&e.preventDefault()} onInteractOutside={e=>busy&&e.preventDefault()}>
     <DialogTitle>{result?.ok&&merging?'合并完成':`${plan?'确认':''}${merging?'合并':'删除'}所选人物`} · {people.length} 人</DialogTitle>
     <DialogDescription>{merging?result?.ok?`已保留「${target}」。视频、待归档任务和账号关联已合入，同名文件保留两份。`:'先查看人物视频，再选择保留人物。同名文件保留两份，账号关联和待归档任务一起合并。':'删除所选人物，并将其整个目录（含视频和附属文件）移入全局暂存区。待归档任务撤回，账号关联和识别映射移除，文件内容保留。'}</DialogDescription>
     <div ref={body} className="pw-people-dialog-body">
@@ -57,11 +57,12 @@ export function PeopleActionDialog({action,people:selection,theme,onClose,onSave
         {!plan&&!merging&&<div className="pw-file-selection"><strong>已选 {people.length} 个人物</strong><ul>{people.map(person=><li key={person}>{person}</li>)}</ul></div>}
         {plan&&!result&&<>
           <div className="pw-operation-summary"><strong>{merging?`保留 ${plan.request.target}，合入其余 ${plan.plans.length} 人`:`删除 ${plan.plans.length} 个人物`}</strong><p>涉及 {plan.plans.reduce((sum,p)=>sum+p.files.length,0)} 个文件 · {(plan.plans.reduce((sum,p)=>sum+p.total_bytes,0)/2**20).toFixed(1)} MB</p><p>{merging?'同名文件会自动改名以保留两份，最终路径以合并结果为准。':'目录文件移入暂存区，人物将从列表移除。'}</p></div>
-          <div className="pw-batch-summary">{plan.plans.map(p=><div key={p.person}><strong>{p.person}{merging?` → ${plan.request.target}`:''}</strong><span>{p.files.length} 个文件 · {(p.total_bytes/2**20).toFixed(1)} MB</span><small>{p.merge_summary?.pending_tasks??p.delete_summary?.pending_tasks??0} 条待归档 · {p.merge_summary?.manual_accounts??p.delete_summary?.manual_accounts??0} 个账号关联</small>{!merging&&<code>{p.target_directory}</code>}</div>)}</div>
+          <div className="pw-batch-summary">{plan.plans.map(p=><div key={p.person}><strong>{p.person}{merging?` → ${plan.request.target}`:''}</strong><span>{p.files.length} 个文件 · {(p.total_bytes/2**20).toFixed(1)} MB</span>{(p.merge_summary||p.delete_summary)&&<small>{(p.merge_summary||p.delete_summary)!.pending_tasks} 条待归档 · {(p.merge_summary||p.delete_summary)!.manual_accounts} 个账号关联</small>}{!merging&&<code>{p.target_directory}</code>}</div>)}</div>
           <p className="pw-batch-note">按人物依次处理；如某项失败，会停止剩余操作并列出已完成的结果。</p>
         </>}
         {result?.ok&&merging&&<div className="pw-merge-result"><strong>{people.length} 个人物 → {target}</strong><p>已合入 {result.completed.reduce((sum,item)=>sum+item.result.changed,0)} 个文件（含附属资料）。</p>{result.completed.map(item=><p key={item.person}>{item.person} · {item.result.changed} 个文件已合入{item.result.warning?` · ${item.result.warning}`:''}</p>)}</div>}
-        {result&&!result.ok&&<div className="pw-error" role="alert"><p>{result.error}</p><p>已完成：{result.completed.map(p=>p.person).join('、')||'无'}</p><p>尚未完成：{result.remaining.join('、')}</p></div>}
+        {result&&!result.ok&&<div className="pw-error" role="alert"><p>{result.error}</p>{result.recovery_needed&&<p>当前人物结果待核对，写入已暂停；已完成人物保留。</p>}<p>已完成：{result.completed.map(p=>p.person).join('、')||'无'}</p><p>尚未完成：{result.remaining.join('、')}</p></div>}
+        {applying&&!merging&&progress&&<div className="pw-batch-note" role="status"><strong>{progress.active_person?`正在处理 ${progress.active_person}`:'正在核对批次'}</strong><p>已完成：{progress.completed.join('、')||'无'}</p><p>尚未完成：{progress.remaining.join('、')}</p></div>}
         {progressError&&applying&&<p role="status" className="pw-batch-note">{progressError}</p>}
         {error&&<p className="pw-error" role="alert">{error}</p>}
       </WorkbenchStep>

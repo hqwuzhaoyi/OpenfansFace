@@ -1,9 +1,9 @@
 """Batch selection regression. Requires a fresh http-person-merge.py fixture on port 8923."""
 import argparse,json,sqlite3,urllib.request,urllib.error,urllib.parse,hashlib,time,concurrent.futures
 from pathlib import Path
-parser=argparse.ArgumentParser();parser.add_argument('root',type=Path);args=parser.parse_args()
+parser=argparse.ArgumentParser();parser.add_argument('root',type=Path);parser.add_argument('--port',type=int,default=8923);args=parser.parse_args()
 root=args.root.resolve();assert root.parent==Path('/tmp').resolve() and root.name.startswith('face-admin-person-fileops-merge-batch-') and (root/'.fileops-fixture').exists()
-base=root/'base';creators=root/'media/pikpak/creators';url='http://127.0.0.1:8923'
+base=root/'base';creators=root/'media/pikpak/creators';url=f'http://127.0.0.1:{args.port}'
 def call(endpoint,body=None,status=200):
  try:
   with urllib.request.urlopen(urllib.request.Request(url+endpoint,data=json.dumps(body).encode() if body is not None else None,headers={'Content-Type':'application/json'}),timeout=90) as r:
@@ -42,6 +42,9 @@ assert not (creators/'丙').exists() and (creators/'甲').exists();assert apply(
 sql('DROP TRIGGER fail_batch_merge')
 result=apply(preview('merge',['甲','乙'],'乙'));assert result['ok'];assert '甲' not in names() and '丙' not in names()
 assert call('/api/persons/library?name='+urllib.parse.quote('乙'))['files'].__len__()==8
+# Integer PK plus a separate role uniqueness constraint: retained target wins, other roles survive.
+assert sql("SELECT source,confidence FROM asset_entity WHERE asset_id=1 AND entity_id=2 AND role='creator'")==[('target-existing',.75)]
+assert sql("SELECT source FROM asset_entity WHERE asset_id=1 AND entity_id=2 AND role='appearance'")==[('source-extra',)]
 assert 'A曾用名' in next(p for p in call('/api/persons/library')['persons'] if p['name']=='乙')['aliases']
 first=call('/api/persons/library?preview=1&name='+urllib.parse.quote('乙'));second=call('/api/persons/library?preview=1&name='+urllib.parse.quote('乙')+'&offset=4')
 assert first['total_videos']==8 and len(first['files'])==4 and first['next_offset']==4 and second['next_offset'] is None

@@ -1,6 +1,6 @@
-import { NextResponse } from 'next/server'
-import { buildPlan } from '@/lib/review-plan'
-import { loadArchive } from '@/lib/review-store'
-export async function GET() {
-  return NextResponse.json({ ...buildPlan(), history: loadArchive().slice().reverse().slice(0, 200) })
+import { nativeArchive } from '@/lib/archive-native-backend'
+import { NextRequest, NextResponse } from 'next/server'
+export async function GET(req:NextRequest) {
+  try { return NextResponse.json(await nativeArchive('archive-preview'),{headers:{'Cache-Control':'no-store'}}) }
+  catch(error:any) { return NextResponse.json({error:error.message,code:error.code,path:error.path,step:error.step},{status:error.status||500}) }
 }

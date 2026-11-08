@@ -28,7 +28,13 @@ def read_json(path, fallback):
         return fallback
 
 
+def native_results_owned():
+    return True  # Production ownership is permanent; env toggles cannot revive old publication.
+
+
 def publish(path, data):
+    if path.name == 'results.json' and path.parent.name == 'watermarks' and native_results_owned():
+        raise RuntimeError('共享水印结果由原生协调器管理；请使用自动处理队列')
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix='.' + path.name, dir=path.parent)
     try:
@@ -219,95 +225,12 @@ def scan_video(item, root, directory, engine, job_id, progress=None):
     return dict(candidates=candidates, sampled_frames=successes)
 
 
-def process_job(job, directory, root, engine_factory=PaddleEngine, scanner=scan_video):
-    records = read_json(directory / 'results.json', {})
-    progress = dict(job_id=job['id'], status='running', processed=0, total=len(job['videos']), failed=0, stage='准备识别')
-    publish(directory / 'progress.json', progress)
-    engine = None
-    try:
-        for item in job['videos']:
-            before = records.get(item['vid'], {})
-            cached = same_file(before, item) and before.get('pipeline') == PIPELINE
-            try:
-                validate_source(item, root)
-            except (OSError, ValueError):
-                cached = False
-            # A restart resumes the same job, including already-finished failures.
-            reuse = cached and (before.get('job_id') == job['id'] or (before.get('status') == 'done' and not job.get('force')))
-            if reuse:
-                record = dict(before, job_id=job['id'])
-            else:
-                record = dict(item, pipeline=PIPELINE, job_id=job['id'], checked_at=now(), sampled_frames=0, candidates=[])
-                try:
-                    validate_source(item, root)
-                    if engine is None:
-                        progress['stage'] = '加载文字识别模型（首次需要下载）'
-                        publish(directory / 'progress.json', progress)
-                        # Model setup failure is a job failure, not "no watermark" for every video.
-                        engine = engine_factory()
-                    progress['stage'] = '识别 ' + Path(item['path']).name
-                    publish(directory / 'progress.json', progress)
-                    record.update(scanner(item, root, directory, engine, job['id']), status='done')
-                except Exception as error:
-                    if engine is None and progress['stage'].startswith('加载'):
-                        raise
-                    record.update(status='error', error=str(error)[:400])
-            records[item['vid']] = record
-            publish(directory / 'results.json', records)
-            retained = {c['evidence'] for c in record['candidates']}
-            for candidate in before.get('candidates', []):
-                filename = candidate.get('evidence', '')
-                if filename not in retained and re.fullmatch(r'[a-f0-9-]+\.jpg', filename):
-                    try:
-                        (directory / 'evidence' / filename).unlink(missing_ok=True)
-                    except OSError:
-                        pass  # Evidence cleanup must not fail a successfully persisted scan.
-            progress['processed'] += 1
-            progress['failed'] += record['status'] == 'error'
-            publish(directory / 'progress.json', progress)
-        progress.update(status='complete', stage='识别完成')
-    except Exception as error:
-        progress.update(status='error', error=str(error)[:500])
-    publish(directory / 'progress.json', progress)
-    return progress
+def process_job(*args, **kwargs):
+    raise RuntimeError('独立水印发布已退役；使用 processing_worker.py 的原生结果发布')
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--base', type=Path, default=Path(os.environ.get('FACES_BASE', '/data/base')))
-    parser.add_argument('--root', type=Path, default=Path(os.environ.get('MEDIA2_ROOT', '/mnt/media2')))
-    parser.add_argument('--once', action='store_true', help='Process the current request then exit')
-    args = parser.parse_args()
-    directory = args.base / 'watermarks'
-    directory.mkdir(parents=True, exist_ok=True)
-    with (directory / '.worker.lock').open('w') as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            raise SystemExit('A watermark worker is already running')
-        stopped = threading.Event()
-        def heartbeat():
-            while not stopped.is_set():
-                publish(directory / 'worker.json', dict(at=now(), pipeline=PIPELINE))
-                stopped.wait(10)
-        thread = threading.Thread(target=heartbeat, daemon=True)
-        thread.start()
-        try:
-            while True:
-                job = read_json(directory / 'job.json', None)
-                progress = read_json(directory / 'progress.json', {})
-                if job and (progress.get('job_id') != job['id'] or progress.get('status') == 'running'):
-                    result = process_job(job, directory, args.root)
-                    print(json.dumps(result, ensure_ascii=False), flush=True)
-                    if args.once and result['status'] == 'error':
-                        return 1
-                if args.once:
-                    return 0
-                time.sleep(3)
-        finally:
-            stopped.set()
-            thread.join(timeout=12)
-            publish(directory / 'worker.json', dict(at='1970-01-01T00:00:00+00:00', pipeline=PIPELINE))
+    raise SystemExit('独立水印写入 worker 已退役；使用 processing_worker.py')
 
 
 if __name__ == '__main__':

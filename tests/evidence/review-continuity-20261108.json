@@ -1,0 +1,92 @@
+{
+  "ticket": 18,
+  "date": "2026-11-08",
+  "deployment": "not deployed",
+  "native_http": [
+    "immutable server evidence",
+    "delivered row tokens",
+    "cross-session rejection",
+    "face-only recompute accepted",
+    "fixed page slots",
+    "append-only restored lane",
+    "restart persistence",
+    "duplicate receipt",
+    "ABA rejection",
+    "manual note/defer/restore",
+    "failed batch preserved",
+    "file and task path guard",
+    "rules guard",
+    "effective health guard",
+    "expiry without latest fallback"
+  ],
+  "browser": {
+    "tools": [
+      "ego-browser",
+      "agent-browser"
+    ],
+    "fixture": "marked isolated 50-video fixture, real ffmpeg H.264 playback",
+    "desktop": {
+      "rows_frozen": 24,
+      "scroll_top_preserved": 200,
+      "active_freeze": true,
+      "selection_protection": true,
+      "draft_protection": true,
+      "video_playing_protection": true,
+      "video_duration_seconds": 8,
+      "idle_apply": true,
+      "late_response_discarded": true,
+      "manual_update_cancel": true,
+      "manual_update_accept": true,
+      "update_dialog_focus_restore": true,
+      "failed_refresh_retained_rows": 24,
+      "cross_page_note_preserved": true,
+      "cross_page_confirm_kept_page": true,
+      "undo_kept_page": true
+    },
+    "visibility": {
+      "hidden_protected": true,
+      "return_counts_as_activity": true,
+      "method": "page visibility getter/event test injection"
+    },
+    "narrow": {
+      "width": 390,
+      "horizontal_overflow": false,
+      "keyboard_enter": true,
+      "escape_focus_restore": true,
+      "reduced_motion": true,
+      "entry_duration": "0s",
+      "open_modal_idle_protection": true
+    },
+    "clock": "page Date.now offset and captured real polling callbacks; no product test endpoint",
+    "network_failure": "page fetch rejection, original snapshot retained"
+  },
+  "checks": {
+    "rust_tests": 64,
+    "model_tests": 10,
+    "typecheck": "passed",
+    "production_build": "passed",
+    "archive_http_suite": "passed",
+    "shared_metadata_http_suite": "passed",
+    "schema7_old_binary_refusal": "passed"
+  },
+  "remaining_integration": [
+    "central maximum schema migration and old-writer refusal",
+    "#17 native health material",
+    "#19 worker/GPU background publication joint run"
+  ],
+  "performance": {
+    "fixture_rows": 500,
+    "snapshot_ms": 427,
+    "status_ms": 175,
+    "scope": "local isolated fixture; not a production throughput claim"
+  },
+  "standalone_smoke": {
+    "standalone_page": 200,
+    "static_assets": 21,
+    "all_assets_status": 200,
+    "review_rows": 24,
+    "schema": 7,
+    "video_range_status": 206,
+    "content_range": "bytes 0-1023/163722"
+  }
+}

@@ -3,7 +3,7 @@ import path from 'node:path'
 import { createHash } from 'node:crypto'
 import { CREATORS, STAGE } from './env'
 import { ReviewError, validateCreator } from './review-logic'
-import { validateArchiveName } from './archive-files'
+import { validateArchiveName } from './archive-paths'
 
 export function fingerprint(file:string):string {
   const stat=fs.lstatSync(/*turbopackIgnore: true*/ file,{bigint:true})
