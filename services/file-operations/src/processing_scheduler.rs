@@ -1051,6 +1051,9 @@ pub fn heartbeat(config: &Config, body: &Value) -> Result<Value> {
     let paused = setting(&tx, "paused")?
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let discovery_requested = setting(&tx, "discovery_requested")?
+        .and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|n| n as f64)))
+        .unwrap_or(0.0);
     tx.commit()?;
 
     if let Some(beat) = body.get("heartbeat").filter(|v| v.is_object()) {
@@ -1073,6 +1076,7 @@ pub fn heartbeat(config: &Config, body: &Value) -> Result<Value> {
         "active": active,
         "concurrency": desired,
         "paused": paused,
+        "discovery_requested": discovery_requested,
         "lease_expires_at": expiry,
     }))
 }
@@ -2726,6 +2730,1185 @@ pub fn home_tasks(config: &Config, body: &Value) -> Result<Value> {
     }))
 }
 
+fn value_as_id_str(v: &Value) -> Option<String> {
+    if let Some(s) = v.as_str() {
+        Some(s.to_owned())
+    } else if let Some(n) = v.as_i64() {
+        Some(n.to_string())
+    } else {
+        v.as_u64().map(|n| n.to_string())
+    }
+}
+
+fn safe_video_sources(config: &Config) -> BTreeMap<String, String> {
+    let mut sources = BTreeMap::new();
+    let faces_path = config.base.join("faces.db");
+    if faces_path.exists()
+        && let Ok(fconn) = db::open(&faces_path)
+        && let Ok(rows) = db::rows(&fconn, "SELECT vid,path FROM videos ORDER BY vid", [])
+    {
+        for row in rows {
+            if let (Some(id), Some(p)) = (row["vid"].as_str(), row["path"].as_str()) {
+                sources.insert(id.to_owned(), p.to_owned());
+            }
+        }
+    }
+    if let Ok((_, overrides)) = review::read(config, "video-path-overrides.json", json!({}))
+        && let Some(obj) = overrides.as_object()
+    {
+        for (id, p) in obj {
+            if let Some(s) = p.as_str() {
+                sources.insert(id.clone(), s.to_owned());
+            }
+        }
+    }
+    let jobs_path = db_path(config);
+    if jobs_path.exists()
+        && let Ok(jconn) = db::open(&jobs_path)
+        && let Ok(rows) = db::rows(&jconn, "SELECT vid,path FROM tasks ORDER BY vid", [])
+    {
+        for row in rows {
+            if let (Some(id), Some(p)) = (row["vid"].as_str(), row["path"].as_str()) {
+                sources.entry(id.to_owned()).or_insert_with(|| p.to_owned());
+            }
+        }
+    }
+    sources
+}
+
+pub fn verify_attempt_artifact(config: &Config, body: &Value) -> Result<Value> {
+    let deny = || Ok(json!({"ok": true, "accepted": false, "valid": false, "file": Value::Null}));
+    let Some(attempt) = body["attempt"].as_str() else {
+        return deny();
+    };
+    let relative_owned = if let Some(rel) = body["relative"].as_str().filter(|s| !s.is_empty()) {
+        rel.to_owned()
+    } else if let (Some(folder), Some(name)) = (
+        body["folder"].as_str().filter(|s| !s.is_empty()),
+        body["name"].as_str().filter(|s| !s.is_empty()),
+    ) {
+        if folder == "watermarks" {
+            format!("watermarks/evidence/{name}")
+        } else {
+            format!("{folder}/{name}")
+        }
+    } else {
+        return deny();
+    };
+    let relative = relative_owned.as_str();
+    if crate::model::validate_id(attempt).is_err() {
+        return deny();
+    }
+    if Path::new(relative)
+        .components()
+        .any(|c| !matches!(c, std::path::Component::Normal(_)))
+    {
+        return deny();
+    }
+    let Ok(base_real) = fs::canonicalize(&config.base) else {
+        return deny();
+    };
+    let directory = base_real.join("processing/attempts").join(attempt);
+    let db_file = db_path(config);
+    if !db_file.exists() {
+        return deny();
+    }
+    let Ok(conn) = db::open(&db_file) else {
+        return deny();
+    };
+    let has_table: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='_face_admin_processing_results')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
+    if !has_table {
+        return deny();
+    }
+    let Ok(Some(raw)) = conn
+        .query_row(
+            "SELECT result FROM _face_admin_processing_results WHERE id=?",
+            [attempt],
+            |r| r.get::<_, String>(0),
+        )
+        .optional()
+    else {
+        return deny();
+    };
+    let Ok(receipt) = serde_json::from_str::<Value>(&raw) else {
+        return deny();
+    };
+    let task = &receipt["task"];
+    if receipt["ok"] != true
+        || receipt["accepted"] != true
+        || task["run_id"].as_str() != Some(attempt)
+    {
+        return deny();
+    }
+    let vid = receipt["vid"]
+        .as_str()
+        .or_else(|| task["vid"].as_str())
+        .unwrap_or("");
+    let stage = receipt["stage"]
+        .as_str()
+        .or_else(|| task["stage"].as_str())
+        .unwrap_or("");
+    let file = directory.join(relative);
+
+    // Ensure no newer accepted receipt for the same (vid, stage) has superseded this attempt
+    // without retaining a reference to `file`.
+    if !vid.is_empty()
+        && let Ok(rows) = db::rows(
+            &conn,
+            "SELECT id,result FROM _face_admin_processing_results ORDER BY rowid DESC",
+            [],
+        )
+    {
+        for row in rows {
+            let Some(other_id) = row["id"].as_str() else {
+                continue;
+            };
+            if other_id == attempt {
+                break;
+            }
+            let Some(other_raw) = row["result"].as_str() else {
+                continue;
+            };
+            let Ok(other) = serde_json::from_str::<Value>(other_raw) else {
+                continue;
+            };
+            if other["ok"] != true || other["accepted"] != true {
+                continue;
+            }
+            let other_vid = other["vid"]
+                .as_str()
+                .or_else(|| other["task"]["vid"].as_str())
+                .unwrap_or("");
+            let other_stage = other["stage"]
+                .as_str()
+                .or_else(|| other["task"]["stage"].as_str())
+                .unwrap_or("");
+            if other_vid == vid && (stage.is_empty() || other_stage == stage) {
+                let still_referenced = other["data"]["face"]["thumbs"]
+                    .as_array()
+                    .is_some_and(|arr| {
+                        arr.iter().any(|v| {
+                            v.as_str().is_some_and(|s| {
+                                Path::new(s) == file
+                                    || fs::canonicalize(s).ok().as_deref() == Some(file.as_path())
+                            })
+                        })
+                    })
+                    || other["data"]["watermark"]["artifact_attempt"].as_str() == Some(attempt);
+                if !still_referenced {
+                    return deny();
+                }
+                break;
+            }
+        }
+    }
+
+    let sources = safe_video_sources(config);
+    let resolved_source = review::source(config, vid, &sources)
+        .or_else(|| task["path"].as_str().map(str::to_owned))
+        .unwrap_or_default();
+    let Ok(current_source) = fs::canonicalize(&resolved_source) else {
+        return deny();
+    };
+    let Ok(source_stat) = fs::metadata(&current_source) else {
+        return deny();
+    };
+    let current_id = files::identity(&source_stat);
+    let identity = &receipt["source_identity"];
+    let Some(expected_dev) = value_as_id_str(&identity["dev"]) else {
+        return deny();
+    };
+    let Some(expected_ino) = value_as_id_str(&identity["ino"]) else {
+        return deny();
+    };
+    let Some(expected_size) = review::number(&task["size"]) else {
+        return deny();
+    };
+    let Some(expected_mtime) = task["mtime_ns"].as_str() else {
+        return deny();
+    };
+    if current_id["dev"].as_str() != Some(expected_dev.as_str())
+        || current_id["ino"].as_str() != Some(expected_ino.as_str())
+        || i64::try_from(source_stat.len()).ok() != Some(expected_size)
+        || files::mtime_ns(&source_stat) != expected_mtime
+    {
+        return deny();
+    }
+    let face = &receipt["data"]["face"];
+    let watermark = &receipt["data"]["watermark"];
+    let thumb_ref = face["thumbs"].as_array().is_some_and(|arr| {
+        arr.iter().any(|v| {
+            v.as_str().is_some_and(|s| {
+                Path::new(s) == file
+                    || fs::canonicalize(s).ok().as_deref() == Some(file.as_path())
+            })
+        })
+    });
+    let watermark_ref = watermark["artifact_attempt"].as_str() == Some(attempt)
+        && watermark["candidates"].as_array().is_some_and(|arr| {
+            arr.iter().any(|c| {
+                c["evidence"].as_str().is_some_and(|ev| {
+                    Path::new("watermarks/evidence").join(ev) == Path::new(relative)
+                })
+            })
+        });
+    if !(thumb_ref || watermark_ref)
+        || !file.starts_with(&directory)
+        || fs::canonicalize(&file).ok().as_deref() != Some(file.as_path())
+        || !fs::metadata(&file).is_ok_and(|m| m.is_file())
+    {
+        return deny();
+    }
+    Ok(json!({
+        "ok": true,
+        "accepted": true,
+        "valid": true,
+        "file": file.to_string_lossy(),
+    }))
+}
+
+fn load_active_face_groups(config: &Config, face_version: &str) -> Result<Vec<Value>> {
+    let db_file = db_path(config);
+    if !db_file.exists() {
+        return Ok(Vec::new());
+    }
+    let conn = db::open(&db_file)?;
+    let has_table: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='face_groups')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
+    if !has_table {
+        return Ok(Vec::new());
+    }
+    let mut handled = BTreeSet::new();
+    for name in ["integration-queue.json", "archive-history.json"] {
+        if let Ok((_, doc)) = review::read(config, name, json!([]))
+            && let Some(arr) = doc.as_array()
+        {
+            for r in arr {
+                if let Some(id) = r["vid"].as_str() {
+                    handled.insert(id.to_owned());
+                }
+            }
+        }
+    }
+    let mut active = BTreeSet::new();
+    if let Ok(rows) = db::rows(
+        &conn,
+        "SELECT vid,data FROM tasks WHERE stage IN ('review','face') AND manual=0 AND json_extract(data,'$.kind')='none'",
+        [],
+    ) {
+        for row in rows {
+            if !row["vid"].as_str().is_some_and(|id| handled.contains(id))
+                && let Ok(data) = review::task_data(&row)
+                && let Some(id) = data["face"]["unknown_group"].as_str()
+            {
+                active.insert(id.to_owned());
+            }
+        }
+    }
+    let mut out = Vec::new();
+    if let Ok(rows) = db::rows(
+        &conn,
+        "SELECT * FROM face_groups WHERE version=? ORDER BY id",
+        [face_version],
+    ) {
+        for row in rows {
+            let Some(id) = row["id"].as_str() else {
+                continue;
+            };
+            if !active.contains(id) {
+                continue;
+            }
+            let Ok(bytes) = serde_json::from_value::<Vec<u8>>(row["embedding"]["$blob"].clone())
+            else {
+                continue;
+            };
+            if bytes.len() != 2048 {
+                continue;
+            }
+            let floats: Vec<f32> = bytes
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+                .collect();
+            if floats.iter().any(|x| !x.is_finite()) {
+                continue;
+            }
+            out.push(json!({
+                "id": id,
+                "version": face_version,
+                "embedding": floats,
+            }));
+        }
+    }
+    Ok(out)
+}
+
+fn validate_task_source(config: &Config, path: &str) -> Option<fs::Metadata> {
+    let p = Path::new(path);
+    if p.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        return None;
+    }
+    let sym = fs::symlink_metadata(p).ok()?;
+    if sym.file_type().is_symlink() || !sym.is_file() {
+        return None;
+    }
+    let real = fs::canonicalize(p).ok()?;
+    let real_root = fs::canonicalize(&config.media).ok()?;
+    let creators_root = fs::canonicalize(config.creators())
+        .unwrap_or_else(|_| real_root.join("pikpak/creators"));
+    if !real.starts_with(&real_root)
+        || real.starts_with(&creators_root)
+        || real
+            .components()
+            .any(|c| c.as_os_str() == ".face-cleanup-staging")
+    {
+        return None;
+    }
+    fs::metadata(&real).ok()
+}
+
+pub fn cache_check(engine: &Engine, body: &Value) -> Result<Value> {
+    let config = &engine.config;
+    let stage = body["stage"].as_str().unwrap_or("text");
+    let vid = body["vid"].as_str().unwrap_or("");
+    let path = body["path"].as_str().unwrap_or("");
+    let size = review::number(&body["size"]).unwrap_or(-1);
+    let mtime_ns = body["mtime_ns"].as_str().unwrap_or("");
+    let pipeline = body["pipeline"].as_str().unwrap_or(DEFAULT_PIPELINE);
+    let face_version = body["face_version"]
+        .as_str()
+        .unwrap_or(DEFAULT_FACE_VERSION);
+
+    let Some(stat) = validate_task_source(config, path) else {
+        return Ok(json!({
+            "ok": true,
+            "hit": false,
+            "text_valid": false,
+            "face_feature_valid": false,
+            "stage": stage,
+            "reason": "source_missing_or_unsafe",
+        }));
+    };
+    if i64::try_from(stat.len()).ok() != Some(size) || files::mtime_ns(&stat) != mtime_ns {
+        return Ok(json!({
+            "ok": true,
+            "hit": false,
+            "text_valid": false,
+            "face_feature_valid": false,
+            "stage": stage,
+            "reason": "source_fingerprint_changed",
+        }));
+    }
+    let current_identity = files::identity(&stat);
+
+    let mut text_valid = false;
+    let mut text_cached = Value::Null;
+    let results = review::read(config, "watermarks/results.json", json!({}))?.1;
+    let existing = &results[vid];
+    if existing.is_object()
+        && existing["status"] == "done"
+        && existing["pipeline"].as_str() == Some(pipeline)
+        && existing["path"].as_str() == Some(path)
+        && review::number(&existing["size"]) == Some(size)
+        && existing["mtime_ns"].as_str() == Some(mtime_ns)
+        && existing["candidates"].is_array()
+    {
+        let mut attempt_ok = true;
+        if let Some(attempt) = existing["artifact_attempt"].as_str() {
+            if crate::model::validate_id(attempt).is_err() {
+                attempt_ok = false;
+            } else {
+                let db_file = db_path(config);
+                if db_file.exists()
+                    && let Ok(conn) = db::open(&db_file)
+                    && conn
+                        .query_row(
+                            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='_face_admin_processing_results')",
+                            [],
+                            |r| r.get::<_, bool>(0),
+                        )
+                        .unwrap_or(false)
+                {
+                    let receipt_ok = conn
+                        .query_row(
+                            "SELECT result FROM _face_admin_processing_results WHERE id=?",
+                            [attempt],
+                            |r| r.get::<_, String>(0),
+                        )
+                        .optional()
+                        .ok()
+                        .flatten()
+                        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+                        .is_some_and(|rec| {
+                            let id = &rec["source_identity"];
+                            rec["ok"] == true
+                                && rec["accepted"] == true
+                                && value_as_id_str(&id["dev"]).as_deref()
+                                    == current_identity["dev"].as_str()
+                                && value_as_id_str(&id["ino"]).as_deref()
+                                    == current_identity["ino"].as_str()
+                        });
+                    if !receipt_ok {
+                        attempt_ok = false;
+                    }
+                }
+            }
+        }
+        if attempt_ok {
+            for cand in existing["candidates"].as_array().into_iter().flatten() {
+                if let Some(ev) = cand["evidence"].as_str() {
+                    let ev_path = if let Some(attempt) = existing["artifact_attempt"].as_str() {
+                        config
+                            .base
+                            .join("processing/attempts")
+                            .join(attempt)
+                            .join("watermarks/evidence")
+                            .join(ev)
+                    } else {
+                        config.base.join("watermarks/evidence").join(ev)
+                    };
+                    if fs::canonicalize(&ev_path).ok().as_deref() != Some(ev_path.as_path())
+                        || !fs::metadata(&ev_path).is_ok_and(|m| m.is_file())
+                    {
+                        attempt_ok = false;
+                        break;
+                    }
+                }
+            }
+        }
+        if attempt_ok {
+            text_valid = true;
+            text_cached = existing.clone();
+        }
+    }
+
+    let active_groups = load_active_face_groups(config, face_version).unwrap_or_default();
+    let mut face_feature_valid = false;
+    let mut face_feature_cache = Value::Null;
+    let mut face_feature_sha = Value::Null;
+    let db_file = db_path(config);
+    if db_file.exists()
+        && let Ok(conn) = db::open(&db_file)
+    {
+        let has_results: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='_face_admin_processing_results')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(false);
+        if has_results
+            && let Ok(rows) = db::rows(
+                &conn,
+                "SELECT result FROM _face_admin_processing_results WHERE json_extract(result,'$.vid')=? OR json_extract(result,'$.task.vid')=? ORDER BY rowid DESC",
+                [vid, vid],
+            )
+        {
+            for row in rows {
+                let Some(raw) = row["result"].as_str() else {
+                    continue;
+                };
+                let Ok(rec) = serde_json::from_str::<Value>(raw) else {
+                    continue;
+                };
+                if rec["ok"] != true || rec["accepted"] != true {
+                    continue;
+                }
+                let face = &rec["data"]["face"];
+                if !face.is_object() || face["version"].as_str() != Some(face_version) {
+                    continue;
+                }
+                if let Some(expected_hashes) = body.get("model_hashes").filter(|v| v.is_object())
+                    && face["execution"]["model_hashes"].is_object()
+                    && &face["execution"]["model_hashes"] != expected_hashes
+                {
+                    continue;
+                }
+                let Some(cache_str) = face["feature_cache"].as_str().filter(|s| !s.is_empty()) else {
+                    continue;
+                };
+                let Some(expected_sha) = face["feature_cache_sha256"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                else {
+                    continue;
+                };
+                let cache_path = Path::new(cache_str);
+                let attempts_root = config.base.join("processing/attempts");
+                let real_attempts = fs::canonicalize(&attempts_root).unwrap_or(attempts_root);
+                let Ok(real_cache) = fs::canonicalize(cache_path) else {
+                    continue;
+                };
+                if !real_cache.starts_with(&real_attempts)
+                    || crate::processing_result::artifact_hash(&real_cache)
+                        .ok()
+                        .as_deref()
+                        != Some(expected_sha)
+                {
+                    continue;
+                }
+                let thumbs_ok = face["thumbs"].as_array().is_none_or(|arr| {
+                    arr.iter().all(|t| {
+                        t.as_str().is_some_and(|tp| {
+                            fs::canonicalize(tp)
+                                .ok()
+                                .is_some_and(|rp| rp.starts_with(&real_attempts) && rp.is_file())
+                        })
+                    })
+                });
+                if !thumbs_ok {
+                    continue;
+                }
+                let rec_id = face
+                    .get("source_identity")
+                    .filter(|v| v.is_object())
+                    .unwrap_or(&rec["source_identity"]);
+                let rec_dev = value_as_id_str(&rec_id["dev"]);
+                let rec_ino = value_as_id_str(&rec_id["ino"]);
+                let same_origin = rec["task"]["path"].as_str() == Some(path)
+                    && review::number(&rec["task"]["size"]) == Some(size)
+                    && rec["task"]["mtime_ns"].as_str() == Some(mtime_ns)
+                    && rec_dev.as_deref() == current_identity["dev"].as_str()
+                    && rec_ino.as_deref() == current_identity["ino"].as_str();
+                let relocated_ok = if same_origin {
+                    true
+                } else if let (Some(dev), Some(ino)) = (rec_dev, rec_ino) {
+                    let origin = json!({
+                        "path": rec["task"]["path"],
+                        "size": review::number(&rec["task"]["size"]).unwrap_or(0).to_string(),
+                        "mtime_ns": rec["task"]["mtime_ns"],
+                        "dev": dev,
+                        "ino": ino,
+                    });
+                    crate::reference_relocation::verify(
+                        engine,
+                        &json!({
+                            "vid": vid,
+                            "source": path,
+                            "cache": real_cache.to_string_lossy(),
+                            "cache_sha256": expected_sha,
+                            "origin": origin,
+                            "current_identity": current_identity,
+                        }),
+                    )
+                    .is_ok_and(|p| p["verified"] == true)
+                } else {
+                    false
+                };
+                if !relocated_ok {
+                    continue;
+                }
+                face_feature_valid = true;
+                face_feature_cache = json!(real_cache.to_string_lossy());
+                face_feature_sha = json!(expected_sha);
+                break;
+            }
+        }
+    }
+
+    let hit = if stage == "face" {
+        face_feature_valid
+    } else {
+        text_valid
+    };
+    Ok(json!({
+        "ok": true,
+        "hit": hit,
+        "stage": stage,
+        "text_valid": text_valid,
+        "text_cached": text_cached,
+        "watermark": text_cached,
+        "face_feature_valid": face_feature_valid,
+        "feature_cache": face_feature_cache,
+        "feature_cache_sha256": face_feature_sha,
+        "source_identity": current_identity,
+        "active_face_groups": active_groups,
+    }))
+}
+
+pub fn reference_state(engine: &Engine, body: &Value) -> Result<Value> {
+    let config = &engine.config;
+    let input_version = crate::shared_metadata::analysis_state(config)?["version"]
+        .as_str()
+        .unwrap_or("")
+        .to_owned();
+    let renames = review::read(config, "person-renames.json", json!({}))?.1;
+    let report = review::read(config, "report.json", json!({}))?.1;
+    let queue = review::read(config, "integration-queue.json", json!([]))?.1;
+    let history = review::read(config, "archive-history.json", json!([]))?.1;
+    let mut assigned = serde_json::Map::new();
+    for row in queue
+        .as_array()
+        .into_iter()
+        .flatten()
+        .chain(history.as_array().into_iter().flatten())
+    {
+        if row["file_state"].as_str() == Some("staged") {
+            continue;
+        }
+        if let (Some(vid), Some(creator)) = (row["vid"].as_str(), row["creator"].as_str()) {
+            assigned.insert(
+                vid.to_owned(),
+                json!(crate::processing_result::canonical_person(creator, &renames)),
+            );
+        }
+    }
+    let sources = safe_video_sources(config);
+    let creators_prefix = format!("{}/pikpak/creators/", config.media.to_string_lossy());
+    for (vid, p) in &sources {
+        let resolved = mapped_path(config, p).or_else(|| mapped_path(config, vid));
+        if let Some(rp) = resolved
+            && let Some(rest) = rp.strip_prefix(&creators_prefix)
+            && let Some(person) = rest.split('/').next().filter(|s| !s.is_empty())
+        {
+            assigned.entry(vid.clone()).or_insert_with(|| {
+                json!(crate::processing_result::canonical_person(person, &renames))
+            });
+        }
+    }
+    let ref_file = config.base.join("processing/references.npz");
+    let mut current_refs = Value::Null;
+    let mut valid = false;
+    let db_file = db_path(config);
+    if db_file.exists()
+        && let Ok(conn) = db::open(&db_file)
+        && let Ok(Some(saved)) = setting(&conn, "references")
+    {
+        let sha_ok = saved["sha256"].as_str().is_none_or(|expected| {
+            crate::processing_result::artifact_hash(&ref_file)
+                .ok()
+                .as_deref()
+                == Some(expected)
+        });
+        if ref_file.is_file()
+            && saved["input_version"].as_str() == Some(input_version.as_str())
+            && sha_ok
+        {
+            valid = true;
+        }
+        current_refs = saved;
+    }
+
+    let mut accepted_receipts = serde_json::Map::new();
+    if db_file.exists()
+        && let Ok(conn) = db::open(&db_file)
+        && conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='_face_admin_processing_results')",
+                [],
+                |r| r.get::<_, bool>(0),
+            )
+            .unwrap_or(false)
+        && let Ok(rows) = db::rows(
+            &conn,
+            "SELECT result FROM _face_admin_processing_results ORDER BY rowid DESC",
+            [],
+        )
+    {
+        let attempts_root = fs::canonicalize(config.base.join("processing/attempts"))
+            .unwrap_or_else(|_| config.base.join("processing/attempts"));
+        for row in rows {
+            let Some(raw) = row["result"].as_str() else {
+                continue;
+            };
+            let Ok(rec) = serde_json::from_str::<Value>(raw) else {
+                continue;
+            };
+            if rec["ok"] != true || rec["accepted"] != true {
+                continue;
+            }
+            let Some(vid) = rec["vid"].as_str() else {
+                continue;
+            };
+            if !assigned.contains_key(vid) {
+                continue;
+            }
+            let face = &rec["data"]["face"];
+            let Some(cache) = face["feature_cache"].as_str() else {
+                continue;
+            };
+            let Some(sha) = face["feature_cache_sha256"].as_str() else {
+                continue;
+            };
+            let cp = Path::new(cache);
+            if cp.file_name().and_then(|s| s.to_str()) != Some("features.npz") {
+                continue;
+            }
+            let Ok(real_cp) = fs::canonicalize(cp) else {
+                continue;
+            };
+            if !real_cp.starts_with(&attempts_root) {
+                continue;
+            }
+            let identity = face
+                .get("source_identity")
+                .filter(|v| v.is_object())
+                .cloned()
+                .or_else(|| rec.get("source_identity").cloned())
+                .unwrap_or_else(|| json!({}));
+            accepted_receipts
+                .entry(vid.to_owned())
+                .or_insert_with(|| json!([]))
+                .as_array_mut()
+                .unwrap()
+                .push(json!({
+                    "cache": real_cp.to_string_lossy(),
+                    "feature_cache": real_cp.to_string_lossy(),
+                    "sha256": sha,
+                    "feature_cache_sha256": sha,
+                    "source_identity": identity,
+                }));
+        }
+    }
+
+    let _ = body;
+    Ok(json!({
+        "ok": true,
+        "version": input_version,
+        "input_version": input_version,
+        "valid": valid,
+        "references": current_refs,
+        "renames": renames,
+        "report": report,
+        "report_identities": report.get("identities").cloned().unwrap_or_else(|| json!([])),
+        "assigned": assigned,
+        "sources": sources,
+        "accepted_receipts": accepted_receipts,
+    }))
+}
+
+pub fn publish_references(engine: &Engine, body: &Value) -> Result<Value> {
+    let config = &engine.config;
+    let staged_raw = body["staged_path"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| bad("缺少待发布参考文件路径"))?;
+    let expected_sha = body["sha256"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| bad("缺少待发布参考文件校验和"))?;
+    let version = body["version"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| bad("缺少参考特征版本"))?;
+    let input_version = body["input_version"]
+        .as_str()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| bad("缺少参考输入版本"))?;
+    let people = review::number(&body["people"]).unwrap_or(0);
+    let templates = review::number(&body["templates"]).unwrap_or(0);
+
+    let tmp_root = config.base.join("processing/tmp");
+    fs::create_dir_all(&tmp_root)?;
+    let real_tmp = fs::canonicalize(&tmp_root)?;
+    let staged_path = Path::new(staged_raw);
+    let real_staged = fs::canonicalize(staged_path)
+        .map_err(|_| bad("待发布参考文件不存在或路径无效"))?;
+    if !real_staged.starts_with(&real_tmp)
+        || real_staged.parent() != Some(real_tmp.as_path())
+        || !fs::symlink_metadata(&real_staged)?.is_file()
+    {
+        return Err(bad("待发布参考文件必须位于受限临时目录 processing/tmp 下"));
+    }
+    let current_input = crate::shared_metadata::analysis_state(config)?["version"]
+        .as_str()
+        .unwrap_or("")
+        .to_owned();
+    if current_input != input_version {
+        let _ = fs::remove_file(&real_staged);
+        return Err(conflict("人物参考资料已变化，等待重新建立参考"));
+    }
+    let actual_sha = crate::processing_result::artifact_hash(&real_staged)?;
+    if actual_sha != expected_sha {
+        let _ = fs::remove_file(&real_staged);
+        return Err(conflict("待发布参考文件校验和不匹配"));
+    }
+    let target = config.base.join("processing/references.npz");
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = fs::set_permissions(&real_staged, fs::Permissions::from_mode(0o644));
+    }
+    fs::rename(&real_staged, &target)?;
+    files::sync_parent(&target)?;
+
+    let conn = open_or_init(config)?;
+    let now = now_sec(&conn)?;
+    let meta = json!({
+        "version": version,
+        "input_version": input_version,
+        "people": people,
+        "templates": templates,
+        "sha256": actual_sha,
+        "updated_at": now,
+    });
+    set_setting(&conn, "references", &meta)?;
+    Ok(json!({
+        "ok": true,
+        "published": true,
+        "version": version,
+        "input_version": input_version,
+        "people": people,
+        "templates": templates,
+        "sha256": actual_sha,
+    }))
+}
+
+fn extract_attempt_from_path(attempts_roots: &[PathBuf], raw_path: &str) -> Option<String> {
+    let p = Path::new(raw_path);
+    let mut candidates = vec![p.to_path_buf()];
+    if let Ok(real) = fs::canonicalize(p)
+        && !candidates.contains(&real)
+    {
+        candidates.push(real);
+    }
+    for cand in candidates {
+        for root in attempts_roots {
+            if let Ok(rel) = cand.strip_prefix(root)
+                && let Some(std::path::Component::Normal(first)) = rel.components().next()
+                && let Some(id) = first.to_str()
+                && crate::model::validate_id(id).is_ok()
+            {
+                return Some(id.to_owned());
+            }
+        }
+    }
+    None
+}
+
+fn entry_age_seconds(path: &Path) -> f64 {
+    let now = std::time::SystemTime::now();
+    let newest_mtime = |p: &Path| -> Option<std::time::SystemTime> {
+        let mut latest = fs::symlink_metadata(p).ok()?.modified().ok()?;
+        if p.is_dir()
+            && let Ok(entries) = fs::read_dir(p)
+        {
+            for entry in entries.flatten() {
+                if let Ok(meta) = entry.metadata()
+                    && let Ok(m) = meta.modified()
+                    && m > latest
+                {
+                    latest = m;
+                }
+            }
+        }
+        Some(latest)
+    };
+    newest_mtime(path)
+        .and_then(|m| now.duration_since(m).ok())
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+pub fn evict_artifacts(engine: &Engine, body: &Value) -> Result<Value> {
+    let config = &engine.config;
+    let grace_seconds = body
+        .get("grace_seconds")
+        .and_then(|v| v.as_f64().or_else(|| v.as_i64().map(|n| n as f64)))
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .unwrap_or(300.0);
+
+    let attempts_dir = config.base.join("processing/attempts");
+    let mut attempts_roots = vec![attempts_dir.clone()];
+    if let Ok(real) = fs::canonicalize(&attempts_dir)
+        && !attempts_roots.contains(&real)
+    {
+        attempts_roots.push(real);
+    }
+
+    let mut protected_attempts = BTreeSet::new();
+    let mut rolled_back_ops = BTreeSet::new();
+    let mut superseded_receipts = BTreeSet::new();
+
+    if let Ok(rows) = db::rows(&engine.store.db, "SELECT id,status FROM operations", []) {
+        for row in rows {
+            if let (Some(id), Some(status)) = (row["id"].as_str(), row["status"].as_str()) {
+                if matches!(
+                    status,
+                    "accepted" | "running" | "recovery_needed" | "rolling_back"
+                ) {
+                    protected_attempts.insert(id.to_owned());
+                } else if status == "rolled_back" {
+                    rolled_back_ops.insert(id.to_owned());
+                }
+            }
+        }
+    }
+
+    let mut assigned_vids = BTreeSet::new();
+    for doc_name in ["integration-queue.json", "archive-history.json"] {
+        if let Ok((_, doc)) = review::read(config, doc_name, json!([]))
+            && let Some(arr) = doc.as_array()
+        {
+            for r in arr {
+                if r["file_state"].as_str() != Some("staged")
+                    && let Some(vid) = r["vid"].as_str()
+                {
+                    assigned_vids.insert(vid.to_owned());
+                }
+            }
+        }
+    }
+    let sources = safe_video_sources(config);
+    let creators_prefix = format!("{}/pikpak/creators/", config.media.to_string_lossy());
+    for (vid, p) in &sources {
+        let resolved = mapped_path(config, p).or_else(|| mapped_path(config, vid));
+        if let Some(rp) = resolved
+            && rp.starts_with(&creators_prefix)
+        {
+            assigned_vids.insert(vid.clone());
+        }
+    }
+
+    if let Ok((_, wm_results)) = review::read(config, "watermarks/results.json", json!({}))
+        && let Some(obj) = wm_results.as_object()
+    {
+        for rec in obj.values() {
+            if let Some(attempt) = rec["artifact_attempt"].as_str()
+                && crate::model::validate_id(attempt).is_ok()
+            {
+                protected_attempts.insert(attempt.to_owned());
+            }
+        }
+    }
+
+    let db_file = db_path(config);
+    if db_file.exists() {
+        let conn = open_or_init(config)?;
+        let now = now_sec(&conn)?;
+        let mut current_tasks = BTreeMap::new();
+        for row in db::rows(
+            &conn,
+            "SELECT vid,path,size,mtime_ns,stage,run_id,lease_expires_at,data FROM tasks",
+            [],
+        )? {
+            let vid = row["vid"].as_str().unwrap_or("").to_owned();
+            let path = row["path"].as_str().unwrap_or("").to_owned();
+            let size = review::number(&row["size"]).unwrap_or(-1);
+            let mtime = row["mtime_ns"].as_str().unwrap_or("").to_owned();
+            current_tasks.insert(vid, (path, size, mtime));
+
+            let run_id = row["run_id"].as_str().unwrap_or("");
+            let stage = row["stage"].as_str().unwrap_or("");
+            let expiry = row["lease_expires_at"].as_f64().unwrap_or(0.0);
+            if !run_id.is_empty() && (matches!(stage, "text" | "face") || expiry > now) {
+                protected_attempts.insert(run_id.to_owned());
+            }
+            if let Ok(data) = review::task_data(&row) {
+                if let Some(attempt) = data["watermark"]["artifact_attempt"].as_str()
+                    && crate::model::validate_id(attempt).is_ok()
+                {
+                    protected_attempts.insert(attempt.to_owned());
+                }
+                if let Some(fc) = data["face"]["feature_cache"].as_str()
+                    && let Some(attempt) = extract_attempt_from_path(&attempts_roots, fc)
+                {
+                    protected_attempts.insert(attempt);
+                }
+                for thumb in data["face"]["thumbs"].as_array().into_iter().flatten() {
+                    if let Some(tp) = thumb.as_str()
+                        && let Some(attempt) = extract_attempt_from_path(&attempts_roots, tp)
+                    {
+                        protected_attempts.insert(attempt);
+                    }
+                }
+                for m in data["face"]["matches"].as_array().into_iter().flatten() {
+                    if let Some(tp) = m["thumb"].as_str()
+                        && let Some(attempt) = extract_attempt_from_path(&attempts_roots, tp)
+                    {
+                        protected_attempts.insert(attempt);
+                    }
+                }
+            }
+        }
+        for row in db::rows(
+            &conn,
+            "SELECT id FROM processing_runs WHERE status='running'",
+            [],
+        )? {
+            if let Some(id) = row["id"].as_str().filter(|s| !s.is_empty()) {
+                protected_attempts.insert(id.to_owned());
+            }
+        }
+
+        let has_results: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='_face_admin_processing_results')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(false);
+        if has_results {
+            let mut seen_vid_stage = BTreeSet::new();
+            for row in db::rows(
+                &conn,
+                "SELECT id,result FROM _face_admin_processing_results ORDER BY rowid DESC",
+                [],
+            )? {
+                let Some(id) = row["id"].as_str() else {
+                    continue;
+                };
+                let Some(raw) = row["result"].as_str() else {
+                    continue;
+                };
+                let Ok(res) = serde_json::from_str::<Value>(raw) else {
+                    superseded_receipts.insert(id.to_owned());
+                    continue;
+                };
+                if res["ok"] != true || res["accepted"] != true {
+                    superseded_receipts.insert(id.to_owned());
+                    continue;
+                }
+                let vid = res["vid"]
+                    .as_str()
+                    .or_else(|| res["task"]["vid"].as_str())
+                    .unwrap_or("")
+                    .to_owned();
+                let stage = res["stage"]
+                    .as_str()
+                    .or_else(|| res["task"]["stage"].as_str())
+                    .unwrap_or("face")
+                    .to_owned();
+                let t_path = res["task"]["path"].as_str().unwrap_or("");
+                let t_size = review::number(&res["task"]["size"]).unwrap_or(-1);
+                let t_mtime = res["task"]["mtime_ns"].as_str().unwrap_or("");
+                let matches_current = current_tasks
+                    .get(&vid)
+                    .is_none_or(|(p, sz, mt)| p == t_path && *sz == t_size && mt == t_mtime);
+                let is_assigned = assigned_vids.contains(&vid);
+                let is_latest = seen_vid_stage.insert((vid.clone(), stage));
+                if is_latest && (matches_current || is_assigned) {
+                    protected_attempts.insert(id.to_owned());
+                    if let Some(wm_att) = res["data"]["watermark"]["artifact_attempt"].as_str()
+                        && crate::model::validate_id(wm_att).is_ok()
+                    {
+                        protected_attempts.insert(wm_att.to_owned());
+                    }
+                    if let Some(fc) = res["data"]["face"]["feature_cache"].as_str()
+                        && let Some(att) = extract_attempt_from_path(&attempts_roots, fc)
+                    {
+                        protected_attempts.insert(att);
+                    }
+                    for thumb in res["data"]["face"]["thumbs"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                    {
+                        if let Some(tp) = thumb.as_str()
+                            && let Some(att) = extract_attempt_from_path(&attempts_roots, tp)
+                        {
+                            protected_attempts.insert(att);
+                        }
+                    }
+                } else {
+                    superseded_receipts.insert(id.to_owned());
+                }
+            }
+        }
+    }
+
+    let mut evicted_attempts = Vec::new();
+    let mut preserved_attempts = Vec::new();
+    if attempts_dir.is_dir() {
+        for entry in fs::read_dir(&attempts_dir)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let path = entry.path();
+            if path.join("publication.json").exists()
+                && !path.join("receipt.json").exists()
+                && !rolled_back_ops.contains(&name)
+            {
+                protected_attempts.insert(name.clone());
+            }
+            if protected_attempts.contains(&name) || entry_age_seconds(&path) < grace_seconds {
+                preserved_attempts.push(name);
+                continue;
+            }
+            if path.is_dir() {
+                fs::remove_dir_all(&path)?;
+            } else {
+                fs::remove_file(&path)?;
+            }
+            evicted_attempts.push(name);
+        }
+    }
+
+    if db_file.exists() && (!evicted_attempts.is_empty() || !superseded_receipts.is_empty()) {
+        let conn = open_or_init(config)?;
+        let has_results: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='_face_admin_processing_results')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(false);
+        if has_results {
+            for id in &evicted_attempts {
+                if !protected_attempts.contains(id) {
+                    let _ = conn.execute(
+                        "DELETE FROM _face_admin_processing_results WHERE id=?",
+                        [id],
+                    );
+                }
+            }
+            for id in &superseded_receipts {
+                if !protected_attempts.contains(id) && !attempts_dir.join(id).exists() {
+                    let _ = conn.execute(
+                        "DELETE FROM _face_admin_processing_results WHERE id=?",
+                        [id],
+                    );
+                }
+            }
+        }
+    }
+
+    let mut evicted_tmp = Vec::new();
+    let mut preserved_tmp = Vec::new();
+    let tmp_dir = config.base.join("processing/tmp");
+    if tmp_dir.is_dir() {
+        for entry in fs::read_dir(&tmp_dir)? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let path = entry.path();
+            if entry_age_seconds(&path) < grace_seconds {
+                preserved_tmp.push(name);
+                continue;
+            }
+            if path.is_dir() {
+                fs::remove_dir_all(&path)?;
+            } else {
+                fs::remove_file(&path)?;
+            }
+            evicted_tmp.push(name);
+        }
+    }
+
+    evicted_attempts.sort();
+    preserved_attempts.sort();
+    evicted_tmp.sort();
+    preserved_tmp.sort();
+    Ok(json!({
+        "ok": true,
+        "evicted_attempts": evicted_attempts,
+        "preserved_attempts": preserved_attempts,
+        "evicted_tmp": evicted_tmp,
+        "preserved_tmp": preserved_tmp,
+    }))
+}
+
 pub fn execute(engine: &mut Engine, command: &str, body: Value) -> Result<Value> {
     if engine.store.blocked()? {
         return Err(Error::new(
@@ -2742,6 +3925,9 @@ pub fn execute(engine: &mut Engine, command: &str, body: Value) -> Result<Value>
             | "processing-dashboard"
             | "processing-home-tasks"
             | "processing-evaluate-rules"
+            | "processing-artifact-check"
+            | "processing-cache-check"
+            | "processing-reference-state"
     ) {
         return match command {
             "processing-settings" => settings(&engine.config),
@@ -2750,6 +3936,9 @@ pub fn execute(engine: &mut Engine, command: &str, body: Value) -> Result<Value>
             "processing-dashboard" => dashboard(&engine.config, &body),
             "processing-home-tasks" => home_tasks(&engine.config, &body),
             "processing-evaluate-rules" => crate::processing_result::evaluate_rules(&body),
+            "processing-artifact-check" => verify_attempt_artifact(&engine.config, &body),
+            "processing-cache-check" => cache_check(engine, &body),
+            "processing-reference-state" => reference_state(engine, &body),
             _ => unreachable!(),
         };
     }
@@ -2802,6 +3991,17 @@ pub fn execute(engine: &mut Engine, command: &str, body: Value) -> Result<Value>
         "processing-control" => control(&engine.config, &body),
         "processing-concurrency" => set_concurrency(&engine.config, &body),
         "processing-retry-errors" => retry_errors(&engine.config, &body),
+        "processing-publish-references" => publish_references(engine, &body),
+        "processing-evict-artifacts" => evict_artifacts(engine, &body),
+        "processing-event" => {
+            let conn = open_or_init(&engine.config)?;
+            let now = now_sec(&conn)?;
+            let vid = body["vid"].as_str().filter(|s| !s.is_empty());
+            let kind = body["kind"].as_str().unwrap_or("info");
+            let message = body["message"].as_str().unwrap_or("");
+            event(&conn, now, vid, kind, message)?;
+            Ok(json!({"ok": true}))
+        }
         _ => Err(bad("未知分析调度命令")),
     }
 }
@@ -3189,5 +4389,438 @@ mod tests {
         assert_eq!(ht["total"], 2);
         assert_eq!(ht["counts"]["review"], 1);
         assert_eq!(ht["counts"]["queued"], 1);
+    }
+
+    #[test]
+    fn verify_attempt_artifact_enforces_latest_accepted_receipt_and_source_identity() {
+        let env = TestEnv::new();
+        let conn = open_or_init(&env.config).unwrap();
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS _face_admin_processing_results (
+                id TEXT PRIMARY KEY,
+                request_hash TEXT NOT NULL,
+                result TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )",
+            [],
+        )
+        .unwrap();
+
+        let video = env.config.media.join("inbox/v1.mp4");
+        fs::create_dir_all(video.parent().unwrap()).unwrap();
+        fs::write(&video, b"video-bytes-v1").unwrap();
+        let meta = fs::metadata(&video).unwrap();
+        let vpath = video.to_string_lossy().into_owned();
+        let mtime = files::mtime_ns(&meta);
+        let identity = files::identity(&meta);
+
+        let run1 = "11111111-1111-4111-8111-111111111111";
+        let run2 = "22222222-2222-4222-8222-222222222222";
+        let unaccepted = "33333333-3333-4333-8333-333333333333";
+
+        for run in [run1, run2, unaccepted] {
+            let wm_dir = env
+                .config
+                .base
+                .join("processing/attempts")
+                .join(run)
+                .join("watermarks/evidence");
+            let th_dir = env
+                .config
+                .base
+                .join("processing/attempts")
+                .join(run)
+                .join("thumbs");
+            fs::create_dir_all(&wm_dir).unwrap();
+            fs::create_dir_all(&th_dir).unwrap();
+            fs::write(wm_dir.join("crop.jpg"), b"wm").unwrap();
+            fs::write(th_dir.join("face.jpg"), b"face").unwrap();
+        }
+
+        let r1 = json!({
+            "ok": true,
+            "accepted": true,
+            "vid": "v1",
+            "stage": "text",
+            "task": {
+                "vid": "v1",
+                "run_id": run1,
+                "stage": "text",
+                "path": vpath,
+                "size": meta.len(),
+                "mtime_ns": mtime,
+            },
+            "source_identity": identity,
+            "data": {
+                "watermark": {
+                    "artifact_attempt": run1,
+                    "candidates": [{"evidence": "crop.jpg"}]
+                }
+            }
+        });
+        conn.execute(
+            "INSERT INTO _face_admin_processing_results VALUES (?,'h1',?,'1')",
+            params![run1, r1.to_string()],
+        )
+        .unwrap();
+
+        // Accepted run1 watermark is valid
+        let ok1 = verify_attempt_artifact(
+            &env.config,
+            &json!({"attempt": run1, "relative": "watermarks/evidence/crop.jpg"}),
+        )
+        .unwrap();
+        assert_eq!(ok1["accepted"], true);
+        assert_eq!(ok1["valid"], true);
+
+        // Unaccepted run is rejected
+        let bad_unaccepted = verify_attempt_artifact(
+            &env.config,
+            &json!({"attempt": unaccepted, "relative": "watermarks/evidence/crop.jpg"}),
+        )
+        .unwrap();
+        assert_eq!(bad_unaccepted["accepted"], false);
+
+        // Supersede run1 with run2 for stage 'text'
+        let r2 = json!({
+            "ok": true,
+            "accepted": true,
+            "vid": "v1",
+            "stage": "text",
+            "task": {
+                "vid": "v1",
+                "run_id": run2,
+                "stage": "text",
+                "path": vpath,
+                "size": meta.len(),
+                "mtime_ns": mtime,
+            },
+            "source_identity": identity,
+            "data": {
+                "watermark": {
+                    "artifact_attempt": run2,
+                    "candidates": [{"evidence": "crop.jpg"}]
+                }
+            }
+        });
+        conn.execute(
+            "INSERT INTO _face_admin_processing_results VALUES (?,'h2',?,'2')",
+            params![run2, r2.to_string()],
+        )
+        .unwrap();
+
+        let superseded = verify_attempt_artifact(
+            &env.config,
+            &json!({"attempt": run1, "relative": "watermarks/evidence/crop.jpg"}),
+        )
+        .unwrap();
+        assert_eq!(superseded["accepted"], false);
+
+        let ok2 = verify_attempt_artifact(
+            &env.config,
+            &json!({"attempt": run2, "relative": "watermarks/evidence/crop.jpg"}),
+        )
+        .unwrap();
+        assert_eq!(ok2["accepted"], true);
+
+        // Mutating the underlying source video invalidates the accepted artifact
+        fs::write(&video, b"video-bytes-v1-modified-longer").unwrap();
+        let mutated = verify_attempt_artifact(
+            &env.config,
+            &json!({"attempt": run2, "relative": "watermarks/evidence/crop.jpg"}),
+        )
+        .unwrap();
+        assert_eq!(mutated["accepted"], false);
+    }
+
+    #[test]
+    fn cache_check_and_reference_publication_enforce_versioned_inputs() {
+        let env = TestEnv::new();
+        let engine = Engine::new(env.config.clone()).unwrap();
+        let conn = open_or_init(&env.config).unwrap();
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS _face_admin_processing_results (
+                id TEXT PRIMARY KEY,
+                request_hash TEXT NOT NULL,
+                result TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )",
+            [],
+        )
+        .unwrap();
+
+        let video = env.config.media.join("inbox/v1.mp4");
+        fs::create_dir_all(video.parent().unwrap()).unwrap();
+        fs::write(&video, b"video-bytes-for-cache").unwrap();
+        let meta = fs::metadata(&video).unwrap();
+        let vpath = video.to_string_lossy().into_owned();
+        let vsize = i64::try_from(meta.len()).unwrap();
+        let vmtime = files::mtime_ns(&meta);
+        let identity = files::identity(&meta);
+
+        let run_face = "11111111-1111-4111-8111-111111111111";
+        let feat_dir = env.config.base.join("processing/attempts").join(run_face);
+        fs::create_dir_all(&feat_dir).unwrap();
+        let feat_file = feat_dir.join("features.npz");
+        fs::write(&feat_file, b"fake-npz-bytes").unwrap();
+        let feat_sha = crate::processing_result::artifact_hash(&feat_file).unwrap();
+
+        let receipt = json!({
+            "ok": true,
+            "accepted": true,
+            "vid": "v1",
+            "stage": "face",
+            "task": {
+                "vid": "v1",
+                "run_id": run_face,
+                "path": vpath,
+                "size": vsize,
+                "mtime_ns": vmtime,
+            },
+            "source_identity": identity,
+            "data": {
+                "face": {
+                    "version": "buffalo_l-det-rec-8frames-v1",
+                    "feature_cache": feat_file.to_string_lossy(),
+                    "feature_cache_sha256": feat_sha,
+                    "source_identity": identity,
+                    "thumbs": []
+                }
+            }
+        });
+        conn.execute(
+            "INSERT INTO _face_admin_processing_results VALUES (?,'h1',?,'1')",
+            params![run_face, receipt.to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let wm_dir = env.config.base.join("watermarks");
+        fs::create_dir_all(&wm_dir).unwrap();
+        fs::write(
+            wm_dir.join("results.json"),
+            serde_json::to_vec(&json!({
+                "v1": {
+                    "vid": "v1",
+                    "path": vpath,
+                    "size": vsize,
+                    "mtime_ns": vmtime,
+                    "status": "done",
+                    "pipeline": "pipe-v1",
+                    "candidates": []
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let hit = cache_check(
+            &engine,
+            &json!({
+                "vid": "v1",
+                "path": vpath,
+                "size": vsize,
+                "mtime_ns": vmtime,
+                "pipeline": "pipe-v1",
+                "face_version": "buffalo_l-det-rec-8frames-v1"
+            }),
+        )
+        .unwrap();
+        assert_eq!(hit["text_valid"], true);
+        assert_eq!(hit["face_feature_valid"], true);
+
+        // Source size/mtime change invalidates both caches
+        let miss = cache_check(
+            &engine,
+            &json!({
+                "vid": "v1",
+                "path": vpath,
+                "size": vsize + 1,
+                "mtime_ns": vmtime,
+                "pipeline": "pipe-v1",
+                "face_version": "buffalo_l-det-rec-8frames-v1"
+            }),
+        )
+        .unwrap();
+        assert_eq!(miss["text_valid"], false);
+        assert_eq!(miss["face_feature_valid"], false);
+
+        // Reference state & publication validation
+        let faces_conn = db::open(&env.config.base.join("faces.db")).unwrap();
+        faces_conn
+            .execute(
+                "CREATE TABLE IF NOT EXISTS faces (id INTEGER PRIMARY KEY, vid TEXT, score REAL, emb BLOB, thumb TEXT)",
+                [],
+            )
+            .unwrap();
+        drop(faces_conn);
+        let state = reference_state(&engine, &json!({})).unwrap();
+        let input_v = state["input_version"].as_str().unwrap().to_owned();
+        let tmp_dir = env.config.base.join("processing/tmp");
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let staged = tmp_dir.join("references-test.npz");
+        let staged_bytes = b"PK\x03\x04fake-npz-zip-header";
+        fs::write(&staged, staged_bytes).unwrap();
+        let staged_sha = crate::processing_result::artifact_hash(&staged).unwrap();
+
+        let pub_ok = publish_references(
+            &engine,
+            &json!({
+                "staged_path": staged.to_string_lossy(),
+                "sha256": staged_sha,
+                "version": "ref-v1",
+                "input_version": input_v,
+                "people": 3,
+                "templates": 5,
+            }),
+        )
+        .unwrap();
+        assert_eq!(pub_ok["published"], true);
+        assert!(env.config.base.join("processing/references.npz").exists());
+
+        // Stale input_version must fail with 409 and remove staged file without overwriting references.npz
+        let staged2 = tmp_dir.join("references-stale.npz");
+        fs::write(&staged2, b"PK\x03\x04stale-npz").unwrap();
+        let stale_sha = crate::processing_result::artifact_hash(&staged2).unwrap();
+        let err = publish_references(
+            &engine,
+            &json!({
+                "staged_path": staged2.to_string_lossy(),
+                "sha256": stale_sha,
+                "version": "ref-stale",
+                "input_version": "0000000000000000000000000000000000000000000000000000000000000000",
+                "people": 1,
+                "templates": 1,
+            }),
+        )
+        .unwrap_err();
+        assert_eq!(err.status, 409);
+        assert!(!staged2.exists());
+        assert_eq!(
+            fs::read(env.config.base.join("processing/references.npz")).unwrap(),
+            staged_bytes
+        );
+    }
+
+    #[test]
+    fn evict_artifacts_preserves_active_pending_accepted_and_reused_while_evicting_stale() {
+        let env = TestEnv::new();
+        let engine = Engine::new(env.config.clone()).unwrap();
+        let conn = open_or_init(&env.config).unwrap();
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS _face_admin_processing_results (
+                id TEXT PRIMARY KEY,
+                request_hash TEXT NOT NULL,
+                result TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )",
+            [],
+        )
+        .unwrap();
+
+        let active_run = "11111111-1111-4111-8111-111111111111";
+        let pending_pub_run = "22222222-2222-4222-8222-222222222222";
+        let accepted_run = "33333333-3333-4333-8333-333333333333";
+        let reused_feat_run = "44444444-4444-4444-8444-444444444444";
+        let superseded_run = "55555555-5555-4555-8555-555555555555";
+        let failed_run = "66666666-6666-4666-8666-666666666666";
+
+        for run in [
+            active_run,
+            pending_pub_run,
+            accepted_run,
+            reused_feat_run,
+            superseded_run,
+            failed_run,
+        ] {
+            let dir = env.config.base.join("processing/attempts").join(run);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(dir.join("artifact.bin"), b"data").unwrap();
+        }
+        // Pending publication journal on pending_pub_run
+        fs::write(
+            env.config
+                .base
+                .join("processing/attempts")
+                .join(pending_pub_run)
+                .join("publication.json"),
+            b"{}",
+        )
+        .unwrap();
+
+        // Active lease on active_run
+        let now = now_sec(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO tasks (vid,path,name,size,mtime_ns,stage,priority,retry_stage,text_attempts,face_attempts,next_retry,lease_expires_at,coordinator_generation,error,manual,note,run_id,batch_id,data,created_at,updated_at)
+             VALUES ('v-active','/m/a.mp4','a.mp4',10,'1','face',10,'face',0,0,0,?,1,'',0,'',?,'b1','{}',?,?)",
+            params![now + 600.0, active_run, now, now],
+        )
+        .unwrap();
+
+        // Superseded receipt followed by latest accepted receipt that reuses features from reused_feat_run
+        let r_old = json!({"ok": true, "accepted": true, "vid": "v-done", "stage": "face", "task": {"vid": "v-done", "run_id": superseded_run, "stage": "face", "path": "/m/done.mp4", "size": 10, "mtime_ns": "1"}, "data": {}});
+        let reused_path = env
+            .config
+            .base
+            .join("processing/attempts")
+            .join(reused_feat_run)
+            .join("features.npz");
+        let r_new = json!({
+            "ok": true,
+            "accepted": true,
+            "vid": "v-done",
+            "stage": "face",
+            "task": {
+                "vid": "v-done",
+                "run_id": accepted_run,
+                "stage": "face",
+                "path": "/m/done.mp4",
+                "size": 10,
+                "mtime_ns": "1"
+            },
+            "data": {
+                "face": {
+                    "feature_cache": reused_path.to_string_lossy()
+                }
+            }
+        });
+        conn.execute(
+            "INSERT INTO _face_admin_processing_results VALUES (?,'h1',?,'1')",
+            params![superseded_run, r_old.to_string()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO _face_admin_processing_results VALUES (?,'h2',?,'2')",
+            params![accepted_run, r_new.to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let res = evict_artifacts(&engine, &json!({"grace_seconds": 0})).unwrap();
+        assert_eq!(res["ok"], true);
+        assert_eq!(res["evicted_attempts"].as_array().unwrap().len(), 2);
+
+        // Protected attempts must still exist
+        for protected in [active_run, pending_pub_run, accepted_run, reused_feat_run] {
+            assert!(
+                env.config
+                    .base
+                    .join("processing/attempts")
+                    .join(protected)
+                    .exists(),
+                "expected protected attempt {protected} to remain"
+            );
+        }
+        // Superseded and failed unaccepted attempts must be evicted
+        for evicted in [superseded_run, failed_run] {
+            assert!(
+                !env.config
+                    .base
+                    .join("processing/attempts")
+                    .join(evicted)
+                    .exists(),
+                "expected terminal unaccepted/superseded attempt {evicted} to be evicted"
+            );
+        }
     }
 }

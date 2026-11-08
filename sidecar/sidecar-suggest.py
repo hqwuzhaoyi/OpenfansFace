@@ -20,7 +20,7 @@ def _build():
     t0 = time.time()
     report_stamp = os.stat(f'{BASE}/report.json').st_mtime_ns
     rep = json.load(open(f'{BASE}/report.json'))
-    db = sqlite3.connect(f'{BASE}/faces.db')
+    db = sqlite3.connect(f'file:{BASE}/faces.db?mode=ro', uri=True)
     cents, names, reps, tpln = [], [], [], []
     for i in rep.get('identities', []):
         name = i.get('name') or ''
@@ -81,7 +81,7 @@ def suggest(cid, topk=12):
     vids = [v['vid'] for v in (cl.get('vids') or [])[:10]]
     if not vids or not len(C):
         return {'cid': cid, 'n_vids': cl.get('n_videos'), 'suggestions': []}
-    db = sqlite3.connect(f'{BASE}/faces.db')
+    db = sqlite3.connect(f'file:{BASE}/faces.db?mode=ro', uri=True)
     qs = ','.join('?' * len(vids))
     rows = db.execute(
         f"SELECT emb FROM faces WHERE vid IN ({qs}) ORDER BY score DESC LIMIT 80",
@@ -107,7 +107,7 @@ def suggest_wall(min_sim=0.58, min_gap=0.03):
     if not len(C):
         return {'suggest_wall': {}}
     cj = json.load(open(f'{BASE}/clusters.json'))
-    db = sqlite3.connect(f'{BASE}/faces.db')
+    db = sqlite3.connect(f'file:{BASE}/faces.db?mode=ro', uri=True)
     out = {}
     for cl in cj:
         vids = [v['vid'] for v in (cl.get('vids') or [])[:10]]

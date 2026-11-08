@@ -72,7 +72,7 @@ class Rebuilder:
                 with tempfile.TemporaryDirectory(prefix='face-analysis-output-') as directory:
                     result = subprocess.run([self.python, str(Path(self.base) / 'identify_faces.py')],
                         capture_output=True, text=True, timeout=900, cwd=self.base,
-                        env={**os.environ, 'F_OUT': directory})
+                        env={**os.environ, 'F_OUT': directory, 'F_INPUT_VERSION': version})
                     if result.returncode:
                         raise RuntimeError(((result.stdout or '') + (result.stderr or ''))[-500:])
                     outputs = {}
