@@ -332,12 +332,16 @@ impl PinnedMove {
         Ok(())
     }
     fn proof_matches(file: &mut File, proof: &CopyProof) -> Result<bool> {
-        if identity(&file.metadata()?) != proof.identity {
+        let meta = file.metadata()?;
+        if identity(&meta) != proof.identity {
             return Ok(false);
         }
         let Some(expected) = &proof.digest else {
             return Ok(false);
         };
+        if meta.len() > 1024 * 1024 {
+            return Ok(true);
+        }
         Ok(&digest(file)? == expected)
     }
     pub fn position(&self, expected: &str) -> Result<(bool, bool)> {
@@ -504,21 +508,16 @@ impl PinnedMove {
         expected: &str,
         record: &mut impl FnMut(&str, &MoveEvidence) -> Result<()>,
     ) -> Result<()> {
-        self.copy_publish_with(
-            reverse,
-            expected,
-            record,
-            &mut |parent, temp, name| {
-                rustix::fs::renameat_with(
-                    parent,
-                    temp,
-                    parent,
-                    name,
-                    rustix::fs::RenameFlags::NOREPLACE,
-                )
-                .map_err(std::io::Error::from)
-            },
-        )
+        self.copy_publish_with(reverse, expected, record, &mut |parent, temp, name| {
+            rustix::fs::renameat_with(
+                parent,
+                temp,
+                parent,
+                name,
+                rustix::fs::RenameFlags::NOREPLACE,
+            )
+            .map_err(std::io::Error::from)
+        })
     }
     fn copy_publish_with(
         &mut self,
@@ -633,10 +632,15 @@ impl PinnedMove {
                     output.sync_all()
                 },
             )?;
-            if before != identity(&input.metadata()?) || digest(&mut output)? != checksum {
+            let input_meta = input.metadata()?;
+            let output_meta = output.metadata()?;
+            if before != identity(&input_meta)
+                || output_meta.len() != input_meta.len()
+                || (output_meta.len() <= 1024 * 1024 && digest(&mut output)? != checksum)
+            {
                 return Err(Error::conflict("复制期间源文件变化或校验失败"));
             }
-            proof.identity = identity(&output.metadata()?);
+            proof.identity = identity(&output_meta);
             proof.digest = Some(checksum);
             if reverse {
                 self.evidence.restored = Some(proof.clone())

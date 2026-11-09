@@ -263,7 +263,7 @@ struct ReconcilableRow {
     in_place: bool,
 }
 
-fn in_place_scanner_match(actual: &Value, expected: &Value) -> Result<()> {
+fn in_place_scanner_match(actual: &Value, expected: &Value, dst_name: Option<&str>) -> Result<()> {
     let actual_obj = actual.as_object().ok_or_else(conflict)?;
     let expected_obj = expected.as_object().ok_or_else(conflict)?;
     if actual_obj.len() != expected_obj.len() {
@@ -277,13 +277,26 @@ fn in_place_scanner_match(actual: &Value, expected: &Value) -> Result<()> {
             continue;
         }
         match key.as_str() {
+            "name" => {
+                if dst_name.is_none() || actual_val.as_str() != dst_name {
+                    return Err(conflict());
+                }
+            }
             "last_seen" => {
                 if actual_val.as_str().is_none_or(|s| s.trim().is_empty()) {
                     return Err(conflict());
                 }
             }
             "mtime" => {
-                if db::integer(actual_val).is_err() {
+                let valid_str = actual_val.as_str().is_some_and(|s| !s.trim().is_empty());
+                if !valid_str && db::integer(actual_val).is_err() {
+                    return Err(conflict());
+                }
+            }
+            "snapshot_path" => {
+                if !expected_val.is_null()
+                    || actual_val.as_str().is_none_or(|s| s.trim().is_empty())
+                {
                     return Err(conflict());
                 }
             }
@@ -539,7 +552,8 @@ fn observe_scanner_rows(
                 if !src_rows.is_empty() {
                     return Err(conflict());
                 }
-                in_place_scanner_match(dst_row, &after[0])?;
+                let dst_name = Path::new(&file.dst).file_name().and_then(|s| s.to_str());
+                in_place_scanner_match(dst_row, &after[0], dst_name)?;
                 apply_in_place_asset_state(
                     &mut observed,
                     &original["id"],
@@ -599,7 +613,7 @@ fn observe_scanner_rows(
             if let Some(src_row) = src_actual.first()
                 && src_row != original
             {
-                in_place_scanner_match(src_row, original)?;
+                in_place_scanner_match(src_row, original, None)?;
                 let mut updated_after = after[0].clone();
                 updated_after["last_seen"] = src_row["last_seen"].clone();
                 updated_after["mtime"] = src_row["mtime"].clone();
@@ -633,7 +647,7 @@ fn observe_scanner_rows(
             if let Some(src_row) = src_actual.first()
                 && src_row != original
             {
-                in_place_scanner_match(src_row, original)?;
+                in_place_scanner_match(src_row, original, None)?;
                 let mut updated_after = after[0].clone();
                 updated_after["last_seen"] = src_row["last_seen"].clone();
                 updated_after["mtime"] = src_row["mtime"].clone();
@@ -1185,7 +1199,12 @@ mod tests {
 
     #[test]
     fn in_place_scanner_move_reconciles_and_applies_creator_link() {
-        let (root, config, plan) = test_config_and_plan();
+        let (root, config, mut plan) = test_config_and_plan();
+        plan.files[0].dst = config
+            .creators()
+            .join("甲/clip (保留两份-e39819aa).mp4")
+            .display()
+            .to_string();
         let conn = db::open(&config.ledger).unwrap();
         conn.execute_batch(
             "DROP TABLE IF EXISTS asset;
@@ -1196,7 +1215,7 @@ mod tests {
                  name TEXT NOT NULL,
                  medium TEXT NOT NULL,
                  size INTEGER NOT NULL,
-                 mtime INTEGER NOT NULL,
+                 mtime TEXT NOT NULL,
                  last_seen TEXT NOT NULL
              );
              CREATE TABLE entity (
@@ -1225,7 +1244,7 @@ mod tests {
             "name": "clip.mp4",
             "medium": "video",
             "size": {"$integer": size.to_string()},
-            "mtime": {"$integer": "100"},
+            "mtime": "2026-03-28",
             "last_seen": "2026-11-08 16:40:26",
         });
         let after_asset = json!({
@@ -1235,7 +1254,7 @@ mod tests {
             "name": "clip.mp4",
             "medium": "video",
             "size": {"$integer": size.to_string()},
-            "mtime": {"$integer": "100"},
+            "mtime": "2026-03-28",
             "last_seen": "2026-11-08 16:40:26",
         });
         let link = json!({
@@ -1288,9 +1307,9 @@ mod tests {
             creators: vec![],
         };
 
-        // Simulate Peach scanner having moved id=1 in-place to win_dst with refreshed last_seen.
+        // Simulate Peach scanner having moved id=1 in-place to win_dst with suffixed name and refreshed last_seen.
         conn.execute(
-            "INSERT INTO asset(id, location, path, name, medium, size, mtime, last_seen) VALUES(1, 'local', ?1, 'clip.mp4', 'video', ?2, 100, '2026-11-08 17:06:49')",
+            "INSERT INTO asset(id, location, path, name, medium, size, mtime, last_seen) VALUES(1, 'local', ?1, 'clip (保留两份-e39819aa).mp4', 'video', ?2, '2026-03-28', '2026-11-08 17:06:49')",
             params![win_dst, size],
         )
         .unwrap();

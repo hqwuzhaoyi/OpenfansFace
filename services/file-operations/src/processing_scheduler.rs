@@ -515,10 +515,7 @@ pub fn record_event(config: &Config, body: &Value) -> Result<Value> {
 
 pub fn stage_progress(config: &Config, body: &Value) -> Result<Value> {
     use sha2::{Digest, Sha256};
-    let data = body
-        .get("data")
-        .filter(|v| v.is_object())
-        .unwrap_or(body);
+    let data = body.get("data").filter(|v| v.is_object()).unwrap_or(body);
     let isolated = body["isolated"].as_bool().unwrap_or(true);
     let id = data["id"]
         .as_str()
@@ -527,7 +524,10 @@ pub fn stage_progress(config: &Config, body: &Value) -> Result<Value> {
     let kind = data["kind"].as_str().unwrap_or("text");
     let path = if isolated {
         let digest = format!("{:x}", Sha256::digest(id.as_bytes()));
-        config.base.join("jobs/stages").join(format!("{digest}.json"))
+        config
+            .base
+            .join("jobs/stages")
+            .join(format!("{digest}.json"))
     } else {
         config.base.join("jobs").join(format!("{kind}.json"))
     };
@@ -2965,17 +2965,19 @@ pub fn verify_attempt_artifact(config: &Config, body: &Value) -> Result<Value> {
                 .or_else(|| other["task"]["stage"].as_str())
                 .unwrap_or("");
             if other_vid == vid && (stage.is_empty() || other_stage == stage) {
-                let still_referenced = other["data"]["face"]["thumbs"]
-                    .as_array()
-                    .is_some_and(|arr| {
-                        arr.iter().any(|v| {
-                            v.as_str().is_some_and(|s| {
-                                Path::new(s) == file
-                                    || fs::canonicalize(s).ok().as_deref() == Some(file.as_path())
+                let still_referenced =
+                    other["data"]["face"]["thumbs"]
+                        .as_array()
+                        .is_some_and(|arr| {
+                            arr.iter().any(|v| {
+                                v.as_str().is_some_and(|s| {
+                                    Path::new(s) == file
+                                        || fs::canonicalize(s).ok().as_deref()
+                                            == Some(file.as_path())
+                                })
                             })
                         })
-                    })
-                    || other["data"]["watermark"]["artifact_attempt"].as_str() == Some(attempt);
+                        || other["data"]["watermark"]["artifact_attempt"].as_str() == Some(attempt);
                 if !still_referenced {
                     return deny();
                 }
@@ -3020,8 +3022,7 @@ pub fn verify_attempt_artifact(config: &Config, body: &Value) -> Result<Value> {
     let thumb_ref = face["thumbs"].as_array().is_some_and(|arr| {
         arr.iter().any(|v| {
             v.as_str().is_some_and(|s| {
-                Path::new(s) == file
-                    || fs::canonicalize(s).ok().as_deref() == Some(file.as_path())
+                Path::new(s) == file || fs::canonicalize(s).ok().as_deref() == Some(file.as_path())
             })
         })
     });
@@ -3130,7 +3131,9 @@ fn load_active_face_groups(config: &Config, face_version: &str) -> Result<Vec<Va
 
 fn validate_task_source(config: &Config, path: &str) -> Option<fs::Metadata> {
     let p = Path::new(path);
-    if p.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+    if p.components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
         return None;
     }
     let sym = fs::symlink_metadata(p).ok()?;
@@ -3139,8 +3142,8 @@ fn validate_task_source(config: &Config, path: &str) -> Option<fs::Metadata> {
     }
     let real = fs::canonicalize(p).ok()?;
     let real_root = fs::canonicalize(&config.media).ok()?;
-    let creators_root = fs::canonicalize(config.creators())
-        .unwrap_or_else(|_| real_root.join("pikpak/creators"));
+    let creators_root =
+        fs::canonicalize(config.creators()).unwrap_or_else(|_| real_root.join("pikpak/creators"));
     if !real.starts_with(&real_root)
         || real.starts_with(&creators_root)
         || real
@@ -3309,7 +3312,8 @@ pub fn cache_check(engine: &Engine, body: &Value) -> Result<Value> {
                 {
                     continue;
                 }
-                let Some(cache_str) = face["feature_cache"].as_str().filter(|s| !s.is_empty()) else {
+                let Some(cache_str) = face["feature_cache"].as_str().filter(|s| !s.is_empty())
+                else {
                     continue;
                 };
                 let Some(expected_sha) = face["feature_cache_sha256"]
@@ -3434,7 +3438,9 @@ pub fn reference_state(engine: &Engine) -> Result<Value> {
         if let (Some(vid), Some(creator)) = (row["vid"].as_str(), row["creator"].as_str()) {
             assigned.insert(
                 vid.to_owned(),
-                json!(crate::processing_result::canonical_person(creator, &renames)),
+                json!(crate::processing_result::canonical_person(
+                    creator, &renames
+                )),
             );
         }
     }
@@ -3586,8 +3592,8 @@ pub fn publish_references(engine: &Engine, body: &Value) -> Result<Value> {
     fs::create_dir_all(&tmp_root)?;
     let real_tmp = fs::canonicalize(&tmp_root)?;
     let staged_path = Path::new(staged_raw);
-    let real_staged = fs::canonicalize(staged_path)
-        .map_err(|_| bad("待发布参考文件不存在或路径无效"))?;
+    let real_staged =
+        fs::canonicalize(staged_path).map_err(|_| bad("待发布参考文件不存在或路径无效"))?;
     if !real_staged.starts_with(&real_tmp)
         || real_staged.parent() != Some(real_tmp.as_path())
         || !fs::symlink_metadata(&real_staged)?.is_file()
@@ -4000,8 +4006,8 @@ fn read_catalog_people(config: &Config) -> Vec<String> {
             }
         }
     }
-    if let Some(manual) = read_json_fallback(&config.base.join("people-manual.json"), json!([]))
-        .as_array()
+    if let Some(manual) =
+        read_json_fallback(&config.base.join("people-manual.json"), json!([])).as_array()
     {
         for item in manual {
             if let Some(name) = item["name"].as_str().filter(|s| !s.is_empty()) {
@@ -4065,8 +4071,7 @@ fn http_post_json(
         format!("{host_port}:80")
     };
     let req_path = format!("{base_path}/{}", endpoint.trim_start_matches('/'));
-    let body_bytes =
-        serde_json::to_vec(payload).map_err(|e| format!("序列化计算请求失败: {e}"))?;
+    let body_bytes = serde_json::to_vec(payload).map_err(|e| format!("序列化计算请求失败: {e}"))?;
 
     let mut stream = TcpStream::connect(&connect_addr)
         .map_err(|e| format!("连接计算服务 {connect_addr} 失败: {e}"))?;
@@ -4130,22 +4135,10 @@ pub fn step(engine: &mut Engine, body: &Value) -> Result<Value> {
         }));
     }
 
-    let vid = task_val["vid"]
-        .as_str()
-        .unwrap_or_default()
-        .to_owned();
-    let run_id = task_val["run_id"]
-        .as_str()
-        .unwrap_or_default()
-        .to_owned();
-    let stage = task_val["stage"]
-        .as_str()
-        .unwrap_or("text")
-        .to_owned();
-    let path = task_val["path"]
-        .as_str()
-        .unwrap_or_default()
-        .to_owned();
+    let vid = task_val["vid"].as_str().unwrap_or_default().to_owned();
+    let run_id = task_val["run_id"].as_str().unwrap_or_default().to_owned();
+    let stage = task_val["stage"].as_str().unwrap_or("text").to_owned();
+    let path = task_val["path"].as_str().unwrap_or_default().to_owned();
     let size = task_val["size"].as_i64().unwrap_or(0);
     let mtime_ns = task_val["mtime_ns"]
         .as_str()
@@ -4201,10 +4194,17 @@ pub fn step(engine: &mut Engine, body: &Value) -> Result<Value> {
     let task_data: Value = task_val["data"]
         .as_str()
         .and_then(|s| serde_json::from_str(s).ok())
-        .or_else(|| task_val["data"].as_object().map(|m| Value::Object(m.clone())))
+        .or_else(|| {
+            task_val["data"]
+                .as_object()
+                .map(|m| Value::Object(m.clone()))
+        })
         .unwrap_or_else(|| json!({}));
     let people = read_catalog_people(&engine.config);
-    let mappings = read_json_fallback(&engine.config.base.join("watermarks/mappings.json"), json!({}));
+    let mappings = read_json_fallback(
+        &engine.config.base.join("watermarks/mappings.json"),
+        json!({}),
+    );
     let mut watermark_keys = BTreeSet::new();
     if let Some(map) = mappings.as_object() {
         for k in map.keys() {
@@ -4226,10 +4226,7 @@ pub fn step(engine: &mut Engine, body: &Value) -> Result<Value> {
     });
     let state_out =
         crate::shared_metadata::execute(engine, "state", json!({"scope": scope.clone()}))?;
-    let material_version = state_out["version"]
-        .as_str()
-        .unwrap_or_default()
-        .to_owned();
+    let material_version = state_out["version"].as_str().unwrap_or_default().to_owned();
     task_val["_material"] = json!({
         "scope": scope.clone(),
         "version": material_version.clone(),
@@ -4409,11 +4406,7 @@ pub fn step(engine: &mut Engine, body: &Value) -> Result<Value> {
         pub_body["reference_input_version"] = task_val["_reference_input_version"].clone();
     }
 
-    let attempt_dir = engine
-        .config
-        .base
-        .join("processing/attempts")
-        .join(&run_id);
+    let attempt_dir = engine.config.base.join("processing/attempts").join(&run_id);
     fs::create_dir_all(&attempt_dir)?;
     files::atomic_write(
         &attempt_dir.join("publication.json"),

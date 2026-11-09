@@ -224,7 +224,7 @@ pub fn progress(config: &Config, id: Option<&str>) -> Result<Value> {
     };
     let (plan, created, updated): (Option<String>, Option<f64>, Option<f64>) = db
         .query_row(
-            "SELECT plan,unixepoch(created_at),unixepoch(updated_at) FROM operations WHERE id=?",
+            "SELECT o.plan,unixepoch(o.created_at),unixepoch(COALESCE((SELECT s.at FROM steps s WHERE s.operation_id=o.id ORDER BY s.revision DESC LIMIT 1),o.updated_at)) FROM operations o WHERE o.id=?",
             [&id],
             |r| Ok((Some(r.get(0)?), r.get(1)?, r.get(2)?)),
         )
