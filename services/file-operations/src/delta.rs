@@ -648,39 +648,26 @@ fn mutate(conn: &Connection, delta: &Delta, reverse: bool) -> Result<()> {
         } else {
             (&change.before, &change.after)
         };
-        let old = indexed(source, identity)?;
-        for row in target {
-            if old.contains_key(&key(row, identity)?) {
-                continue;
+        if !reverse && change.table == Table::Asset {
+            let next = indexed(target, identity)?;
+            for row in source.iter().rev() {
+                if next.contains_key(&key(row, identity)?) {
+                    continue;
+                }
+                protect_references(conn, change.table, row, None, &structure.primary)?;
+                if conn.execute(
+                    &format!(
+                        "DELETE FROM {} WHERE {}",
+                        quoted(change.table.name()),
+                        predicate(identity)
+                    ),
+                    params_from_iter(values(row, identity)?),
+                )? != 1
+                {
+                    return Err(invalid("删除行数量发生变化"));
+                }
             }
-            let columns = structure
-                .columns
-                .iter()
-                .map(|c| quoted(c))
-                .collect::<Vec<_>>()
-                .join(",");
-            let placeholders = vec!["?"; structure.columns.len()].join(",");
-            conn.execute(
-                &format!(
-                    "INSERT INTO {} ({columns}) VALUES ({placeholders})",
-                    quoted(change.table.name())
-                ),
-                params_from_iter(values(row, &structure.columns)?),
-            )?;
         }
-    }
-    for change in &changes {
-        let structure = &schemas[&change.table];
-        let identity = if structure.primary.is_empty() {
-            &change.key_columns
-        } else {
-            &structure.primary
-        };
-        let (source, target) = if reverse {
-            (&change.after, &change.before)
-        } else {
-            (&change.before, &change.after)
-        };
         let old = indexed(source, identity)?;
         for row in target {
             let Some(previous) = old.get(&key(row, identity)?) else {
@@ -715,8 +702,30 @@ fn mutate(conn: &Connection, delta: &Delta, reverse: bool) -> Result<()> {
                 return Err(invalid("更新行数量发生变化"));
             }
         }
+        for row in target {
+            if old.contains_key(&key(row, identity)?) {
+                continue;
+            }
+            let columns = structure
+                .columns
+                .iter()
+                .map(|c| quoted(c))
+                .collect::<Vec<_>>()
+                .join(",");
+            let placeholders = vec!["?"; structure.columns.len()].join(",");
+            conn.execute(
+                &format!(
+                    "INSERT INTO {} ({columns}) VALUES ({placeholders})",
+                    quoted(change.table.name())
+                ),
+                params_from_iter(values(row, &structure.columns)?),
+            )?;
+        }
     }
     for change in changes.iter().rev() {
+        if !reverse && change.table == Table::Asset {
+            continue;
+        }
         let structure = &schemas[&change.table];
         let identity = if structure.primary.is_empty() {
             &change.key_columns

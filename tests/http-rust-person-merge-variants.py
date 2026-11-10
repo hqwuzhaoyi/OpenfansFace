@@ -25,6 +25,11 @@ class VariantFixture(m.MergeFixture):
 def spelling_variant_registration():
     x=VariantFixture()
     try:
+        size=(x.momo/'kept.mp4').stat().st_size
+        with sqlite3.connect(x.ledger) as db:
+            db.execute("INSERT INTO asset(id,location,path,name,medium,size,mtime,first_seen,last_seen,play_count,mutation_revision) VALUES(701,'fixture',?,'kept.mp4','video',?,'2026-03-21','2026-11-08','2026-11-08',0,0)",(x.win(x.media/'pikpak/creators/MOMO/kept.mp4'),size))
+            db.execute("INSERT INTO asset_entity(asset_id,entity_id,role,source,confidence) VALUES(701,7,'creator','face-curation-8919',.95)")
+            db.execute("INSERT INTO asset(id,location,path,name,medium,size,mtime,first_seen,last_seen,play_count,mutation_revision) VALUES(702,'fixture',?,'kept.mp4','video',?,'2026-03-21','2026-11-09','2026-11-09',0,0)",(x.win(x.momo/'kept.mp4'),size))
         plan=x.preview(x.merge_request(person='MOMO',target='momo'))
         assert plan['files']==[],plan['files']
         x.apply(plan);assert x.status(plan)['status']=='complete'
@@ -33,6 +38,7 @@ def spelling_variant_registration():
         assert (x.momo/'kept.mp4').read_bytes()==b'momo video'
         with sqlite3.connect(x.ledger) as db:
             assert db.execute("SELECT canonical_name FROM entity WHERE id=7").fetchone()==('momo',)
+            assert db.execute("SELECT id,path FROM asset WHERE id IN (701,702)").fetchall()==[(701,x.win(x.momo/'kept.mp4'))]
             assert not db.execute('PRAGMA foreign_key_check').fetchall()
         assert not (x.base/'.review-write.lock').exists()
         print('PASS spelling variant registration folds into the person that owns the folder')

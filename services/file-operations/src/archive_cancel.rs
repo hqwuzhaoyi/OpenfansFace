@@ -422,11 +422,12 @@ fn apply_in_place_asset_state(
     }
 }
 
-fn index_only(
+pub(crate) fn is_pure_scanner_stub(
     conn: &Connection,
     row: &Value,
     original: &Value,
-    file: &crate::model::FileMove,
+    expected_name: Option<&str>,
+    expected_size: Option<i64>,
 ) -> Result<()> {
     let known: BTreeSet<&str> = "id location path name medium size mtime hash_kind hash creator studio series code duration width height vcodec fps has_audio ctx_length ctx_orient ctx_quality ctx_pace ctx_people play_count last_played rating o_count watch_ratio source_id stash_scene_id snapshot_path first_seen last_seen feedback disposal leave_ratio play_seconds feedback_at seek_count max_reached release_date catalog_title original_title field_owners mutation_revision region disposal_reason".split_whitespace().collect();
     let index: BTreeSet<&str> = "id location path name medium size mtime hash_kind hash duration width height vcodec fps has_audio ctx_length ctx_orient ctx_quality first_seen last_seen".split_whitespace().collect();
@@ -434,9 +435,9 @@ fn index_only(
     if id <= 0
         || id == db::integer(&original["id"])?
         || row["location"] != original["location"]
-        || row["name"].as_str() != Path::new(&file.dst).file_name().and_then(|s| s.to_str())
+        || row["name"].as_str() != expected_name
         || row["medium"] != "video"
-        || db::integer(&row["size"])? != file.size as i64
+        || Some(db::integer(&row["size"])?) != expected_size
     {
         return Err(conflict());
     }
@@ -511,6 +512,21 @@ fn index_only(
         }
     }
     Ok(())
+}
+
+fn index_only(
+    conn: &Connection,
+    row: &Value,
+    original: &Value,
+    file: &crate::model::FileMove,
+) -> Result<()> {
+    is_pure_scanner_stub(
+        conn,
+        row,
+        original,
+        Path::new(&file.dst).file_name().and_then(|s| s.to_str()),
+        Some(file.size as i64),
+    )
 }
 
 fn observe_scanner_rows(

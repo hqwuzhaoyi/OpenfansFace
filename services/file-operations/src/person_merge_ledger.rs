@@ -302,16 +302,33 @@ pub fn snapshot(config: &Config, plan: &Plan) -> Result<ledger::Delta> {
     let mut paths = BTreeSet::new();
     let mut destinations = BTreeSet::new();
     let mut after_assets = vec![];
+    let mut replaced_stubs = vec![];
+    let mut replaced_stub_ids = BTreeSet::new();
     for asset in &assets {
         let path = asset["path"]
             .as_str()
             .ok_or_else(|| Error::conflict("Peach 资产路径无效"))?;
         let dst = metadata::mapped(config, path, plan);
-        if !paths.insert(path.to_owned())
-            || !destinations.insert(dst.clone())
-            || occupied.iter().any(|r| r["path"] == dst)
-        {
+        if !paths.insert(path.to_owned()) || !destinations.insert(dst.clone()) {
             return Err(Error::conflict("Peach 来源或目标资产路径存在冲突").at(dst));
+        }
+        let matching_occupied: Vec<&Value> =
+            occupied.iter().filter(|r| r["path"] == dst).collect();
+        if !matching_occupied.is_empty() {
+            if !shared_entity || matching_occupied.len() > 1 {
+                return Err(Error::conflict("Peach 来源或目标资产路径存在冲突").at(dst));
+            }
+            let stub = matching_occupied[0];
+            crate::archive_cancel::is_pure_scanner_stub(
+                &tx,
+                stub,
+                asset,
+                asset["name"].as_str(),
+                db::integer(&asset["size"]).ok(),
+            )
+            .map_err(|_| Error::conflict("Peach 来源或目标资产路径存在冲突").at(dst.clone()))?;
+            replaced_stub_ids.insert(db::integer(&stub["id"])?);
+            replaced_stubs.push(stub.clone());
         }
         let mut next = asset.clone();
         next["path"] = json!(dst);
@@ -332,12 +349,17 @@ pub fn snapshot(config: &Config, plan: &Plan) -> Result<ledger::Delta> {
             )?;
         }
     }
-    for id in assets.iter().map(|r| db::integer(&r["id"])).chain(
-        source_links
-            .iter()
-            .chain(&target_links)
-            .map(|r| db::integer(&r["asset_id"])),
-    ) {
+    for id in assets
+        .iter()
+        .map(|r| db::integer(&r["id"]))
+        .chain(replaced_stub_ids.iter().copied().map(Ok))
+        .chain(
+            source_links
+                .iter()
+                .chain(&target_links)
+                .map(|r| db::integer(&r["asset_id"])),
+        )
+    {
         let id = id?;
         if let std::collections::btree_map::Entry::Vacant(entry) = by_asset.entry(id) {
             entry.insert(db::rows(
@@ -481,7 +503,15 @@ pub fn snapshot(config: &Config, plan: &Plan) -> Result<ledger::Delta> {
         db::Guard::AssetPrefix {
             prefix: new,
             before: occupied.clone(),
-            after: occupied.into_iter().chain(after_assets.clone()).collect(),
+            after: occupied
+                .into_iter()
+                .filter(|r| {
+                    db::integer(&r["id"])
+                        .ok()
+                        .is_none_or(|id| !replaced_stub_ids.contains(&id))
+                })
+                .chain(after_assets.clone())
+                .collect(),
         },
     ]);
     for (asset_id, before) in by_asset {
@@ -524,11 +554,13 @@ pub fn snapshot(config: &Config, plan: &Plan) -> Result<ledger::Delta> {
                 .collect(),
         });
     }
+    let mut before_assets = assets;
+    before_assets.extend(replaced_stubs);
     Ok(ledger::Delta {
         changes: db::Delta {
             tables: vec![
                 table(&tx, db::Table::Entity, "entity", entities, after_entities)?,
-                table(&tx, db::Table::Asset, "asset", assets, after_assets)?,
+                table(&tx, db::Table::Asset, "asset", before_assets, after_assets)?,
                 table(
                     &tx,
                     db::Table::AssetEntity,
