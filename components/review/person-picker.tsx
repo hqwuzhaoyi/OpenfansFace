@@ -234,102 +234,102 @@ export function PersonPicker({
 
   return (
     <section className="ws-person-picker" aria-label="归名人物选择">
-      <div className="ws-person-choice" data-has-value={!!selectedPerson && !creating}>
-        {selectedPerson && !creating ? (
-          <Card size="compact" selected className="ws-person-selected-banner">
-            <Avatar
-              name={selectedPerson.name}
-              src={selectedPerson.rep_thumb || sampleFaces[0] || undefined}
-              size="md"
-              className="ws-person-selected-avatar"
-            />
-            <div className="ws-person-selected-copy">
-              <div className="ws-person-selected-title">
-                <strong>{selectedPerson.name}</strong>
-                <AnimatedBadge
-                  size="sm"
-                  status={
-                    isNewPerson
-                      ? 'success'
-                      : suggestionMap.has(selectedPerson.name)
-                        ? 'info'
-                        : 'neutral'
-                  }
-                  showIcon={false}
-                >
-                  {isNewPerson
-                    ? '✨ 新人物'
-                    : suggestionMap.has(selectedPerson.name)
-                      ? '候选'
-                      : '已选'}
-                </AnimatedBadge>
-              </div>
-              <small>
-                {isNewPerson
-                  ? '确认归名后自动创建人物档案'
-                  : suggestionMap.get(selectedPerson.name)?.match_reason ||
-                    (selectedPerson.aliases?.length
-                      ? `别名：${selectedPerson.aliases.slice(0, 2).join(' / ')}`
-                      : '已选归名人物')}
-              </small>
-            </div>
-            {isNewPerson ? (
-              <Button
-                variant="outline"
-                size="sm"
-                disabled={disabled}
-                aria-label={`修改新人物名称 ${selectedPerson.name}`}
-                title="修改新人物名称"
-                onClick={() => startCreate(selectedPerson.name)}
-              >
-                <Pencil size={12} />
-                改名
-              </Button>
-            ) : (
-              <Button
-                variant={comparing === selectedPerson.name ? 'secondary' : 'outline'}
-                size="sm"
-                disabled={disabled}
-                aria-label={`看 ${selectedPerson.name} 的对照视频`}
-                aria-pressed={comparing === selectedPerson.name}
-                title="原位展开对照视频核对"
-                onClick={() => toggleCompare(selectedPerson.name)}
-              >
-                <ActionSwapIcon
-                  value={comparing === selectedPerson.name ? 'open' : 'closed'}
-                  animation="roll"
-                >
-                  {comparing === selectedPerson.name ? <EyeOff size={13} /> : <Eye size={13} />}
-                </ActionSwapIcon>
-                <ActionSwapText
-                  value={comparing === selectedPerson.name ? '收起' : '对照'}
-                  animation="roll"
-                >
-                  {comparing === selectedPerson.name ? '收起' : '对照'}
-                </ActionSwapText>
-              </Button>
-            )}
-            <Button
-              variant="ghost"
-              size="icon"
-              aria-label="清空归名人物"
-              title="清空人物"
-              disabled={disabled}
-              onClick={() => onChange('')}
-            >
-              <X size={14} />
-            </Button>
-          </Card>
-        ) : (
-          <strong>{creating ? '新建归名人物' : '选择人物'}</strong>
-        )}
+      <div className="ws-person-choice-head">
+        <strong>{creating ? '新建归名人物' : selectedPerson ? '当前归名人物' : '选择人物'}</strong>
         {!creating && (
-          <Button variant="ghost" disabled={disabled} onClick={() => startCreate()}>
+          <Button variant="ghost" size="sm" disabled={disabled} onClick={() => startCreate()}>
             <Plus size={14} />
             新建人物
           </Button>
         )}
       </div>
+
+      {selectedPerson && !creating && (
+        <Card size="compact" selected className="ws-person-selected-banner">
+          <Avatar
+            name={selectedPerson.name}
+            src={selectedPerson.rep_thumb || sampleFaces[0] || undefined}
+            size="md"
+            className="ws-person-selected-avatar"
+          />
+          <div className="ws-person-selected-copy">
+            <div className="ws-person-selected-title">
+              <strong title={selectedPerson.name}>{selectedPerson.name}</strong>
+              <AnimatedBadge
+                size="sm"
+                status={
+                  isNewPerson
+                    ? 'success'
+                    : suggestionMap.has(selectedPerson.name)
+                      ? 'info'
+                      : 'neutral'
+                }
+                showIcon={false}
+              >
+                {isNewPerson
+                  ? '✨ 新人物'
+                  : suggestionMap.has(selectedPerson.name)
+                    ? '候选'
+                    : '已选'}
+              </AnimatedBadge>
+            </div>
+            <small>
+              {isNewPerson
+                ? '确认归名后自动创建人物档案'
+                : suggestionMap.get(selectedPerson.name)?.match_reason ||
+                  (selectedPerson.aliases?.length
+                    ? `别名：${selectedPerson.aliases.slice(0, 2).join(' / ')}`
+                    : '已选归名人物')}
+            </small>
+          </div>
+          {isNewPerson ? (
+            <Button
+              variant="outline"
+              size="sm"
+              disabled={disabled}
+              aria-label={`修改新人物名称 ${selectedPerson.name}`}
+              title="修改新人物名称"
+              onClick={() => startCreate(selectedPerson.name)}
+            >
+              <Pencil size={12} />
+              改名
+            </Button>
+          ) : (
+            <Button
+              variant={comparing === selectedPerson.name ? 'secondary' : 'outline'}
+              size="sm"
+              disabled={disabled}
+              aria-label={`看 ${selectedPerson.name} 的对照视频`}
+              aria-pressed={comparing === selectedPerson.name}
+              title="原位展开对照视频核对"
+              onClick={() => toggleCompare(selectedPerson.name)}
+            >
+              <ActionSwapIcon
+                value={comparing === selectedPerson.name ? 'open' : 'closed'}
+                animation="roll"
+              >
+                {comparing === selectedPerson.name ? <EyeOff size={13} /> : <Eye size={13} />}
+              </ActionSwapIcon>
+              <ActionSwapText
+                value={comparing === selectedPerson.name ? '收起' : '对照'}
+                animation="roll"
+              >
+                {comparing === selectedPerson.name ? '收起' : '对照'}
+              </ActionSwapText>
+            </Button>
+          )}
+          <Button
+            variant="ghost"
+            size="icon"
+            aria-label="清空归名人物"
+            title="清空人物"
+            disabled={disabled}
+            onClick={() => onChange('')}
+          >
+            <X size={14} />
+          </Button>
+        </Card>
+      )}
 
       {/* BEUI Collapsible Inline Reference Drawer: compare person's archived videos without leaving selection mode */}
       <Collapsible open={Boolean(comparing && !creating)}>
