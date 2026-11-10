@@ -3,6 +3,7 @@
 import { useEffect, useState } from "react"
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query"
 import { HomeShell } from "@/components/home/shell"
+import { BackgroundOperationsProvider } from "@/components/workbench/background-operations"
 
 let sharedQueryClient: QueryClient | null = null
 function getQueryClient() {
@@ -34,7 +35,9 @@ export default function WorkbenchLayout({ children }: { children: React.ReactNod
   }, [])
   return (
     <QueryClientProvider client={client}>
-      <HomeShell>{children}</HomeShell>
+      <BackgroundOperationsProvider>
+        <HomeShell>{children}</HomeShell>
+      </BackgroundOperationsProvider>
     </QueryClientProvider>
   )
 }

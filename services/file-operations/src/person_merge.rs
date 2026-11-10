@@ -44,10 +44,19 @@ pub fn validate(request: &Request) -> Result<()> {
     Ok(())
 }
 fn people(config: &Config, request: &Request) -> Result<(String, String)> {
-    let source = registration::canonical(config, &request.person)?;
+    let source = registration::selected(config, &request.person)?;
     let target = registration::canonical(config, request.target_person.as_ref().unwrap())?;
-    if normalized(&source) == normalized(&target) {
+    if source == target {
         return Err(Error::conflict("请选择两个不同人物并指定保留人物"));
+    }
+    // A spelling variant (letter case / Unicode form) can only be folded in as a
+    // registration. One with its own folder must be the kept person instead.
+    if normalized(&source) == normalized(&target)
+        && registration::has_own_directory(config, &source)?
+    {
+        return Err(Error::conflict(format!(
+            "{source} 与 {target} 只差大小写，且 {source} 有自己的文件夹，请把 {source} 设为保留人物"
+        )));
     }
     for person in [&source, &target] {
         if !registration::known_person(config, person)? {

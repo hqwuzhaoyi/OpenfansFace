@@ -25,6 +25,7 @@ import { ArchiveCheckbox, ArchiveFolderList, type ArchiveListItem } from '@/comp
 import { PathText } from '@/components/review/video'
 import { Button } from '@/components/ui/button'
 import { readWorkbenchCache, writeWorkbenchCache } from '@/components/workbench/state'
+import { useBackgroundOperations } from '@/components/workbench/background-operations'
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from '@/components/ui/alert-dialog'
 import '@/components/review/archive-workbench.css'
 
@@ -41,6 +42,7 @@ export default function IntegrationPage(){return <WorkbenchMotion><Integration /
 
 function Integration() {
   const {instant}=useWorkbenchMotion()
+  const {lockedVids,enqueueArchive,subscribe}=useBackgroundOperations()
   const [watchedId,setWatchedId]=useState<string|null>(null),[job,setJob]=useState<HomeJob|null>(null),[connection,setConnection]=useState('')
   const watchRef=useRef<string|null>(null),runStatus=useRef<HTMLDivElement>(null),archiveTrigger=useRef<HTMLButtonElement>(null)
   const archiving=!!watchedId
@@ -115,8 +117,20 @@ function Integration() {
     return()=>{active=false;clearTimeout(timer);controller.abort()}
   },[watchedId])
 
-  const rows = plan?.rows || []
-  const waves = useMemo(() => groupBatches(plan?.rows || []), [plan])
+  useEffect(()=>{
+    return subscribe(event=>{
+      if(event.type==='archive-settled'){
+        if(event.task.result&&!event.task.result.ok){
+          setResult(event.task.result)
+        }
+        void load()
+      }
+    })
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[subscribe])
+
+  const rows = useMemo(() => (plan?.rows || []).filter(r => !lockedVids.has(r.vid)), [plan, lockedVids])
+  const waves = useMemo(() => groupBatches(rows), [rows])
   const visibleWaves = filterArchiveBatches(waves, query, filter, selected)
   const wave = visibleWaves.find(w => w.key === waveKey) || visibleWaves[0]
   const waveRows = wave?.rows || []
@@ -224,20 +238,22 @@ function Integration() {
     finally { writing.current = false; setBusy(false) }
   }
   const undoRows = (targets: Row[]) => setUndoRequest({ vids: targets.map(row => row.vid), goBack: false })
-  const apply = async () => {
+  const apply = () => {
     if (!plan || writing.current || disabled || (!validChosen.length || validChosen.length > 5000)) return
-    // getRandomValues also works on the HTTP Tailscale origin (randomUUID requires HTTPS).
-    const bytes=crypto.getRandomValues(new Uint8Array(16));bytes[6]=(bytes[6]&15)|64;bytes[8]=(bytes[8]&63)|128
-    const hex=[...bytes].map(b=>b.toString(16).padStart(2,'0')).join('')
-    const id=`${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}`
-    writing.current=true;watch(id);setResult(null);setConnection('');setJob(null);setConfirm(false)
-    try{localStorage.setItem('face-archive-operation',id)}catch{}
-    try {
-      const response=await fetch('/api/plan/apply',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({vids:validChosen.map(r=>r.vid),version:plan.version,operation_id:id})})
-      const data=await response.json()
-      if(!response.ok){settle({ok:false,moved:0,remaining:plan.n,errors:[data.error||'归档请求未被接受']},id);return}
-      settle(data,id)
-    }catch{if(watchRef.current===id)setConnection('连接中断，正在核对本次归档结果…')}
+    const targetVids = validChosen.map(r => r.vid)
+    const targetCreators = [...new Set(validChosen.map(r => r.creator))]
+    setResult(null); setConnection(''); setJob(null); setConfirm(false)
+    enqueueArchive({
+      vids: targetVids,
+      version: plan.version,
+      creators: targetCreators,
+      sizeGb: selectGB,
+    })
+    setSelected(previous => {
+      const next = new Set(previous)
+      for (const vid of targetVids) next.delete(vid)
+      return next
+    })
   }
   const progressPercent=job?jobPercent(job):null
   const resultTitle=result?.recovery_needed?'需要核对恢复，已暂停写操作':result?.rolled_back?'归档失败，本轮已移动的文件已恢复':result?.moved?`已归档 ${result.moved} 个${result.errors.length?' · 部分项目未完成':''}`:'本轮未归档，任务已保留'

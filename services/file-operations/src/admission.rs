@@ -125,6 +125,9 @@ impl Worker {
     pub fn completion(&self) -> Completion {
         Completion(self.gate.clone())
     }
+    pub fn has_pending(&self) -> bool {
+        self.gate.lock().unwrap().pending > 0
+    }
     pub fn set_accepting(&self, accepting: bool) -> Result<Value> {
         let mut gate = self.gate.lock().unwrap();
         if accepting && self.config.parity_root.is_some() {

@@ -71,7 +71,7 @@ fn check_person(config: &Config, person: &str) -> Result<()> {
 }
 pub fn plan(config: &Config, request: Request) -> Result<Plan> {
     validate(&request)?;
-    let person = registration::canonical(config, &request.person)?;
+    let person = registration::selected(config, &request.person)?;
     check_person(config, &person)?;
     let target = person.clone();
     let source_root = config.creators().join(&person);
@@ -170,7 +170,7 @@ pub fn revalidate(config: &Config, plan: &Plan) -> Result<()> {
     {
         return Err(Error::conflict("人物缩略图引用已变化"));
     }
-    if registration::canonical(config, &plan.request.person)? != plan.person
+    if registration::selected(config, &plan.request.person)? != plan.person
         || json!(crate::person_rename::aliases(config, &plan.person)?)
             != plan.execution.as_ref().unwrap().data["identity_names"]
     {

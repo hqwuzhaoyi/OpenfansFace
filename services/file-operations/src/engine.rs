@@ -25,6 +25,10 @@ impl Engine {
         }
         Ok(engine)
     }
+    pub fn open_preview(config: Config) -> Result<Self> {
+        let store = Store::open_preview(&config)?;
+        Ok(Self { config, store })
+    }
     pub fn preview(&mut self, request: Request) -> Result<Value> {
         crate::person_batch::reject_child(&self.store, &request.id)?;
         validate(&request)?;
@@ -425,7 +429,20 @@ impl Engine {
                 .unwrap_or_else(|| Error::new(503, "interrupted", "执行中断后已回退"));
             let rollback = record.status == "rolling_back" || self.store.db.query_row("SELECT EXISTS(SELECT 1 FROM steps WHERE operation_id=? AND phase='compensation_intent')",[id],|r|r.get(0))?;
             if let Err(error) = self.reconcile(&record.plan, &domain, rollback, &cause) {
-                self.reconcile(&record.plan, &domain, true, &error)?;
+                eprintln!(
+                    "operation {} recovery attempt failed (rollback={}): {} {}",
+                    id,
+                    rollback,
+                    error.code,
+                    error.error
+                );
+                self.reconcile(&record.plan, &domain, true, &error)
+                    .inspect_err(|rollback_error| {
+                        eprintln!(
+                            "operation {} recovery rollback failed: {} {}",
+                            id, rollback_error.code, rollback_error.error
+                        )
+                    })?;
             }
             gate.release()
         })();
@@ -482,13 +499,24 @@ impl Engine {
             .latest_step(&plan.id, "ledger_reserved")?
             .is_some();
         let allow_unreserved = !has_ledger_reserved
-            && self
-                .verify_published_archive_destinations(plan, &selected)
-                .is_ok();
+            && match self.verify_published_archive_destinations(plan, &selected) {
+                Ok(()) => true,
+                Err(published) => {
+                    if crate::archive_cancel::supports_scanner_reconciliation(plan) {
+                        eprintln!(
+                            "operation {} archive destination verification failed: {} ({})",
+                            plan.id,
+                            published.error,
+                            published.path.as_deref().unwrap_or("")
+                        );
+                    }
+                    false
+                }
+            };
         let mut retained_indexes = vec![];
         let ledger_state = match self.ledger_state(plan, &domain) {
             Ok(state) => state,
-            Err(error) if plan.action == "archive" => {
+            Err(error) if crate::archive_cancel::supports_scanner_reconciliation(plan) => {
                 retained_indexes = crate::archive_cancel::inspect(
                     &self.config,
                     plan,
@@ -498,7 +526,7 @@ impl Engine {
                         .ok_or_else(|| Error::conflict("缺少归档账本取消依据"))?,
                     allow_unreserved,
                 )
-                .map_err(|_| error)?;
+                .map_err(|observed| with_reconciliation_cause(error, "归档扫描核对", &observed))?;
                 "prepared".into()
             }
             Err(error) => return Err(error),
@@ -507,7 +535,7 @@ impl Engine {
             .store
             .latest_step(&plan.id, "archive_external_indexes_retained")?
         {
-            if plan.action != "archive" {
+            if !crate::archive_cancel::supports_scanner_reconciliation(plan) {
                 return Err(Error::conflict("取消索引依据不属于归档操作"));
             }
             if retained_indexes.is_empty() {
@@ -720,7 +748,9 @@ impl Engine {
         plan: &Plan,
         successful: &[usize],
     ) -> Result<()> {
-        if plan.action != "archive" || successful.is_empty() {
+        if !crate::archive_cancel::supports_scanner_reconciliation(plan)
+            || (successful.is_empty() && !plan.files.is_empty())
+        {
             return Err(Error::conflict("缺少已发布的归档目标文件依据"));
         }
         for &index in successful {
@@ -1128,7 +1158,7 @@ impl Engine {
     fn execute(&mut self, plan: &Plan, accepted: &DomainSnapshot) -> Result<Value> {
         let id = &plan.id;
         self.require_resolved_mutation(id, None)?;
-        if plan.action == "archive" {
+        if crate::archive_cancel::supports_scanner_reconciliation(plan) {
             let _ = crate::archive_cancel::acquire_scanner_lease(&self.config, plan)?;
         }
         if plan.execution.is_none() {
@@ -1322,9 +1352,11 @@ impl Engine {
                         self.ledger_reserve(plan, &domain)?;
                     }
                 }
-                Err(error) if plan.action == "archive" => {
+                Err(error) if crate::archive_cancel::supports_scanner_reconciliation(plan) => {
                     self.verify_published_archive_destinations(plan, &successful)
-                        .map_err(|_| error.clone())?;
+                        .map_err(|published| {
+                            with_reconciliation_cause(error.clone(), "归档目标核对", &published)
+                        })?;
                     let delta = domain
                         .ledger
                         .as_ref()
@@ -1335,7 +1367,7 @@ impl Engine {
                         delta,
                         !has_ledger_reserved,
                     )
-                    .map_err(|_| error)?;
+                    .map_err(|observed| with_reconciliation_cause(error, "归档扫描预留", &observed))?;
                 }
                 Err(error) => return Err(error),
             }
@@ -1389,7 +1421,7 @@ impl Engine {
         let mut reconciled_scanner_assets: Vec<i64> = vec![];
         let evidence = match self.ledger_state(plan, &domain) {
             Ok(state) if state == "committed" => {
-                if plan.action == "archive" {
+                if crate::archive_cancel::supports_scanner_reconciliation(plan) {
                     reconciled_scanner_assets =
                         crate::archive_cancel::committed_reconciled_assets(&self.config, plan)?;
                 }
@@ -1401,7 +1433,7 @@ impl Engine {
                 }
                 match self.ledger_apply(plan, &domain) {
                     Ok(applied) => applied,
-                    Err(error) if plan.action == "archive" => {
+                    Err(error) if crate::archive_cancel::supports_scanner_reconciliation(plan) => {
                         let (applied, reconciled) = self
                             .apply_archive_with_scanner_reconciliation(
                                 plan,
@@ -1415,7 +1447,7 @@ impl Engine {
                     Err(error) => return Err(error),
                 }
             }
-            Err(error) if plan.action == "archive" => {
+            Err(error) if crate::archive_cancel::supports_scanner_reconciliation(plan) => {
                 for &index in &successful {
                     crate::archive::verify_duplicate(&self.config, plan, index, false)?;
                 }
@@ -1507,20 +1539,32 @@ impl Engine {
         error: Error,
     ) -> Result<(Value, Vec<i64>)> {
         self.verify_published_archive_destinations(plan, successful)
-            .map_err(|_| error.clone())?;
+            .map_err(|published| with_reconciliation_cause(error.clone(), "归档目标核对", &published))?;
         let delta = domain
             .ledger
             .as_ref()
             .ok_or_else(|| Error::conflict("缺少账本意图"))?;
         let applied =
             crate::archive_cancel::apply_with_scanner_reconciliation(&self.config, plan, delta)
-                .map_err(|_| error)?;
+                .map_err(|observed| with_reconciliation_cause(error, "归档扫描提交", &observed))?;
         let reconciled = applied["reconciled_scanner_assets"]
             .as_array()
             .map(|ids| ids.iter().filter_map(Value::as_i64).collect())
             .unwrap_or_default();
         Ok((applied, reconciled))
     }
+}
+/// Keep the primary ledger conflict for callers while preserving why the
+/// archive-specific fallback did not apply. A swallowed fallback cause leaves
+/// recovery_needed without any actionable evidence.
+fn with_reconciliation_cause(mut primary: Error, stage: &str, cause: &Error) -> Error {
+    primary.error = match cause.path.as_deref() {
+        Some(path) if !path.is_empty() => {
+            format!("{}；{}：{}（{}）", primary.error, stage, cause.error, path)
+        }
+        _ => format!("{}；{}：{}", primary.error, stage, cause.error),
+    };
+    primary
 }
 fn validate(request: &Request) -> Result<()> {
     model::validate_id(&request.id)?;

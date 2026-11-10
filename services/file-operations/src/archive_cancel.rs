@@ -17,8 +17,14 @@ use std::{
 
 const DEFAULT_SCANNER_LEASE_MS: i64 = 300_000;
 
+#[track_caller]
 fn conflict() -> Error {
-    Error::conflict("归档账本取消依据不足，保留恢复状态")
+    let location = std::panic::Location::caller();
+    Error::conflict(format!(
+        "归档账本取消依据不足，保留恢复状态（{}:{}）",
+        location.file().rsplit('/').next().unwrap_or(location.file()),
+        location.line()
+    ))
 }
 fn quoted(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
@@ -77,15 +83,21 @@ fn ensure_lease_table(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+pub fn supports_scanner_reconciliation(plan: &Plan) -> bool {
+    matches!(plan.action.as_str(), "archive" | "merge-person")
+}
+
 fn write_coordination_files(config: &Config, payload: &Value) {
     let local = config
         .state_db()
         .with_file_name("scanner-coordination.json");
-    if let Some(parent) = local.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(bytes) = serde_json::to_vec(payload) {
-        let _ = files::atomic_write(&local, &bytes);
+    if payload["action"] == "archive" || local.exists() {
+        if let Some(parent) = local.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(bytes) = serde_json::to_vec(payload) {
+            let _ = files::atomic_write(&local, &bytes);
+        }
     }
     if let Some(state_dir) = peach_state_dir(config) {
         let state_file = state_dir.join("archive-scanner-coordination.json");
@@ -135,7 +147,9 @@ fn write_coordination_files(config: &Config, payload: &Value) {
 }
 
 pub fn acquire_scanner_lease(config: &Config, plan: &Plan) -> Result<Value> {
-    if plan.action != "archive" {
+    if plan.action != "archive"
+        && !(supports_scanner_reconciliation(plan) && peach_state_dir(config).is_some())
+    {
         return Ok(Value::Null);
     }
     let now = now_ms();
@@ -184,6 +198,7 @@ pub fn acquire_scanner_lease(config: &Config, plan: &Plan) -> Result<Value> {
 
 pub fn release_scanner_lease(config: &Config, operation_id: &str, terminal_state: &str) {
     let now = now_ms();
+    let mut leased = false;
     if let Ok(mut conn) = db::open(&config.ledger)
         && let Ok(tx) = conn.transaction_with_behavior(TransactionBehavior::Immediate)
         && ensure_lease_table(&tx).is_ok()
@@ -192,11 +207,24 @@ pub fn release_scanner_lease(config: &Config, operation_id: &str, terminal_state
             "UPDATE _face_admin_scanner_leases SET state='expired',updated_at=?1 WHERE state='active' AND expires_at<=?1",
             params![now],
         );
-        let _ = tx.execute(
-            "UPDATE _face_admin_scanner_leases SET state=?2,updated_at=?3 WHERE id=?1 AND state='active'",
-            params![operation_id, terminal_state, now],
-        );
+        leased = tx
+            .execute(
+                "UPDATE _face_admin_scanner_leases SET state=?2,updated_at=?3 WHERE id=?1 AND state='active'",
+                params![operation_id, terminal_state, now],
+            )
+            .unwrap_or(0)
+            > 0;
         let _ = tx.commit();
+    }
+    let local = config
+        .state_db()
+        .with_file_name("scanner-coordination.json");
+    if !leased
+        && !local.exists()
+        && !peach_state_dir(config)
+            .is_some_and(|d| d.join("archive-scanner-coordination.json").exists())
+    {
+        return;
     }
     let payload = json!({
         "operation_id": operation_id,
@@ -394,11 +422,12 @@ fn apply_in_place_asset_state(
     }
 }
 
-fn index_only(
+pub(crate) fn is_pure_scanner_stub(
     conn: &Connection,
     row: &Value,
     original: &Value,
-    file: &crate::model::FileMove,
+    expected_name: Option<&str>,
+    expected_size: Option<i64>,
 ) -> Result<()> {
     let known: BTreeSet<&str> = "id location path name medium size mtime hash_kind hash creator studio series code duration width height vcodec fps has_audio ctx_length ctx_orient ctx_quality ctx_pace ctx_people play_count last_played rating o_count watch_ratio source_id stash_scene_id snapshot_path first_seen last_seen feedback disposal leave_ratio play_seconds feedback_at seek_count max_reached release_date catalog_title original_title field_owners mutation_revision region disposal_reason".split_whitespace().collect();
     let index: BTreeSet<&str> = "id location path name medium size mtime hash_kind hash duration width height vcodec fps has_audio ctx_length ctx_orient ctx_quality first_seen last_seen".split_whitespace().collect();
@@ -406,9 +435,9 @@ fn index_only(
     if id <= 0
         || id == db::integer(&original["id"])?
         || row["location"] != original["location"]
-        || row["name"].as_str() != Path::new(&file.dst).file_name().and_then(|s| s.to_str())
+        || row["name"].as_str() != expected_name
         || row["medium"] != "video"
-        || db::integer(&row["size"])? != file.size as i64
+        || Some(db::integer(&row["size"])?) != expected_size
     {
         return Err(conflict());
     }
@@ -485,13 +514,28 @@ fn index_only(
     Ok(())
 }
 
+fn index_only(
+    conn: &Connection,
+    row: &Value,
+    original: &Value,
+    file: &crate::model::FileMove,
+) -> Result<()> {
+    is_pure_scanner_stub(
+        conn,
+        row,
+        original,
+        Path::new(&file.dst).file_name().and_then(|s| s.to_str()),
+        Some(file.size as i64),
+    )
+}
+
 fn observe_scanner_rows(
     conn: &Connection,
     config: &Config,
     plan: &Plan,
     delta: &ledger::Delta,
 ) -> Result<(Vec<ReconcilableRow>, db::Delta)> {
-    if plan.action != "archive" {
+    if !supports_scanner_reconciliation(plan) {
         return Err(conflict());
     }
     let assets = delta
@@ -500,23 +544,44 @@ fn observe_scanner_rows(
         .iter()
         .find(|t| t.table == db::Table::Asset)
         .ok_or_else(conflict)?;
+    let targets: Vec<(String, Value)> = if plan.action == "archive" {
+        delta
+            .changes
+            .guards
+            .iter()
+            .filter_map(|guard| match guard {
+                db::Guard::AssetPath {
+                    path,
+                    before,
+                    after,
+                } if before.is_empty() && after.len() == 1 => {
+                    Some((path.clone(), after[0].clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    } else {
+        assets
+            .after
+            .iter()
+            .filter_map(|after_row| {
+                let path = after_row["path"].as_str()?;
+                let occupied_before = delta.changes.guards.iter().any(|guard| match guard {
+                    db::Guard::AssetPrefix { prefix, before, .. }
+                        if path.starts_with(prefix.as_str()) =>
+                    {
+                        before.iter().any(|r| r["path"] == path)
+                    }
+                    _ => false,
+                });
+                (!occupied_before).then(|| (path.to_owned(), after_row.clone()))
+            })
+            .collect()
+    };
     let mut observed = delta.changes.clone();
     let mut application = delta.changes.clone();
     let mut pairs = vec![];
-    for guard in &delta.changes.guards {
-        let db::Guard::AssetPath {
-            path,
-            before,
-            after,
-        } = guard
-        else {
-            continue;
-        };
-        // Only empty accepted destinations of this archive's original-ID update.
-        // Canonical duplicate destinations and non-archive scopes are untouched.
-        if !before.is_empty() || after.len() != 1 {
-            continue;
-        }
+    for (path, after_row) in &targets {
         let Some(file) = plan.files.iter().find(|f| {
             Path::new(&f.dst).starts_with(config.creators())
                 && metadata::win(config, &f.dst) == *path
@@ -526,7 +591,7 @@ fn observe_scanner_rows(
         let original = assets
             .before
             .iter()
-            .find(|row| row["id"] == after[0]["id"])
+            .find(|row| row["id"] == after_row["id"])
             .ok_or_else(conflict)?;
         let win_src = metadata::win(config, &file.src);
         if original["path"] != win_src {
@@ -553,7 +618,7 @@ fn observe_scanner_rows(
                     return Err(conflict());
                 }
                 let dst_name = Path::new(&file.dst).file_name().and_then(|s| s.to_str());
-                in_place_scanner_match(dst_row, &after[0], dst_name)?;
+                in_place_scanner_match(dst_row, after_row, dst_name)?;
                 apply_in_place_asset_state(
                     &mut observed,
                     &original["id"],
@@ -614,9 +679,14 @@ fn observe_scanner_rows(
                 && src_row != original
             {
                 in_place_scanner_match(src_row, original, None)?;
-                let mut updated_after = after[0].clone();
+                let mut updated_after = after_row.clone();
                 updated_after["last_seen"] = src_row["last_seen"].clone();
                 updated_after["mtime"] = src_row["mtime"].clone();
+                if updated_after.get("snapshot_path") == Some(&Value::Null)
+                    && src_row.get("snapshot_path").is_some_and(|v| !v.is_null())
+                {
+                    updated_after["snapshot_path"] = src_row["snapshot_path"].clone();
+                }
                 apply_in_place_asset_state(
                     &mut observed,
                     &original["id"],
@@ -648,9 +718,14 @@ fn observe_scanner_rows(
                 && src_row != original
             {
                 in_place_scanner_match(src_row, original, None)?;
-                let mut updated_after = after[0].clone();
+                let mut updated_after = after_row.clone();
                 updated_after["last_seen"] = src_row["last_seen"].clone();
                 updated_after["mtime"] = src_row["mtime"].clone();
+                if updated_after.get("snapshot_path") == Some(&Value::Null)
+                    && src_row.get("snapshot_path").is_some_and(|v| !v.is_null())
+                {
+                    updated_after["snapshot_path"] = src_row["snapshot_path"].clone();
+                }
                 apply_in_place_asset_state(
                     &mut observed,
                     &original["id"],
@@ -673,6 +748,166 @@ fn observe_scanner_rows(
                     stub: src_row.clone(),
                     original: original.clone(),
                     file: file.clone(),
+                    in_place: true,
+                });
+            }
+        }
+    }
+    if plan.action != "archive" {
+        for file in &plan.files {
+            if !Path::new(&file.dst).starts_with(config.creators()) {
+                continue;
+            }
+            let path = metadata::win(config, &file.dst);
+            if targets.iter().any(|(p, _)| p == &path) {
+                continue;
+            }
+            let occupied_before = delta.changes.guards.iter().any(|guard| match guard {
+                db::Guard::AssetPrefix { prefix, before, .. }
+                    if path.starts_with(prefix.as_str()) =>
+                {
+                    before.iter().any(|r| r["path"] == path)
+                }
+                _ => false,
+            });
+            if occupied_before {
+                continue;
+            }
+            let current = db::rows(
+                conn,
+                "SELECT * FROM asset WHERE path=? ORDER BY id LIMIT 2",
+                [path.as_str()],
+            )?;
+            if current.len() > 1 {
+                return Err(conflict());
+            }
+            if let Some(dst_row) = current.first() {
+                let stub_id = db::integer(&dst_row["id"])?;
+                if assets
+                    .before
+                    .iter()
+                    .any(|row| db::integer(&row["id"]).ok() == Some(stub_id))
+                {
+                    return Err(conflict());
+                }
+                index_only(
+                    conn,
+                    dst_row,
+                    &json!({"id":{"$integer":"0"},"location":"local"}),
+                    file,
+                )?;
+                for obs_guard in &mut observed.guards {
+                    if let db::Guard::AssetPrefix {
+                        prefix,
+                        before: obs_before,
+                        ..
+                    } = obs_guard
+                        && path.starts_with(prefix.as_str())
+                        && !obs_before.iter().any(|r| r["id"] == dst_row["id"])
+                    {
+                        obs_before.push(dst_row.clone());
+                    }
+                }
+                pairs.push(ReconcilableRow {
+                    stub: dst_row.clone(),
+                    original: Value::Null,
+                    file: file.clone(),
+                    in_place: false,
+                });
+            }
+        }
+        if !plan.target_person.is_empty() {
+            let target_dir = config.creators().join(&plan.target_person);
+            let win_target_prefix = format!(
+                "{}\\",
+                metadata::win(config, &target_dir.to_string_lossy())
+            );
+            let prefix_rows = db::rows(
+                conn,
+                "SELECT * FROM asset WHERE substr(path,1,length(?))=? ORDER BY id",
+                [win_target_prefix.as_str(), win_target_prefix.as_str()],
+            )?;
+            for row in prefix_rows {
+                let already_observed = observed.guards.iter().any(|g| match g {
+                    db::Guard::AssetPrefix { prefix, before, .. }
+                        if *prefix == win_target_prefix =>
+                    {
+                        before.iter().any(|r| r["id"] == row["id"])
+                    }
+                    _ => false,
+                });
+                if already_observed {
+                    continue;
+                }
+                let Some(row_path) = row["path"].as_str() else {
+                    return Err(conflict());
+                };
+                if assets
+                    .before
+                    .iter()
+                    .chain(&assets.after)
+                    .any(|r| r["id"] == row["id"] || r["path"] == row_path)
+                    || plan.files.iter().any(|f| {
+                        metadata::win(config, &f.src) == row_path
+                            || metadata::win(config, &f.dst) == row_path
+                    })
+                    || observed.guards.iter().any(|g| match g {
+                        db::Guard::AssetPrefix { before, after, .. } => before
+                            .iter()
+                            .chain(after)
+                            .any(|r| r["id"] == row["id"] || r["path"] == row_path),
+                        _ => false,
+                    })
+                {
+                    return Err(conflict());
+                }
+                let rel = row_path
+                    .strip_prefix(&win_target_prefix)
+                    .ok_or_else(conflict)?;
+                let mut native_path = target_dir.clone();
+                for part in rel.split('\\').filter(|s| !s.is_empty()) {
+                    if part == "." || part == ".." {
+                        return Err(conflict());
+                    }
+                    native_path.push(part);
+                }
+                let meta = std::fs::symlink_metadata(&native_path).map_err(|_| conflict())?;
+                if meta.file_type().is_symlink() || !meta.is_file() {
+                    return Err(conflict());
+                }
+                let dummy_file = crate::model::FileMove {
+                    vids: vec![],
+                    src: String::new(),
+                    dst: native_path.to_string_lossy().into_owned(),
+                    size: meta.len(),
+                    version: String::new(),
+                };
+                index_only(
+                    conn,
+                    &row,
+                    &json!({"id":{"$integer":"0"},"location":"local"}),
+                    &dummy_file,
+                )?;
+                for guard in observed.guards.iter_mut().chain(application.guards.iter_mut()) {
+                    if let db::Guard::AssetPrefix {
+                        prefix,
+                        before,
+                        after,
+                    } = guard
+                        && row_path.starts_with(prefix.as_str())
+                    {
+                        if !before.iter().any(|r| r["id"] == row["id"]) {
+                            before.push(row.clone());
+                        }
+                        if !after.iter().any(|r| r["id"] == row["id"]) {
+                            after.push(row.clone());
+                        }
+                    }
+                }
+                pairs.push(ReconcilableRow {
+                    stub: row,
+                    original: Value::Null,
+                    file: dummy_file,
                     in_place: true,
                 });
             }
@@ -743,13 +978,13 @@ fn reconcile_peach_state_files(config: &Config, pairs: &[ReconcilableRow]) {
             let Ok(stub_id) = db::integer(&pair.stub["id"]) else {
                 continue;
             };
-            let Ok(original_id) = db::integer(&pair.original["id"]) else {
-                continue;
-            };
             let removed = if pair.in_place {
                 None
             } else {
                 map.remove(&stub_id.to_string())
+            };
+            let Ok(original_id) = db::integer(&pair.original["id"]) else {
+                continue;
             };
             let identity = removed
                 .as_ref()
@@ -795,7 +1030,7 @@ pub fn reserve_with_scanner_index(
         if signature != plan.version
             || state != "prepared"
             || evidence["backend"] != "rust"
-            || evidence["kind"] != "archive"
+            || evidence["kind"].as_str() != Some(plan.action.as_str())
             || evidence["delta"] != serde_json::to_value(delta)?
         {
             return Err(conflict());
@@ -830,7 +1065,7 @@ pub fn apply_with_scanner_reconciliation(
     if signature != plan.version
         || state != "prepared"
         || evidence["backend"] != "rust"
-        || evidence["kind"] != "archive"
+        || evidence["kind"].as_str() != Some(plan.action.as_str())
         || evidence["delta"] != serde_json::to_value(delta)?
     {
         return Err(conflict());
@@ -947,7 +1182,7 @@ fn proof(
     if signature != plan.version
         || !["prepared", "cancelled"].contains(&state.as_str())
         || evidence["backend"] != "rust"
-        || evidence["kind"] != "archive"
+        || evidence["kind"].as_str() != Some(plan.action.as_str())
         || evidence["delta"] != serde_json::to_value(delta)?
     {
         return Err(conflict());

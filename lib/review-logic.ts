@@ -28,11 +28,19 @@ export function origin(source: ReviewSource, sourceId: string): Pick<QueueItem, 
     : source === 'person' ? `/persons/${encodeURIComponent(sourceId)}`
     : source === 'cluster' ? `/clusters?cid=${encodeURIComponent(sourceId)}` : '/clusters' }
 }
+function uuid(): string {
+  if (typeof globalThis.crypto?.randomUUID === 'function') return globalThis.crypto.randomUUID()
+  const bytes = globalThis.crypto.getRandomValues(new Uint8Array(16))
+  bytes[6] = (bytes[6] & 15) | 64
+  bytes[8] = (bytes[8] & 63) | 128
+  const hex = [...bytes].map(b => b.toString(16).padStart(2, '0')).join('')
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
+}
 export function enqueueItems(queue: QueueItem[], creator: string, vids: string[], provenance: ReturnType<typeof origin>) {
   const existing = new Map(queue.map(v => [v.vid, v]))
   const conflicts = vids.filter(v => existing.has(v) && existing.get(v)!.creator !== creator)
   if (conflicts.length) throw new ReviewError(`${conflicts.length} 个视频已归给其他人物，请先到待归档撤销`, 409)
-  const batch_id = globalThis.crypto.randomUUID()
+  const batch_id = uuid()
   const added: QueueItem[] = vids.filter(v => !existing.has(v)).map(vid => ({ vid, creator, at: new Date().toISOString(), batch_id, ...provenance }))
   return { queue: [...queue, ...added], added }
 }

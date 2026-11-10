@@ -1,6 +1,6 @@
 'use client'
 import { useEffect, useRef, useState } from 'react'
-import { ArrowRight } from 'lucide-react'
+import { ArrowRight, FolderOutput } from 'lucide-react'
 import { Dialog, DialogDescription, DialogTitle } from '@/components/ui/dialog'
 import { api } from '@/lib/face-api'
 import type { LibraryPerson, PersonVideo } from '@/lib/person-library-model'
@@ -10,7 +10,7 @@ import { WorkbenchDialogContent as DialogContent, WorkbenchButton as Button, Wor
 export interface FileActionSelection {action:PersonFileAction;files:PersonVideo[];resumePlan?:PersonFilePlan}
 export const FILE_OPERATION_STORAGE_KEY='person-file-operation-v1'
 const labels:Record<PersonFileAction,string>={'rename-file':'重命名文件','move-files':'移动视频','delete-files':'删除视频','rename-person':'人物重命名','merge-person':'合并人物','delete-person':'删除人物'}
-export function FileActionDialog({selection,person,people,theme,onClose,onSaved,onRolledBack,onBusyChange,onSubmitted,onForget}:{selection:FileActionSelection;person:string;people:LibraryPerson[];theme:'light'|'dark';onClose:()=>void;onSaved:(result:PersonFileResult)=>Promise<void>;onRolledBack:()=>Promise<void>;onBusyChange:(busy:boolean)=>void;onSubmitted:(plan:PersonFilePlan)=>void;onForget:()=>void}) {
+export function FileActionDialog({selection,person,people,theme,onClose,onSaved,onRolledBack,onBusyChange,onSubmitted,onForget,onEnqueueBackground}:{selection:FileActionSelection;person:string;people:LibraryPerson[];theme:'light'|'dark';onClose:()=>void;onSaved:(result:PersonFileResult)=>Promise<void>;onRolledBack:()=>Promise<void>;onBusyChange:(busy:boolean)=>void;onSubmitted:(plan:PersonFilePlan)=>void;onForget:()=>void;onEnqueueBackground?:(payload:{plan:PersonFilePlan;person:string})=>void}) {
   const [name,setName]=useState(selection.action==='rename-person'?person:selection.files[0]?.name||'')
   const [target,setTarget]=useState(''),[folder,setFolder]=useState(''),[plan,setPlan]=useState<PersonFilePlan|null>(selection.resumePlan||null),[error,setError]=useState(''),[busy,setBusy]=useState(false)
   const [targetQuery,setTargetQuery]=useState('')
@@ -55,16 +55,22 @@ export function FileActionDialog({selection,person,people,theme,onClose,onSaved,
   const targets=people.filter(p=>(!merging||p.name!==person)&&[p.name,...(p.aliases||[])].some(value=>value.toLowerCase().includes(targetQuery.toLowerCase())))
   const updateBusy=(value:boolean)=>{setBusy(value);onBusyChange(value)}
   async function preview(){
-    updateBusy(true);setError('')
+    setBusy(true);setError('')
     try{
       const request:PersonFileRequest={action:selection.action,person,
         ...(selection.action==='rename-person'?{new_name:name.trim()}:merging?{}:{files:selection.files.map(file=>({vid:file.vid,path:file.path,version:file.version||''}))}),
         ...(selection.action==='rename-file'?{filename:name.trim()}:{}),...(selection.action==='move-files'?{target_person:target,target_folder:folder.trim()}:merging?{target_person:target}:{})}
       setPlan(await api<PersonFilePlan>('/api/persons/manage',{method:'POST',body:JSON.stringify({mode:'preview',request})}))
-    }catch(e){setError((e as Error).message)}finally{updateBusy(false)}
+    }catch(e){setError((e as Error).message)}finally{setBusy(false)}
   }
   async function apply(){
-    if(!plan||busy||submitted)return;updateBusy(true);setError('')
+    if(!plan||busy||submitted)return
+    if(onEnqueueBackground){
+      onEnqueueBackground({plan,person})
+      onClose()
+      return
+    }
+    updateBusy(true);setError('')
     if(plan.backend==='rust'){
       try{localStorage.setItem(FILE_OPERATION_STORAGE_KEY,JSON.stringify(plan));onSubmitted(plan);setSubmitted(true);setStatus('submitting')}
       catch{setError('无法保存操作编号，请允许浏览器本地存储后再提交。');updateBusy(false);return}
@@ -88,7 +94,7 @@ export function FileActionDialog({selection,person,people,theme,onClose,onSaved,
       {error&&<p role="alert" className="pw-error">{error}</p>}
       <div className="pw-modal-actions"><Button disabled={busy} onClick={onClose}>取消</Button><Button className="pw-primary" type="submit" disabled={busy||!valid}>{busy?'检查文件和账本…':'预览变更'}<ArrowRight size={14}/></Button></div>
     </form>:<>
-      <div className="pw-operation-summary">{['rename-person','merge-person'].includes(plan.action)?<strong>{plan.person} → {plan.target_person}</strong>:<strong>{plan.files.length} 个视频 · {(plan.total_bytes/2**20).toFixed(1)} MB</strong>}<p>{merging?`合并 ${plan.files.length} 个文件（含附属资料），保留目标人物 ${plan.target_person}`:plan.action==='delete-files'?'将移入全局暂存区':plan.action==='move-files'?`移动到 ${plan.target_person}`:'文件路径及相关记录将一起更新'}</p>{plan.merge_summary&&<><p>迁移 {plan.merge_summary.pending_tasks} 条待归档任务 · {plan.merge_summary.manual_accounts} 个手动账号关联</p>{plan.merge_summary.renamed_files>0&&<p>{plan.merge_summary.renamed_files} 个文件的目标名或路径已调整，保留双方文件。</p>}{plan.merge_summary.keep_target_template&&<p>双方都有模板设置，保留目标人物的选择；来源设置会留档。</p>}</>}</div>
+      <div className="pw-operation-summary">{['rename-person','merge-person'].includes(plan.action)?<strong>{plan.person} → {plan.target_person}</strong>:<strong>{plan.files.length} 个视频 · {(plan.total_bytes/2**20).toFixed(1)} MB</strong>}<p>{merging?`合并 ${plan.files.length} 个文件（含附属资料），保留目标人物 ${plan.target_person}`:plan.action==='delete-files'?'将移入全局暂存区':plan.action==='move-files'?`移动到 ${plan.target_person}`:'文件路径及相关记录将一起更新'}</p>{plan.target_directory&&<div className="pw-merge-target-path"><FolderOutput size={14}/><span>{plan.action==='delete-files'?'暂存文件夹':'目标文件夹'}</span><code>{plan.target_directory}</code></div>}{plan.merge_summary&&<><p>迁移 {plan.merge_summary.pending_tasks} 条待归档任务 · {plan.merge_summary.manual_accounts} 个手动账号关联</p>{plan.merge_summary.renamed_files>0&&<p>{plan.merge_summary.renamed_files} 个文件的目标名或路径已调整，保留双方文件。</p>}{plan.merge_summary.keep_target_template&&<p>双方都有模板设置，保留目标人物的选择；来源设置会留档。</p>}</>}</div>
       <div className="pw-move-preview">{!plan.files.length&&<p>没有需要搬动的文件，将更新人物资料与归属记录。</p>}{plan.files.map(file=><div key={file.src}><span>原路径</span><code>{file.src}</code><span>新路径{file.renamed?' · 已调整以保留两份':''}</span><code>{file.dst}</code></div>)}</div>
       {error&&<p role="alert" className="pw-error">{error}</p>}
       {submitted?<>

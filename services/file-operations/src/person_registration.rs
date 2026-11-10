@@ -5,6 +5,7 @@ use crate::{
     model::{Error, Result, hash},
 };
 use serde_json::{Value, json};
+use unicode_normalization::UnicodeNormalization;
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
@@ -178,12 +179,85 @@ pub fn canonical_in(name: &str, aliases: &Value) -> Result<String> {
     }
     Ok(current)
 }
+fn folded(name: &str) -> String {
+    name.nfc().collect::<String>().to_lowercase()
+}
+/// True when two person names differ only by letter case or Unicode form.
+pub fn same_spelling(a: &str, b: &str) -> bool {
+    folded(a) == folded(b)
+}
+/// Whether this exact name (not a case variant) owns a creators directory.
+pub fn has_own_directory(config: &Config, name: &str) -> Result<bool> {
+    let entries = match fs::read_dir(config.creators()) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if entry.file_name().to_str() == Some(name) {
+            let kind = entry.file_type()?;
+            return Ok(kind.is_dir() && !kind.is_symlink());
+        }
+    }
+    Ok(false)
+}
+/// Resolve a person picked for a whole-person operation. A name that still owns
+/// residue (directory or registration) stays literal even if an alias now points
+/// elsewhere, so that residue can be merged or deleted on its own; otherwise the
+/// alias resolves to the current person.
+pub fn selected(config: &Config, name: &str) -> Result<String> {
+    files::validate_name(name)?;
+    if known_person(config, name)? {
+        return Ok(name.to_owned());
+    }
+    canonical(config, name)
+}
+/// Reuse an existing person whose name differs only by letter case or Unicode
+/// form, so registering "MomoYih" does not create a second "momoyih".
+pub fn existing_spelling(config: &Config, name: &str) -> Result<String> {
+    if known_person(config, name)? {
+        return Ok(name.to_owned());
+    }
+    let key = folded(name);
+    // A folder is the strongest evidence of the real spelling; registrations
+    // only decide when no folder matches.
+    let mut folders = BTreeSet::new();
+    match fs::read_dir(config.creators()) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry?;
+                if let Some(candidate) = entry.file_name().to_str()
+                    && folded(candidate) == key
+                    && entry.file_type()?.is_dir()
+                {
+                    folders.insert(candidate.to_owned());
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    let mut registered = BTreeSet::new();
+    let (_, people) = document(config, "people-manual.json", true)?;
+    for row in people.as_array().into_iter().flatten() {
+        if let Some(candidate) = row["name"].as_str()
+            && folded(candidate) == key
+        {
+            registered.insert(candidate.to_owned());
+        }
+    }
+    let found = if folders.is_empty() { registered } else { folders };
+    Ok(if found.len() == 1 {
+        found.into_iter().next().unwrap()
+    } else {
+        name.to_owned()
+    })
+}
 pub fn known_person(config: &Config, name: &str) -> Result<bool> {
-    let root = config.creators().join(name);
-    if root
-        .symlink_metadata()
-        .is_ok_and(|m| m.is_dir() && !m.file_type().is_symlink())
-    {
+    // Exact listing, not a path lookup: case-insensitive storage would
+    // otherwise report a spelling variant as owning the real folder.
+    if has_own_directory(config, name)? {
         return Ok(true);
     }
     let (_, deleted) = document(config, "people-deleted.json", false)?;
