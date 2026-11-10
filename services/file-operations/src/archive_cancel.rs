@@ -790,7 +790,12 @@ fn observe_scanner_rows(
                 {
                     return Err(conflict());
                 }
-                index_only(conn, dst_row, &json!({"id":0,"location":"local"}), file)?;
+                index_only(
+                    conn,
+                    dst_row,
+                    &json!({"id":{"$integer":"0"},"location":"local"}),
+                    file,
+                )?;
                 for obs_guard in &mut observed.guards {
                     if let db::Guard::AssetPrefix {
                         prefix,
