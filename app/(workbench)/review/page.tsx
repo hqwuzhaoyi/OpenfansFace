@@ -8,9 +8,12 @@ import { workspaceToast as toast } from '@/components/workbench/feedback'
 import { api } from '@/lib/face-api'
 import type { ProcessingTask } from '@/lib/processing-model'
 import { reviewSelectionKey, toggleReviewSelection, removeReviewSelection, type ReviewSelections } from '@/lib/review-selection'
-import { PersonPicker, type PersonChoice } from '@/components/review/person-picker'
+import { PersonPicker, type PersonChoice, type PersonNameHint } from '@/components/review/person-picker'
 import { VideoCover } from '@/components/review/video-cover'
-import { PrivateImage } from '@/components/private-media'
+import { Card } from '@/components/beui/motion/card'
+import { Collapsible, CollapsibleContent } from '@/components/beui/motion/collapsible'
+import { AvatarGroup } from '@/components/beui/motion/avatar-group'
+import { DigitSwap } from '@/components/beui/motion/digit-swap'
 import { reviewListSummary } from '@/lib/review-list-summary'
 import { QueueReceipt } from '@/components/review/workflow'
 import { ResponsiveDialogContent } from '@/components/review/responsive-dialog'
@@ -143,6 +146,20 @@ export default function Review() {
       return {name,rep_thumb:existing?.rep_thumb||info.thumb||null,aliases:existing?.aliases,sim:info.sim,match_count:info.count,match_reason:parts.join(' · ')}
     })
   })():[]
+  const selectionSampleFaces=chosen.length?[...new Set(chosen.flatMap(t=>(t.data.face?.thumbs||[]).slice(0,2).map(p=>`/thumb?p=${encodeURIComponent(p)}`)))].slice(0,6):[]
+  const selectionNameHints:PersonNameHint[]=chosen.length?(()=>{
+    const map=new Map<string,string>()
+    for(const t of chosen){
+      for(const c of t.data.candidates||[])if(c.name.trim()&&!map.has(c.name.trim()))map.set(c.name.trim(),'候选线索')
+      for(const w of t.data.watermark?.candidates||[]){
+        if(w.platform==='Telegram')continue
+        const token=(w.token||w.text||'').replace(/^@+/,'').trim()
+        if(token&&token.length>=2&&token.length<=60&&!/[\\/]/.test(token)&&!map.has(token))map.set(token,w.platform?`${w.platform}水印`:'水印线索')
+      }
+      for(const f of t.data.folder||[])if(f.name.trim()&&!map.has(f.name.trim()))map.set(f.name.trim(),'目录线索')
+    }
+    return [...map.entries()].slice(0,6).map(([name,source])=>({name,source}))
+  })():[]
   const selectionPreviewTask=selectionPreviewVid?chosen.find(t=>t.vid===selectionPreviewVid)||null:null
   const changeQuery=(value:string)=>{if(!group&&data?.group)setGroup(data.group.key);updateFilters({q:value,page:'0',vid:''})}
   const chooseGroup=(key:string)=>{setGroup(key);setPage(0);setLinkFocus('');setPreviewOpen(false)}
@@ -192,23 +209,27 @@ export default function Review() {
   const backReference=()=>{const previous=reference;setReference(null);if(previous)requestAnimationFrame(()=>{const area=document.querySelector('.ws-detail-content');if(area)area.scrollTop=previous.scroll;const trigger=[...document.querySelectorAll<HTMLButtonElement>('.ws-detail-content button')].find(b=>b.getAttribute('aria-label')===`看 ${previous.name} 的对照视频`);trigger?.focus({preventScroll:true})})}
   const detail=<>
 
-    <div className="ws-detail-heading"><h2 ref={selectionHeading} tabIndex={-1}>{reference?`${reference.name} · 对照视频`:detailMode==='selection'?`核对所选 · ${chosen.length}`:'视频与证据'}</h2>{reference?<Button variant="ghost" onClick={backReference}><ArrowLeft size={14}/>返回{reference.returnTo==='selection'?'人物选择':'证据'}</Button>:detailMode==='selection'&&<Button variant="ghost" size="sm" onClick={()=>setDetailMode('video')}><ArrowLeft size={14}/>返回证据</Button>}{wide&&!reference&&detailMode==='video'&&focused&&<span className="ws-muted">{rows.findIndex(t=>t.vid===focused.vid)>=0?`${rows.findIndex(t=>t.vid===focused.vid)+1} / ${rows.length}`:'已查看'}</span>}</div>
+    <div className="ws-detail-heading"><h2 ref={selectionHeading} tabIndex={-1}>{reference?`${reference.name} · 对照视频`:detailMode==='selection'?<>核对所选 · <DigitSwap value={chosen.length}/></>:'视频与证据'}</h2>{reference?<Button variant="ghost" onClick={backReference}><ArrowLeft size={14}/>返回{reference.returnTo==='selection'?'人物选择':'证据'}</Button>:detailMode==='selection'&&<Button variant="ghost" size="sm" onClick={()=>setDetailMode('video')}><ArrowLeft size={14}/>返回证据</Button>}{wide&&!reference&&detailMode==='video'&&focused&&<span className="ws-muted">{rows.findIndex(t=>t.vid===focused.vid)>=0?`${rows.findIndex(t=>t.vid===focused.vid)+1} / ${rows.length}`:'已查看'}</span>}</div>
     <div className="ws-detail-content" data-sheet-scroll>
       {reference?<ReferencePanel name={reference.name}/>:detailMode==='video'?(focused?<EvidencePanel key={focused.vid} task={focused} note={notes[focused.vid]??focused.note} onNoteChange={note=>{if(noteBaseline.current[focused.vid]===undefined)noteBaseline.current[focused.vid]=focused.note;setNotes(current=>{const next={...current};if(note===focused.note)delete next[focused.vid];else next[focused.vid]=note;return next})}} onSaveNote={()=>action('note',[focused.vid],notes[focused.vid]??focused.note)} onSource={sourceOnly} busy={busy} creator={creator} onChoose={setCreator} onReference={openReference}/>:<p className="ws-empty">选择视频查看证据</p>):<div className="ws-decision">
         <div>
-          <p className="mb-2 text-xs text-muted-foreground">{data?.group?.label||'当前确认组'} · {chosen.length} 个视频{hiddenCount>0?`，其中 ${hiddenCount} 个不在当前页`:''}</p>
-          {selectionPreviewTask&&<div className="ws-confirm-preview" role="region" aria-label={`原位预览 ${selectionPreviewTask.name}`}>
-            <div className="ws-confirm-preview-head">
-              <strong title={selectionPreviewTask.name}>{selectionPreviewTask.name}</strong>
-              <div className="ws-confirm-preview-actions">
-                <Button variant="ghost" size="sm" onClick={()=>inspect(selectionPreviewTask)}>完整证据</Button>
-                <Button variant="ghost" size="icon" aria-label="收起原位预览" title="收起预览" onClick={()=>setSelectionPreviewVid(null)}><X size={14}/></Button>
-              </div>
-            </div>
-            <WorkspaceMedia key={selectionPreviewTask.vid} path={selectionPreviewTask.path} name={selectionPreviewTask.name} autoPlay/>
-          </div>}
+          <p className="mb-2 text-xs text-muted-foreground">{data?.group?.label||'当前确认组'} · <DigitSwap value={chosen.length}/> 个视频{hiddenCount>0?`，其中 ${hiddenCount} 个不在当前页`:''}</p>
+          <Collapsible open={Boolean(selectionPreviewTask)}>
+            <CollapsibleContent>
+              {selectionPreviewTask&&<Card size="compact" variant="muted" className="ws-confirm-preview" role="region" aria-label={`原位预览 ${selectionPreviewTask.name}`}>
+                <div className="ws-confirm-preview-head">
+                  <strong title={selectionPreviewTask.name}>{selectionPreviewTask.name}</strong>
+                  <div className="ws-confirm-preview-actions">
+                    <Button variant="ghost" size="sm" onClick={()=>inspect(selectionPreviewTask)}>完整证据</Button>
+                    <Button variant="ghost" size="icon" aria-label="收起原位预览" title="收起预览" onClick={()=>setSelectionPreviewVid(null)}><X size={14}/></Button>
+                  </div>
+                </div>
+                <WorkspaceMedia key={selectionPreviewTask.vid} path={selectionPreviewTask.path} name={selectionPreviewTask.name} autoPlay/>
+              </Card>}
+            </CollapsibleContent>
+          </Collapsible>
           <div className="ws-confirm-list" aria-label="本次完整归名范围">{chosen.map(t=>{
-            const summary=reviewListSummary(t),faceThumbs=t.data.face?.thumbs?.slice(0,2)||[],isPreviewing=selectionPreviewTask?.vid===t.vid
+            const summary=reviewListSummary(t),faceThumbs=t.data.face?.thumbs?.slice(0,3)||[],isPreviewing=selectionPreviewTask?.vid===t.vid
             return <div key={t.vid} className="ws-confirm-file" data-active={isPreviewing||undefined}>
               <button type="button" className="ws-confirm-thumb" aria-label={`原位播放 ${t.name}`} title="原位播放预览" onClick={()=>{setInspected(current=>({...current,[scope]:t}));setSelectionPreviewVid(prev=>prev===t.vid?null:t.vid)}}>
                 <VideoCover video={{path:t.path,thumb:faceThumbs[0]?`/thumb?p=${encodeURIComponent(faceThumbs[0])}`:null,size:t.size,mtime_ns:t.mtime_ns}} sampleTime={summary.sampleTime}/>
@@ -217,7 +238,7 @@ export default function Review() {
               <div className="ws-confirm-body">
                 <div className="ws-confirm-top">
                   <Button variant="ghost" className="ws-confirm-name" onClick={()=>{setInspected(current=>({...current,[scope]:t}));setSelectionPreviewVid(prev=>prev===t.vid?null:t.vid)}} aria-label={`核对所选 ${t.name}`}><Play size={12}/><span>{t.name}</span></Button>
-                  {faceThumbs.length>0&&<div className="ws-confirm-faces" aria-label="检出人脸">{faceThumbs.map(path=><PrivateImage compact key={path} src={'/thumb?p='+encodeURIComponent(path)} alt="" loading="lazy" className="ws-confirm-face"/>)}</div>}
+                  {faceThumbs.length>0&&<AvatarGroup size="sm" max={3} label="检出人脸" className="ws-confirm-faces" members={faceThumbs.map((path,idx)=>({id:`${t.vid}-${idx}`,name:`${t.name} 人脸 ${idx+1}`,src:`/thumb?p=${encodeURIComponent(path)}`}))}/>}
                   <Button className="ws-icon" variant="ghost" size="sm" aria-label={`取消选择 ${t.name}`} title="取消选择" disabled={busy} onClick={()=>toggle([t])}><X size={14}/></Button>
                 </div>
                 <WorkspacePath value={t.path} compact/>
@@ -225,7 +246,7 @@ export default function Review() {
             </div>
           })}</div>
         </div>
-        <PersonPicker search={pickerSearch[scope]||''} onSearchChange={value=>setPickerSearch(current=>({...current,[scope]:value}))} onReference={openReference} compact people={people} suggestions={selectionSuggestions} value={creator} onChange={setCreator} disabled={busy} error={peopleError} onRetry={loadPeople}/>
+        <PersonPicker search={pickerSearch[scope]||''} onSearchChange={value=>setPickerSearch(current=>({...current,[scope]:value}))} onReference={openReference} compact people={people} suggestions={selectionSuggestions} sampleFaces={selectionSampleFaces} nameHints={selectionNameHints} value={creator} onChange={setCreator} disabled={busy} error={peopleError} onRetry={loadPeople}/>
         {commonMarks.length>0&&<WorkspaceField label="共同账号规则"><WorkspaceSelect label="保存共同账号规则" value={watermarkKey} disabled={busy} onChange={setWatermarkKey} options={[{value:'',label:'仅归名，不保存账号规则'},...commonMarks.map(c=>({value:c.key,label:`${c.platform} · ${c.token}`}))]}/></WorkspaceField>}
         <p className="text-xs text-muted-foreground">确认后加入待归档，文件暂不移动。</p>
       </div>}
@@ -233,7 +254,7 @@ export default function Review() {
       {focused?.review_blocked&&detailMode==='video'&&<p role="alert" className="ws-error">{focused.review_blocked}</p>}
       {submitError&&<p role="alert" className="ws-error">{submitError}</p>}
     </div>
-    <div className="ws-detail-actions">{reference?<><Button variant="outline" disabled={busy} onClick={backReference}>返回{reference.returnTo==='selection'?'人物选择':'证据'}</Button><Button disabled={busy} onClick={()=>{setCreator(reference.name);backReference()}}>选择 {reference.name}</Button></>:detailMode==='selection'?<Button disabled={busy||!chosen.length||!creator.trim()||sessionExpired||chosen.some(t=>blockedIds.has(t.vid))} onClick={confirm}>{busy?'正在保存…':`归给 ${creator.trim()||'所选人物'} · ${chosen.length}`}</Button>:<><Button variant="outline" disabled={!focused||busy||!!focused?.review_blocked&&!selected.has(focused.vid)} onClick={()=>focused&&toggle([focused])}>{focused&&selected.has(focused.vid)?'取消选择此视频':'选择此视频'}</Button>{chosen.length>0&&<Button disabled={busy} onClick={openSelection}>核对所选 · {chosen.length}</Button>}</>}</div>
+    <div className="ws-detail-actions">{reference?<><Button variant="outline" disabled={busy} onClick={backReference}>返回{reference.returnTo==='selection'?'人物选择':'证据'}</Button><Button disabled={busy} onClick={()=>{setCreator(reference.name);backReference()}}>选择 {reference.name}</Button></>:detailMode==='selection'?<Button disabled={busy||!chosen.length||!creator.trim()||sessionExpired||chosen.some(t=>blockedIds.has(t.vid))} onClick={confirm}>{busy?'正在保存…':<>归给 {creator.trim()||'所选人物'} · <DigitSwap value={chosen.length}/></>}</Button>:<><Button variant="outline" disabled={!focused||busy||!!focused?.review_blocked&&!selected.has(focused.vid)} onClick={()=>focused&&toggle([focused])}>{focused&&selected.has(focused.vid)?'取消选择此视频':'选择此视频'}</Button>{chosen.length>0&&<Button disabled={busy} onClick={openSelection}>核对所选 · <DigitSwap value={chosen.length}/></Button>}</>}</div>
   </>
   return <main className="ws-page" aria-label="人工确认工作区" data-review-session={data?.session}>
     <header className="ws-header"><h1>人工确认</h1><div className="ws-actions"><NavigationButton variant="ghost" size="sm" asChild><Link href="/operations"><span className="ws-link-label">分析中</span><span className="ws-count">{updates?.waiting??data?.waiting??'—'}</span><ChevronRight size={14}/></Link></NavigationButton><Button variant={updates?.has_updates||sessionExpired?"outline":"ghost"} aria-label="更新人工确认列表" title={updates?.refreshing?`后台正在更新 ${updates.refreshing} 条建议，当前列表保持不变`:'更新建议和分组'} disabled={busy||loading} onClick={requestRefresh}><RefreshCw size={15}/>{updates?.has_updates||sessionExpired?<span>有更新</span>:updates?.refreshing?<span className="ws-muted">后台更新中</span>:null}</Button></div></header>

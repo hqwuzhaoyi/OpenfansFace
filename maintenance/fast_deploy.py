@@ -172,6 +172,40 @@ def build_web_context(
     }
 
 
+def build_web_overlay(
+    output_tar_gz: Path,
+    base_image: str,
+    payload_tar_gz: Path,
+) -> dict:
+    if not payload_tar_gz.is_file():
+        raise FileNotFoundError(f"Web payload archive not found: {payload_tar_gz}")
+    payload_bytes = payload_tar_gz.read_bytes()
+    dockerfile_lines = [
+        f"FROM {base_image}",
+        "WORKDIR /app",
+        "ENV NODE_ENV=production HOSTNAME=0.0.0.0 NEXT_TELEMETRY_DISABLED=1 FACES_BASE=/data/base MEDIA2_ROOT=/mnt/media2 DOCKER_SOCK=/var/run/docker.sock",
+        "COPY web-app-payload.tar.gz /tmp/web-app-payload.tar.gz",
+        "RUN rm -rf /app/.next /app/public && tar -xzf /tmp/web-app-payload.tar.gz -C /app && rm -f /tmp/web-app-payload.tar.gz",
+        'CMD ["node", "server.js"]',
+        "",
+    ]
+    output_tar_gz.parent.mkdir(parents=True, exist_ok=True)
+    with output_tar_gz.open("wb") as raw_out:
+        with gzip.GzipFile(filename="", mode="wb", fileobj=raw_out, mtime=0) as gz:
+            with tarfile.open(mode="w", fileobj=gz) as tar:
+                add_bytes_to_tar(tar, "web-app-payload.tar.gz", payload_bytes, mode=0o644)
+                add_bytes_to_tar(tar, "Dockerfile", "\n".join(dockerfile_lines).encode("utf-8"), mode=0o644)
+
+    return {
+        "kind": "web-overlay",
+        "base_image": base_image,
+        "archive_path": str(output_tar_gz),
+        "archive_bytes": output_tar_gz.stat().st_size,
+        "archive_sha256": sha256_file(output_tar_gz),
+        "payload_sha256": sha256_bytes(payload_bytes),
+    }
+
+
 def build_rust_overlay(
     output_tar_gz: Path,
     base_image: str,
@@ -302,6 +336,11 @@ def main(argv: list[str] | None = None) -> int:
     p_web.add_argument("--runtime-base-image", default="face-admin-prod:current")
     p_web.add_argument("--run-typecheck-in-docker", action="store_true")
 
+    p_wov = sub.add_parser("web-overlay", help="Build thin-layer Web standalone overlay tar.gz")
+    p_wov.add_argument("--output", type=Path, required=True)
+    p_wov.add_argument("--base-image", required=True)
+    p_wov.add_argument("--payload", type=Path, required=True)
+
     p_rust = sub.add_parser("rust-overlay", help="Build thin-layer Rust binary overlay tar.gz")
     p_rust.add_argument("--output", type=Path, required=True)
     p_rust.add_argument("--base-image", required=True)
@@ -325,6 +364,12 @@ def main(argv: list[str] | None = None) -> int:
             deps_image=args.deps_image,
             runtime_base_image=args.runtime_base_image,
             skip_typecheck=not args.run_typecheck_in_docker,
+        )
+    elif args.command == "web-overlay":
+        result = build_web_overlay(
+            output_tar_gz=args.output,
+            base_image=args.base_image,
+            payload_tar_gz=args.payload,
         )
     elif args.command == "rust-overlay":
         result = build_rust_overlay(
