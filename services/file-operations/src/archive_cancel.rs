@@ -753,6 +753,65 @@ fn observe_scanner_rows(
             }
         }
     }
+    if plan.action != "archive" {
+        for file in &plan.files {
+            if !Path::new(&file.dst).starts_with(config.creators()) {
+                continue;
+            }
+            let path = metadata::win(config, &file.dst);
+            if targets.iter().any(|(p, _)| p == &path) {
+                continue;
+            }
+            let occupied_before = delta.changes.guards.iter().any(|guard| match guard {
+                db::Guard::AssetPrefix { prefix, before, .. }
+                    if path.starts_with(prefix.as_str()) =>
+                {
+                    before.iter().any(|r| r["path"] == path)
+                }
+                _ => false,
+            });
+            if occupied_before {
+                continue;
+            }
+            let current = db::rows(
+                conn,
+                "SELECT * FROM asset WHERE path=? ORDER BY id LIMIT 2",
+                [path.as_str()],
+            )?;
+            if current.len() > 1 {
+                return Err(conflict());
+            }
+            if let Some(dst_row) = current.first() {
+                let stub_id = db::integer(&dst_row["id"])?;
+                if assets
+                    .before
+                    .iter()
+                    .any(|row| db::integer(&row["id"]).ok() == Some(stub_id))
+                {
+                    return Err(conflict());
+                }
+                index_only(conn, dst_row, &json!({"id":0,"location":"local"}), file)?;
+                for obs_guard in &mut observed.guards {
+                    if let db::Guard::AssetPrefix {
+                        prefix,
+                        before: obs_before,
+                        ..
+                    } = obs_guard
+                        && path.starts_with(prefix.as_str())
+                        && !obs_before.iter().any(|r| r["id"] == dst_row["id"])
+                    {
+                        obs_before.push(dst_row.clone());
+                    }
+                }
+                pairs.push(ReconcilableRow {
+                    stub: dst_row.clone(),
+                    original: Value::Null,
+                    file: file.clone(),
+                    in_place: false,
+                });
+            }
+        }
+    }
     if pairs.is_empty() {
         return Err(conflict());
     }
@@ -818,13 +877,13 @@ fn reconcile_peach_state_files(config: &Config, pairs: &[ReconcilableRow]) {
             let Ok(stub_id) = db::integer(&pair.stub["id"]) else {
                 continue;
             };
-            let Ok(original_id) = db::integer(&pair.original["id"]) else {
-                continue;
-            };
             let removed = if pair.in_place {
                 None
             } else {
                 map.remove(&stub_id.to_string())
+            };
+            let Ok(original_id) = db::integer(&pair.original["id"]) else {
+                continue;
             };
             let identity = removed
                 .as_ref()
