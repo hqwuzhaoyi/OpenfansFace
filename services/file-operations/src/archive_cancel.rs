@@ -83,15 +83,21 @@ fn ensure_lease_table(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+pub fn supports_scanner_reconciliation(plan: &Plan) -> bool {
+    matches!(plan.action.as_str(), "archive" | "merge-person")
+}
+
 fn write_coordination_files(config: &Config, payload: &Value) {
     let local = config
         .state_db()
         .with_file_name("scanner-coordination.json");
-    if let Some(parent) = local.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    if let Ok(bytes) = serde_json::to_vec(payload) {
-        let _ = files::atomic_write(&local, &bytes);
+    if payload["action"] == "archive" || local.exists() {
+        if let Some(parent) = local.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(bytes) = serde_json::to_vec(payload) {
+            let _ = files::atomic_write(&local, &bytes);
+        }
     }
     if let Some(state_dir) = peach_state_dir(config) {
         let state_file = state_dir.join("archive-scanner-coordination.json");
@@ -141,7 +147,9 @@ fn write_coordination_files(config: &Config, payload: &Value) {
 }
 
 pub fn acquire_scanner_lease(config: &Config, plan: &Plan) -> Result<Value> {
-    if plan.action != "archive" {
+    if plan.action != "archive"
+        && !(supports_scanner_reconciliation(plan) && peach_state_dir(config).is_some())
+    {
         return Ok(Value::Null);
     }
     let now = now_ms();
@@ -190,6 +198,7 @@ pub fn acquire_scanner_lease(config: &Config, plan: &Plan) -> Result<Value> {
 
 pub fn release_scanner_lease(config: &Config, operation_id: &str, terminal_state: &str) {
     let now = now_ms();
+    let mut leased = false;
     if let Ok(mut conn) = db::open(&config.ledger)
         && let Ok(tx) = conn.transaction_with_behavior(TransactionBehavior::Immediate)
         && ensure_lease_table(&tx).is_ok()
@@ -198,11 +207,24 @@ pub fn release_scanner_lease(config: &Config, operation_id: &str, terminal_state
             "UPDATE _face_admin_scanner_leases SET state='expired',updated_at=?1 WHERE state='active' AND expires_at<=?1",
             params![now],
         );
-        let _ = tx.execute(
-            "UPDATE _face_admin_scanner_leases SET state=?2,updated_at=?3 WHERE id=?1 AND state='active'",
-            params![operation_id, terminal_state, now],
-        );
+        leased = tx
+            .execute(
+                "UPDATE _face_admin_scanner_leases SET state=?2,updated_at=?3 WHERE id=?1 AND state='active'",
+                params![operation_id, terminal_state, now],
+            )
+            .unwrap_or(0)
+            > 0;
         let _ = tx.commit();
+    }
+    let local = config
+        .state_db()
+        .with_file_name("scanner-coordination.json");
+    if !leased
+        && !local.exists()
+        && !peach_state_dir(config)
+            .is_some_and(|d| d.join("archive-scanner-coordination.json").exists())
+    {
+        return;
     }
     let payload = json!({
         "operation_id": operation_id,
@@ -497,7 +519,7 @@ fn observe_scanner_rows(
     plan: &Plan,
     delta: &ledger::Delta,
 ) -> Result<(Vec<ReconcilableRow>, db::Delta)> {
-    if plan.action != "archive" {
+    if !supports_scanner_reconciliation(plan) {
         return Err(conflict());
     }
     let assets = delta
@@ -506,23 +528,44 @@ fn observe_scanner_rows(
         .iter()
         .find(|t| t.table == db::Table::Asset)
         .ok_or_else(conflict)?;
+    let targets: Vec<(String, Value)> = if plan.action == "archive" {
+        delta
+            .changes
+            .guards
+            .iter()
+            .filter_map(|guard| match guard {
+                db::Guard::AssetPath {
+                    path,
+                    before,
+                    after,
+                } if before.is_empty() && after.len() == 1 => {
+                    Some((path.clone(), after[0].clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    } else {
+        assets
+            .after
+            .iter()
+            .filter_map(|after_row| {
+                let path = after_row["path"].as_str()?;
+                let occupied_before = delta.changes.guards.iter().any(|guard| match guard {
+                    db::Guard::AssetPrefix { prefix, before, .. }
+                        if path.starts_with(prefix.as_str()) =>
+                    {
+                        before.iter().any(|r| r["path"] == path)
+                    }
+                    _ => false,
+                });
+                (!occupied_before).then(|| (path.to_owned(), after_row.clone()))
+            })
+            .collect()
+    };
     let mut observed = delta.changes.clone();
     let mut application = delta.changes.clone();
     let mut pairs = vec![];
-    for guard in &delta.changes.guards {
-        let db::Guard::AssetPath {
-            path,
-            before,
-            after,
-        } = guard
-        else {
-            continue;
-        };
-        // Only empty accepted destinations of this archive's original-ID update.
-        // Canonical duplicate destinations and non-archive scopes are untouched.
-        if !before.is_empty() || after.len() != 1 {
-            continue;
-        }
+    for (path, after_row) in &targets {
         let Some(file) = plan.files.iter().find(|f| {
             Path::new(&f.dst).starts_with(config.creators())
                 && metadata::win(config, &f.dst) == *path
@@ -532,7 +575,7 @@ fn observe_scanner_rows(
         let original = assets
             .before
             .iter()
-            .find(|row| row["id"] == after[0]["id"])
+            .find(|row| row["id"] == after_row["id"])
             .ok_or_else(conflict)?;
         let win_src = metadata::win(config, &file.src);
         if original["path"] != win_src {
@@ -559,7 +602,7 @@ fn observe_scanner_rows(
                     return Err(conflict());
                 }
                 let dst_name = Path::new(&file.dst).file_name().and_then(|s| s.to_str());
-                in_place_scanner_match(dst_row, &after[0], dst_name)?;
+                in_place_scanner_match(dst_row, after_row, dst_name)?;
                 apply_in_place_asset_state(
                     &mut observed,
                     &original["id"],
@@ -620,9 +663,14 @@ fn observe_scanner_rows(
                 && src_row != original
             {
                 in_place_scanner_match(src_row, original, None)?;
-                let mut updated_after = after[0].clone();
+                let mut updated_after = after_row.clone();
                 updated_after["last_seen"] = src_row["last_seen"].clone();
                 updated_after["mtime"] = src_row["mtime"].clone();
+                if updated_after.get("snapshot_path") == Some(&Value::Null)
+                    && src_row.get("snapshot_path").is_some_and(|v| !v.is_null())
+                {
+                    updated_after["snapshot_path"] = src_row["snapshot_path"].clone();
+                }
                 apply_in_place_asset_state(
                     &mut observed,
                     &original["id"],
@@ -654,9 +702,14 @@ fn observe_scanner_rows(
                 && src_row != original
             {
                 in_place_scanner_match(src_row, original, None)?;
-                let mut updated_after = after[0].clone();
+                let mut updated_after = after_row.clone();
                 updated_after["last_seen"] = src_row["last_seen"].clone();
                 updated_after["mtime"] = src_row["mtime"].clone();
+                if updated_after.get("snapshot_path") == Some(&Value::Null)
+                    && src_row.get("snapshot_path").is_some_and(|v| !v.is_null())
+                {
+                    updated_after["snapshot_path"] = src_row["snapshot_path"].clone();
+                }
                 apply_in_place_asset_state(
                     &mut observed,
                     &original["id"],
@@ -801,7 +854,7 @@ pub fn reserve_with_scanner_index(
         if signature != plan.version
             || state != "prepared"
             || evidence["backend"] != "rust"
-            || evidence["kind"] != "archive"
+            || evidence["kind"].as_str() != Some(plan.action.as_str())
             || evidence["delta"] != serde_json::to_value(delta)?
         {
             return Err(conflict());
@@ -836,7 +889,7 @@ pub fn apply_with_scanner_reconciliation(
     if signature != plan.version
         || state != "prepared"
         || evidence["backend"] != "rust"
-        || evidence["kind"] != "archive"
+        || evidence["kind"].as_str() != Some(plan.action.as_str())
         || evidence["delta"] != serde_json::to_value(delta)?
     {
         return Err(conflict());
@@ -953,7 +1006,7 @@ fn proof(
     if signature != plan.version
         || !["prepared", "cancelled"].contains(&state.as_str())
         || evidence["backend"] != "rust"
-        || evidence["kind"] != "archive"
+        || evidence["kind"].as_str() != Some(plan.action.as_str())
         || evidence["delta"] != serde_json::to_value(delta)?
     {
         return Err(conflict());

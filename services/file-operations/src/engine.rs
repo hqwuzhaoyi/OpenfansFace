@@ -498,7 +498,7 @@ impl Engine {
             && match self.verify_published_archive_destinations(plan, &selected) {
                 Ok(()) => true,
                 Err(published) => {
-                    if plan.action == "archive" {
+                    if crate::archive_cancel::supports_scanner_reconciliation(plan) {
                         eprintln!(
                             "operation {} archive destination verification failed: {} ({})",
                             plan.id,
@@ -512,7 +512,7 @@ impl Engine {
         let mut retained_indexes = vec![];
         let ledger_state = match self.ledger_state(plan, &domain) {
             Ok(state) => state,
-            Err(error) if plan.action == "archive" => {
+            Err(error) if crate::archive_cancel::supports_scanner_reconciliation(plan) => {
                 retained_indexes = crate::archive_cancel::inspect(
                     &self.config,
                     plan,
@@ -531,7 +531,7 @@ impl Engine {
             .store
             .latest_step(&plan.id, "archive_external_indexes_retained")?
         {
-            if plan.action != "archive" {
+            if !crate::archive_cancel::supports_scanner_reconciliation(plan) {
                 return Err(Error::conflict("取消索引依据不属于归档操作"));
             }
             if retained_indexes.is_empty() {
@@ -744,7 +744,7 @@ impl Engine {
         plan: &Plan,
         successful: &[usize],
     ) -> Result<()> {
-        if plan.action != "archive" || successful.is_empty() {
+        if !crate::archive_cancel::supports_scanner_reconciliation(plan) || successful.is_empty() {
             return Err(Error::conflict("缺少已发布的归档目标文件依据"));
         }
         for &index in successful {
@@ -1152,7 +1152,7 @@ impl Engine {
     fn execute(&mut self, plan: &Plan, accepted: &DomainSnapshot) -> Result<Value> {
         let id = &plan.id;
         self.require_resolved_mutation(id, None)?;
-        if plan.action == "archive" {
+        if crate::archive_cancel::supports_scanner_reconciliation(plan) {
             let _ = crate::archive_cancel::acquire_scanner_lease(&self.config, plan)?;
         }
         if plan.execution.is_none() {
@@ -1346,7 +1346,7 @@ impl Engine {
                         self.ledger_reserve(plan, &domain)?;
                     }
                 }
-                Err(error) if plan.action == "archive" => {
+                Err(error) if crate::archive_cancel::supports_scanner_reconciliation(plan) => {
                     self.verify_published_archive_destinations(plan, &successful)
                         .map_err(|published| {
                             with_reconciliation_cause(error.clone(), "归档目标核对", &published)
@@ -1415,7 +1415,7 @@ impl Engine {
         let mut reconciled_scanner_assets: Vec<i64> = vec![];
         let evidence = match self.ledger_state(plan, &domain) {
             Ok(state) if state == "committed" => {
-                if plan.action == "archive" {
+                if crate::archive_cancel::supports_scanner_reconciliation(plan) {
                     reconciled_scanner_assets =
                         crate::archive_cancel::committed_reconciled_assets(&self.config, plan)?;
                 }
@@ -1427,7 +1427,7 @@ impl Engine {
                 }
                 match self.ledger_apply(plan, &domain) {
                     Ok(applied) => applied,
-                    Err(error) if plan.action == "archive" => {
+                    Err(error) if crate::archive_cancel::supports_scanner_reconciliation(plan) => {
                         let (applied, reconciled) = self
                             .apply_archive_with_scanner_reconciliation(
                                 plan,
@@ -1441,7 +1441,7 @@ impl Engine {
                     Err(error) => return Err(error),
                 }
             }
-            Err(error) if plan.action == "archive" => {
+            Err(error) if crate::archive_cancel::supports_scanner_reconciliation(plan) => {
                 for &index in &successful {
                     crate::archive::verify_duplicate(&self.config, plan, index, false)?;
                 }

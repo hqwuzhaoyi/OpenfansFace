@@ -86,6 +86,25 @@ def registration_reuses_spelling():
         print('PASS registration reuses an existing spelling instead of adding a variant')
     finally:x.stop()
 
+def merge_scanner_in_place_reconciliation():
+    import http.client
+    x=m.MergeFixture(True)
+    try:
+        plan=x.preview(x.merge_request());x.fault('ledger_commit_intent')
+        try:x.apply(plan)
+        except (OSError,http.client.HTTPException):pass
+        assert x.process.wait(timeout=5)==86
+        (x.root/'rust-fault.json').unlink();x.stop()
+        with sqlite3.connect(x.ledger) as db:
+            for file in plan['files']:
+                db.execute('UPDATE asset SET path=?,last_seen=? WHERE path=?',(x.win(Path(file['dst'])),'2026-11-10 01:59:11',x.win(Path(file['src']))))
+        x.start();x.assert_success(plan)
+        status=x.status(plan)
+        assert status['result'].get('reconciled_scanner_assets')==[1],status
+        print('PASS merge-person reconciles in-place Peach scanner asset move on recovery')
+    finally:x.stop()
+
 if __name__=='__main__':
     spelling_variant_registration();spelling_variant_with_folder_must_be_kept()
     alias_residue();alias_target_resolves_to_current_person();registration_reuses_spelling()
+    merge_scanner_in_place_reconciliation()
