@@ -28,6 +28,8 @@ type Group={key:string;label:string;kind:string;count:number}
 type Data={has_updates?:boolean;session?:string;session_at?:number;expires_at?:number;remaining?:number;next_page?:number|null;previous_page?:number|null;blocked?:{vid:string;message:string}[];counts:Record<string,number>;groups:Group[];group:Group|null;total:number;rows:ProcessingTask[];page:number;limit:number;waiting:number;online:boolean;folders:string[];focus_missing:boolean}
 const views=[{value:'all',label:'全部'},{value:'suggested',label:'有候选'},{value:'conflict',label:'证据冲突'},{value:'none',label:'无候选'},{value:'manual',label:'人工接管'},{value:'deferred',label:'暂缓'}]
 
+const uuid=()=>{if(typeof crypto!=='undefined'&&typeof crypto.randomUUID==='function')return crypto.randomUUID();const bytes=crypto.getRandomValues(new Uint8Array(16));bytes[6]=(bytes[6]&15)|64;bytes[8]=(bytes[8]&63)|128;const hex=[...bytes].map(b=>b.toString(16).padStart(2,'0')).join('');return `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}`}
+
 export default function Review() {
   const [data,setData]=useState<Data|null>(()=>readWorkbenchCache<Data>('review:lastData')??null),[error,setError]=useState(''),[loading,setLoading]=useState(()=>!readWorkbenchCache<Data>('review:lastData')),[busy,setBusy]=useState(false)
   const {values:filters,ready:initialized,update:updateFilters}=useWorkspaceQuery({view:'all',group:'',q:'',folder:'',page:'0',person:'',cluster:'',vid:''},{view:views.map(v=>v.value)})
@@ -46,7 +48,7 @@ export default function Review() {
   const [reference,setReference]=useState<{name:string;returnTo:'video'|'selection';scroll:number}|null>(null)
   const [people,setPeople]=useState<PersonChoice[]>(()=>readWorkbenchCache<PersonChoice[]>('review:people')??[]),[peopleError,setPeopleError]=useState(''),[receipt,setReceipt]=useState<{vids:string[];creator:string;session:string}|null>(null)
   const pendingMutations=useRef(new Map<string,string>())
-  const mutate=async<T=any>(path:string,body:Record<string,unknown>,method='POST'):Promise<T>=>{const key=JSON.stringify([path,method,body]),id=pendingMutations.current.get(key)||crypto.randomUUID();pendingMutations.current.set(key,id);try{const result=await api<T>(path,{method,body:JSON.stringify({...body,operation_id:id})});pendingMutations.current.delete(key);return result}catch(error:any){if(!error.resultUnknown)pendingMutations.current.delete(key);else error.message+=`（操作 ${id}，重试将查询同一回执）`;throw error}}
+  const mutate=async<T=any>(path:string,body:Record<string,unknown>,method='POST'):Promise<T>=>{const key=JSON.stringify([path,method,body]),id=pendingMutations.current.get(key)||uuid();pendingMutations.current.set(key,id);try{const result=await api<T>(path,{method,body:JSON.stringify({...body,operation_id:id})});pendingMutations.current.delete(key);return result}catch(error:any){if(!error.resultUnknown)pendingMutations.current.delete(key);else error.message+=`（操作 ${id}，重试将查询同一回执）`;throw error}}
   const refreshFocus=useRef<HTMLElement|null>(null)
   const returnFocus=useRef<HTMLElement|null>(null),session=useRef<string|undefined>(readWorkbenchCache<string>('review:session')),noteBaseline=useRef<Record<string,string>>({}),notesRef=useRef(notes),polling=useRef(false),scrollAnchor=useRef<{vid:string;offset:number}[]|null>(null)
   notesRef.current=notes
