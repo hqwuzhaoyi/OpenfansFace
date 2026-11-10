@@ -1,6 +1,6 @@
 'use client'
 import { WorkspacePath } from '@/components/workbench/inner'
-import { PrivateVideo } from '@/components/private-media'
+import { WorkbenchVideoPlayer } from '@/components/workbench/video-player'
 import { useEffect, useRef, useState } from 'react'
 import Link from 'next/link'
 import { api } from '@/lib/face-api'
@@ -44,7 +44,7 @@ export function VideoPlayer({ video, onClose, returnFocus, instantEntry }: { vid
   return <Dialog open={!!video} onOpenChange={o => { if (!o) close() }}>
     <ResponsiveDialogContent open={!!video} inert={!video} style={instantEntry === undefined ? undefined : { animationName: video ? 'review-dialog-in' : 'review-dialog-out', animationDuration: instantEntry ? '0ms' : '180ms' }} overlayProps={instantEntry === undefined ? undefined : { style: { animationName: video ? 'review-overlay-in' : 'review-dialog-out', animationDuration: instantEntry ? '0ms' : '140ms' } }} onOpenAutoFocus={()=>{trigger.current=document.activeElement instanceof HTMLElement?document.activeElement:null}} onCloseAutoFocus={event=>{event.preventDefault();const target=returnFocus?.current?.isConnected?returnFocus.current:trigger.current;if(target?.isConnected)target.focus({preventScroll:true})}} className="flex max-h-[92dvh] flex-col gap-0 overflow-hidden p-0 sm:max-w-4xl sm:p-0">
       <DialogHeader className="shrink-0 border-b p-4 pr-14 text-left"><DialogTitle>视频预览</DialogTitle><DialogDescription>关闭后回到刚才的位置，勾选保持不变。</DialogDescription></DialogHeader>
-      {video&&<div data-sheet-scroll className="min-h-0 flex-1 space-y-3 overflow-y-auto p-4"><p className="break-all text-sm font-medium">{video.name}</p><PrivateVideo key={src} src={src} controls autoPlay playsInline preload="metadata" onError={playbackError} className="max-h-[55dvh] w-full rounded-lg bg-black"/>
+      {video&&<div data-sheet-scroll className="min-h-0 flex-1 space-y-3 overflow-y-auto p-4"><p className="break-all text-sm font-medium">{video.name}</p><WorkbenchVideoPlayer key={src} src={src} name={video.name||fileName(video.vid)} poster={video.thumb||undefined} autoPlay enableGlobalHotkeys onError={playbackError}/>
         {failed&&<div role="alert" className="space-y-3 rounded-lg border border-amber-500/30 p-3 text-sm text-amber-300"><p className="flex items-start gap-2"><AlertCircle className="mt-0.5 h-4 w-4 shrink-0"/>暂时无法播放，可能是路径变化、网络中断或手机不支持此编码。</p>{reported&&<p className="text-xs">已记下本次失败，下一次自动体检会优先复查。原文件保留。</p>}<Button asChild variant="outline" className="min-h-11"><Link href="/staging#video-health" onClick={close}>查看视频体检与失效记录</Link></Button></div>}<PathText value={video.path||video.vid}/></div>}
       <div className="mobile-bottom-actions shrink-0 border-t p-3"><Button variant="outline" className="min-h-11 w-full" onClick={close}>关闭播放，继续核对</Button></div>
     </ResponsiveDialogContent>

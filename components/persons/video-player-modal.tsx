@@ -14,6 +14,8 @@ import {
   Pause,
   Pencil,
   Play,
+  RotateCcw,
+  RotateCw,
   SkipBack,
   SkipForward,
   Trash2,
@@ -107,8 +109,13 @@ export function PersonVideoDialog({
   const copyTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const idleTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const holdTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const touchHoldTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const singleTapTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const holdingRight = useRef(false)
+  const holdingTouch = useRef(false)
   const preHoldSpeed = useRef(1)
+  const lastTapRef = useRef<{ time: number; x: number }>({ time: 0, x: 0 })
+  const pointerDownPos = useRef<{ x: number; y: number } | null>(null)
 
   const [failed, setFailed] = useState(false)
   const [paused, setPaused] = useState(false)
@@ -120,6 +127,7 @@ export function PersonVideoDialog({
   const [duration, setDuration] = useState<number>(0)
   const [isFullscreen, setIsFullscreen] = useState(false)
   const [controlsVisible, setControlsVisible] = useState(true)
+  const [isTouchDevice, setIsTouchDevice] = useState(false)
   const [showEpisodes, setShowEpisodes] = useState(false)
   const [showShortcuts, setShowShortcuts] = useState(false)
   const [speedMenuOpen, setSpeedMenuOpen] = useState(false)
@@ -155,14 +163,25 @@ export function PersonVideoDialog({
       if (copyTimer.current) clearTimeout(copyTimer.current)
       if (idleTimer.current) clearTimeout(idleTimer.current)
       if (holdTimer.current) clearTimeout(holdTimer.current)
+      if (touchHoldTimer.current) clearTimeout(touchHoldTimer.current)
+      if (singleTapTimer.current) clearTimeout(singleTapTimer.current)
     }
   }, [])
 
   useEffect(() => {
     const onFsChange = () => setIsFullscreen(!!document.fullscreenElement)
+    const el = videoRef.current
+    const onWebkitBegin = () => setIsFullscreen(true)
+    const onWebkitEnd = () => setIsFullscreen(false)
     document.addEventListener('fullscreenchange', onFsChange)
-    return () => document.removeEventListener('fullscreenchange', onFsChange)
-  }, [])
+    el?.addEventListener('webkitbeginfullscreen', onWebkitBegin)
+    el?.addEventListener('webkitendfullscreen', onWebkitEnd)
+    return () => {
+      document.removeEventListener('fullscreenchange', onFsChange)
+      el?.removeEventListener('webkitbeginfullscreen', onWebkitBegin)
+      el?.removeEventListener('webkitendfullscreen', onWebkitEnd)
+    }
+  }, [video?.vid])
 
   useEffect(() => {
     setFailed(false)
@@ -185,6 +204,16 @@ export function PersonVideoDialog({
   const togglePlay = useCallback(() => {
     const el = videoRef.current
     if (!el) return
+    const revealBtn = stageRef.current?.querySelector<HTMLButtonElement>(
+      '.privacy-video:not([data-revealed="true"]) .privacy-reveal'
+    )
+    if (revealBtn) {
+      revealBtn.click()
+      requestAnimationFrame(() => {
+        void videoRef.current?.play().catch(() => {})
+      })
+      return
+    }
     revealControls()
     if (el.paused) {
       void el.play().catch(() => {})
@@ -242,13 +271,35 @@ export function PersonVideoDialog({
   }, [muted, volume, flashHud])
 
   const toggleFullscreen = useCallback(() => {
-    const container = stageRef.current || videoRef.current
-    if (!container) return
+    const container = stageRef.current
+    const el = videoRef.current as (HTMLVideoElement & {
+      webkitEnterFullscreen?: () => void
+    }) | null
     if (document.fullscreenElement) {
       void document.exitFullscreen().catch(() => {})
-    } else {
-      void container.requestFullscreen?.().catch(() => {})
+      return
     }
+    if (container && typeof container.requestFullscreen === 'function') {
+      container.requestFullscreen().catch(() => {
+        el?.webkitEnterFullscreen?.()
+      })
+    } else if (el?.webkitEnterFullscreen) {
+      el.webkitEnterFullscreen()
+    }
+  }, [])
+
+  const endTouchBoost = useCallback(() => {
+    if (touchHoldTimer.current) {
+      clearTimeout(touchHoldTimer.current)
+      touchHoldTimer.current = null
+    }
+    if (holdingTouch.current) {
+      holdingTouch.current = false
+      setHoldingBoost(false)
+      if (videoRef.current) videoRef.current.playbackRate = preHoldSpeed.current
+      return true
+    }
+    return false
   }, [])
 
   const copyPath = useCallback(async () => {
@@ -440,14 +491,115 @@ export function PersonVideoDialog({
               ref={stageRef}
               className="pw-theater-stage"
               data-controls={controlsVisible || paused || holdingBoost ? 'visible' : 'hidden'}
-              onPointerMove={revealControls}
+              data-touch={isTouchDevice || undefined}
+              onPointerMove={e => {
+                if (e.pointerType === 'mouse') revealControls()
+                else if (pointerDownPos.current) {
+                  const dx = Math.abs(e.clientX - pointerDownPos.current.x)
+                  const dy = Math.abs(e.clientY - pointerDownPos.current.y)
+                  if (dx > 12 || dy > 12) {
+                    if (touchHoldTimer.current) {
+                      clearTimeout(touchHoldTimer.current)
+                      touchHoldTimer.current = null
+                    }
+                  }
+                }
+              }}
+              onPointerDown={e => {
+                const isTouch = e.pointerType !== 'mouse'
+                setIsTouchDevice(isTouch)
+                if (
+                  (e.target as HTMLElement).closest(
+                    '.pw-theater-top, .pw-theater-bottom, .pw-theater-center, .pw-theater-shortcuts-sheet, .privacy-reveal'
+                  )
+                ) {
+                  return
+                }
+                pointerDownPos.current = { x: e.clientX, y: e.clientY }
+                if (isTouch) {
+                  preHoldSpeed.current = speed
+                  if (touchHoldTimer.current) clearTimeout(touchHoldTimer.current)
+                  touchHoldTimer.current = setTimeout(() => {
+                    holdingTouch.current = true
+                    setHoldingBoost(true)
+                    if (videoRef.current) {
+                      if (videoRef.current.paused) void videoRef.current.play().catch(() => {})
+                      videoRef.current.playbackRate = 2.0
+                    }
+                  }, 300)
+                }
+              }}
+              onPointerCancel={() => {
+                pointerDownPos.current = null
+                endTouchBoost()
+              }}
+              onPointerUp={e => {
+                if (
+                  (e.target as HTMLElement).closest(
+                    '.pw-theater-top, .pw-theater-bottom, .pw-theater-center, .pw-theater-shortcuts-sheet, .privacy-reveal'
+                  )
+                ) {
+                  pointerDownPos.current = null
+                  endTouchBoost()
+                  return
+                }
+                const wasHolding = endTouchBoost()
+                const down = pointerDownPos.current
+                pointerDownPos.current = null
+                if (wasHolding) return
+
+                if (e.pointerType !== 'mouse') {
+                  if (down && (Math.abs(e.clientX - down.x) > 14 || Math.abs(e.clientY - down.y) > 14)) {
+                    return
+                  }
+                  const now = Date.now()
+                  const rect = stageRef.current?.getBoundingClientRect()
+                  const relX = rect ? (e.clientX - rect.left) / Math.max(1, rect.width) : 0.5
+                  if (now - lastTapRef.current.time < 280) {
+                    if (singleTapTimer.current) {
+                      clearTimeout(singleTapTimer.current)
+                      singleTapTimer.current = null
+                    }
+                    lastTapRef.current = { time: 0, x: 0 }
+                    if (relX < 0.35) seekBy(-5)
+                    else if (relX > 0.65) seekBy(5)
+                    else togglePlay()
+                  } else {
+                    lastTapRef.current = { time: now, x: relX }
+                    if (singleTapTimer.current) clearTimeout(singleTapTimer.current)
+                    singleTapTimer.current = setTimeout(() => {
+                      setControlsVisible(v => {
+                        const next = !v
+                        if (next) revealControls()
+                        return next
+                      })
+                    }, 220)
+                  }
+                }
+              }}
               onClick={e => {
-                if ((e.target as HTMLElement).closest('.pw-theater-top, .pw-theater-bottom, .pw-theater-shortcuts-sheet')) return
-                togglePlay()
+                if (
+                  (e.target as HTMLElement).closest(
+                    '.pw-theater-top, .pw-theater-bottom, .pw-theater-center, .pw-theater-shortcuts-sheet, .privacy-reveal'
+                  )
+                ) {
+                  return
+                }
+                if (!isTouchDevice) {
+                  togglePlay()
+                }
               }}
               onDoubleClick={e => {
-                if ((e.target as HTMLElement).closest('.pw-theater-top, .pw-theater-bottom, .pw-theater-shortcuts-sheet')) return
-                toggleFullscreen()
+                if (
+                  (e.target as HTMLElement).closest(
+                    '.pw-theater-top, .pw-theater-bottom, .pw-theater-center, .pw-theater-shortcuts-sheet, .privacy-reveal'
+                  )
+                ) {
+                  return
+                }
+                if (!isTouchDevice) {
+                  toggleFullscreen()
+                }
               }}
             >
               <PrivateVideo
@@ -473,7 +625,7 @@ export function PersonVideoDialog({
                   setVolume(e.currentTarget.volume)
                 }}
                 onRateChange={e => {
-                  if (!holdingRight.current) setSpeed(e.currentTarget.playbackRate)
+                  if (!holdingRight.current && !holdingTouch.current) setSpeed(e.currentTarget.playbackRate)
                 }}
                 onError={() => {
                   setFailed(true)
@@ -626,6 +778,44 @@ export function PersonVideoDialog({
                 )}
               </AnimatePresence>
 
+              {/* Center Touch & Paused Controls (-5s / Play-Pause / +5s) */}
+              <div
+                className="pw-theater-center"
+                data-visible={paused || (isTouchDevice && controlsVisible) || undefined}
+              >
+                <button
+                  type="button"
+                  className="pw-theater-center-seek"
+                  aria-label="快退 5 秒"
+                  title="快退 5 秒 (←)"
+                  onClick={() => seekBy(-5)}
+                >
+                  <RotateCcw size={16} />
+                  <span>5s</span>
+                </button>
+                <button
+                  type="button"
+                  className="pw-theater-center-play"
+                  aria-label={paused ? '播放视频' : '暂停视频'}
+                  title={paused ? '播放 (Space)' : '暂停 (Space)'}
+                  onClick={togglePlay}
+                >
+                  <ActionSwapIcon value={paused ? 'play' : 'pause'} animation="roll">
+                    {paused ? <Play size={22} fill="currentColor" /> : <Pause size={22} fill="currentColor" />}
+                  </ActionSwapIcon>
+                </button>
+                <button
+                  type="button"
+                  className="pw-theater-center-seek"
+                  aria-label="快进 5 秒"
+                  title="快进 5 秒 (→)"
+                  onClick={() => seekBy(5)}
+                >
+                  <RotateCw size={16} />
+                  <span>5s</span>
+                </button>
+              </div>
+
               {/* Bottom Gradient Player Bar */}
               <div className="pw-theater-bottom">
                 {/* Interactive Scrubber Timeline */}
@@ -641,6 +831,7 @@ export function PersonVideoDialog({
                       const next = Number(e.target.value)
                       setCurrentTime(next)
                       if (videoRef.current) videoRef.current.currentTime = next
+                      revealControls()
                     }}
                   />
                   <div className="pw-theater-timeline-track">
@@ -649,6 +840,10 @@ export function PersonVideoDialog({
                       style={{ transform: `scaleX(${progressRatio})` }}
                     />
                   </div>
+                  <span
+                    className="pw-theater-timeline-thumb"
+                    style={{ left: `${progressRatio * 100}%` }}
+                  />
                 </div>
 
                 {/* Controls Row */}

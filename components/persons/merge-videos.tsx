@@ -1,12 +1,11 @@
 'use client'
-import { PrivateVideo } from '@/components/private-media'
+import { WorkbenchVideoPlayer } from '@/components/workbench/video-player'
 import { VideoCover } from '@/components/review/video-cover'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Check, Copy, Folder, FolderCheck, FolderInput, X } from 'lucide-react'
 import { ActionSwapIcon, ActionSwapText } from '@/components/beui/motion/action-swap'
 import { Avatar } from '@/components/beui/motion/avatar-group'
 import { Card } from '@/components/beui/motion/card'
-import { Kbd } from '@/components/ui/kbd'
 import { api } from '@/lib/face-api'
 import type { PersonLibraryPreview, PersonVideo } from '@/lib/person-library-model'
 import { WorkbenchButton as Button } from './ui'
@@ -52,11 +51,7 @@ export function MergePersonVideos({
       if(e.defaultPrevented||e.metaKey||e.ctrlKey||e.altKey)return
       const tag=(e.target as HTMLElement|null)?.tagName
       if(tag&&['INPUT','TEXTAREA','SELECT'].includes(tag))return
-      const el=player.current;if(!el)return
-      if(e.key===' '||e.key==='k'||e.key==='K'){e.preventDefault();if(el.paused)void el.play().catch(()=>{});else el.pause()}
-      else if(e.key==='ArrowLeft'){e.preventDefault();el.currentTime=Math.max(0,el.currentTime-5)}
-      else if(e.key==='ArrowRight'){e.preventDefault();el.currentTime=Math.min(el.duration||Infinity,el.currentTime+5)}
-      else if(e.key==='c'||e.key==='C'){e.preventDefault();void navigator.clipboard.writeText(active.path).then(()=>{setCopied(true);setTimeout(()=>setCopied(false),1400)}).catch(()=>{})}
+      if(e.key==='c'||e.key==='C'){e.preventDefault();void navigator.clipboard.writeText(active.path).then(()=>{setCopied(true);setTimeout(()=>setCopied(false),1400)}).catch(()=>{})}
     }
     window.addEventListener('keydown',onKey)
     return()=>window.removeEventListener('keydown',onKey)
@@ -87,7 +82,7 @@ export function MergePersonVideos({
       <code>{data.root}</code>
       {target&&(isTarget?<b>目标保留目录</b>:<span>→ 合入 {target}</span>)}
     </div>}
-    {active&&<div className="pw-merge-player"><div className="pw-merge-player-head"><span>{active.name}</span><div className="pw-merge-player-actions"><Button aria-label="复制视频路径" title="复制视频路径 (C)" onClick={()=>void navigator.clipboard.writeText(active.path).then(()=>{setCopied(true);setTimeout(()=>setCopied(false),1400)}).catch(()=>{})}><ActionSwapIcon value={copied?'copied':'copy'} animation="roll">{copied?<Check size={12}/>:<Copy size={12}/>}</ActionSwapIcon></Button><Button aria-label="关闭视频预览" onClick={()=>onPlay(null)}><X size={15}/></Button></div></div><PrivateVideo ref={player} key={active.path} src={videoUrl(active)} poster={active.thumb||undefined} controls autoPlay playsInline onError={()=>setPlayError('暂时无法播放，请检查文件或浏览器编码支持。')}/>{playError&&<p role="alert">{playError}</p>}<code>{active.path}</code></div>}
+    {active&&<div className="pw-merge-player"><div className="pw-merge-player-head"><span>{active.name}</span><div className="pw-merge-player-actions"><Button aria-label="复制视频路径" title="复制视频路径 (C)" onClick={()=>void navigator.clipboard.writeText(active.path).then(()=>{setCopied(true);setTimeout(()=>setCopied(false),1400)}).catch(()=>{})}><ActionSwapIcon value={copied?'copied':'copy'} animation="roll">{copied?<Check size={12}/>:<Copy size={12}/>}</ActionSwapIcon></Button><Button aria-label="关闭视频预览" onClick={()=>onPlay(null)}><X size={15}/></Button></div></div><WorkbenchVideoPlayer videoRef={player} key={active.path} src={videoUrl(active)} name={active.name} poster={active.thumb||undefined} autoPlay compact enableGlobalHotkeys onError={()=>setPlayError('暂时无法播放，请检查文件或浏览器编码支持。')}/>{playError&&<p role="alert">{playError}</p>}<code>{active.path}</code></div>}
     <div className="pw-merge-video-grid">{files.map(video=><Button key={video.path} className="pw-merge-video" aria-label={`预览 ${name} 的 ${video.name}`} disabled={disabled} onClick={()=>onPlay({person:name,video})}><VideoCover video={video} className="pw-merge-cover"/><strong title={video.name}>{video.name}</strong><small>{video.folder==='.'?'根目录':video.folder} · {size(video.size)}</small></Button>)}</div>
     {data&&!data.total_videos&&<p className="pw-merge-no-video">暂无视频，仍可合并人物资料。</p>}
     {state?.error&&<div className="pw-error" role="alert"><p>{state.error}</p><Button disabled={state.loading||disabled} onClick={()=>onLoad(name,data?.files.length||0)}>重新加载视频</Button></div>}
