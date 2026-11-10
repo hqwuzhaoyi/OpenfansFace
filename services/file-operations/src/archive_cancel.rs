@@ -816,6 +816,102 @@ fn observe_scanner_rows(
                 });
             }
         }
+        if !plan.target_person.is_empty() {
+            let target_dir = config.creators().join(&plan.target_person);
+            let win_target_prefix = format!(
+                "{}\\",
+                metadata::win(config, &target_dir.to_string_lossy())
+            );
+            let prefix_rows = db::rows(
+                conn,
+                "SELECT * FROM asset WHERE substr(path,1,length(?))=? ORDER BY id",
+                [win_target_prefix.as_str(), win_target_prefix.as_str()],
+            )?;
+            for row in prefix_rows {
+                let already_observed = observed.guards.iter().any(|g| match g {
+                    db::Guard::AssetPrefix { prefix, before, .. }
+                        if *prefix == win_target_prefix =>
+                    {
+                        before.iter().any(|r| r["id"] == row["id"])
+                    }
+                    _ => false,
+                });
+                if already_observed {
+                    continue;
+                }
+                let Some(row_path) = row["path"].as_str() else {
+                    return Err(conflict());
+                };
+                if assets
+                    .before
+                    .iter()
+                    .chain(&assets.after)
+                    .any(|r| r["id"] == row["id"] || r["path"] == row_path)
+                    || plan.files.iter().any(|f| {
+                        metadata::win(config, &f.src) == row_path
+                            || metadata::win(config, &f.dst) == row_path
+                    })
+                    || observed.guards.iter().any(|g| match g {
+                        db::Guard::AssetPrefix { before, after, .. } => before
+                            .iter()
+                            .chain(after)
+                            .any(|r| r["id"] == row["id"] || r["path"] == row_path),
+                        _ => false,
+                    })
+                {
+                    return Err(conflict());
+                }
+                let rel = row_path
+                    .strip_prefix(&win_target_prefix)
+                    .ok_or_else(conflict)?;
+                let mut native_path = target_dir.clone();
+                for part in rel.split('\\').filter(|s| !s.is_empty()) {
+                    if part == "." || part == ".." {
+                        return Err(conflict());
+                    }
+                    native_path.push(part);
+                }
+                let meta = std::fs::symlink_metadata(&native_path).map_err(|_| conflict())?;
+                if meta.file_type().is_symlink() || !meta.is_file() {
+                    return Err(conflict());
+                }
+                let dummy_file = crate::model::FileMove {
+                    vids: vec![],
+                    src: String::new(),
+                    dst: native_path.to_string_lossy().into_owned(),
+                    size: meta.len(),
+                    version: String::new(),
+                };
+                index_only(
+                    conn,
+                    &row,
+                    &json!({"id":{"$integer":"0"},"location":"local"}),
+                    &dummy_file,
+                )?;
+                for guard in observed.guards.iter_mut().chain(application.guards.iter_mut()) {
+                    if let db::Guard::AssetPrefix {
+                        prefix,
+                        before,
+                        after,
+                    } = guard
+                        && row_path.starts_with(prefix.as_str())
+                    {
+                        if !before.iter().any(|r| r["id"] == row["id"]) {
+                            before.push(row.clone());
+                        }
+                        if !after.iter().any(|r| r["id"] == row["id"]) {
+                            after.push(row.clone());
+                        }
+                    }
+                }
+                pairs.push(ReconcilableRow {
+                    stub: row,
+                    original: Value::Null,
+                    file: dummy_file,
+                    in_place: true,
+                });
+            }
+        }
     }
     if pairs.is_empty() {
         return Err(conflict());

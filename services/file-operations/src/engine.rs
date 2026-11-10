@@ -744,7 +744,9 @@ impl Engine {
         plan: &Plan,
         successful: &[usize],
     ) -> Result<()> {
-        if !crate::archive_cancel::supports_scanner_reconciliation(plan) || successful.is_empty() {
+        if !crate::archive_cancel::supports_scanner_reconciliation(plan)
+            || (successful.is_empty() && !plan.files.is_empty())
+        {
             return Err(Error::conflict("缺少已发布的归档目标文件依据"));
         }
         for &index in successful {
