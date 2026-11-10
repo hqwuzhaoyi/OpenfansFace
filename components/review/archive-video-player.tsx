@@ -1,7 +1,7 @@
 'use client'
 
 import { useEffect, useRef, useState } from 'react'
-import { WorkbenchVideoPlayer } from '@/components/workbench/video-player'
+import { ExternalPlayerBar, WorkbenchVideoPlayer } from '@/components/workbench/video-player'
 import Link from 'next/link'
 import { AlertCircle, RefreshCw } from 'lucide-react'
 import { api } from '@/lib/face-api'
@@ -44,6 +44,6 @@ export function ArchiveVideoPlayer({ video, detailVisibleOnMobile }: { video: Re
   }
   return <div className="archive-inlinePlayer">
     <WorkbenchVideoPlayer videoRef={player} key={attempt} src={source} name={video.name} poster={video.thumb || undefined} preload="none" onError={playbackError} />
-    {failed && <div role="alert" className="archive-playerError"><p><AlertCircle size={15} />暂时无法播放，请检查文件路径、网络或视频编码。</p>{reported && <small>已记录播放失败，原文件保留。</small>}<div><Button variant="outline" size="sm" onClick={() => { reportSequence.current++; setFailed(false); setReported(false); setAttempt(value => value + 1) }}><RefreshCw size={14} />重新加载</Button><Link href="/staging#video-health">查看视频体检</Link></div></div>}
+    {failed && <div role="alert" className="archive-playerError"><p><AlertCircle size={15} />暂时无法播放，请检查文件路径、网络或视频编码，或使用外部播放器打开。</p><ExternalPlayerBar src={source} name={video.name} />{reported && <small>已记录播放失败，原文件保留。</small>}<div><Button variant="outline" size="sm" onClick={() => { reportSequence.current++; setFailed(false); setReported(false); setAttempt(value => value + 1) }}><RefreshCw size={14} />重新加载</Button><Link href="/staging#video-health">查看视频体检</Link></div></div>}
   </div>
 }

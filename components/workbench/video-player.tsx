@@ -3,6 +3,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
 import {
+  Check,
+  Copy,
+  ExternalLink,
   FastForward,
   Maximize2,
   Minimize2,
@@ -18,6 +21,110 @@ import { ActionSwapIcon } from '@/components/beui/motion/action-swap'
 import { EASE_OUT } from '@/lib/beui/ease'
 
 const SPEEDS = [1, 1.25, 1.5, 2] as const
+
+export const strictEncodeURIComponent = (value: string) =>
+  encodeURIComponent(value).replace(
+    /[!'()*]/g,
+    ch => `%${ch.charCodeAt(0).toString(16).toUpperCase()}`
+  )
+
+export function normalizeVideoApiPath(src: string, name?: string): string {
+  try {
+    const parsed = new URL(src, 'http://localhost')
+    const rawP = parsed.searchParams.get('p')
+    if (!rawP) return src
+    const fileName = (name || rawP.split(/[\\/]/).pop() || 'video.mp4').trim() || 'video.mp4'
+    return `/api/video/${strictEncodeURIComponent(fileName)}?p=${strictEncodeURIComponent(rawP)}`
+  } catch {
+    return src
+  }
+}
+
+export interface ExternalPlayerLinks {
+  streamUrl: string
+  infuse: string
+  nplayer: string
+  senplayer: string
+}
+
+export function buildExternalPlayerLinks(src: string, name?: string): ExternalPlayerLinks {
+  const relative = normalizeVideoApiPath(src, name)
+  const origin =
+    typeof window !== 'undefined' && window.location?.origin
+      ? window.location.origin
+      : 'http://127.0.0.1:8919'
+  const streamUrl = relative.startsWith('http') ? relative : `${origin}${relative}`
+  const encodedStream = strictEncodeURIComponent(streamUrl)
+  return {
+    streamUrl,
+    infuse: `infuse://x-callback-url/play?url=${encodedStream}`,
+    nplayer: /^https?:\/\//i.test(streamUrl) ? `nplayer-${streamUrl}` : `nplayer://${encodedStream}`,
+    senplayer: `senplayer://x-callback-url/play?url=${encodedStream}`,
+  }
+}
+
+export function ExternalPlayerBar({
+  src,
+  name,
+  className = '',
+}: {
+  src: string
+  name?: string
+  className?: string
+}) {
+  const [copied, setCopied] = useState(false)
+  const links = buildExternalPlayerLinks(src, name)
+  return (
+    <div className={`wb-ext-player-bar ${className}`} role="group" aria-label="外部播放器打开">
+      <span className="wb-ext-player-label">外部播放器：</span>
+      <a
+        href={links.infuse}
+        className="wb-ext-player-chip"
+        aria-label="在 Infuse 中打开"
+        title="使用 Infuse 播放此视频流"
+      >
+        <ExternalLink size={12} />
+        <span>Infuse</span>
+      </a>
+      <a
+        href={links.nplayer}
+        className="wb-ext-player-chip"
+        aria-label="在 nPlayer 中打开"
+        title="使用 nPlayer 播放此视频流"
+      >
+        <ExternalLink size={12} />
+        <span>nPlayer</span>
+      </a>
+      <a
+        href={links.senplayer}
+        className="wb-ext-player-chip"
+        aria-label="在 SenPlayer 中打开"
+        title="使用 SenPlayer 播放此视频流"
+      >
+        <ExternalLink size={12} />
+        <span>SenPlayer</span>
+      </a>
+      <button
+        type="button"
+        className="wb-ext-player-chip"
+        aria-label="复制视频流地址"
+        title="复制 HTTP 流地址到剪贴板"
+        onClick={() => {
+          void navigator.clipboard
+            ?.writeText(links.streamUrl)
+            .then(() => {
+              setCopied(true)
+              setTimeout(() => setCopied(false), 1600)
+            })
+            .catch(() => {})
+        }}
+      >
+        {copied ? <Check size={12} /> : <Copy size={12} />}
+        <span>{copied ? '已复制流地址' : '复制流地址'}</span>
+      </button>
+    </div>
+  )
+}
 
 export const formatVideoClock = (seconds?: number) => {
   if (seconds === undefined || !Number.isFinite(seconds) || seconds < 0) return '00:00'
@@ -80,8 +187,12 @@ export function WorkbenchVideoPlayer({
   const [isFullscreen, setIsFullscreen] = useState(false)
   const [controlsVisible, setControlsVisible] = useState(true)
   const [speedMenuOpen, setSpeedMenuOpen] = useState(false)
+  const [extMenuOpen, setExtMenuOpen] = useState(false)
   const [isTouchDevice, setIsTouchDevice] = useState(false)
   const [hud, setHud] = useState<{ key: number; label: string } | null>(null)
+
+  const streamSrc = normalizeVideoApiPath(src, name)
+  const extLinks = buildExternalPlayerLinks(src, name)
 
   const assignVideoRef = useCallback(
     (node: HTMLVideoElement | null) => {
@@ -100,11 +211,16 @@ export function WorkbenchVideoPlayer({
   const scheduleHideControls = useCallback(() => {
     if (idleTimer.current) clearTimeout(idleTimer.current)
     idleTimer.current = setTimeout(() => {
-      if (internalVideoRef.current && !internalVideoRef.current.paused && !speedMenuOpen) {
+      if (
+        internalVideoRef.current &&
+        !internalVideoRef.current.paused &&
+        !speedMenuOpen &&
+        !extMenuOpen
+      ) {
         setControlsVisible(false)
       }
     }, 2600)
-  }, [speedMenuOpen])
+  }, [speedMenuOpen, extMenuOpen])
 
   const revealControls = useCallback(() => {
     setControlsVisible(true)
@@ -141,6 +257,7 @@ export function WorkbenchVideoPlayer({
     setCurrentTime(0)
     setDuration(0)
     setSpeedMenuOpen(false)
+    setExtMenuOpen(false)
     revealControls()
   }, [src, autoPlay, revealControls])
 
@@ -450,7 +567,7 @@ export function WorkbenchVideoPlayer({
     >
       <PrivateVideo
         ref={assignVideoRef}
-        src={src}
+        src={streamSrc}
         poster={poster}
         aria-label={`播放 ${name}`}
         controls={false}
@@ -641,13 +758,82 @@ export function WorkbenchVideoPlayer({
           </div>
 
           <div className="wb-vstage-controls-right">
+            {/* External Player Menu (Infuse / nPlayer / SenPlayer) */}
+            <div className="wb-vstage-speed-wrap">
+              <button
+                type="button"
+                className="wb-vstage-pill"
+                aria-label="外部播放器打开"
+                title="在 Infuse / nPlayer / SenPlayer 中打开"
+                aria-expanded={extMenuOpen}
+                onClick={() => {
+                  setSpeedMenuOpen(false)
+                  setExtMenuOpen(v => !v)
+                }}
+              >
+                <ExternalLink size={12} />
+                <span className="wb-vstage-hide-xs">外部</span>
+              </button>
+              <AnimatePresence initial={false}>
+                {extMenuOpen && (
+                  <motion.div
+                    role="menu"
+                    aria-label="选择外部播放器"
+                    className="wb-vstage-speed-menu wb-vstage-ext-menu"
+                    initial={reduce ? false : { opacity: 0, transform: 'translateY(4px)' }}
+                    animate={{ opacity: 1, transform: 'translateY(0px)' }}
+                    exit={reduce ? undefined : { opacity: 0, transform: 'translateY(4px)' }}
+                    transition={{ duration: reduce ? 0 : 0.14, ease: EASE_OUT }}
+                  >
+                    <a
+                      href={extLinks.infuse}
+                      role="menuitem"
+                      onClick={() => setExtMenuOpen(false)}
+                    >
+                      Infuse
+                    </a>
+                    <a
+                      href={extLinks.nplayer}
+                      role="menuitem"
+                      onClick={() => setExtMenuOpen(false)}
+                    >
+                      nPlayer
+                    </a>
+                    <a
+                      href={extLinks.senplayer}
+                      role="menuitem"
+                      onClick={() => setExtMenuOpen(false)}
+                    >
+                      SenPlayer
+                    </a>
+                    <button
+                      type="button"
+                      role="menuitem"
+                      onClick={() => {
+                        setExtMenuOpen(false)
+                        void navigator.clipboard
+                          ?.writeText(extLinks.streamUrl)
+                          .then(() => flashHud('流地址已复制'))
+                          .catch(() => {})
+                      }}
+                    >
+                      复制流地址
+                    </button>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </div>
+
             <div className="wb-vstage-speed-wrap">
               <button
                 type="button"
                 className="wb-vstage-pill"
                 aria-label={`播放倍速 ${speed}x`}
                 aria-expanded={speedMenuOpen}
-                onClick={() => setSpeedMenuOpen(v => !v)}
+                onClick={() => {
+                  setExtMenuOpen(false)
+                  setSpeedMenuOpen(v => !v)
+                }}
               >
                 {speed === 1 ? '倍速' : `${speed}x`}
               </button>

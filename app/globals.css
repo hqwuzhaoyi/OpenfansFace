@@ -559,9 +559,11 @@ html[data-privacy-mode="true"] .wb-vstage > .privacy-video:not([data-revealed="t
   box-shadow: 0 10px 28px #0009;
   z-index: 6;
 }
-.wb-vstage-speed-menu button {
+.wb-vstage-speed-menu button,
+.wb-vstage-speed-menu a {
   height: 28px;
   min-height: 28px !important;
+  min-width: 0;
   padding: 0 10px;
   border: 0;
   border-radius: 5px;
@@ -570,8 +572,17 @@ html[data-privacy-mode="true"] .wb-vstage > .privacy-video:not([data-revealed="t
   font-size: 11px;
   font-variant-numeric: tabular-nums;
   text-align: center;
+  text-decoration: none;
+  white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
 }
-.wb-vstage-speed-menu button:hover {
+.wb-vstage-ext-menu {
+  min-width: 96px;
+}
+.wb-vstage-speed-menu button:hover,
+.wb-vstage-speed-menu a:hover {
   background: #ffffff17;
   color: #fff;
 }
@@ -579,6 +590,38 @@ html[data-privacy-mode="true"] .wb-vstage > .privacy-video:not([data-revealed="t
   background: #ffffff26;
   color: #fff;
   font-weight: 600;
+}
+.wb-ext-player-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: 11px;
+}
+.wb-ext-player-label {
+  color: var(--muted-foreground);
+}
+.wb-ext-player-chip {
+  height: 28px;
+  min-height: 28px !important;
+  min-width: 0 !important;
+  padding: 0 9px;
+  border-radius: 7px;
+  border: 1px solid var(--border);
+  background: color-mix(in oklab, var(--muted) 65%, var(--background));
+  color: var(--foreground);
+  font-size: 11px;
+  font-weight: 500;
+  text-decoration: none;
+  white-space: nowrap;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  transition: background 140ms var(--ease-out-ui), border-color 140ms var(--ease-out-ui);
+}
+.wb-ext-player-chip:hover {
+  background: var(--accent);
+  border-color: var(--foreground);
 }
 @media (max-width: 767px), (pointer: coarse) {
   .wb-vstage-timeline {
@@ -603,9 +646,16 @@ html[data-privacy-mode="true"] .wb-vstage > .privacy-video:not([data-revealed="t
     padding: 0 10px;
     font-size: 12px;
   }
-  .wb-vstage-speed-menu button {
+  .wb-vstage-speed-menu button,
+  .wb-vstage-speed-menu a {
     height: 34px;
     min-height: 34px !important;
+    font-size: 12px;
+  }
+  .wb-ext-player-chip {
+    height: 34px;
+    min-height: 34px !important;
+    padding: 0 11px;
     font-size: 12px;
   }
   .wb-vstage-hide-xs {

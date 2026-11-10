@@ -1,5 +1,5 @@
 'use client'
-import { WorkbenchVideoPlayer } from '@/components/workbench/video-player'
+import { ExternalPlayerBar, WorkbenchVideoPlayer } from '@/components/workbench/video-player'
 import { VideoCover } from '@/components/review/video-cover'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Check, Copy, Folder, FolderCheck, FolderInput, X } from 'lucide-react'
@@ -82,7 +82,7 @@ export function MergePersonVideos({
       <code>{data.root}</code>
       {target&&(isTarget?<b>目标保留目录</b>:<span>→ 合入 {target}</span>)}
     </div>}
-    {active&&<div className="pw-merge-player"><div className="pw-merge-player-head"><span>{active.name}</span><div className="pw-merge-player-actions"><Button aria-label="复制视频路径" title="复制视频路径 (C)" onClick={()=>void navigator.clipboard.writeText(active.path).then(()=>{setCopied(true);setTimeout(()=>setCopied(false),1400)}).catch(()=>{})}><ActionSwapIcon value={copied?'copied':'copy'} animation="roll">{copied?<Check size={12}/>:<Copy size={12}/>}</ActionSwapIcon></Button><Button aria-label="关闭视频预览" onClick={()=>onPlay(null)}><X size={15}/></Button></div></div><WorkbenchVideoPlayer videoRef={player} key={active.path} src={videoUrl(active)} name={active.name} poster={active.thumb||undefined} autoPlay compact enableGlobalHotkeys onError={()=>setPlayError('暂时无法播放，请检查文件或浏览器编码支持。')}/>{playError&&<p role="alert">{playError}</p>}<code>{active.path}</code></div>}
+    {active&&<div className="pw-merge-player"><div className="pw-merge-player-head"><span>{active.name}</span><div className="pw-merge-player-actions"><Button aria-label="复制视频路径" title="复制视频路径 (C)" onClick={()=>void navigator.clipboard.writeText(active.path).then(()=>{setCopied(true);setTimeout(()=>setCopied(false),1400)}).catch(()=>{})}><ActionSwapIcon value={copied?'copied':'copy'} animation="roll">{copied?<Check size={12}/>:<Copy size={12}/>}</ActionSwapIcon></Button><Button aria-label="关闭视频预览" onClick={()=>onPlay(null)}><X size={15}/></Button></div></div><WorkbenchVideoPlayer videoRef={player} key={active.path} src={videoUrl(active)} name={active.name} poster={active.thumb||undefined} autoPlay compact enableGlobalHotkeys onError={()=>setPlayError('暂时无法播放，请检查文件或浏览器编码支持，或使用外部播放器打开。')}/>{playError&&<div role="alert"><p>{playError}</p><ExternalPlayerBar src={videoUrl(active)} name={active.name}/></div>}<code>{active.path}</code></div>}
     <div className="pw-merge-video-grid">{files.map(video=><Button key={video.path} className="pw-merge-video" aria-label={`预览 ${name} 的 ${video.name}`} disabled={disabled} onClick={()=>onPlay({person:name,video})}><VideoCover video={video} className="pw-merge-cover"/><strong title={video.name}>{video.name}</strong><small>{video.folder==='.'?'根目录':video.folder} · {size(video.size)}</small></Button>)}</div>
     {data&&!data.total_videos&&<p className="pw-merge-no-video">暂无视频，仍可合并人物资料。</p>}
     {state?.error&&<div className="pw-error" role="alert"><p>{state.error}</p><Button disabled={state.loading||disabled} onClick={()=>onLoad(name,data?.files.length||0)}>重新加载视频</Button></div>}

@@ -10,7 +10,7 @@ import { Card } from '@/components/beui/motion/card'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
-import { WorkbenchVideoPlayer } from '@/components/workbench/video-player'
+import { ExternalPlayerBar, WorkbenchVideoPlayer } from '@/components/workbench/video-player'
 import './workspace.css'
 
 type ButtonProps=Omit<ComponentProps<typeof BeuiButton>,'variant'|'size'>&{variant?:'default'|'primary'|'secondary'|'ghost'|'outline';size?:'sm'|'default'|'icon'|'lg'}
@@ -53,7 +53,7 @@ export function WorkspacePath({value,label='完整路径',compact=false}:{value:
 
 const mediaPositions=new Map<string,number>()
 export function WorkspaceMedia({path,name,autoPlay=false}:{path:string;name:string;autoPlay?:boolean}){
-  const [failed,setFailed]=useState(false),[attempt,setAttempt]=useState(0)
+  const [failed,setFailed]=useState(false),[attempt,setAttempt]=useState(0),src=`/api/video?p=${encodeURIComponent(path)}`
   useEffect(()=>{setFailed(false);setAttempt(0)},[path])
-  return <div className="ws-media"><WorkbenchVideoPlayer key={`${path}:${attempt}`} src={`/api/video?p=${encodeURIComponent(path)}`} name={name} autoPlay={autoPlay} initialTime={mediaPositions.get(path)||0} onTimeRemember={t=>{mediaPositions.set(path,t);if(mediaPositions.size>200)mediaPositions.delete(mediaPositions.keys().next().value!)}} onError={()=>setFailed(true)}/>{failed&&<WorkspaceCard><WorkspaceMessage error>暂时无法播放，请核对文件路径、网络或编码支持。</WorkspaceMessage><WorkspaceButton variant="outline" onClick={()=>{setFailed(false);setAttempt(n=>n+1)}}>重新加载视频</WorkspaceButton></WorkspaceCard>}</div>
+  return <div className="ws-media"><WorkbenchVideoPlayer key={`${path}:${attempt}`} src={src} name={name} autoPlay={autoPlay} initialTime={mediaPositions.get(path)||0} onTimeRemember={t=>{mediaPositions.set(path,t);if(mediaPositions.size>200)mediaPositions.delete(mediaPositions.keys().next().value!)}} onError={()=>setFailed(true)}/>{failed&&<WorkspaceCard><WorkspaceMessage error>暂时无法播放，请核对文件路径、网络或编码支持，或直接用外部播放器打开。</WorkspaceMessage><ExternalPlayerBar src={src} name={name}/><WorkspaceButton variant="outline" onClick={()=>{setFailed(false);setAttempt(n=>n+1)}}>重新加载视频</WorkspaceButton></WorkspaceCard>}</div>
 }

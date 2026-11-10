@@ -4,6 +4,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { AnimatePresence, motion } from 'motion/react'
 import {
   Check,
+  ExternalLink,
   FolderInput,
   FolderOpen,
   FastForward,
@@ -25,6 +26,11 @@ import {
   X,
 } from 'lucide-react'
 import { PrivateVideo } from '@/components/private-media'
+import {
+  buildExternalPlayerLinks,
+  ExternalPlayerBar,
+  normalizeVideoApiPath,
+} from '@/components/workbench/video-player'
 import { VideoCover } from '@/components/review/video-cover'
 import { Dialog, DialogDescription, DialogTitle } from '@/components/ui/dialog'
 import { Kbd, KbdGroup } from '@/components/ui/kbd'
@@ -131,8 +137,13 @@ export function PersonVideoDialog({
   const [showEpisodes, setShowEpisodes] = useState(false)
   const [showShortcuts, setShowShortcuts] = useState(false)
   const [speedMenuOpen, setSpeedMenuOpen] = useState(false)
+  const [extMenuOpen, setExtMenuOpen] = useState(false)
   const [copied, setCopied] = useState(false)
   const [hud, setHud] = useState<{ key: number; label: string } | null>(null)
+
+  const rawVideoSrc = video ? `/api/video?p=${encodeURIComponent(video.path || video.vid)}` : ''
+  const streamSrc = video ? normalizeVideoApiPath(rawVideoSrc, video.name) : ''
+  const extLinks = video ? buildExternalPlayerLinks(rawVideoSrc, video.name) : null
 
   const index = video ? playlist.findIndex(item => item.vid === video.vid) : -1
   const hasPrev = index > 0
@@ -151,11 +162,17 @@ export function PersonVideoDialog({
     setControlsVisible(true)
     if (idleTimer.current) clearTimeout(idleTimer.current)
     idleTimer.current = setTimeout(() => {
-      if (videoRef.current && !videoRef.current.paused && !speedMenuOpen && !showShortcuts) {
+      if (
+        videoRef.current &&
+        !videoRef.current.paused &&
+        !speedMenuOpen &&
+        !extMenuOpen &&
+        !showShortcuts
+      ) {
         setControlsVisible(false)
       }
     }, 2600)
-  }, [speedMenuOpen, showShortcuts])
+  }, [speedMenuOpen, extMenuOpen, showShortcuts])
 
   useEffect(() => {
     return () => {
@@ -190,6 +207,7 @@ export function PersonVideoDialog({
     setDuration(video?.duration || 0)
     setCopied(false)
     setSpeedMenuOpen(false)
+    setExtMenuOpen(false)
     revealControls()
   }, [video?.vid, video?.duration, revealControls])
 
@@ -605,7 +623,7 @@ export function PersonVideoDialog({
               <PrivateVideo
                 ref={videoRef}
                 key={video.path || video.vid}
-                src={`/api/video?p=${encodeURIComponent(video.path || video.vid)}`}
+                src={streamSrc}
                 poster={video.thumb || undefined}
                 controls={false}
                 autoPlay
@@ -924,6 +942,74 @@ export function PersonVideoDialog({
                   </div>
 
                   <div className="pw-theater-controls-right">
+                    {/* External Player Menu (Infuse / nPlayer / SenPlayer) */}
+                    {extLinks && (
+                      <div className="pw-theater-speed-wrap">
+                        <button
+                          type="button"
+                          className="pw-theater-pill-btn"
+                          aria-label="外部播放器打开"
+                          title="在 Infuse / nPlayer / SenPlayer 中打开"
+                          aria-expanded={extMenuOpen}
+                          onClick={() => {
+                            setSpeedMenuOpen(false)
+                            setExtMenuOpen(v => !v)
+                          }}
+                        >
+                          <ExternalLink size={13} />
+                          <span>外部播放</span>
+                        </button>
+                        <AnimatePresence initial={false}>
+                          {extMenuOpen && (
+                            <motion.div
+                              role="menu"
+                              aria-label="选择外部播放器"
+                              className="pw-theater-speed-menu pw-theater-ext-menu"
+                              initial={instant ? false : { opacity: 0, transform: 'translateY(4px)' }}
+                              animate={{ opacity: 1, transform: 'translateY(0px)' }}
+                              exit={instant ? undefined : { opacity: 0, transform: 'translateY(4px)' }}
+                              transition={{ duration: instant ? 0 : 0.14, ease: EASE_OUT }}
+                            >
+                              <a
+                                href={extLinks.infuse}
+                                role="menuitem"
+                                onClick={() => setExtMenuOpen(false)}
+                              >
+                                Infuse
+                              </a>
+                              <a
+                                href={extLinks.nplayer}
+                                role="menuitem"
+                                onClick={() => setExtMenuOpen(false)}
+                              >
+                                nPlayer
+                              </a>
+                              <a
+                                href={extLinks.senplayer}
+                                role="menuitem"
+                                onClick={() => setExtMenuOpen(false)}
+                              >
+                                SenPlayer
+                              </a>
+                              <button
+                                type="button"
+                                role="menuitem"
+                                onClick={() => {
+                                  setExtMenuOpen(false)
+                                  void navigator.clipboard
+                                    ?.writeText(extLinks.streamUrl)
+                                    .then(() => flashHud('流地址已复制'))
+                                    .catch(() => {})
+                                }}
+                              >
+                                复制流地址
+                              </button>
+                            </motion.div>
+                          )}
+                        </AnimatePresence>
+                      </div>
+                    )}
+
                     {/* Speed Pill + Popover Menu (Bilibili style) */}
                     <div className="pw-theater-speed-wrap">
                       <button
@@ -931,7 +1017,10 @@ export function PersonVideoDialog({
                         className="pw-theater-pill-btn"
                         aria-label={`播放倍速 ${speed}x`}
                         aria-expanded={speedMenuOpen}
-                        onClick={() => setSpeedMenuOpen(v => !v)}
+                        onClick={() => {
+                          setExtMenuOpen(false)
+                          setSpeedMenuOpen(v => !v)
+                        }}
                       >
                         {speed === 1 ? '倍速' : `${speed}x`}
                       </button>
@@ -991,9 +1080,10 @@ export function PersonVideoDialog({
             </div>
 
             {failed && (
-              <p role="alert" className="pw-error pw-theater-error">
-                暂时无法播放，请核对文件路径、网络或浏览器编码支持。
-              </p>
+              <div role="alert" className="pw-error pw-theater-error">
+                <p>暂时无法播放，请核对文件路径、网络或浏览器编码支持，或使用外部播放器打开。</p>
+                <ExternalPlayerBar src={rawVideoSrc} name={video.name} />
+              </div>
             )}
 
             {/* Single Clean Footer Bar (Ponytail: no duplicate file CRUD buttons) */}
