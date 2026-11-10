@@ -66,7 +66,7 @@ fn canonical(config: &Config, input: Selection) -> Result<Selection> {
         .iter()
         .map(|name| {
             files::validate_name(name)?;
-            person_registration::canonical(config, name)
+            person_registration::selected(config, name)
         })
         .collect::<Result<Vec<_>>>()?;
     let unique = people.iter().collect::<std::collections::BTreeSet<_>>();

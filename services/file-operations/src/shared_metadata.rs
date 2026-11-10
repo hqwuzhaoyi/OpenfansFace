@@ -782,6 +782,8 @@ fn prepare(config: &Config, body: &Value, id: &str) -> Result<Prepared> {
             add("template-overrides.json", before, value)?;
         }
         "person-remember" => {
+            let name = person_registration::existing_spelling(config, &name)?;
+            out.guards = json!({"name":name});
             let (before, mut value) = review::read(config, "people-manual.json", json!([]))?;
             let rows = value.as_array_mut().unwrap();
             let existing = rows.iter().position(|v| v["name"] == name);

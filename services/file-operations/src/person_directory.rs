@@ -36,6 +36,21 @@ pub fn inventory(source: &Path, target: &Path) -> Result<Inventory> {
         Err(e) => return Err(e.into()),
         Ok(_) => (),
     }
+    // On case-insensitive storage `creators/MOMO` resolves to `creators/momo`.
+    // A spelling variant without its own folder must never adopt another
+    // person's folder, so require the exact name in the parent listing.
+    if let (Some(parent), Some(name)) = (source.parent(), source.file_name()) {
+        let mut exact = false;
+        for entry in fs::read_dir(parent)? {
+            if entry?.file_name() == name {
+                exact = true;
+                break;
+            }
+        }
+        if !exact {
+            return Ok(result);
+        }
+    }
     fn walk(src: &Path, dst: &Path, result: &mut Inventory) -> Result<()> {
         permissions::writable_directory(src, "source_directory")?;
         permissions::writable_directory(src.parent().unwrap(), "source_directory")?;

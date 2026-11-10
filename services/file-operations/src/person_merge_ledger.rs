@@ -257,12 +257,20 @@ fn default_link(
 pub fn snapshot(config: &Config, plan: &Plan) -> Result<ledger::Delta> {
     let mut conn = db::open(&config.ledger)?;
     let tx = conn.transaction()?;
-    let source = creator(&tx, &plan.person)?;
+    let mut source = creator(&tx, &plan.person)?;
     let target = creator(&tx, &plan.target_person)?;
-    let source_id = source.first().map(|r| r["id"].clone());
+    let mut source_id = source.first().map(|r| r["id"].clone());
     let target_id = target.first().map(|r| r["id"].clone());
+    let mut shared_entity = false;
     if source_id.is_some() && source_id == target_id {
-        return Err(Error::conflict("Peach 中所选名字已指向同一人物"));
+        // Peach matches names case-insensitively: a spelling variant already
+        // shares the kept person's entity, so there is no entity to merge.
+        if !crate::person_registration::same_spelling(&plan.person, &plan.target_person) {
+            return Err(Error::conflict("Peach 中所选名字已指向同一人物"));
+        }
+        source.clear();
+        source_id = None;
+        shared_entity = true;
     }
     for row in source.iter().chain(&target) {
         person_metadata(row)?;
@@ -452,6 +460,13 @@ pub fn snapshot(config: &Config, plan: &Plan) -> Result<ledger::Delta> {
             before: source.clone(),
             after: vec![],
         },
+    ];
+    if shared_entity {
+        // The variant's name query returns the kept entity, which the target
+        // guard below already pins exactly.
+        guards.clear();
+    }
+    guards.extend([
         db::Guard::CreatorName {
             canonical: plan.target_person.clone(),
             normalized: plan.target_person.to_lowercase(),
@@ -468,7 +483,7 @@ pub fn snapshot(config: &Config, plan: &Plan) -> Result<ledger::Delta> {
             before: occupied.clone(),
             after: occupied.into_iter().chain(after_assets.clone()).collect(),
         },
-    ];
+    ]);
     for (asset_id, before) in by_asset {
         let id = json!({"$integer":asset_id.to_string()});
         guards.push(db::Guard::AssetLinks {

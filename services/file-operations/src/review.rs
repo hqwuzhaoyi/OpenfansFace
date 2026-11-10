@@ -431,11 +431,14 @@ pub fn prepare(
         }
         out.result = json!({"ok":true,"bucket":"rejected","queued":false});
     } else {
-        let name = creator(
+        let name = crate::person_registration::existing_spelling(
             config,
-            body.get("creator")
-                .or_else(|| claim.as_ref().and_then(|c| c.get("name")))
-                .unwrap_or(&Value::Null),
+            &creator(
+                config,
+                body.get("creator")
+                    .or_else(|| claim.as_ref().and_then(|c| c.get("name")))
+                    .unwrap_or(&Value::Null),
+            )?,
         )?;
         let src = if claim.is_some() {
             "approval"
