@@ -17,8 +17,14 @@ use std::{
 
 const DEFAULT_SCANNER_LEASE_MS: i64 = 300_000;
 
+#[track_caller]
 fn conflict() -> Error {
-    Error::conflict("归档账本取消依据不足，保留恢复状态")
+    let location = std::panic::Location::caller();
+    Error::conflict(format!(
+        "归档账本取消依据不足，保留恢复状态（{}:{}）",
+        location.file().rsplit('/').next().unwrap_or(location.file()),
+        location.line()
+    ))
 }
 fn quoted(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))

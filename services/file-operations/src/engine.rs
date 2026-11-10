@@ -425,7 +425,20 @@ impl Engine {
                 .unwrap_or_else(|| Error::new(503, "interrupted", "执行中断后已回退"));
             let rollback = record.status == "rolling_back" || self.store.db.query_row("SELECT EXISTS(SELECT 1 FROM steps WHERE operation_id=? AND phase='compensation_intent')",[id],|r|r.get(0))?;
             if let Err(error) = self.reconcile(&record.plan, &domain, rollback, &cause) {
-                self.reconcile(&record.plan, &domain, true, &error)?;
+                eprintln!(
+                    "operation {} recovery attempt failed (rollback={}): {} {}",
+                    id,
+                    rollback,
+                    error.code,
+                    error.error
+                );
+                self.reconcile(&record.plan, &domain, true, &error)
+                    .inspect_err(|rollback_error| {
+                        eprintln!(
+                            "operation {} recovery rollback failed: {} {}",
+                            id, rollback_error.code, rollback_error.error
+                        )
+                    })?;
             }
             gate.release()
         })();
@@ -482,9 +495,20 @@ impl Engine {
             .latest_step(&plan.id, "ledger_reserved")?
             .is_some();
         let allow_unreserved = !has_ledger_reserved
-            && self
-                .verify_published_archive_destinations(plan, &selected)
-                .is_ok();
+            && match self.verify_published_archive_destinations(plan, &selected) {
+                Ok(()) => true,
+                Err(published) => {
+                    if plan.action == "archive" {
+                        eprintln!(
+                            "operation {} archive destination verification failed: {} ({})",
+                            plan.id,
+                            published.error,
+                            published.path.as_deref().unwrap_or("")
+                        );
+                    }
+                    false
+                }
+            };
         let mut retained_indexes = vec![];
         let ledger_state = match self.ledger_state(plan, &domain) {
             Ok(state) => state,
@@ -498,7 +522,7 @@ impl Engine {
                         .ok_or_else(|| Error::conflict("缺少归档账本取消依据"))?,
                     allow_unreserved,
                 )
-                .map_err(|_| error)?;
+                .map_err(|observed| with_reconciliation_cause(error, "归档扫描核对", &observed))?;
                 "prepared".into()
             }
             Err(error) => return Err(error),
@@ -1324,7 +1348,9 @@ impl Engine {
                 }
                 Err(error) if plan.action == "archive" => {
                     self.verify_published_archive_destinations(plan, &successful)
-                        .map_err(|_| error.clone())?;
+                        .map_err(|published| {
+                            with_reconciliation_cause(error.clone(), "归档目标核对", &published)
+                        })?;
                     let delta = domain
                         .ledger
                         .as_ref()
@@ -1335,7 +1361,7 @@ impl Engine {
                         delta,
                         !has_ledger_reserved,
                     )
-                    .map_err(|_| error)?;
+                    .map_err(|observed| with_reconciliation_cause(error, "归档扫描预留", &observed))?;
                 }
                 Err(error) => return Err(error),
             }
@@ -1507,20 +1533,32 @@ impl Engine {
         error: Error,
     ) -> Result<(Value, Vec<i64>)> {
         self.verify_published_archive_destinations(plan, successful)
-            .map_err(|_| error.clone())?;
+            .map_err(|published| with_reconciliation_cause(error.clone(), "归档目标核对", &published))?;
         let delta = domain
             .ledger
             .as_ref()
             .ok_or_else(|| Error::conflict("缺少账本意图"))?;
         let applied =
             crate::archive_cancel::apply_with_scanner_reconciliation(&self.config, plan, delta)
-                .map_err(|_| error)?;
+                .map_err(|observed| with_reconciliation_cause(error, "归档扫描提交", &observed))?;
         let reconciled = applied["reconciled_scanner_assets"]
             .as_array()
             .map(|ids| ids.iter().filter_map(Value::as_i64).collect())
             .unwrap_or_default();
         Ok((applied, reconciled))
     }
+}
+/// Keep the primary ledger conflict for callers while preserving why the
+/// archive-specific fallback did not apply. A swallowed fallback cause leaves
+/// recovery_needed without any actionable evidence.
+fn with_reconciliation_cause(mut primary: Error, stage: &str, cause: &Error) -> Error {
+    primary.error = match cause.path.as_deref() {
+        Some(path) if !path.is_empty() => {
+            format!("{}；{}：{}（{}）", primary.error, stage, cause.error, path)
+        }
+        _ => format!("{}；{}：{}", primary.error, stage, cause.error),
+    };
+    primary
 }
 fn validate(request: &Request) -> Result<()> {
     model::validate_id(&request.id)?;
