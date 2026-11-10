@@ -58,8 +58,10 @@ def run():
         candidate=f.media/'pikpak/My Telegram/候选.mp4';candidate.parent.mkdir();candidate.write_bytes(b'candidate')
         with sqlite3.connect(f.base/'faces.db') as db:
             db.execute('INSERT INTO videos VALUES(?,?,?,?,?)',('candidate',str(candidate),candidate.name,str(candidate.parent),candidate.stat().st_size))
-        observed=observations(['candidate',fmod.VID,str(f.root/'ledger.db')])
+            db.execute('INSERT INTO videos VALUES(?,?,?,?,?)',('dir-entry',str(candidate.parent),candidate.parent.name,str(candidate.parent.parent),0))
+        observed=observations(['candidate','dir-entry',fmod.VID,str(f.root/'ledger.db')])
         assert observed['candidate']['eligible'] and observed['candidate']['mtime_ns']==str(candidate.stat().st_mtime_ns)
+        assert observed['dir-entry']=={'status':'not_file','eligible':False,'path':str(candidate.parent)},observed['dir-entry']
         assert not observed[fmod.VID]['eligible'] and observed[str(f.root/'ledger.db')]['status']=='missing'
         f.call({'vids':['x']*513},route='/v1/person-library/observations',status=400)
         f.call({'vids':[],'path':str(candidate)},route='/v1/person-library/observations',status=400)

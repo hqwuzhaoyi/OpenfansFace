@@ -1135,6 +1135,13 @@ pub fn library_observations(config: &Config, ids: &[String]) -> Result<Value> {
                 );
                 continue;
             }
+            Err(error) if error.error == "路径不是普通文件" => {
+                rows.insert(
+                    id.clone(),
+                    json!({"status":"not_file","eligible":false,"path":path}),
+                );
+                continue;
+            }
             Err(error) => return Err(error.at(path).during("library_observation")),
         };
         let fingerprint = files::fingerprint(path, &stat);
