@@ -41,7 +41,7 @@ export default function Review() {
   const {trackReviewMutation}=useBackgroundOperations()
   const [data,setData]=useState<Data|null>(()=>readWorkbenchCache<Data>('review:lastData')??null),[error,setError]=useState(''),[loading,setLoading]=useState(()=>!readWorkbenchCache<Data>('review:lastData')),[busy,setBusy]=useState(false)
   const [pendingVids,setPendingVids]=useState<Set<string>>(()=>new Set())
-  const pendingVidsRef=useRef(new Set<string>()),inFlightCountRef=useRef(0),autoSelectFirstRef=useRef(false)
+  const pendingVidsRef=useRef(new Set<string>()),inFlightCountRef=useRef(0),initializedScopesRef=useRef(new Set<string>()),forceSelectAllScopeRef=useRef<string|null>(null)
   const {values:filters,ready:initialized,update:updateFilters}=useWorkspaceQuery({view:'all',group:'',q:'',folder:'',page:'0',person:'',cluster:'',vid:''},{view:views.map(v=>v.value)})
   const {view,group,q:query,folder,person:personScope,cluster:clusterScope,vid:linkFocus}=filters,page=Number(filters.page)
   const [search,setSearch]=useState('')
@@ -68,7 +68,7 @@ export default function Review() {
   const {version:activityVersion,canApply:canAutoApply}=useReviewActivity(busy||pendingVids.size>0||loading||hasSelections||hasDrafts||previewOpen||!!reference||refreshConfirm||detailMode==='selection')
 
   const wide=useWideWorkspace(),sequence=useRef(0),selectionHeading=useRef<HTMLHeadingElement>(null)
-  const activeGroup=data?.group?.key||group,scope=reviewSelectionKey(activeGroup,view==='deferred'),chosen=selections[scope]||[],rows=(data?.rows||[]).filter(r=>!pendingVids.has(r.vid))
+  const activeGroup=group||data?.group?.key||'',groupMatched=!group||data?.group?.key===group,scope=reviewSelectionKey(activeGroup,view==='deferred'),chosen=selections[scope]||[],rows=(groupMatched?data?.rows||[]:[]).filter(r=>!pendingVids.has(r.vid))
   const blockedIds=new Set((data?.blocked||[]).map(item=>item.vid))
   const selected=new Set(chosen.map(t=>t.vid)),originalFocus=(inspected[scope]&&!pendingVids.has(inspected[scope].vid)?inspected[scope]:undefined)||rows.find(t=>t.vid===linkFocus)||rows[0],focused=originalFocus?{...originalFocus,review_blocked:data?.blocked?.find(item=>item.vid===originalFocus.vid)?.message}:undefined,hiddenCount=chosen.filter(t=>!rows.some(r=>r.vid===t.vid)).length
   const actionTargets=chosen.length>0?chosen:(focused?[focused]:[])
@@ -85,14 +85,31 @@ export default function Review() {
     const idx=groupsList.findIndex(g=>g.key===currentKey)
     return (idx>=0?groupsList.slice(idx+1).find(g=>g.key!==currentKey&&g.count>0)||groupsList.slice(0,idx).find(g=>g.key!==currentKey&&g.count>0):groupsList.find(g=>g.key!==currentKey&&g.count>0))||null
   },[])
+  const applyGroupDefaultSelection=useCallback((pageData:Data)=>{
+    const targetGroupKey=pageData.group?.key||group
+    if(!targetGroupKey)return
+    const targetScope=reviewSelectionKey(targetGroupKey,view==='deferred')
+    const pageScopeKey=`${targetScope}:${pageData.page??page}`
+    const visible=pageData.rows.filter(r=>!pendingVidsRef.current.has(r.vid))
+    if(!visible.length)return
+    const shouldSelectAll=forceSelectAllScopeRef.current===targetScope||(!initializedScopesRef.current.has(pageScopeKey)&&(pageData.group?.kind==='suggested'||view==='suggested'))
+    if(!shouldSelectAll)return
+    initializedScopesRef.current.add(pageScopeKey)
+    if(forceSelectAllScopeRef.current===targetScope)forceSelectAllScopeRef.current=null
+    const pageBlocked=new Set((pageData.blocked||[]).map(item=>item.vid))
+    const selectable=visible.filter(r=>!pageBlocked.has(r.vid))
+    const first=selectable[0]||visible[0]
+    setInspected(current=>({...current,[targetScope]:first}))
+    if(selectable.length>0)setSelections(current=>({...current,[targetScope]:selectable}))
+  },[group,page,view])
   const load=useCallback(async(options:{refresh?:boolean;automatic?:boolean;preservePosition?:boolean;silent?:boolean}={})=>{
     if(!initialized)return null
     if(options.preservePosition&&listScroll.ref.current){const area=listScroll.ref.current,top=area.getBoundingClientRect().top;scrollAnchor.current=[...area.querySelectorAll<HTMLElement>('[data-vid]')].filter(e=>e.getBoundingClientRect().bottom>top).map(e=>({vid:e.dataset.vid!,offset:e.getBoundingClientRect().top-top}))}
     const cacheKey='review:page:'+JSON.stringify([view,group,search,folder,page,linkFocus,personScope,clusterScope])
     const cachedPage=!options.refresh&&!options.preservePosition&&!options.silent?readWorkbenchCache<Data>(cacheKey):undefined
-    if(cachedPage){setData(cachedPage);setLoading(false)}
+    if(cachedPage){setData(cachedPage);applyGroupDefaultSelection(cachedPage);setLoading(false)}
     const token=++sequence.current,activityAtStart=activityVersion()
-    if(!options.automatic&&!options.silent&&(options.refresh||!cachedPage&&!data))setLoading(true)
+    if(!options.automatic&&!options.silent&&(options.refresh||!cachedPage&&(!data||!!group&&data.group?.key!==group)))setLoading(true)
     try{
       const params=new URLSearchParams({view,group,q:search,folder,page:String(page),vid:linkFocus,person:personScope,cluster:clusterScope,...(!options.refresh&&session.current?{session:session.current}:{snapshot:'1'})})
       const next=await api<Data>('/api/review?'+params)
@@ -105,27 +122,28 @@ export default function Review() {
       if(next.group?.key&&next.group.key!==group)writeWorkbenchCache('review:page:'+JSON.stringify([view,next.group.key,search,folder,next.page,linkFocus,personScope,clusterScope]),next)
       setData(next);setUpdates(previous=>({has_updates:next.has_updates??previous?.has_updates??false,refreshing:previous?.refreshing||0,blocked:previous?.blocked||0,waiting:next.waiting}));setSelections(current=>Object.fromEntries(Object.entries(current).map(([key,tasks])=>[key,tasks.map(t=>next.rows.find(r=>r.vid===t.vid)||t)])));setInspected(current=>Object.fromEntries(Object.entries(current).map(([key,t])=>[key,next.rows.find(r=>r.vid===t.vid)||t])));setError('');setSessionExpired(false)
       for(const row of next.rows)if(notesRef.current[row.vid]===undefined)noteBaseline.current[row.vid]=row.note
-      if(options.refresh){setSelections({});setDrafts({});setNotes({});setPickerSearch({});noteBaseline.current={};setInspected({});setReference(null);setDetailMode('video');setPreviewOpen(false);setSubmitError('');setUpdates(null)}
+      if(options.refresh){initializedScopesRef.current.clear();setSelections({});setDrafts({});setNotes({});setPickerSearch({});noteBaseline.current={};setInspected({});setReference(null);setDetailMode('video');setPreviewOpen(false);setSubmitError('');setUpdates(null)}
       const visibleNextRows=next.rows.filter(r=>!pendingVidsRef.current.has(r.vid))
-      if(autoSelectFirstRef.current&&visibleNextRows.length>0){
-        autoSelectFirstRef.current=false
-        const first=visibleNextRows[0],nextScope=reviewSelectionKey(next.group?.key||group,view==='deferred')
-        setInspected(current=>({...current,[nextScope]:first}))
-        setSelections(current=>({...current,[nextScope]:[first]}))
-      }
-      if(!options.silent&&group&&(!next.group||(!search&&!folder&&(next.remaining??visibleNextRows.length)===0))){
-        const fallbackGroup=findNextAvailableGroup(next.groups,group)
+      const currentGroupKey=next.group?.key||group
+      if(!options.silent&&currentGroupKey&&(!next.group||(!search&&!folder&&(next.remaining??visibleNextRows.length)===0))){
+        const fallbackGroup=findNextAvailableGroup(next.groups,currentGroupKey)
         if(fallbackGroup){
-          autoSelectFirstRef.current=true
+          const fallbackScope=reviewSelectionKey(fallbackGroup.key,view==='deferred')
+          initializedScopesRef.current.delete(`${fallbackScope}:0`)
+          forceSelectAllScopeRef.current=fallbackScope
           updateFilters({group:fallbackGroup.key,page:'0',vid:''})
           return next
         }
       }
+      applyGroupDefaultSelection(next)
       if((!group&&next.group)||page!==next.page||options.refresh&&next.group?.key!==group)updateFilters({group:next.group?.key||group,page:String(next.page)})
       return next
     }catch(e:any){if(token===sequence.current){if(options.automatic)setUpdates(previous=>({...previous,has_updates:true,refreshing:previous?.refreshing||0,blocked:previous?.blocked||0}));else if(!options.silent)setError(e.message);if(/核对已过期|核对会话|本次核对已过期/.test(e.message)){deleteWorkbenchCache('review:session');setSessionExpired(true)}}return null}
     finally{if(token===sequence.current&&!options.automatic&&!options.silent)setLoading(false)}
-  },[initialized,view,group,search,folder,page,linkFocus,personScope,clusterScope,updateFilters,activityVersion,canAutoApply,findNextAvailableGroup])
+  },[initialized,view,group,search,folder,page,linkFocus,personScope,clusterScope,updateFilters,activityVersion,canAutoApply,findNextAvailableGroup,applyGroupDefaultSelection])
+  const latestLoadRef=useRef(load)
+  latestLoadRef.current=load
+  useEffect(()=>{if(data&&(!group||data.group?.key===group))applyGroupDefaultSelection(data)},[data,group,applyGroupDefaultSelection])
   useLayoutEffect(()=>{
     if(loading||!scrollAnchor.current||!listScroll.ref.current)return
     const area=listScroll.ref.current,top=area.getBoundingClientRect().top,anchors=scrollAnchor.current;scrollAnchor.current=null
@@ -187,7 +205,7 @@ export default function Review() {
   })():[]
   const selectionPreviewTask=selectionPreviewVid?actionTargets.find(t=>t.vid===selectionPreviewVid)||null:null
   const changeQuery=(value:string)=>{if(!group&&data?.group)setGroup(data.group.key);updateFilters({q:value,page:'0',vid:''})}
-  const chooseGroup=(key:string)=>{setGroup(key);setPage(0);setLinkFocus('');setPreviewOpen(false)}
+  const chooseGroup=(key:string)=>{const targetScope=reviewSelectionKey(key,view==='deferred');if(!(selections[targetScope]?.length)){initializedScopesRef.current.delete(`${targetScope}:0`);forceSelectAllScopeRef.current=targetScope}setGroup(key);setPage(0);setLinkFocus('');setPreviewOpen(false)}
   const toggle=(tasks:ProcessingTask[])=>{setSelections(current=>({...current,[scope]:toggleReviewSelection(current[scope]||[],tasks)}));setWatermarkKey('')}
   const clear=()=>setSelections(current=>({...current,[scope]:[]}))
   const inspect=(task:ProcessingTask)=>{setReference(null);if(!previewOpen){returnFocus.current=document.activeElement as HTMLElement;setInstantEntry(!!document.activeElement?.matches(':focus-visible')||matchMedia('(prefers-reduced-motion: reduce)').matches)}setInspected(current=>({...current,[scope]:task}));setDetailMode('video');if(!wide)setPreviewOpen(true)}
@@ -228,7 +246,8 @@ export default function Review() {
     setInspected(current=>Object.fromEntries(Object.entries(current).filter(([,task])=>!completedSet.has(task.vid))))
     setDrafts(current=>({...current,[scope]:{creator:undefined,watermarkKey:''}}))
     if(nextRemainingInGroup>0&&data?.next_page!=null){
-      autoSelectFirstRef.current=true
+      initializedScopesRef.current.delete(`${scope}:${data.next_page}`)
+      forceSelectAllScopeRef.current=scope
       setPage(data.next_page)
       setLinkFocus('')
       return
@@ -236,7 +255,9 @@ export default function Review() {
     const groupsAfter=(data?.groups||[]).map(g=>g.key===activeGroup?{...g,count:Math.max(0,g.count-vids.length)}:g)
     const nextGroup=findNextAvailableGroup(groupsAfter,activeGroup)
     if(nextGroup){
-      autoSelectFirstRef.current=true
+      const nextScope=reviewSelectionKey(nextGroup.key,view==='deferred')
+      initializedScopesRef.current.delete(`${nextScope}:0`)
+      forceSelectAllScopeRef.current=nextScope
       setPreviewOpen(false)
       updateFilters({group:nextGroup.key,page:'0',vid:''})
     }else{
@@ -299,7 +320,7 @@ export default function Review() {
       toast.error(e.message)
     }finally{
       removePendingVids(vids)
-      if(inFlightCountRef.current===0)void load({preservePosition:true,silent:true})
+      if(inFlightCountRef.current===0)void latestLoadRef.current({preservePosition:true,silent:true})
     }
   }
   const sourceOnly=async(key:string)=>{
@@ -337,7 +358,7 @@ export default function Review() {
       toast.error(e.message)
     }finally{
       removePendingVids(vids)
-      if(inFlightCountRef.current===0)void load({preservePosition:true,silent:true})
+      if(inFlightCountRef.current===0)void latestLoadRef.current({preservePosition:true,silent:true})
     }
   }
   const confirm=()=>confirmTargets(actionTargets,creator)
@@ -431,7 +452,7 @@ export default function Review() {
         <div className="ws-toolbar"><WorkspaceSearch value={query} onChange={changeQuery} label="搜索当前组视频" placeholder="搜索文件名或路径…" disabled={false}><Popover.Root><Popover.Trigger asChild><InputGroupButton size="icon-sm" aria-label="分组与筛选" title="分组与筛选" data-active={!!folder}><SlidersHorizontal size={15}/>{folder&&<span className="size-1.5 rounded-full bg-current"/>}</InputGroupButton></Popover.Trigger><Popover.Portal><Popover.Content className="ws-filter-content" align="end" sideOffset={6}><div className="ws-mobile-filter"><WorkspaceField label="确认组"><WorkspaceSelect label="选择确认组" value={activeGroup} onChange={chooseGroup} options={(data?.groups||[]).map(g=>({value:g.key,label:`${g.label} · ${g.count}`}))} placeholder="暂无确认组"/></WorkspaceField></div><WorkspaceField label="原文件夹"><WorkspaceSelect label="按原文件夹筛选" value={folder} onChange={value=>{setFolder(value);if(!group&&data?.group)setGroup(data.group.key)}} options={[{value:'',label:'全部文件夹'},...(data?.folders||[]).map(f=>({value:f,label:f}))]}/></WorkspaceField>{folder&&<Button className="mt-3" variant="ghost" size="sm" onClick={()=>{setFolder('');setPage(0)}}>清除筛选</Button>}</Popover.Content></Popover.Portal></Popover.Root></WorkspaceSearch></div>
         <div className="ws-selection"><Checkbox className="ws-check" aria-label="选择当前页视频" motionPreset="instant" checked={rows.length>0&&rows.every(t=>selected.has(t.vid))} indeterminate={rows.some(t=>selected.has(t.vid))&&!rows.every(t=>selected.has(t.vid))} disabled={disabled||!rows.length} onCheckedChange={()=>toggle(rows)}/><div className="ws-selection-summary"><strong>{chosen.length?`已选 ${chosen.length}`:data?.group?.label||'待确认'}</strong><span> · {hiddenCount?`${hiddenCount} 个在其他页或被筛选隐藏`:data?`${data.remaining??data.total} 个待核对`:'读取中'}</span></div></div>
         <div ref={listScroll.ref} className="ws-list" aria-busy={loading||query!==search} onScroll={listScroll.onScroll}>
-          {loading&&!data?<p role="status" className="ws-empty">加载视频…</p>:!rows.length?<div className="ws-empty"><p>{group&&!data?.group?'该组已处理完，选择另一组继续。':query||folder?'当前筛选下没有视频。':data?.remaining===0?'本组已完成，可选择其他组继续。':'本批已处理完，可继续下一批。'}</p>{(query||folder)&&<Button variant="ghost" onClick={()=>{changeQuery('');setFolder('')}}>清除筛选</Button>}{!query&&!folder&&nextAvailableGroup&&<Button variant="outline" onClick={()=>{autoSelectFirstRef.current=true;chooseGroup(nextAvailableGroup.key)}}>下一待确认组 · {nextAvailableGroup.label}（{nextAvailableGroup.count}）</Button>}</div>:rows.map(t=><ReviewSummaryRow key={t.vid} task={t} selected={selected.has(t.vid)} active={focused?.vid===t.vid} disabled={disabled||!!t.review_blocked&&!selected.has(t.vid)} onToggle={()=>toggle([t])} onInspect={()=>inspect(t)}/>)}
+          {loading&&(!data||!groupMatched)?<p role="status" className="ws-empty">加载视频…</p>:!rows.length?<div className="ws-empty"><p>{group&&!data?.group?'该组已处理完，选择另一组继续。':query||folder?'当前筛选下没有视频。':data?.remaining===0?'本组已完成，可选择其他组继续。':'本批已处理完，可继续下一批。'}</p>{(query||folder)&&<Button variant="ghost" onClick={()=>{changeQuery('');setFolder('')}}>清除筛选</Button>}{!query&&!folder&&nextAvailableGroup&&<Button variant="outline" onClick={()=>chooseGroup(nextAvailableGroup.key)}>下一待确认组 · {nextAvailableGroup.label}（{nextAvailableGroup.count}）</Button>}</div>:rows.map(t=><ReviewSummaryRow key={t.vid} task={t} selected={selected.has(t.vid)} active={focused?.vid===t.vid} disabled={disabled||!!t.review_blocked&&!selected.has(t.vid)} onToggle={()=>toggle([t])} onInspect={()=>inspect(t)}/>)}
         </div>
         {chosen.length>0&&<div className="ws-bulk" aria-label="所选视频操作"><span className="ws-muted">已选 {chosen.length}</span>{chosen.length>0&&<Button className="ws-icon" variant="ghost" size="sm" title="清空当前组选择" aria-label="清空当前组选择" onClick={clear}><X size={14}/></Button>}<Button variant="outline" size="sm" disabled={disabled||!chosen.length} onClick={()=>void action(view==='deferred'?'restore':'defer',chosen.map(t=>t.vid))}>{view==='deferred'?'恢复':'暂缓'}</Button>{creator.trim()&&<Button size="sm" disabled={disabled||!chosen.length||chosen.some(t=>blockedIds.has(t.vid)||pendingVids.has(t.vid))} onClick={()=>void confirmTargets(chosen,creator)}>归给 {creator.trim()} · <DigitSwap value={chosen.length}/></Button>}<Button variant={creator.trim()?'outline':'default'} size="sm" disabled={disabled||!chosen.length} onClick={openSelection}><ListChecks size={14}/>核对所选</Button></div>}
         <div className="ws-pagination"><span>{data?`${data.remaining??data.total} 个待核对 · 第 ${currentPage+1} / ${Math.max(1,Math.ceil(data.total/data.limit))} 批`:'读取中'}</span><div className="ws-actions"><Button className="ws-icon" variant="ghost" size="sm" aria-label="上一页" title="上一页" disabled={disabled||(data?.session?data.previous_page==null:currentPage===0)} onClick={()=>{setPage(data?.previous_page??currentPage-1);setLinkFocus('')}}><ChevronLeft size={15}/></Button><Button className="ws-icon" variant="ghost" size="sm" aria-label="下一页" title="下一页" disabled={disabled||!data||(data.session?data.next_page==null:(currentPage+1)*data.limit>=data.total)} onClick={()=>{setPage(data?.next_page??currentPage+1);setLinkFocus('')}}><ChevronRight size={15}/></Button></div></div>
