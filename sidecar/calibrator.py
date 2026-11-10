@@ -72,7 +72,7 @@ def _picked_index(name):
 def identity_groups(name):
     name = canonical_name(name)
     import sqlite3
-    con = sqlite3.connect(f'{BASE}/faces.db')
+    con = sqlite3.connect(f'file:{BASE}/faces.db?mode=ro', uri=True)
     rows = con.execute("""SELECT f.emb, f.thumb, f.ts, f.vid, v.duration, v.path FROM faces f
                           JOIN videos v ON v.vid=f.vid
                           WHERE v.status='done' ORDER BY f.id""").fetchall()

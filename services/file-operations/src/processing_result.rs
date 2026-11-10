@@ -37,7 +37,8 @@ struct Submission {
     version: String,
     task: Task,
     data: Value,
-    next_stage: String,
+    #[serde(default)]
+    next_stage: Option<String>,
     #[serde(default)]
     reference_input_version: Option<String>,
 }
@@ -72,6 +73,392 @@ fn submission(plan: &Plan) -> Result<Submission> {
     )
     .map_err(|_| invalid("分析结果请求格式无效"))
 }
+pub fn canonical_person(name: &str, aliases: &Value) -> String {
+    let mut current = name.to_owned();
+    let mut seen = BTreeSet::new();
+    while let Some(next) = aliases.get(&current).and_then(Value::as_str) {
+        if !seen.insert(current.clone()) {
+            break;
+        }
+        current = next.to_owned();
+    }
+    current
+}
+
+pub fn load_catalog(config: &Config, aliases: &Value) -> Result<Vec<String>> {
+    let mut names = BTreeSet::new();
+    let report = review::read(config, "report.json", json!({}))?.1;
+    for person in report["identities"].as_array().into_iter().flatten() {
+        if let Some(name) = person["name"].as_str().filter(|s| !s.is_empty()) {
+            names.insert(canonical_person(name, aliases));
+        }
+    }
+    for person in review::read(config, "people-manual.json", json!([]))?
+        .1
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        if let Some(name) = person["name"].as_str().filter(|s| !s.is_empty()) {
+            names.insert(canonical_person(name, aliases));
+        }
+    }
+    for doc in ["integration-queue.json", "archive-history.json"] {
+        for row in review::read(config, doc, json!([]))?
+            .1
+            .as_array()
+            .into_iter()
+            .flatten()
+        {
+            if let Some(name) = row["creator"].as_str().filter(|s| !s.is_empty()) {
+                names.insert(canonical_person(name, aliases));
+            }
+        }
+    }
+    Ok(names.into_iter().collect())
+}
+
+pub fn load_legacy_names(config: &Config, vid: &str, aliases: &Value) -> Result<Vec<String>> {
+    let report = review::read(config, "report.json", json!({}))?.1;
+    let mut out = Vec::new();
+    for person in report["identities"].as_array().into_iter().flatten() {
+        let matched = person["vids"]
+            .as_array()
+            .is_some_and(|vids| vids.iter().any(|v| v["vid"].as_str() == Some(vid)));
+        if matched && let Some(name) = person["name"].as_str().filter(|s| !s.is_empty()) {
+            out.push(canonical_person(name, aliases));
+        }
+    }
+    Ok(out)
+}
+
+pub fn folder_hints(file: &str, people: &[String]) -> Vec<Value> {
+    let parts: Vec<String> = Path::new(file)
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    let tail = &parts[parts.len().saturating_sub(4)..];
+    let text = tail.join(" ");
+    let text_lower = text.to_lowercase();
+    let text_bytes = text.as_bytes();
+    let sorted: BTreeSet<&str> = people.iter().map(String::as_str).collect();
+    let mut output = Vec::new();
+    for name in sorted {
+        if name.chars().count() < 2 {
+            continue;
+        }
+        let matched = if name.is_ascii() {
+            let needle = name.as_bytes();
+            text_bytes
+                .windows(needle.len())
+                .enumerate()
+                .any(|(i, window)| {
+                    window.eq_ignore_ascii_case(needle)
+                        && (i == 0 || !text_bytes[i - 1].is_ascii_alphanumeric())
+                        && (i + needle.len() == text_bytes.len()
+                            || !text_bytes[i + needle.len()].is_ascii_alphanumeric())
+                })
+        } else {
+            text_lower.contains(&name.to_lowercase())
+        };
+        if matched {
+            output.push(json!({
+                "name": name,
+                "source": "folder",
+                "detail": "文件名或文件夹名称命中",
+            }));
+            if output.len() >= 10 {
+                break;
+            }
+        }
+    }
+    output
+}
+
+pub fn candidates_from_text(
+    watermark: &Value,
+    mappings: &Value,
+    folder: &[Value],
+    aliases: &Value,
+) -> Vec<Value> {
+    let mut result = folder.to_vec();
+    for mark in watermark["candidates"].as_array().into_iter().flatten() {
+        let Some(key) = mark["key"].as_str() else {
+            continue;
+        };
+        let mapping = &mappings[key];
+        let map_kind = mapping["kind"].as_str();
+        if map_kind == Some("source")
+            || (mark["platform"].as_str() == Some("Telegram") && map_kind != Some("person"))
+        {
+            continue;
+        }
+        if map_kind == Some("person")
+            && let Some(creator) = mapping["creator"].as_str().filter(|s| !s.is_empty())
+        {
+            result.push(json!({
+                "name": canonical_person(creator, aliases),
+                "source": "watermark",
+                "confirmed": true,
+                "key": key,
+                "detail": mark["text"].as_str().unwrap_or(""),
+            }));
+        } else if mark["kind"].as_str() == Some("account") {
+            let token = mark["token"]
+                .as_str()
+                .unwrap_or("")
+                .trim_start_matches('@')
+                .trim();
+            if !token.is_empty()
+                && token != "."
+                && token != ".."
+                && token.chars().count() <= 120
+                && !token
+                    .chars()
+                    .any(|c| c == '/' || c == '\\' || ('\x00'..='\x1f').contains(&c))
+            {
+                result.push(json!({
+                    "name": token,
+                    "source": "watermark",
+                    "confirmed": false,
+                    "key": key,
+                    "detail": format!("账号尚未确认：{}", mark["text"].as_str().unwrap_or("")),
+                }));
+            }
+        }
+    }
+    result
+}
+
+pub fn can_skip_face(candidates: &[Value], legacy_names: &[String]) -> bool {
+    let confirmed: BTreeSet<&str> = candidates
+        .iter()
+        .filter(|c| c["source"].as_str() == Some("watermark") && c["confirmed"] == true)
+        .filter_map(|c| c["name"].as_str())
+        .collect();
+    let mut others: BTreeSet<&str> = candidates
+        .iter()
+        .filter_map(|c| c["name"].as_str())
+        .collect();
+    for name in legacy_names {
+        others.insert(name.as_str());
+    }
+    confirmed.len() == 1 && others.is_subset(&confirmed)
+}
+
+pub fn resolve_candidates(candidates: &[Value]) -> Value {
+    struct Entry {
+        name: String,
+        sources: Vec<String>,
+        evidence: Vec<Value>,
+        score: Option<f64>,
+    }
+    let mut grouped: Vec<Entry> = Vec::new();
+    for candidate in candidates {
+        let Some(name) = candidate["name"].as_str() else {
+            continue;
+        };
+        let source = candidate["source"].as_str().unwrap_or("");
+        let pos = if let Some(idx) = grouped.iter().position(|e| e.name == name) {
+            idx
+        } else {
+            grouped.push(Entry {
+                name: name.to_owned(),
+                sources: Vec::new(),
+                evidence: Vec::new(),
+                score: None,
+            });
+            grouped.len() - 1
+        };
+        let entry = &mut grouped[pos];
+        if !entry.sources.iter().any(|s| s == source) {
+            entry.sources.push(source.to_owned());
+        }
+        entry.evidence.push(candidate.clone());
+        if let Some(score) = candidate.get("score").and_then(Value::as_f64) {
+            let current = entry.score.filter(|v| *v != 0.0).unwrap_or(0.0);
+            entry.score = Some(current.max(score));
+        }
+    }
+    grouped.sort_by(|a, b| {
+        let a_wm = a.sources.iter().any(|s| s == "watermark");
+        let b_wm = b.sources.iter().any(|s| s == "watermark");
+        (!a_wm)
+            .cmp(&(!b_wm))
+            .then_with(|| (-(a.score.unwrap_or(0.0))).total_cmp(&(-(b.score.unwrap_or(0.0)))))
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    let values: Vec<Value> = grouped
+        .iter()
+        .map(|e| {
+            json!({
+                "name": e.name,
+                "sources": e.sources,
+                "evidence": e.evidence,
+                "score": e.score,
+            })
+        })
+        .collect();
+    let kind = if values.is_empty() {
+        "none"
+    } else if values.len() > 1 {
+        "conflict"
+    } else {
+        "suggested"
+    };
+    let suggested = if values.len() == 1 {
+        json!(values[0]["name"])
+    } else {
+        Value::Null
+    };
+    json!({
+        "candidates": values,
+        "kind": kind,
+        "suggested": suggested,
+    })
+}
+
+fn resolve_stage_data(
+    config: &Config,
+    stage: &str,
+    vid: &str,
+    path: &str,
+    data: &mut Value,
+) -> Result<(String, bool)> {
+    let aliases = review::read(config, "person-renames.json", json!({}))?.1;
+    if stage == "text" {
+        let people = load_catalog(config, &aliases)?;
+        let folder = folder_hints(path, &people);
+        let mappings = review::read(config, "watermarks/mappings.json", json!({}))?.1;
+        let text_candidates =
+            candidates_from_text(&data["watermark"], &mappings, &folder, &aliases);
+        let legacy = load_legacy_names(config, vid, &aliases)?;
+        let skip = can_skip_face(&text_candidates, &legacy);
+        let resolved = resolve_candidates(&text_candidates);
+        let next = if skip { "review" } else { "face_queued" };
+        data["folder"] = json!(folder);
+        data["text_candidates"] = json!(text_candidates);
+        data["text_complete"] = json!(true);
+        data["face_skipped"] = json!(skip);
+        data["ready"] = json!(skip);
+        data["kind"] = resolved["kind"].clone();
+        data["candidates"] = resolved["candidates"].clone();
+        data["suggested"] = resolved["suggested"].clone();
+        Ok((next.to_owned(), skip))
+    } else {
+        if let Some(matches) = data["face"]["matches"].as_array_mut() {
+            for m in matches {
+                if let Some(name) = m["name"].as_str() {
+                    m["name"] = json!(canonical_person(name, &aliases));
+                }
+            }
+        }
+        let mut combined = data["text_candidates"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default();
+        if let Some(matches) = data["face"]["matches"].as_array() {
+            combined.extend(matches.iter().cloned());
+        }
+        let resolved = resolve_candidates(&combined);
+        data["face_complete"] = json!(true);
+        data["ready"] = json!(true);
+        data["kind"] = resolved["kind"].clone();
+        data["candidates"] = resolved["candidates"].clone();
+        data["suggested"] = resolved["suggested"].clone();
+        Ok(("review".to_owned(), false))
+    }
+}
+
+pub fn evaluate_rules(body: &Value) -> Result<Value> {
+    match body["op"].as_str() {
+        Some("folder_hints") => {
+            let file = body["file"].as_str().unwrap_or("");
+            let people: Vec<String> = body["people"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect();
+            Ok(json!(folder_hints(file, &people)))
+        }
+        Some("candidates_from_text") => {
+            let folder: Vec<Value> = body["folder"].as_array().cloned().unwrap_or_default();
+            let aliases = if body["aliases"].is_object() {
+                body["aliases"].clone()
+            } else {
+                json!({})
+            };
+            Ok(json!(candidates_from_text(
+                &body["watermark"],
+                &body["mappings"],
+                &folder,
+                &aliases,
+            )))
+        }
+        Some("can_skip_face") => {
+            let candidates: Vec<Value> = body["candidates"].as_array().cloned().unwrap_or_default();
+            let legacy: Vec<String> = body["legacy_names"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str().map(str::to_owned))
+                .collect();
+            Ok(json!(can_skip_face(&candidates, &legacy)))
+        }
+        Some("resolve_candidates") => {
+            let candidates: Vec<Value> = body["candidates"].as_array().cloned().unwrap_or_default();
+            Ok(resolve_candidates(&candidates))
+        }
+        Some("stage") => {
+            let base = Path::new(
+                body["base"]
+                    .as_str()
+                    .ok_or_else(|| invalid("缺少 base 路径"))?,
+            )
+            .to_path_buf();
+            let config = Config {
+                bind: "127.0.0.1:0".into(),
+                base: base.clone(),
+                media: base.clone(),
+                ledger: base.join("ledger.db"),
+                token: None,
+                fixture: None,
+                parity_root: None,
+            };
+            let task = &body["task"];
+            let stage = task["stage"].as_str().unwrap_or("text");
+            let old = task["data"]
+                .as_str()
+                .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                .or_else(|| task["data"].as_object().map(|m| Value::Object(m.clone())))
+                .unwrap_or_else(|| json!({}));
+            let mut data = old.clone();
+            if stage == "text" {
+                if let Some(obj) = data.as_object_mut() {
+                    obj.remove("face");
+                    obj.remove("face_complete");
+                }
+                data["watermark"] = body["data"]["watermark"].clone();
+            } else {
+                data["face"] = body["data"]["face"].clone();
+            }
+            let (next_stage, _) = resolve_stage_data(
+                &config,
+                stage,
+                task["vid"].as_str().unwrap_or(""),
+                task["path"].as_str().unwrap_or(""),
+                &mut data,
+            )?;
+            Ok(json!({
+                "data": data,
+                "next_stage": next_stage,
+            }))
+        }
+        _ => Err(invalid("未知规则计算操作")),
+    }
+}
+
 pub fn validate(r: &Request) -> Result<()> {
     model::validate_id(&r.id)?;
     if !r.files.is_empty()
@@ -89,7 +476,9 @@ pub fn validate(r: &Request) -> Result<()> {
     if s.operation_id != r.id
         || s.task.run_id != r.id
         || !matches!(s.task.stage.as_str(), "text" | "face")
-        || !matches!(s.next_stage.as_str(), "review" | "face_queued")
+        || s.next_stage
+            .as_deref()
+            .is_some_and(|n| !matches!(n, "review" | "face_queued"))
         || s.scope["vids"] != json!([s.task.vid])
         || s.version.is_empty()
         || !s.task.lease_expires_at.is_finite()
@@ -101,7 +490,7 @@ pub fn validate(r: &Request) -> Result<()> {
         return Err(invalid("文字分析必须绑定完整账号规则快照"));
     }
     if s.task.stage == "face"
-        && (s.next_stage != "review"
+        && (s.next_stage.as_deref().is_some_and(|n| n != "review")
             || s.reference_input_version
                 .as_deref()
                 .is_none_or(str::is_empty))
@@ -126,21 +515,27 @@ pub fn validate(r: &Request) -> Result<()> {
         "suggested",
     ];
     if data.keys().any(|k| !KEYS.contains(&k.as_str()))
-        || s.data["text_complete"] != true
-        || s.data["ready"] != json!(s.next_stage == "review")
-        || !s.data["face_skipped"].is_boolean()
-        || !s.data["candidates"].is_array()
-        || !matches!(
-            s.data["kind"].as_str(),
-            Some("none" | "suggested" | "conflict")
-        )
+        || (s.task.stage == "text" && !s.data["watermark"].is_object())
+        || (data.contains_key("text_complete") && s.data["text_complete"] != true)
+        || (data.contains_key("ready")
+            && (!s.data["ready"].is_boolean()
+                || s.next_stage
+                    .as_deref()
+                    .is_some_and(|n| s.data["ready"] != json!(n == "review"))))
+        || (data.contains_key("face_skipped") && !s.data["face_skipped"].is_boolean())
+        || (data.contains_key("candidates") && !s.data["candidates"].is_array())
+        || (data.contains_key("kind")
+            && !matches!(
+                s.data["kind"].as_str(),
+                Some("none" | "suggested" | "conflict")
+            ))
     {
         return Err(invalid("结果包含非分析字段或不一致的就绪状态"));
     }
     if s.task.stage == "face"
-        && (s.data["face_complete"] != true
-            || !s.data["face"].is_object()
-            || s.data["face_skipped"] != false)
+        && (!s.data["face"].is_object()
+            || (data.contains_key("face_complete") && s.data["face_complete"] != true)
+            || (data.contains_key("face_skipped") && s.data["face_skipped"] != false))
     {
         return Err(invalid("人脸阶段结果不完整"));
     }
@@ -492,16 +887,16 @@ fn prepare_data(
     conn: &rusqlite::Connection,
     s: &Submission,
     task: &Value,
-) -> Result<(Value, Option<Value>)> {
+) -> Result<(Value, Option<Value>, String)> {
     let old = review::task_data(task)?;
     let mut data = s.data.clone();
     if s.task.stage == "text" {
         data.as_object_mut().unwrap().remove("face");
         data.as_object_mut().unwrap().remove("face_complete");
-        if data["face_skipped"] != data["ready"] {
-            return Err(invalid("文字阶段完成标记不一致"));
-        }
     } else {
+        if old["text_complete"] != true || !old["watermark"].is_object() {
+            return Err(stale("人脸结果不能覆盖文字阶段证据"));
+        }
         for field in [
             "watermark",
             "folder",
@@ -509,9 +904,10 @@ fn prepare_data(
             "text_complete",
             "face_skipped",
         ] {
-            if data[field] != old[field] {
+            if s.data.get(field).is_some_and(|v| v != &old[field]) {
                 return Err(stale("人脸结果不能覆盖文字阶段证据"));
             }
+            data[field] = old[field].clone();
         }
         required(&data["face"], "version")?;
         required(&data["face"], "reference_version")?;
@@ -597,6 +993,20 @@ fn prepare_data(
                 return Err(invalid("文字证据附件无效"));
             }
         }
+    }
+    let (next_stage, skip) =
+        resolve_stage_data(config, &s.task.stage, &s.task.vid, &s.task.path, &mut data)?;
+    if s.task.stage == "text" {
+        if s.data
+            .get("face_skipped")
+            .is_some_and(|v| v != &json!(skip))
+            || s.data.get("ready").is_some_and(|v| v != &json!(skip))
+            || s.next_stage.as_deref().is_some_and(|n| n != next_stage)
+        {
+            return Err(invalid("文字阶段完成标记不一致"));
+        }
+    } else {
+        data["face_skipped"] = json!(false);
     }
     let input = data["face"]["unknown_group_input"].clone();
     if let Some(face) = data.get_mut("face").and_then(Value::as_object_mut) {
@@ -722,7 +1132,7 @@ fn prepare_data(
         data["face"]["source_identity"] =
             files::identity(&review::safe_source(config, &s.task.path)?);
     }
-    Ok((data, group))
+    Ok((data, group, next_stage))
 }
 fn document(config: &Config) -> Result<Value> {
     Ok(review::read(config, "watermarks/results.json", json!({}))?.1)
@@ -848,7 +1258,7 @@ pub fn apply(engine: &mut Engine, plan: &Plan, gate: WriteGate) -> Result<Value>
     };
     let prepared = (|| -> Result<Evidence> {
         let task = current(&tx, &engine.config, &s)?;
-        let (data, group) = prepare_data(&engine.config, &tx, &s, &task)?;
+        let (data, group, next_stage) = prepare_data(&engine.config, &tx, &s, &task)?;
         let before = document(&engine.config)?.get(&s.task.vid).cloned();
         let after = if s.task.stage == "text" {
             Some(data["watermark"].clone())
@@ -861,7 +1271,7 @@ pub fn apply(engine: &mut Engine, plan: &Plan, gate: WriteGate) -> Result<Value>
             before,
             after,
             group,
-            result: json!({"ok":true,"accepted":true,"id":plan.id,"vid":s.task.vid,"run_id":s.task.run_id,"stage":s.task.stage,"next_stage":s.next_stage,"task":s.task,"source_identity":files::identity(&review::safe_source(&engine.config,&s.task.path)?),"data":data}),
+            result: json!({"ok":true,"accepted":true,"id":plan.id,"vid":s.task.vid,"run_id":s.task.run_id,"stage":s.task.stage,"next_stage":next_stage,"task":s.task,"source_identity":files::identity(&review::safe_source(&engine.config,&s.task.path)?),"data":data}),
         })
     })();
     let e = match prepared {
@@ -895,6 +1305,7 @@ pub fn apply(engine: &mut Engine, plan: &Plan, gate: WriteGate) -> Result<Value>
         // Check actual file again at the database commit boundary, with the lease transaction held.
         current(&tx, &engine.config, &s)?;
         let data = &e.result["data"];
+        let next_stage = required(&e.result, "next_stage")?;
         if let Some(path) = data["face"]["feature_cache"].as_str()
             && data["face"]["feature_cache_sha256"] != artifact_hash(Path::new(path))?
         {
@@ -913,7 +1324,7 @@ pub fn apply(engine: &mut Engine, plan: &Plan, gate: WriteGate) -> Result<Value>
         };
         tx.execute(
             "UPDATE tasks SET data=?,stage=?,error=NULL,next_retry=0,updated_at=? WHERE vid=?",
-            params![serde_json::to_string(data)?, s.next_stage, now, s.task.vid],
+            params![serde_json::to_string(data)?, next_stage, now, s.task.vid],
         )?;
         if tx.execute("UPDATE processing_runs SET status='done',error=NULL,finished_at=?,execution=? WHERE id=? AND status='running'",params![now,serde_json::to_string(&execution)?,s.task.run_id])?!=1{return Err(stale("执行回执已结束"))}
         let text = data["text_complete"] == true;
@@ -953,4 +1364,59 @@ pub fn apply(engine: &mut Engine, plan: &Plan, gate: WriteGate) -> Result<Value>
         Ok(())
     })();
     resolve(engine, plan, &e, gate, attempted.err())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn folder_hints_and_unconfirmed_handle_cannot_skip_faces() {
+        let hints = folder_hints("/media/Alice/movie.mp4", &["Alice".into()]);
+        assert_eq!(hints[0]["name"], "Alice");
+        assert!(!can_skip_face(&hints, &[]));
+        let mark = json!({
+            "candidates": [{
+                "key": "a",
+                "text": "@Alice",
+                "token": "@Alice",
+                "platform": "unknown",
+                "kind": "account"
+            }]
+        });
+        let proposed = candidates_from_text(&mark, &json!({}), &hints, &json!({}));
+        assert!(!can_skip_face(&proposed, &[]));
+        let confirmed = candidates_from_text(
+            &mark,
+            &json!({"a": {"kind": "person", "creator": "Alice"}}),
+            &hints,
+            &json!({}),
+        );
+        assert!(can_skip_face(&confirmed, &[]));
+        assert!(!can_skip_face(&confirmed, &["Bob".into()]));
+        let mut with_bob = confirmed.clone();
+        with_bob.push(json!({"name": "Bob", "source": "folder"}));
+        assert!(!can_skip_face(&with_bob, &[]));
+        assert_eq!(
+            candidates_from_text(&mark, &json!({"a": {"kind": "source"}}), &[], &json!({})),
+            Vec::<Value>::new()
+        );
+    }
+
+    #[test]
+    fn multiple_candidates_resolve_as_conflict_and_rank_watermark_first() {
+        let resolved = resolve_candidates(&[
+            json!({"name": "Bob", "source": "folder"}),
+            json!({"name": "Alice", "source": "watermark"}),
+            json!({"name": "Alice", "source": "face", "score": 0.6}),
+        ]);
+        assert_eq!(resolved["kind"], "conflict");
+        assert!(resolved["suggested"].is_null());
+        let candidates = resolved["candidates"].as_array().unwrap();
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(candidates[0]["name"], "Alice");
+        assert_eq!(candidates[0]["score"], 0.6);
+        assert_eq!(candidates[1]["name"], "Bob");
+        assert_eq!(resolve_candidates(&[])["kind"], "none");
+    }
 }

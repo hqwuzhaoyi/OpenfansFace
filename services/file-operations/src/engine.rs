@@ -257,6 +257,7 @@ impl Engine {
         let executed = self.execute(&plan, &domain);
         match executed {
             Ok(result) => {
+                crate::archive_cancel::release_scanner_lease(&self.config, &plan.id, "committed");
                 gate.release()?;
                 crate::fault::checkpoint(&self.config, "complete")?;
                 Ok(result)
@@ -265,10 +266,20 @@ impl Engine {
                 // A failed call is not a failed transaction. Inspect all domains before deciding.
                 match self.reconcile(&plan, &domain, true, &error) {
                     Ok(Some(result)) => {
+                        crate::archive_cancel::release_scanner_lease(
+                            &self.config,
+                            &plan.id,
+                            "committed",
+                        );
                         gate.release()?;
                         Ok(result)
                     }
                     Ok(None) => {
+                        crate::archive_cancel::release_scanner_lease(
+                            &self.config,
+                            &plan.id,
+                            "rolled_back",
+                        );
                         gate.release()?;
                         Err(error)
                     }
@@ -281,6 +292,7 @@ impl Engine {
         }
     }
     fn recovery_failure(&mut self, plan: &Plan, error: &Error) -> Result<()> {
+        crate::archive_cancel::release_scanner_lease(&self.config, &plan.id, "recovery_needed");
         if error.code == "recovery_required" && error.mutation_outcome.is_some() {
             return self.store.fail(&plan.id, error, true);
         }
@@ -331,6 +343,9 @@ impl Engine {
         crate::store::status(&self.config.state_db(), &request.id)
     }
     fn recover_startup(&mut self) -> Result<()> {
+        let active_ids: std::collections::BTreeSet<String> =
+            self.store.recovery_ids()?.into_iter().collect();
+        crate::archive_cancel::recover_scanner_leases(&self.config, &active_ids);
         for id in self.store.recovery_ids()? {
             self.recover_one(&id);
         }
@@ -458,6 +473,18 @@ impl Engine {
         self.require_resolved_mutation(&plan.id, Some(cause))?;
         let (domain, selected) = self.commit_scope(plan, accepted)?;
         let snapshot = &domain.metadata;
+        let has_retained_step = self
+            .store
+            .latest_step(&plan.id, "archive_external_indexes_retained")?
+            .is_some();
+        let has_ledger_reserved = self
+            .store
+            .latest_step(&plan.id, "ledger_reserved")?
+            .is_some();
+        let allow_unreserved = !has_ledger_reserved
+            && self
+                .verify_published_archive_destinations(plan, &selected)
+                .is_ok();
         let mut retained_indexes = vec![];
         let ledger_state = match self.ledger_state(plan, &domain) {
             Ok(state) => state,
@@ -469,6 +496,7 @@ impl Engine {
                         .ledger
                         .as_ref()
                         .ok_or_else(|| Error::conflict("缺少归档账本取消依据"))?,
+                    allow_unreserved,
                 )
                 .map_err(|_| error)?;
                 "prepared".into()
@@ -490,6 +518,7 @@ impl Engine {
                         .ledger
                         .as_ref()
                         .ok_or_else(|| Error::conflict("缺少归档账本取消依据"))?,
+                    allow_unreserved,
                 )?;
             }
             if saved["rows"] != json!(retained_indexes) {
@@ -525,7 +554,7 @@ impl Engine {
             None
         };
         let cause = persisted_cause.as_ref().unwrap_or(cause);
-        let rollback = rollback || failed_rollback || !retained_indexes.is_empty();
+        let rollback = rollback || failed_rollback || has_retained_step;
         let external_cause = Error::new(
             409,
             "archive_external_index_retained",
@@ -598,6 +627,7 @@ impl Engine {
                     plan,
                     domain.ledger.as_ref().unwrap(),
                     &retained_indexes,
+                    allow_unreserved,
                 )?;
             }
             crate::fault::checkpoint(&self.config, "compensation_ledger_fenced")?;
@@ -630,6 +660,7 @@ impl Engine {
                         &self.config,
                         plan,
                         domain.ledger.as_ref().unwrap(),
+                        allow_unreserved,
                     )? != retained_indexes
                 {
                     return Err(Error::conflict("归档回退期间外部索引已变化"));
@@ -670,15 +701,41 @@ impl Engine {
                     &self.config,
                     plan,
                     domain.ledger.as_ref().unwrap(),
+                    allow_unreserved,
                 )? != retained_indexes
             {
                 return Err(Error::conflict("归档回退期间外部索引已变化"));
             }
             self.store.rolled_back(&plan.id, cause)?;
+            crate::archive_cancel::release_scanner_lease(&self.config, &plan.id, "rolled_back");
             Ok(None)
         } else {
-            self.execute(plan, &domain).map(Some)
+            let result = self.execute(plan, &domain)?;
+            crate::archive_cancel::release_scanner_lease(&self.config, &plan.id, "committed");
+            Ok(Some(result))
         }
+    }
+    fn verify_published_archive_destinations(
+        &self,
+        plan: &Plan,
+        successful: &[usize],
+    ) -> Result<()> {
+        if plan.action != "archive" || successful.is_empty() {
+            return Err(Error::conflict("缺少已发布的归档目标文件依据"));
+        }
+        for &index in successful {
+            let file = plan
+                .files
+                .get(index)
+                .ok_or_else(|| Error::conflict("归档文件索引越界"))?;
+            let pinned = self.pin(plan, index)?;
+            if pinned.position(&file.version)? != (false, true) {
+                return Err(Error::conflict("归档目标文件位置与已发布记录不一致").at(&file.dst));
+            }
+            let evidence = self.store.file_evidence(&plan.id, index)?;
+            files::inspect_committed_destination(file, &evidence)?;
+        }
+        Ok(())
     }
     fn pin(&self, plan: &Plan, index: usize) -> Result<PinnedMove> {
         if let Some(execution) = &plan.execution {
@@ -706,6 +763,277 @@ impl Engine {
             json!({"file_index":index,"src":file.src,"dst":file.dst,"move_evidence":evidence}),
         )?;
         crate::fault::checkpoint(&self.config, &format!("{phase}:{index}"))
+    }
+    fn execute_files_concurrent(&mut self, plan: &Plan, failures: &mut Vec<Value>) -> Result<()> {
+        enum Msg {
+            Checkpoint {
+                phase: String,
+                evidence: Value,
+                ack: std::sync::mpsc::SyncSender<Result<()>>,
+            },
+            FileCheckpoint {
+                index: usize,
+                phase: String,
+                evidence: files::MoveEvidence,
+                ack: std::sync::mpsc::SyncSender<Result<()>>,
+            },
+            PreEffectFailure {
+                failure: Value,
+                ack: std::sync::mpsc::SyncSender<Result<()>>,
+            },
+            Done(Result<()>),
+        }
+        let id = &plan.id;
+        let mut pending = Vec::new();
+        for (index, file) in plan.files.iter().enumerate() {
+            if failures.iter().any(|f| f["file_index"] == index) {
+                continue;
+            }
+            let started = self
+                .store
+                .latest_file_step(id, index)?
+                .unwrap_or(Value::Null);
+            let initial_evidence = self.store.file_evidence(id, index)?;
+            let is_complete_step = self
+                .store
+                .db
+                .query_row(
+                    "SELECT phase FROM steps WHERE operation_id=?1 AND json_extract(evidence,'$.file_index')=?2 ORDER BY revision DESC LIMIT 1",
+                    rusqlite::params![id, index as i64],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?
+                .as_deref()
+                == Some("source_removed");
+            if is_complete_step
+                && let Some(execution) = &plan.execution
+                && let Ok(pinned) = files::recover_move(
+                    &self.config,
+                    &execution.scopes[index],
+                    file,
+                    initial_evidence.clone(),
+                )
+                && pinned.position(&file.version).ok() == Some((false, true))
+                && crate::archive::verify_duplicate(&self.config, plan, index, false).is_ok()
+            {
+                continue;
+            }
+            pending.push((index, started, initial_evidence));
+        }
+        if pending.is_empty() {
+            return Ok(());
+        }
+        let owned_rt = if tokio::runtime::Handle::try_current().is_err() {
+            Some(
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(4)
+                    .enable_all()
+                    .build()
+                    .map_err(|e| {
+                        Error::new(
+                            503,
+                            "internal_error",
+                            format!("Tokio 运行时初始化失败：{e}"),
+                        )
+                    })?,
+            )
+        } else {
+            None
+        };
+        let handle = match &owned_rt {
+            Some(rt) => rt.handle().clone(),
+            None => tokio::runtime::Handle::current(),
+        };
+        let semaphore = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
+        let (tx, rx) = std::sync::mpsc::channel::<Msg>();
+        let plan_arc = std::sync::Arc::new(plan.clone());
+        let aborted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        for (index, started, initial_evidence) in pending {
+            let sem = semaphore.clone();
+            let tx = tx.clone();
+            let config = self.config.clone();
+            let plan = plan_arc.clone();
+            let aborted = aborted.clone();
+            handle.spawn(async move {
+                let _permit = sem.acquire_owned().await.ok();
+                if aborted.load(std::sync::atomic::Ordering::Relaxed) {
+                    let _ = tx.send(Msg::Done(Ok(())));
+                    return;
+                }
+                let tx_inner = tx.clone();
+                let res = tokio::task::spawn_blocking(move || -> Result<()> {
+                    let send_checkpoint = |phase: &str, evidence: Value| -> Result<()> {
+                        let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
+                        tx_inner
+                            .send(Msg::Checkpoint {
+                                phase: phase.to_owned(),
+                                evidence,
+                                ack: ack_tx,
+                            })
+                            .map_err(|_| Error::new(503, "internal_error", "检查点通道已关闭"))?;
+                        ack_rx
+                            .recv()
+                            .map_err(|_| Error::new(503, "internal_error", "检查点回执丢失"))?
+                    };
+                    let send_file_checkpoint =
+                        |phase: &str, evidence: &files::MoveEvidence| -> Result<()> {
+                            let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
+                            tx_inner
+                                .send(Msg::FileCheckpoint {
+                                    index,
+                                    phase: phase.to_owned(),
+                                    evidence: evidence.clone(),
+                                    ack: ack_tx,
+                                })
+                                .map_err(|_| {
+                                    Error::new(503, "internal_error", "文件检查点通道已关闭")
+                                })?;
+                            ack_rx
+                                .recv()
+                                .map_err(|_| Error::new(503, "internal_error", "文件检查点回执丢失"))?
+                        };
+                    let file = &plan.files[index];
+                    let execution = plan
+                        .execution
+                        .as_ref()
+                        .ok_or_else(|| Error::conflict("缺少并发执行范围"))?;
+                    let pinned = if started.is_null() {
+                        if plan.action == "archive"
+                            && execution.data["rows"][index]["operation"] == "stage-duplicate"
+                        {
+                            send_checkpoint(
+                                "duplicate_verification_intent",
+                                json!({"index":index,"src":file.src}),
+                            )?;
+                        }
+                        crate::archive::verify_duplicate(&config, &plan, index, true)
+                            .and_then(|_| {
+                                files::prepare_move(&config, &execution.scopes[index], file)
+                            })
+                            .and_then(|_| {
+                                files::recover_move(
+                                    &config,
+                                    &execution.scopes[index],
+                                    file,
+                                    initial_evidence.clone(),
+                                )
+                            })
+                    } else {
+                        files::recover_move(
+                            &config,
+                            &execution.scopes[index],
+                            file,
+                            initial_evidence.clone(),
+                        )
+                    };
+                    let mut pinned = match pinned {
+                        Ok(p) => p,
+                        Err(error) => {
+                            if started.is_null() {
+                                let failure = json!({"file_index":index,"src":file.src,"dst":file.dst,"error":error,"unchanged":true});
+                                let (ack_tx, ack_rx) = std::sync::mpsc::sync_channel(1);
+                                tx_inner
+                                    .send(Msg::PreEffectFailure {
+                                        failure,
+                                        ack: ack_tx,
+                                    })
+                                    .map_err(|_| {
+                                        Error::new(503, "internal_error", "失败记录通道已关闭")
+                                    })?;
+                                ack_rx
+                                    .recv()
+                                    .map_err(|_| {
+                                        Error::new(503, "internal_error", "失败记录回执丢失")
+                                    })??;
+                                if execution.failure_policy == FailurePolicy::ContinueUnchanged {
+                                    return Ok(());
+                                }
+                            }
+                            return Err(error);
+                        }
+                    };
+                    send_file_checkpoint("destination_publish_intent", &pinned.evidence)?;
+                    if !pinned.position(&file.version)?.1 {
+                        pinned.publish_recoverable(
+                            &config,
+                            &file.version,
+                            &mut |phase, proof| send_file_checkpoint(phase, proof),
+                        )?;
+                    }
+                    send_file_checkpoint("destination_published", &pinned.evidence)?;
+                    crate::archive::verify_duplicate(&config, &plan, index, false)?;
+                    send_file_checkpoint("source_remove_intent", &pinned.evidence)?;
+                    if pinned.position(&file.version)?.0 {
+                        pinned.remove_source_recorded(&file.version, &mut |phase, proof| {
+                            send_file_checkpoint(phase, proof)
+                        })?;
+                    }
+                    send_file_checkpoint("source_removed", &pinned.evidence)?;
+                    Ok(())
+                })
+                .await
+                .unwrap_or_else(|_| Err(Error::new(503, "internal_error", "并发文件任务中断")));
+                let _ = tx.send(Msg::Done(res));
+            });
+        }
+        drop(tx);
+        let mut first_err: Option<Error> = None;
+        while let Ok(msg) = rx.recv() {
+            match msg {
+                Msg::Checkpoint {
+                    phase,
+                    evidence,
+                    ack,
+                } => {
+                    let res = self.checkpoint(&plan.id, &phase, evidence);
+                    if let Err(ref e) = res
+                        && first_err.is_none()
+                    {
+                        aborted.store(true, std::sync::atomic::Ordering::Relaxed);
+                        first_err = Some(e.clone());
+                    }
+                    let _ = ack.send(res);
+                }
+                Msg::FileCheckpoint {
+                    index,
+                    phase,
+                    evidence,
+                    ack,
+                } => {
+                    let res = self.file_checkpoint(plan, index, &phase, &evidence);
+                    if let Err(ref e) = res
+                        && first_err.is_none()
+                    {
+                        aborted.store(true, std::sync::atomic::Ordering::Relaxed);
+                        first_err = Some(e.clone());
+                    }
+                    let _ = ack.send(res);
+                }
+                Msg::PreEffectFailure { failure, ack } => {
+                    let res = self.checkpoint(&plan.id, "file_failed", failure.clone());
+                    if res.is_ok() {
+                        failures.push(failure);
+                    } else if let Err(ref e) = res
+                        && first_err.is_none()
+                    {
+                        aborted.store(true, std::sync::atomic::Ordering::Relaxed);
+                        first_err = Some(e.clone());
+                    }
+                    let _ = ack.send(res);
+                }
+                Msg::Done(Err(e)) => {
+                    if first_err.is_none() {
+                        aborted.store(true, std::sync::atomic::Ordering::Relaxed);
+                        first_err = Some(e);
+                    }
+                }
+                Msg::Done(Ok(())) => {}
+            }
+        }
+        if let Some(err) = first_err {
+            return Err(err);
+        }
+        Ok(())
     }
     fn commit_scope(
         &self,
@@ -800,6 +1128,9 @@ impl Engine {
     fn execute(&mut self, plan: &Plan, accepted: &DomainSnapshot) -> Result<Value> {
         let id = &plan.id;
         self.require_resolved_mutation(id, None)?;
+        if plan.action == "archive" {
+            let _ = crate::archive_cancel::acquire_scanner_lease(&self.config, plan)?;
+        }
         if plan.execution.is_none() {
             self.checkpoint(
                 id,
@@ -823,92 +1154,119 @@ impl Engine {
                     })?;
                 }
                 let mut failures = self.store.failures(id)?;
-                for (index, file) in plan.files.iter().enumerate() {
-                    if failures.iter().any(|f| f["file_index"] == index) {
-                        continue;
-                    }
-                    let started: Value = self
-                        .store
-                        .latest_file_step(id, index)?
-                        .unwrap_or(Value::Null);
-                    let pinned = if let Some(execution) = &plan.execution
-                        && started.is_null()
-                    {
-                        if plan.action == "archive"
-                            && execution.data["rows"][index]["operation"] == "stage-duplicate"
+                let use_tokio_concurrent = self.config.fixture.is_none()
+                    && plan.files.len() > 1
+                    && plan
+                        .execution
+                        .as_ref()
+                        .is_some_and(|e| e.failure_policy == FailurePolicy::ContinueUnchanged);
+                if use_tokio_concurrent {
+                    self.execute_files_concurrent(plan, &mut failures)?;
+                } else {
+                    for (index, file) in plan.files.iter().enumerate() {
+                        if failures.iter().any(|f| f["file_index"] == index) {
+                            continue;
+                        }
+                        let started: Value = self
+                            .store
+                            .latest_file_step(id, index)?
+                            .unwrap_or(Value::Null);
+                        let pinned = if let Some(execution) = &plan.execution
+                            && started.is_null()
                         {
-                            self.checkpoint(
-                                id,
-                                "duplicate_verification_intent",
-                                json!({"index":index,"src":file.src}),
-                            )?;
-                        }
-                        crate::archive::verify_duplicate(&self.config, plan, index, true)
-                            .and_then(|_| {
-                                files::prepare_move(&self.config, &execution.scopes[index], file)
-                            })
-                            .and_then(|_| self.pin(plan, index))
-                    } else {
-                        self.pin(plan, index)
-                    };
-                    let mut pinned = match pinned {
-                        Ok(p) => p,
-                        Err(error) => {
-                            if started.is_null()
-                                && let Some(execution) = &plan.execution
+                            if plan.action == "archive"
+                                && execution.data["rows"][index]["operation"] == "stage-duplicate"
                             {
-                                // prepare_move / pin are read-only, and no before-effect
-                                // file intent exists. This proves only this file untouched;
-                                // separately journaled directory effects still need cleanup.
-                                let failure = json!({"file_index":index,"src":file.src,"dst":file.dst,"error":error,"unchanged":true});
-                                self.checkpoint(id, "file_failed", failure.clone())?;
-                                failures.push(failure);
-                                if execution.failure_policy == FailurePolicy::ContinueUnchanged {
-                                    continue;
-                                }
+                                self.checkpoint(
+                                    id,
+                                    "duplicate_verification_intent",
+                                    json!({"index":index,"src":file.src}),
+                                )?;
                             }
-                            return Err(error);
-                        }
-                    };
-                    self.file_checkpoint(
-                        plan,
-                        index,
-                        "destination_publish_intent",
-                        &pinned.evidence,
-                    )?;
-                    if !pinned.position(&file.version)?.1 {
-                        if plan.execution.is_some() {
-                            let config = self.config.clone();
-                            pinned.publish_recoverable(
-                                &config,
-                                &file.version,
-                                &mut |phase, proof| self.file_checkpoint(plan, index, phase, proof),
-                            )?;
+                            crate::archive::verify_duplicate(&self.config, plan, index, true)
+                                .and_then(|_| {
+                                    files::prepare_move(
+                                        &self.config,
+                                        &execution.scopes[index],
+                                        file,
+                                    )
+                                })
+                                .and_then(|_| self.pin(plan, index))
                         } else {
-                            pinned.publish_recorded(&file.version, &mut |phase, proof| {
+                            self.pin(plan, index)
+                        };
+                        let mut pinned = match pinned {
+                            Ok(p) => p,
+                            Err(error) => {
+                                if started.is_null()
+                                    && let Some(execution) = &plan.execution
+                                {
+                                    // prepare_move / pin are read-only, and no before-effect
+                                    // file intent exists. This proves only this file untouched;
+                                    // separately journaled directory effects still need cleanup.
+                                    let failure = json!({"file_index":index,"src":file.src,"dst":file.dst,"error":error,"unchanged":true});
+                                    self.checkpoint(id, "file_failed", failure.clone())?;
+                                    failures.push(failure);
+                                    if execution.failure_policy == FailurePolicy::ContinueUnchanged
+                                    {
+                                        continue;
+                                    }
+                                }
+                                return Err(error);
+                            }
+                        };
+                        self.file_checkpoint(
+                            plan,
+                            index,
+                            "destination_publish_intent",
+                            &pinned.evidence,
+                        )?;
+                        if !pinned.position(&file.version)?.1 {
+                            if plan.execution.is_some() {
+                                let config = self.config.clone();
+                                pinned.publish_recoverable(
+                                    &config,
+                                    &file.version,
+                                    &mut |phase, proof| {
+                                        self.file_checkpoint(plan, index, phase, proof)
+                                    },
+                                )?;
+                            } else {
+                                pinned.publish_recorded(&file.version, &mut |phase, proof| {
+                                    self.file_checkpoint(plan, index, phase, proof)
+                                })?;
+                            }
+                        }
+                        crate::fault::checkpoint(&self.config, "destination_published_unrecorded")?;
+                        crate::fault::checkpoint(
+                            &self.config,
+                            &format!("destination_published_unrecorded:{index}"),
+                        )?;
+                        self.file_checkpoint(
+                            plan,
+                            index,
+                            "destination_published",
+                            &pinned.evidence,
+                        )?;
+                        crate::archive::verify_duplicate(&self.config, plan, index, false)?;
+                        self.file_checkpoint(
+                            plan,
+                            index,
+                            "source_remove_intent",
+                            &pinned.evidence,
+                        )?;
+                        if pinned.position(&file.version)?.0 {
+                            pinned.remove_source_recorded(&file.version, &mut |phase, proof| {
                                 self.file_checkpoint(plan, index, phase, proof)
                             })?;
                         }
+                        crate::fault::checkpoint(&self.config, "source_removed_unrecorded")?;
+                        crate::fault::checkpoint(
+                            &self.config,
+                            &format!("source_removed_unrecorded:{index}"),
+                        )?;
+                        self.file_checkpoint(plan, index, "source_removed", &pinned.evidence)?;
                     }
-                    crate::fault::checkpoint(&self.config, "destination_published_unrecorded")?;
-                    crate::fault::checkpoint(
-                        &self.config,
-                        &format!("destination_published_unrecorded:{index}"),
-                    )?;
-                    self.file_checkpoint(plan, index, "destination_published", &pinned.evidence)?;
-                    crate::archive::verify_duplicate(&self.config, plan, index, false)?;
-                    self.file_checkpoint(plan, index, "source_remove_intent", &pinned.evidence)?;
-                    if pinned.position(&file.version)?.0 {
-                        pinned.remove_source_recorded(&file.version, &mut |phase, proof| {
-                            self.file_checkpoint(plan, index, phase, proof)
-                        })?;
-                    }
-                    crate::fault::checkpoint(&self.config, "source_removed_unrecorded")?;
-                    crate::fault::checkpoint(
-                        &self.config,
-                        &format!("source_removed_unrecorded:{index}"),
-                    )?;
-                    self.file_checkpoint(plan, index, "source_removed", &pinned.evidence)?;
                 }
             }
             if plan.execution.is_some() {
@@ -952,13 +1310,34 @@ impl Engine {
             crate::archive::verify_duplicate(&self.config, plan, index, false)?;
         }
         if plan.execution.is_some() {
+            let has_ledger_reserved = self.store.latest_step(id, "ledger_reserved")?.is_some();
             self.checkpoint(
                 id,
                 "ledger_reserve_intent",
                 json!({"signature":plan.version,"successful_file_indexes":successful}),
             )?;
-            if self.ledger_state(plan, &domain)? == "absent" {
-                self.ledger_reserve(plan, &domain)?;
+            match self.ledger_state(plan, &domain) {
+                Ok(state) => {
+                    if state == "absent" {
+                        self.ledger_reserve(plan, &domain)?;
+                    }
+                }
+                Err(error) if plan.action == "archive" => {
+                    self.verify_published_archive_destinations(plan, &successful)
+                        .map_err(|_| error.clone())?;
+                    let delta = domain
+                        .ledger
+                        .as_ref()
+                        .ok_or_else(|| Error::conflict("缺少账本意图"))?;
+                    crate::archive_cancel::reserve_with_scanner_index(
+                        &self.config,
+                        plan,
+                        delta,
+                        !has_ledger_reserved,
+                    )
+                    .map_err(|_| error)?;
+                }
+                Err(error) => return Err(error),
             }
             self.checkpoint(id, "ledger_reserved", json!({"state":"prepared"}))?;
         }
@@ -1007,14 +1386,57 @@ impl Engine {
             "ledger_commit_intent",
             json!({"signature":plan.version}),
         )?;
-        let evidence = if self.ledger_state(plan, &domain)? == "committed" {
-            json!({"reconciled":true})
-        } else {
-            for &index in &successful {
-                crate::archive::verify_duplicate(&self.config, plan, index, false)?;
+        let mut reconciled_scanner_assets: Vec<i64> = vec![];
+        let evidence = match self.ledger_state(plan, &domain) {
+            Ok(state) if state == "committed" => {
+                if plan.action == "archive" {
+                    reconciled_scanner_assets =
+                        crate::archive_cancel::committed_reconciled_assets(&self.config, plan)?;
+                }
+                json!({"reconciled":true})
             }
-            self.ledger_apply(plan, &domain)?
+            Ok(_) => {
+                for &index in &successful {
+                    crate::archive::verify_duplicate(&self.config, plan, index, false)?;
+                }
+                match self.ledger_apply(plan, &domain) {
+                    Ok(applied) => applied,
+                    Err(error) if plan.action == "archive" => {
+                        let (applied, reconciled) = self
+                            .apply_archive_with_scanner_reconciliation(
+                                plan,
+                                &domain,
+                                &successful,
+                                error,
+                            )?;
+                        reconciled_scanner_assets = reconciled;
+                        applied
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error) if plan.action == "archive" => {
+                for &index in &successful {
+                    crate::archive::verify_duplicate(&self.config, plan, index, false)?;
+                }
+                let (applied, reconciled) = self.apply_archive_with_scanner_reconciliation(
+                    plan,
+                    &domain,
+                    &successful,
+                    error,
+                )?;
+                reconciled_scanner_assets = reconciled;
+                applied
+            }
+            Err(error) => return Err(error),
         };
+        if !reconciled_scanner_assets.is_empty() {
+            self.checkpoint(
+                id,
+                "archive_scanner_indexes_reconciled",
+                json!({"asset_ids":reconciled_scanner_assets}),
+            )?;
+        }
         crate::fault::checkpoint(&self.config, "ledger_committed_unrecorded")?;
         self.checkpoint(id, "ledger_committed", evidence)?;
         let mut directory_warning = None;
@@ -1064,13 +1486,40 @@ impl Engine {
         } else {
             model::final_result(plan)
         };
+        if !reconciled_scanner_assets.is_empty() {
+            result["reconciled_scanner_assets"] = json!(reconciled_scanner_assets);
+        }
         if let Some(warning) = directory_warning {
             result["warning"] = json!(warning);
         }
         self.checkpoint(id, "final_receipt_intent", json!({"result":result}))?;
         self.store.complete(plan, &result)?;
+        crate::archive_cancel::release_scanner_lease(&self.config, &plan.id, "committed");
         crate::fault::checkpoint(&self.config, "final_receipt_unreleased")?;
         Ok(result)
+    }
+
+    fn apply_archive_with_scanner_reconciliation(
+        &self,
+        plan: &Plan,
+        domain: &DomainSnapshot,
+        successful: &[usize],
+        error: Error,
+    ) -> Result<(Value, Vec<i64>)> {
+        self.verify_published_archive_destinations(plan, successful)
+            .map_err(|_| error.clone())?;
+        let delta = domain
+            .ledger
+            .as_ref()
+            .ok_or_else(|| Error::conflict("缺少账本意图"))?;
+        let applied =
+            crate::archive_cancel::apply_with_scanner_reconciliation(&self.config, plan, delta)
+                .map_err(|_| error)?;
+        let reconciled = applied["reconciled_scanner_assets"]
+            .as_array()
+            .map(|ids| ids.iter().filter_map(Value::as_i64).collect())
+            .unwrap_or_default();
+        Ok((applied, reconciled))
     }
 }
 fn validate(request: &Request) -> Result<()> {
@@ -1549,5 +1998,23 @@ mod shared_tests {
         let serialized = serde_json::to_value(plan).unwrap();
         assert!(serialized.get("execution").is_none());
         assert!(serialized["request"].get("target_person").is_none());
+    }
+    #[test]
+    fn tokio_concurrent_multi_file_execution_commits_and_isolates_unchanged_failures() {
+        let (mut config, mut plan, domain) = fixture(6);
+        config.fixture = None;
+        plan.execution.as_mut().unwrap().failure_policy = FailurePolicy::ContinueUnchanged;
+        plan.version = hash(&plan);
+        let (mut engine, gate) = admitted(&config, &plan, &domain);
+        let result = engine.execute(&plan, &domain).unwrap();
+        gate.release().unwrap();
+        assert_eq!(result["ok"], true);
+        for index in 0..6 {
+            assert!(!Path::new(&plan.files[index].src).exists());
+            assert!(Path::new(&plan.files[index].dst).exists());
+        }
+        let status = crate::store::status(&config.state_db(), &plan.id).unwrap();
+        assert_eq!(status["completed"], 6);
+        assert_eq!(status["status"], "complete");
     }
 }

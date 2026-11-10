@@ -51,7 +51,12 @@ impl Store {
           CREATE TABLE IF NOT EXISTS review_sessions(id TEXT PRIMARY KEY, expires INTEGER NOT NULL, snapshot TEXT NOT NULL);
           CREATE TABLE IF NOT EXISTS review_deliveries(token TEXT PRIMARY KEY, session TEXT NOT NULL, vid TEXT NOT NULL, evidence TEXT NOT NULL, FOREIGN KEY(session) REFERENCES review_sessions(id) ON DELETE CASCADE);
           CREATE INDEX IF NOT EXISTS review_delivery_session ON review_deliveries(session,vid);
+          CREATE INDEX IF NOT EXISTS idx_operations_status ON operations(status,created_at,id);
           PRAGMA user_version=9;")?;
+        let _ = conn.execute(
+            "DELETE FROM operations WHERE status='not_started' AND created_at < datetime('now','-2 hours') AND NOT EXISTS(SELECT 1 FROM steps WHERE operation_id=operations.id) AND NOT EXISTS(SELECT 1 FROM gates WHERE id=operations.id)",
+            [],
+        );
         let stat = identity(&ownership.metadata()?);
         let identity = serde_json::to_string(&json!({"dev":stat["dev"],"ino":stat["ino"]}))?;
         conn.execute("INSERT OR IGNORE INTO authority VALUES(1,?)", [&identity])?;
@@ -74,7 +79,7 @@ impl Store {
             "recovery_required",
             "执行器重启，未完成操作需要核对恢复",
         ))?;
-        conn.execute("UPDATE operations SET status='recovery_needed',error=?,revision=revision+1 WHERE status IN ('accepted','running')",[error])?;
+        conn.execute("UPDATE operations SET status='recovery_needed',error=?,revision=MAX(revision,COALESCE((SELECT MAX(s.revision) FROM steps s WHERE s.operation_id=operations.id),0))+1 WHERE status IN ('accepted','running')",[error])?;
         Ok(Self {
             db: conn,
             _ownership: ownership,
@@ -169,7 +174,7 @@ impl Store {
         Ok(())
     }
     pub fn rolled_back(&mut self, id: &str, cause: &Error) -> Result<()> {
-        self.db.execute("UPDATE operations SET status='rolled_back',phase='rolled_back',error=?,revision=revision+1,updated_at=CURRENT_TIMESTAMP WHERE id=?", params![serde_json::to_string(cause)?,id])?;
+        self.db.execute("UPDATE operations SET status='rolled_back',phase='rolled_back',error=?,revision=MAX(revision,COALESCE((SELECT MAX(s.revision) FROM steps s WHERE s.operation_id=operations.id),0))+1,updated_at=CURRENT_TIMESTAMP WHERE id=?", params![serde_json::to_string(cause)?,id])?;
         Ok(())
     }
     pub fn blocked(&self) -> Result<bool> {
@@ -188,8 +193,8 @@ impl Store {
     }
     pub fn step(&mut self, id: &str, status: &str, phase: &str, evidence: Value) -> Result<()> {
         let tx = self.db.transaction()?;
-        tx.execute("UPDATE operations SET status=?,phase=?,revision=revision+1,updated_at=CURRENT_TIMESTAMP WHERE id=?",params![status,phase,id])?;
-        tx.execute("INSERT INTO steps(operation_id,revision,phase,evidence) SELECT id,revision,?,? FROM operations WHERE id=?",params![phase,serde_json::to_string(&evidence)?,id])?;
+        tx.execute("UPDATE operations SET status=?1,phase=?2,updated_at=CURRENT_TIMESTAMP WHERE id=?3 AND status!=?1",params![status,phase,id])?;
+        tx.execute("INSERT INTO steps(operation_id,revision,phase,evidence) VALUES(?1,COALESCE((SELECT MAX(revision) FROM steps WHERE operation_id=?1),(SELECT revision FROM operations WHERE id=?1))+1,?2,?3)",params![id,phase,serde_json::to_string(&evidence)?])?;
         tx.commit()?;
         Ok(())
     }
@@ -200,11 +205,11 @@ impl Store {
         Ok(())
     }
     pub fn complete(&mut self, plan: &Plan, result: &Value) -> Result<()> {
-        self.db.execute("UPDATE operations SET status='complete',phase='complete',error=NULL,result=?,revision=revision+1,updated_at=CURRENT_TIMESTAMP WHERE id=?",params![serde_json::to_string(result)?,plan.id])?;
+        self.db.execute("UPDATE operations SET status='complete',phase='complete',error=NULL,result=?,revision=MAX(revision,COALESCE((SELECT MAX(s.revision) FROM steps s WHERE s.operation_id=operations.id),0))+1,updated_at=CURRENT_TIMESTAMP WHERE id=?",params![serde_json::to_string(result)?,plan.id])?;
         Ok(())
     }
     pub fn fail(&mut self, id: &str, error: &Error, recovery: bool) -> Result<()> {
-        self.db.execute("UPDATE operations SET status=?,error=?,revision=revision+1,updated_at=CURRENT_TIMESTAMP WHERE id=?",params![if recovery {"recovery_needed"}else{"failed"},serde_json::to_string(error)?,id])?;
+        self.db.execute("UPDATE operations SET status=?,error=?,revision=MAX(revision,COALESCE((SELECT MAX(s.revision) FROM steps s WHERE s.operation_id=operations.id),0))+1,updated_at=CURRENT_TIMESTAMP WHERE id=?",params![if recovery {"recovery_needed"}else{"failed"},serde_json::to_string(error)?,id])?;
         Ok(())
     }
 }
@@ -227,7 +232,7 @@ pub(crate) fn record(db: &Connection, id: &str) -> Result<Option<Record>> {
         Option<String>,
         Option<String>,
     );
-    let row:Option<StoredRecord>=db.query_row("SELECT plan,request_hash,status,phase,revision,result,error FROM operations WHERE id=?",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?))).optional()?;
+    let row:Option<StoredRecord>=db.query_row("SELECT o.plan,o.request_hash,o.status,COALESCE((SELECT s.phase FROM steps s WHERE s.operation_id=o.id AND s.revision>o.revision ORDER BY s.revision DESC LIMIT 1),o.phase),MAX(o.revision,COALESCE((SELECT MAX(s.revision) FROM steps s WHERE s.operation_id=o.id),0)),o.result,o.error FROM operations o WHERE o.id=?",[id],|r|Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?,r.get(4)?,r.get(5)?,r.get(6)?))).optional()?;
     row.map(
         |(plan, request_hash, status, phase, revision, result, error)| {
             Ok(Record {

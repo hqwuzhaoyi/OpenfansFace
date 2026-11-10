@@ -632,6 +632,38 @@ fn apply_delta_domain(
         return Err(Error::conflict("本地事务已有回执"));
     }
     crate::delta::apply(&tx, delta)?;
+    if jobs
+        && matches!(
+            plan.action.as_str(),
+            "review-note" | "review-defer" | "review-restore"
+        )
+    {
+        let has_events: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='events')",
+            [],
+            |r| r.get(0),
+        )?;
+        if has_events {
+            let now: f64 = tx.query_row("SELECT unixepoch('now','subsec')", [], |r| r.get(0))?;
+            let (kind, message) = match plan.action.as_str() {
+                "review-note" => ("note", "更新备注"),
+                "review-defer" => ("defer", "暂时跳过"),
+                _ => ("restore", "恢复核对"),
+            };
+            for table in &delta.tables {
+                if table.table == db::Table::Tasks {
+                    for row in &table.after {
+                        if let Some(vid) = row["vid"].as_str() {
+                            tx.execute(
+                                "INSERT INTO events(at,vid,kind,message) VALUES(?,?,?,?)",
+                                params![now, vid, kind, message],
+                            )?;
+                        }
+                    }
+                }
+            }
+        }
+    }
     let evidence = json!({"delta":delta});
     tx.execute(
         "INSERT INTO _face_admin_rust_commits VALUES(?,?,?)",

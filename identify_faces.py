@@ -42,7 +42,7 @@ def identity_of(p):
     return None, None
 
 t0 = time.time()
-db = sqlite3.connect(f'{BASE}/faces.db')
+db = sqlite3.connect(f'file:{BASE}/faces.db?mode=ro', uri=True)
 vids = {}
 for vid, path, name, size, dur, zone, coll in db.execute(
         "SELECT vid,path,name,size,duration,zone,collection FROM videos WHERE status='done'").fetchall():

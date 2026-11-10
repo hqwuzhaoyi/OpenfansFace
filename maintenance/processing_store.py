@@ -1,9 +1,40 @@
 """Durable task leases, fixed discovery cohorts, and model-stage run history."""
 import json
+import os
 import sqlite3
 import time
 import uuid
 from pathlib import Path
+
+from processing_publication import native
+
+
+def _rust_enabled() -> bool:
+    return bool(os.environ.get('FILE_OPERATIONS_RUST_URL', '').strip())
+
+
+class _RustStoreHandle:
+    """Lightweight handle used when Rust owns `processing.db` so Python opens no SQLite connection."""
+
+    def __init__(self, base):
+        self.base = Path(base)
+        self.in_transaction = False
+
+    def commit(self):
+        return None
+
+    def rollback(self):
+        return None
+
+    def close(self):
+        return None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
 
 SCHEMA = '''
 PRAGMA journal_mode=WAL;
@@ -42,6 +73,8 @@ CREATE INDEX IF NOT EXISTS processing_run_time ON processing_runs(started_at DES
 
 
 def connect(base):
+    if _rust_enabled():
+        return _RustStoreHandle(base)
     folder = Path(base) / 'processing'
     folder.mkdir(parents=True, exist_ok=True)
     con = sqlite3.connect(folder / 'processing.db', timeout=15)
@@ -108,6 +141,15 @@ def ensure_member(con, task, legacy=False):
 
 def reconcile(con, items, batch_id, bootstrapped):
     """Fingerprint changes start a new cohort entry; existing completion stays auditable."""
+    if _rust_enabled():
+        if getattr(con, 'in_transaction', False):
+            con.commit()
+        res = native('processing-reconcile', {
+            'items': list(items),
+            'batch_id': batch_id,
+            'bootstrapped': bool(bootstrapped),
+        }, timeout=30)
+        return res['eligible']
     current = {row['path']: dict(row) for row in con.execute('SELECT * FROM tasks')}
     by_vid = {row['vid']: row for row in current.values()}
     active = set()
@@ -142,6 +184,11 @@ def reconcile(con, items, batch_id, bootstrapped):
 
 
 def claim(con, capacity=1):
+    if _rust_enabled():
+        if getattr(con, 'in_transaction', False):
+            con.commit()
+        res = native('processing-claim', {'capacity': capacity}, timeout=30)
+        return res.get('task')
     con.execute('BEGIN IMMEDIATE')
     try:
         if setting(con, 'paused', False) or con.execute("SELECT COUNT(*) FROM tasks WHERE stage IN ('text','face')").fetchone()[0] >= effective_concurrency(con, capacity):
@@ -184,8 +231,12 @@ def close_run(con, task, status, error=None):
                 (status, str(error)[:500] if error else None, time.time(), task.get('run_id', '')))
 
 
-
 def fail(con, task, error):
+    if _rust_enabled():
+        if getattr(con, 'in_transaction', False):
+            con.commit()
+        native('processing-fail', {'task': task, 'error': str(error)[:500]}, timeout=30)
+        return
     attempts = task['text_attempts'] if task['stage'] == 'text' else task['face_attempts']
     stage = 'retry' if attempts < 3 else 'error'
     result = con.execute(f'UPDATE tasks SET stage=?,retry_stage=?,error=?,next_retry=?,updated_at=? WHERE {GUARD}',
@@ -196,10 +247,24 @@ def fail(con, task, error):
     con.commit()
 
 
-def release_task(con, task, reason, excluded=False):
+def release_task(con, task, reason, excluded=False, retry_delay=0):
+    if _rust_enabled():
+        if getattr(con, 'in_transaction', False):
+            con.commit()
+        native('processing-release', {
+            'task': task,
+            'reason': str(reason),
+            'excluded': bool(excluded),
+            'retry_delay': retry_delay,
+        }, timeout=30)
+        return
     field = 'text_attempts' if task['stage'] == 'text' else 'face_attempts'
+    next_retry = 0 if excluded or not retry_delay else time.time() + retry_delay
     result = con.execute(f'''UPDATE tasks SET stage=?,next_retry=0,{field}=MAX(0,{field}-1),error=?,updated_at=?
         WHERE {GUARD}''', ('excluded' if excluded else 'retry', None if excluded else reason, time.time(), *guard(task)))
+    if result.rowcount and next_retry:
+        con.execute("UPDATE tasks SET next_retry=? WHERE vid=? AND run_id=? AND stage='retry' AND manual=0",
+                    (next_retry, task['vid'], task.get('run_id', '')))
     if result.rowcount and excluded:
         con.execute('UPDATE batch_items SET excluded=1 WHERE batch_id=? AND vid=? AND completed=0', (task['batch_id'], task['vid']))
     close_run(con, task, ('cancelled' if excluded else 'waiting') if result.rowcount else 'superseded', reason)
@@ -207,6 +272,11 @@ def release_task(con, task, reason, excluded=False):
 
 
 def recover(con):
+    if _rust_enabled():
+        if getattr(con, 'in_transaction', False):
+            con.commit()
+        native('processing-recover', {}, timeout=30)
+        return
     set_setting(con, 'coordinator_generation', str(uuid.uuid4()))
     # Only call with the exclusive coordinator lock and no live stage futures.
     con.execute("UPDATE processing_runs SET status='interrupted',finished_at=?,error='协调器重启或阶段意外中断' WHERE status='running'", (time.time(),))

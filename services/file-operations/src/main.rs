@@ -30,6 +30,7 @@ mod person_move;
 mod person_registration;
 mod person_rename;
 mod processing_result;
+mod processing_scheduler;
 mod reference_relocation;
 mod review;
 mod review_sessions;
@@ -203,6 +204,19 @@ fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
         }
         return Ok(());
     }
+    if args.get(1).map(String::as_str) == Some("--evaluate-rules") {
+        let body: Value = serde_json::from_str(args.get(2).ok_or("missing rule input")?)?;
+        match processing_result::evaluate_rules(&body) {
+            Ok(out) => {
+                println!("{}", serde_json::to_string(&out)?);
+                return Ok(());
+            }
+            Err(e) => {
+                eprintln!("{}", e.error);
+                std::process::exit(1);
+            }
+        }
+    }
     serve()
 }
 
@@ -364,6 +378,23 @@ async fn archive_post(
         .as_str()
         .ok_or_else(|| Error::new(400, "invalid_request", "缺少命令"))?
         .to_owned();
+    if command == "archive-preview" && app.config.fixture.is_none() {
+        let permit = app
+            .status_reads
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::new(503, "unavailable", "读取服务不可用"))?;
+        let config = app.config;
+        return Ok(Json(
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                archive::preview(&config)
+            })
+            .await
+            .map_err(|_| Error::new(503, "unavailable", "归档预览读取失败"))??,
+        ));
+    }
     let (reply, wait) = oneshot::channel();
     app.worker.try_send(Work {
         command: Command::Archive {

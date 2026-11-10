@@ -332,12 +332,16 @@ impl PinnedMove {
         Ok(())
     }
     fn proof_matches(file: &mut File, proof: &CopyProof) -> Result<bool> {
-        if identity(&file.metadata()?) != proof.identity {
+        let meta = file.metadata()?;
+        if identity(&meta) != proof.identity {
             return Ok(false);
         }
         let Some(expected) = &proof.digest else {
             return Ok(false);
         };
+        if meta.len() > 1024 * 1024 {
+            return Ok(true);
+        }
         Ok(&digest(file)? == expected)
     }
     pub fn position(&self, expected: &str) -> Result<(bool, bool)> {
@@ -504,6 +508,24 @@ impl PinnedMove {
         expected: &str,
         record: &mut impl FnMut(&str, &MoveEvidence) -> Result<()>,
     ) -> Result<()> {
+        self.copy_publish_with(reverse, expected, record, &mut |parent, temp, name| {
+            rustix::fs::renameat_with(
+                parent,
+                temp,
+                parent,
+                name,
+                rustix::fs::RenameFlags::NOREPLACE,
+            )
+            .map_err(std::io::Error::from)
+        })
+    }
+    fn copy_publish_with(
+        &mut self,
+        reverse: bool,
+        expected: &str,
+        record: &mut impl FnMut(&str, &MoveEvidence) -> Result<()>,
+        publish: &mut impl FnMut(&File, &str, &std::ffi::OsStr) -> std::io::Result<()>,
+    ) -> Result<()> {
         let (from, to, from_parent, to_parent) = if reverse {
             (&self.dst, &self.src, &self.destination_parent, &self.parent)
         } else {
@@ -560,6 +582,7 @@ impl PinnedMove {
             }
             record("copy_created", &self.evidence)?;
         }
+        let mut just_verified = false;
         if proof.digest.is_none() {
             let mut output: File = openat(
                 to_parent,
@@ -594,6 +617,7 @@ impl PinnedMove {
             }
             input.seek(SeekFrom::Start(0))?;
             let before = identity(&input.metadata()?);
+            let mut checksum = String::new();
             mutation(
                 self.fixture.as_deref(),
                 to,
@@ -601,56 +625,125 @@ impl PinnedMove {
                 &mut |phase| record(phase, &self.evidence),
                 || {
                     output.set_len(0)?;
-                    std::io::copy(&mut input, &mut output)?;
+                    checksum = copy_and_digest(&mut input, &mut output)?;
                     output.set_times(
                         fs::FileTimes::new().set_modified(input.metadata()?.modified()?),
                     )?;
                     output.sync_all()
                 },
             )?;
-            let checksum = digest(&mut input)?;
-            if before != identity(&input.metadata()?) || digest(&mut output)? != checksum {
+            let input_meta = input.metadata()?;
+            let output_meta = output.metadata()?;
+            if before != identity(&input_meta)
+                || output_meta.len() != input_meta.len()
+                || (output_meta.len() <= 1024 * 1024 && digest(&mut output)? != checksum)
+            {
                 return Err(Error::conflict("复制期间源文件变化或校验失败"));
             }
-            proof.identity = identity(&output.metadata()?);
+            proof.identity = identity(&output_meta);
             proof.digest = Some(checksum);
             if reverse {
                 self.evidence.restored = Some(proof.clone())
             } else {
                 self.evidence.copy = Some(proof.clone())
             };
+            just_verified = true;
             record("copy_verified", &self.evidence)?;
         }
         self.verify_parents()?;
-        let mut output: File = openat(
+        let (src_present, dst_present) = self.position(expected)?;
+        let already_published = if reverse { src_present } else { dst_present };
+        let target_name = Path::new(to).file_name().unwrap();
+        if !already_published {
+            let mut output: File = openat(
+                to_parent,
+                proof.temp.as_str(),
+                OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )?
+            .into();
+            if if just_verified && output.metadata()?.len() > 1024 * 1024 {
+                identity(&output.metadata()?) != proof.identity
+            } else {
+                !Self::proof_matches(&mut output, &proof)?
+            } {
+                return Err(Error::conflict("临时复制文件校验失败"));
+            }
+            record("copy_publish_intent", &self.evidence)?;
+            let linked_fallback = mutation(
+                self.fixture.as_deref(),
+                to,
+                "copy_publish",
+                &mut |phase| record(phase, &self.evidence),
+                || match publish(to_parent, proof.temp.as_str(), target_name) {
+                    Ok(()) => {
+                        to_parent.sync_all()?;
+                        Ok(false)
+                    }
+                    Err(error)
+                        if [
+                            rustix::io::Errno::INVAL.raw_os_error(),
+                            rustix::io::Errno::OPNOTSUPP.raw_os_error(),
+                            rustix::io::Errno::NOSYS.raw_os_error(),
+                        ]
+                        .contains(&error.raw_os_error().unwrap_or_default()) =>
+                    {
+                        linkat(
+                            to_parent,
+                            proof.temp.as_str(),
+                            to_parent,
+                            target_name,
+                            AtFlags::empty(),
+                        )?;
+                        to_parent.sync_all()?;
+                        Ok(true)
+                    }
+                    Err(error) => Err(error),
+                },
+            )?;
+            if linked_fallback {
+                self.cleanup_copy_temp(to_parent, &proof, record)?;
+            }
+        } else {
+            self.cleanup_copy_temp(to_parent, &proof, record)?;
+        }
+        let (src_now, dst_now) = self.position(expected)?;
+        if !if reverse { src_now } else { dst_now } {
+            return Err(Error::conflict("复制目标尚未发布"));
+        }
+        record("copy_published", &self.evidence)
+    }
+    fn cleanup_copy_temp(
+        &self,
+        to_parent: &File,
+        proof: &CopyProof,
+        record: &mut impl FnMut(&str, &MoveEvidence) -> Result<()>,
+    ) -> Result<()> {
+        match openat(
             to_parent,
             proof.temp.as_str(),
             OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
             Mode::empty(),
-        )?
-        .into();
-        if !Self::proof_matches(&mut output, &proof)? {
-            return Err(Error::conflict("临时复制文件校验失败"));
+        ) {
+            Ok(fd) => {
+                let file: File = fd.into();
+                if !same_inode(&identity(&file.metadata()?), &proof.identity) {
+                    return Err(Error::conflict("临时复制文件被替换"));
+                }
+                mutation(
+                    self.fixture.as_deref(),
+                    &proof.temp,
+                    "copy_cleanup",
+                    &mut |phase| record(phase, &self.evidence),
+                    || match unlinkat(to_parent, proof.temp.as_str(), AtFlags::empty()) {
+                        Ok(()) | Err(rustix::io::Errno::NOENT) => to_parent.sync_all(),
+                        Err(e) => Err(e.into()),
+                    },
+                )
+            }
+            Err(rustix::io::Errno::NOENT) => Ok(()),
+            Err(e) => Err(e.into()),
         }
-        self.position(expected)?;
-        record("copy_publish_intent", &self.evidence)?;
-        mutation(
-            self.fixture.as_deref(),
-            to,
-            "copy_publish",
-            &mut |phase| record(phase, &self.evidence),
-            || {
-                rustix::fs::renameat_with(
-                    to_parent,
-                    proof.temp.as_str(),
-                    to_parent,
-                    Path::new(to).file_name().unwrap(),
-                    rustix::fs::RenameFlags::NOREPLACE,
-                )?;
-                to_parent.sync_all()
-            },
-        )?;
-        record("copy_published", &self.evidence)
     }
     #[cfg(test)]
     pub fn remove_source(&self, expected: &str) -> Result<()> {
@@ -764,11 +857,26 @@ impl PinnedMove {
         Ok(())
     }
 }
+fn copy_and_digest(input: &mut File, output: &mut File) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    input.seek(SeekFrom::Start(0))?;
+    let mut state = Sha256::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    loop {
+        let count = input.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        state.update(&buffer[..count]);
+        output.write_all(&buffer[..count])?;
+    }
+    Ok(format!("{:x}", state.finalize()))
+}
 fn digest(file: &mut File) -> Result<String> {
     use sha2::{Digest, Sha256};
     file.seek(SeekFrom::Start(0))?;
     let mut state = Sha256::new();
-    let mut buffer = [0u8; 65536];
+    let mut buffer = vec![0u8; 1024 * 1024];
     loop {
         let count = file.read(&mut buffer)?;
         if count == 0 {
@@ -1908,5 +2016,88 @@ mod tests {
         fs::rename(parent, parent.with_extension("old")).unwrap();
         fs::create_dir(parent).unwrap();
         assert!(recover_move(&config, &scope, &file, evidence).is_err());
+    }
+    #[test]
+    fn copy_publish_nfs_fallback_links_cleans_temp_resumes_and_compensates() {
+        let (config, file, scope) = fixture();
+        let mut pinned = prepare_move(&config, &scope, &file).unwrap();
+        let mut evidence = MoveEvidence::default();
+        let interrupted = pinned.copy_publish_with(
+            false,
+            &file.version,
+            &mut |phase, proof| {
+                evidence = proof.clone();
+                if phase == "filesystem_mutation_resolved" && Path::new(&file.dst).exists() {
+                    return Err(Error::conflict("fixture stop after link fallback"));
+                }
+                Ok(())
+            },
+            &mut |_, _, _| {
+                Err(std::io::Error::from_raw_os_error(
+                    rustix::io::Errno::INVAL.raw_os_error(),
+                ))
+            },
+        );
+        assert!(interrupted.is_err());
+        assert!(Path::new(&file.dst).exists());
+        let temp_path = Path::new(&file.dst)
+            .parent()
+            .unwrap()
+            .join(&evidence.copy.as_ref().unwrap().temp);
+        assert!(temp_path.exists());
+        drop(pinned);
+
+        let mut recovered = recover_move(&config, &scope, &file, evidence.clone()).unwrap();
+        recovered
+            .copy_publish_with(
+                false,
+                &file.version,
+                &mut |_, proof| {
+                    evidence = proof.clone();
+                    Ok(())
+                },
+                &mut |_, _, _| {
+                    Err(std::io::Error::from_raw_os_error(
+                        rustix::io::Errno::INVAL.raw_os_error(),
+                    ))
+                },
+            )
+            .unwrap();
+        assert!(!temp_path.exists());
+        assert_eq!(fs::read(&file.dst).unwrap(), b"owned fixture bytes\0\xff");
+        recovered.remove_source(&file.version).unwrap();
+        drop(recovered);
+
+        let mut recovered = recover_move(&config, &scope, &file, evidence).unwrap();
+        recovered
+            .compensate_recoverable(&config, &file.version, &mut |_, _| Ok(()))
+            .unwrap();
+        assert_eq!(fs::read(&file.src).unwrap(), b"owned fixture bytes\0\xff");
+        assert!(!Path::new(&file.dst).exists());
+    }
+    #[test]
+    fn copy_publish_nfs_fallback_never_replaces_late_target() {
+        let (config, file, scope) = fixture();
+        let mut pinned = prepare_move(&config, &scope, &file).unwrap();
+        let mut evidence = MoveEvidence::default();
+        let result = pinned.copy_publish_with(
+            false,
+            &file.version,
+            &mut |phase, proof| {
+                evidence = proof.clone();
+                if phase == "copy_publish_intent" {
+                    fs::write(&file.dst, b"external-late").unwrap();
+                }
+                Ok(())
+            },
+            &mut |_, _, _| {
+                Err(std::io::Error::from_raw_os_error(
+                    rustix::io::Errno::INVAL.raw_os_error(),
+                ))
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(fs::read(&file.dst).unwrap(), b"external-late");
+        assert_eq!(fs::read(&file.src).unwrap(), b"owned fixture bytes\0\xff");
     }
 }

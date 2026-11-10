@@ -5,7 +5,7 @@ import { homeTasks } from '@/lib/home-tasks'
 export const runtime='nodejs'
 let rebuild:{at:number;running:boolean;msg?:string}|undefined
 export async function GET(req:NextRequest){try{
-  const data=homeTasks(req.nextUrl.searchParams),url=process.env.CALIBRATOR_URL
+  const data=await homeTasks(req.nextUrl.searchParams),url=process.env.CALIBRATOR_URL
   const archive=await nativeArchiveProgress(null)
   data.jobs=data.jobs.filter(job=>job.kind!=='archive')
   if(archive.job&&(!archive.job.finished_at||Date.now()/1000-archive.job.finished_at<86400))data.jobs.push(normalizeJob(archive.job,Date.now()/1000,archive.job.heartbeat_at))

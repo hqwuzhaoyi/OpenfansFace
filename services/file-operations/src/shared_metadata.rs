@@ -966,6 +966,9 @@ pub fn execute(engine: &mut Engine, command: &str, mut body: Value) -> Result<Va
     if command == "processing-result" {
         return crate::processing_result::execute(engine, body);
     }
+    if command.starts_with("processing-") {
+        return crate::processing_scheduler::execute(engine, command, body);
+    }
     if [
         "state",
         "check-state",

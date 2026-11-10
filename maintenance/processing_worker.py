@@ -19,22 +19,43 @@ from task_progress import TaskProgress, stage_progress
 from processing_store import connect, setting, set_setting, event, reconcile, claim, fail, recover, release_task, effective_concurrency
 from processing_publication import prepare, publish_result, recover_publications, attempt_directory, PublicationError, native
 from processing_gpu import inference_status
-from processing_logic import folder_hints, candidates_from_text, can_skip_face, resolve_candidates
-from processing_faces import mapped, build_references, analyze, canonical_person, FACE_VERSION, capture_references
+from processing_faces import mapped, build_references, analyze, canonical_person, FACE_VERSION, MODEL_HASHES, capture_references
+from processing_compute import RUNTIME, compute_write_guard, get_resident_client, close_resident_client
 from watermark_worker import PIPELINE, PaddleEngine, read_json, publish, scan_video, same_file, validate_source, now
+
+
+_ACTIVE_RUN_IDS = set()
+_ACTIVE_RUN_LOCK = threading.Lock()
 
 
 def media_available(con, root):
     """A shared mount outage must not spend each video's retry budget."""
+    ok = True
+    detail = None
     try:
         root.stat()
         with os.scandir(root) as entries:
             next(entries, None)
     except OSError as error:
+        ok = False
+        detail = str(error)[:350]
+    if os.environ.get('FILE_OPERATIONS_RUST_URL'):
+        try:
+            resp = native('processing-media-status', {
+                'available': bool(ok),
+                'root': str(root),
+                'error': detail,
+            }, timeout=5)
+            if isinstance(resp, dict) and 'available' in resp:
+                return bool(resp['available'])
+        except Exception:
+            pass
+        return ok
+    if not ok:
         with con:
             if not setting(con, 'media_unavailable', False):
-                event(con, None, 'media_unavailable', '媒体挂载不可读，暂停领取任务：' + str(error)[:350])
-                set_setting(con, 'media_unavailable', dict(at=time.time(), error=str(error)[:350]))
+                event(con, None, 'media_unavailable', '媒体挂载不可读，暂停领取任务：' + detail)
+                set_setting(con, 'media_unavailable', dict(at=time.time(), error=detail))
         return False
     if setting(con, 'media_unavailable', False):
         with con:
@@ -79,6 +100,12 @@ def source_item(vid, stored, root):
 
 
 def discover(base, root, api_url, assets=None):
+    if os.environ.get('FILE_OPERATIONS_RUST_URL'):
+        references = build_references(base, root)
+        payload = {'pipeline': PIPELINE, 'face_version': FACE_VERSION, 'references': references}
+        if assets is not None:
+            payload['assets'] = list(assets)
+        return native('processing-discover', payload, timeout=120)['eligible']
     progress = TaskProgress(base, "discovery", "媒体发现")
     progress.update(stage="读取 Peach 账本")
     con = connect(base)
@@ -179,18 +206,40 @@ def text_stage(task, base, root):
     progress.update(stage="检查文字缓存")
     validate_source(task, root)
     directory = attempt_directory(base, task) / 'watermarks'; directory.mkdir(exist_ok=True)
-    records = read_json(base / 'watermarks/results.json', {})
-    existing = records.get(task['vid'], {})
-    if existing.get('status') == 'done' and existing.get('pipeline') == PIPELINE and same_file(existing, task):
-        return existing
+    cache_check = task.get('_cache_check')
+    if isinstance(cache_check, dict):
+        if cache_check.get('text_valid') is True and isinstance(cache_check.get('text_cached'), dict):
+            return cache_check['text_cached']
+    else:
+        records = read_json(base / 'watermarks/results.json', {})
+        existing = records.get(task['vid'], {})
+        if existing.get('status') == 'done' and existing.get('pipeline') == PIPELINE and same_file(existing, task):
+            return existing
     progress.update(stage='加载文字模型', done=None, total=None)
-    result = scan_video(task, root, directory, PaddleEngine(), task['run_id'], progress=progress)
+    engine = RUNTIME.get_ocr_engine(PaddleEngine)
+    result = scan_video(task, root, directory, engine, task['run_id'], progress=progress)
     record = {key: task[key] for key in ('vid', 'path', 'size', 'mtime_ns')}
-    record.update(result, status='done', pipeline=PIPELINE, job_id=task['batch_id'], checked_at=now(), artifact_attempt=task['run_id'], execution={'backend': 'cpu', 'stage': 'ocr', 'pipeline': PIPELINE})
+    record.update(
+        result,
+        status='done',
+        pipeline=PIPELINE,
+        job_id=task['batch_id'],
+        checked_at=now(),
+        artifact_attempt=task['run_id'],
+        execution={
+            'backend': 'cpu',
+            'stage': 'ocr',
+            'pipeline': PIPELINE,
+            'resident_load_count': RUNTIME.ocr_load_count,
+            'resident_tasks_run': RUNTIME.ocr_tasks_run,
+        },
+    )
     return record
 
 
 def stage_subprocess(task, base, root):
+    if os.environ.get('PROCESSING_COMPUTE_MODE') != 'subprocess':
+        return get_resident_client().run_stage(task, base, root)
     folder = base / 'processing/tmp'; folder.mkdir(exist_ok=True)
     with tempfile.TemporaryDirectory(dir=folder, prefix='stage-') as tmp:
         manifest, result = Path(tmp) / 'task.json', Path(tmp) / 'result.json'
@@ -211,13 +260,17 @@ def stage_subprocess(task, base, root):
 
 
 def process_one(base, root, runner=stage_subprocess, capacity=1, publisher=publish_result, preparer=prepare, reference_loader=capture_references):
-    con = connect(base)
+    con = None if os.environ.get('FILE_OPERATIONS_RUST_URL') else connect(base)
     try:
         if not media_available(con, root):
             return False
         task = claim(con, capacity=capacity)
         if not task:
             return False
+        run_id = task.get('run_id')
+        if run_id:
+            with _ACTIVE_RUN_LOCK:
+                _ACTIVE_RUN_IDS.add(run_id)
         task["_progress_id"] = task["run_id"]
         progress = None
         try:
@@ -227,6 +280,24 @@ def process_one(base, root, runner=stage_subprocess, capacity=1, publisher=publi
                 progress.finish()
                 return True
             validate_source(task, root)
+            if os.environ.get('FILE_OPERATIONS_RUST_URL'):
+                try:
+                    cache_info = native('processing-cache-check', {
+                        'stage': task['stage'],
+                        'vid': task['vid'],
+                        'path': task['path'],
+                        'size': task['size'],
+                        'mtime_ns': str(task['mtime_ns']),
+                        'pipeline': PIPELINE,
+                        'face_version': FACE_VERSION,
+                        'model_hashes': MODEL_HASHES,
+                    })
+                    if isinstance(cache_info, dict) and 'text_valid' in cache_info:
+                        task['_cache_check'] = cache_info
+                        if isinstance(cache_info.get('active_face_groups'), list):
+                            task['_active_face_groups'] = cache_info['active_face_groups']
+                except Exception:
+                    pass
             data = json.loads(task['data'])
             people = catalog(base)
             mapping = read_json(base / 'watermarks/mappings.json', {})
@@ -236,35 +307,40 @@ def process_one(base, root, runner=stage_subprocess, capacity=1, publisher=publi
                 reference_loader(task, base, root)
             if task['stage'] == 'text':
                 watermark = runner(task, base, root)
-                folder = folder_hints(task['path'], catalog(base))
-                mapping = read_json(base / 'watermarks/mappings.json', {})
-                text_candidates = candidates_from_text(watermark, mapping, folder)
-                legacy = [p['name'] for p in read_json(base / 'report.json', {}).get('identities', []) if any(v['vid'] == task['vid'] for v in p.get('vids', []))]
-                skip = can_skip_face(text_candidates, legacy)
-                data.pop('face', None); data.pop('face_complete', None)
-                data.update(watermark=watermark, folder=folder, text_candidates=text_candidates, text_complete=True,
-                            face_skipped=skip, ready=skip, **resolve_candidates(text_candidates))
-                next_stage = 'review' if skip else 'face_queued'
+                raw = {'watermark': watermark}
             else:
                 face = runner(task, base, root)
-                data.update(face=face, face_complete=True, ready=True, **resolve_candidates(data.get('text_candidates', []) + face['matches']))
-                next_stage = 'review'
+                raw = {'face': face}
             if was_handled(base, task['vid']):
                 release_task(con, task, '分析期间已由人工处理', excluded=True)
                 progress.finish()
                 return True
             validate_source(task, root)
-            publisher(task, base, data, next_stage)
+            publisher(task, base, raw, None)
+            if os.environ.get('FILE_OPERATIONS_RUST_URL'):
+                try:
+                    native('processing-evict-artifacts', {'tmp_max_age_sec': 3600})
+                except Exception:
+                    pass
             progress.finish()
         except Exception as error:
             if isinstance(error, PublicationError) and error.uncertain:
                 # Keep active attempt fenced until exact receipt replay resolves it.
-                with con:
-                    event(con, task['vid'], 'publication_unknown', str(error))
+                if os.environ.get('FILE_OPERATIONS_RUST_URL'):
+                    try:
+                        native('processing-event', {
+                            'vid': task['vid'],
+                            'kind': 'publication_unknown',
+                            'message': str(error),
+                            'detail': str(error),
+                        })
+                    except Exception:
+                        pass
+                else:
+                    with con:
+                        event(con, task['vid'], 'publication_unknown', str(error))
             elif isinstance(error, PublicationError) and error.status >= 500 and not error.operation_id:
-                release_task(con, task, '原生协调器不可用，等待恢复')
-                with con:
-                    con.execute("UPDATE tasks SET next_retry=? WHERE vid=? AND run_id=? AND stage='retry' AND manual=0", (time.time() + 30, task['vid'], task['run_id']))
+                release_task(con, task, '原生协调器不可用，等待恢复', retry_delay=30)
             elif was_handled(base, task['vid']):
                 release_task(con, task, '分析期间已由人工处理', excluded=True)
             elif media_available(con, root):
@@ -273,9 +349,14 @@ def process_one(base, root, runner=stage_subprocess, capacity=1, publisher=publi
                 release_task(con, task, '媒体挂载不可读，等待恢复')
             if progress:
                 progress.finish(error)
+        finally:
+            if run_id:
+                with _ACTIVE_RUN_LOCK:
+                    _ACTIVE_RUN_IDS.discard(run_id)
         return True
     finally:
-        con.close()
+        if con is not None:
+            con.close()
 
 
 def main():
@@ -289,7 +370,8 @@ def main():
     args = parser.parse_args(); base, root = args.base, args.root
     if args.stage:
         task = json.loads(args.task.read_text())
-        result = text_stage(task, base, root) if args.stage == 'text' else analyze(task, base, root)
+        with compute_write_guard(base, root, run_id=task.get('run_id')):
+            result = text_stage(task, base, root) if args.stage == 'text' else analyze(task, base, root)
         publish(args.result, result)
         return
     if not os.environ.get('FILE_OPERATIONS_RUST_URL'):
@@ -302,6 +384,7 @@ def main():
             raise SystemExit('Processing coordinator already running')
         stop = threading.Event()
         native_ready = threading.Event()
+        shared_state = {'desired': max_concurrency(), 'paused': False, 'active': 0, 'discovery_requested': 0.0}
         def heartbeats():
             while not stop.is_set():
                 if not native_ready.is_set():
@@ -311,25 +394,40 @@ def main():
                             text_pipeline=PIPELINE, protocol=3, max_concurrency=max_concurrency(),
                             concurrency=0, active=0, waiting_native_admission=True, native_ready=False))
                 else:
-                    state = connect(base)
                     try:
-                        desired = effective_concurrency(state, max_concurrency())
-                        active = state.execute("SELECT COUNT(*) FROM tasks WHERE stage IN ('text','face')").fetchone()[0]
+                        with _ACTIVE_RUN_LOCK:
+                            active_run_ids = sorted(_ACTIVE_RUN_IDS)
+                        hb_resp = native('processing-heartbeat', {
+                            'run_ids': active_run_ids,
+                            'capacity': max_concurrency(),
+                            'heartbeat': dict(
+                                pid=os.getpid(),
+                                text_pipeline=PIPELINE,
+                                protocol=3,
+                                max_concurrency=max_concurrency(),
+                                waiting_native_admission=False,
+                                native_ready=True,
+                                inference=inference_status(),
+                            ),
+                        }, timeout=10)
+                        if isinstance(hb_resp, dict):
+                            shared_state['desired'] = int(hb_resp.get('concurrency', max_concurrency()))
+                            shared_state['paused'] = bool(hb_resp.get('paused', False))
+                            shared_state['active'] = int(hb_resp.get('active', 0))
+                            shared_state['discovery_requested'] = float(hb_resp.get('discovery_requested', 0.0))
+                    except Exception:
                         publish(folder / 'heartbeat.json', dict(at=time.time(), pid=os.getpid(), text_pipeline=PIPELINE,
-                                protocol=3, max_concurrency=max_concurrency(), concurrency=desired, active=active,
+                                protocol=3, max_concurrency=max_concurrency(), concurrency=shared_state['desired'], active=shared_state['active'],
                                 waiting_native_admission=False, native_ready=True, inference=inference_status()))
-                    finally:
-                        state.close()
                 stop.wait(10 if native_ready.is_set() else 1)
         def discovery():
             due = 0
             while not stop.is_set():
-                state = connect(base)
-                requested = setting(state, 'discovery_requested', 0)
-                state.close()
+                requested = shared_state.get('discovery_requested', 0.0)
                 if time.time() >= due or requested > due - 300:
                     try:
                         discover(base, root, args.api_url)
+                        native('processing-evict-artifacts', {'tmp_max_age_sec': 3600})
                     except Exception as error:
                         print('Discovery:', str(error), flush=True)
                     due = time.time() + 300
@@ -351,11 +449,7 @@ def main():
             if stop.is_set():
                 return
             recover_publications(base)
-            con = connect(base)
-            try:
-                recover(con)
-            finally:
-                con.close()
+            recover(None)
             native_ready.set()
             if args.once:
                 discover(base, root, args.api_url)
@@ -372,21 +466,18 @@ def main():
                                 future.result()
                             except Exception as error:
                                 print('Coordinator stage:', str(error), flush=True)
-                    state = connect(base)
-                    try:
-                        if not inflight and state.execute("SELECT COUNT(*) FROM tasks WHERE stage IN ('text','face')").fetchone()[0]:
-                            recover_publications(base)
-                            recover(state)
-                        desired = effective_concurrency(state, max_concurrency())
-                        paused = setting(state, 'paused', False)
-                    finally:
-                        state.close()
+                    if not inflight and shared_state.get('active', 0) > 0:
+                        recover_publications(base)
+                        recover(None)
+                    desired = shared_state.get('desired', max_concurrency())
+                    paused = shared_state.get('paused', False)
                     if not paused:
                         while len(inflight) < desired:
                             inflight.add(executor.submit(process_one, base, root, capacity=max_concurrency()))
                     stop.wait(1)
         finally:
             stop.set(); heartbeat.join(timeout=12)
+            close_resident_client()
             publish(folder / 'heartbeat.json', dict(at=0, protocol=3, max_concurrency=max_concurrency(),
                     waiting_native_admission=False, native_ready=False, active=0))
 

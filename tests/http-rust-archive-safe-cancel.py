@@ -1,4 +1,4 @@
-"""Narrow own-archive rollback, never delete/coalesce scanner rows or retry production."""
+"""Scanner coordination, atomic adoption of pure blank scanner rows, strict conflict rejection, and crash/rollback safety."""
 import concurrent.futures
 import importlib.util
 import json
@@ -27,16 +27,46 @@ def preview_isolates_one_collision():
     finally:f.stop()
 
 
+def seed_peach_state(f, dst):
+    state_dir = f.ledger.parent / 'state'
+    state_dir.mkdir(parents=True, exist_ok=True)
+    (state_dir / 'library-new-assets.json').write_text(json.dumps([1001, 2002]))
+    (state_dir / 'local-file-identities.json').write_text(json.dumps({
+        '1001': {
+            'id': 1001,
+            'location': 'fixture',
+            'path': f.win(dst),
+            'native': str(dst),
+            'identity': [1, 2, dst.stat().st_size if dst.exists() else 0, 4, 5],
+        }
+    }))
+    if not (state_dir / 'library-processing-control.json').exists():
+        (state_dir / 'library-processing-control.json').write_text(json.dumps({'paused': False}))
+    return state_dir
+
+
 def late_case(kind='pure',crash=None,after_crash=None):
     f=a.Fixture(3)
     try:
+        state_dir=f.ledger.parent/'state'
+        state_dir.mkdir(parents=True,exist_ok=True)
+        (state_dir/'library-processing-control.json').write_text(json.dumps({'paused':False}))
         original=r.seed_refs(f);f.confirm();preview=f.preview();op=str(uuid.uuid4())
         destinations=[f.creators/'Momoyih'/p.name for p in f.sources]
-        phase='destination_published:2' if kind=='before_reserve' else 'ledger_commit_intent'
+        if kind=='before_reserve':
+            phase='destination_published:2'
+        else:
+            phase='ledger_commit_intent'
         f.fault(phase,milliseconds=600)
         with concurrent.futures.ThreadPoolExecutor() as pool:
             work=pool.submit(f.apply,preview,None,op);a.wait_fault(f)
+            with sqlite3.connect(f.ledger) as db:
+                lease=db.execute('SELECT state FROM _face_admin_scanner_leases WHERE id=?',(op,)).fetchone()
+                assert lease==('active',),lease
+            control=json.loads((state_dir/'library-processing-control.json').read_text())
+            assert control.get('paused') is True and control.get('archive_lease',{}).get('operation_id')==op,control
             scanner=r.insert_scanner_row(f,destinations[0])
+            seed_peach_state(f,destinations[0])
             with sqlite3.connect(f.ledger) as db:
                 if kind=='manual':db.execute('UPDATE asset SET rating=5 WHERE id=1001')
                 elif kind=='field_owner':db.execute("UPDATE asset SET field_owners='{\"name\":\"manual\"}' WHERE id=1001")
@@ -57,6 +87,8 @@ def late_case(kind='pure',crash=None,after_crash=None):
                 elif kind=='source_changed':db.execute("UPDATE asset SET feedback='new external edit' WHERE id=1")
                 elif kind=='missing_receipt':db.execute('DELETE FROM _face_admin_person_ops WHERE id=?',(op,))
                 elif kind=='committed_receipt':db.execute("UPDATE _face_admin_person_ops SET state='committed' WHERE id=?",(op,))
+                elif kind=='rollback_pure':
+                    db.execute("CREATE TRIGGER force_rollback BEFORE UPDATE OF path ON asset WHEN OLD.id=3 BEGIN SELECT RAISE(ABORT,'forced rollback'); END")
             if kind=='file_identity':
                 file=destinations[0];old=file.read_bytes();file.rename(file.with_suffix('.foreign-backup'));file.write_bytes(old)
             preserved=r.snapshot(f);foreign=r.rows(f.ledger,'SELECT * FROM asset WHERE id=1001')
@@ -70,36 +102,114 @@ def late_case(kind='pure',crash=None,after_crash=None):
                     with sqlite3.connect(f.ledger) as db:
                         if after_crash=='remove_index':db.execute('DELETE FROM asset WHERE id=1001')
                         elif after_crash=='manual_reference':db.execute("INSERT INTO asset_tag(asset_id,tag,source) VALUES(1001,'late manual relation','user')")
+                        elif after_crash=='post_commit_tamper':db.execute("DELETE FROM asset_entity WHERE asset_id=1 AND role='creator'")
                     preserved=r.snapshot(f);foreign=r.rows(f.ledger,'SELECT * FROM asset WHERE id=1001')
                 f.start();result=f.call(id=op)['result']
-        safe=kind=='pure' and after_crash is None
-        assert result.get('rolled_back') is safe,result
-        assert result.get('recovery_needed') is (not safe),result
-        assert r.snapshot(f)==preserved and r.rows(f.ledger,'SELECT * FROM asset WHERE id=1001')==foreign
-        if safe:
+        reconciled = kind in ('pure','before_reserve') and after_crash is None
+        safe_rollback = kind == 'rollback_pure' and after_crash is None
+        if reconciled:
+            assert result['ok'] and result['moved']==3,result
+            assert result.get('reconciled_scanner_assets')==[1001],result
+            assert not result.get('rolled_back') and not result.get('recovery_needed'),result
+            assert not any(p.exists() for p in f.sources)
+            assert all(p.read_bytes()==a.BYTES+str(i).encode() for i,p in enumerate(destinations))
+            assert not f.queue() and not (f.base/'.review-write.lock').exists()
+            expected = {
+                **original,
+                'assets': [
+                    {**row, 'path': f.win(destinations[i])}
+                    for i, row in enumerate(original['assets'])
+                ],
+            }
+            assert r.snapshot(f) == expected
+            with sqlite3.connect(f.ledger) as db:
+                assert db.execute('SELECT * FROM asset WHERE id=1001').fetchall()==[]
+                assert db.execute('SELECT state FROM _face_admin_person_ops WHERE id=?',(op,)).fetchone()==('committed',)
+                assert db.execute('SELECT state FROM _face_admin_scanner_leases WHERE id=?',(op,)).fetchone()==('committed',)
+            assert json.loads((state_dir/'library-new-assets.json').read_text())==[2002]
+            identities=json.loads((state_dir/'local-file-identities.json').read_text())
+            assert '1001' not in identities and identities['1']['path']==f.win(destinations[0])
+            control=json.loads((state_dir/'library-processing-control.json').read_text())
+            assert control.get('paused') is False and 'archive_lease' not in control
+            assert f.apply(preview,op=op)==result
+            f.stop();f.start();assert f.call(id=op)['result']==result
+        elif safe_rollback:
+            assert result.get('rolled_back') is True and not result.get('recovery_needed'),result
+            assert r.snapshot(f)==preserved and r.rows(f.ledger,'SELECT * FROM asset WHERE id=1001')==foreign
             assert all(p.read_bytes()==a.BYTES+str(i).encode() for i,p in enumerate(f.sources))
             assert not any(p.exists() for p in destinations) and len(f.queue())==3
             assert not (f.base/'.review-write.lock').exists()
             assert result['external_index_conflicts'] and not result['ok'] and result['moved']==0
             assert all(row['retryable'] is False for row in result['failures'])
             assert r.snapshot(f)==original
-            with sqlite3.connect(f.ledger) as db:assert db.execute('SELECT state FROM _face_admin_person_ops WHERE id=?',(op,)).fetchone()==('cancelled',)
-            # No new archive: exact same operation returns its terminal rollback receipt.
+            with sqlite3.connect(f.ledger) as db:
+                assert db.execute('SELECT state FROM _face_admin_person_ops WHERE id=?',(op,)).fetchone()==('cancelled',)
+                assert db.execute('SELECT state FROM _face_admin_scanner_leases WHERE id=?',(op,)).fetchone()==('rolled_back',)
+            control=json.loads((state_dir/'library-processing-control.json').read_text())
+            assert control.get('paused') is False and 'archive_lease' not in control
             assert f.apply(preview,op=op)==result
             f.stop();f.start();assert f.call(id=op)['result']==result
             current=f.preview();assert current['n_ok']==2
         else:
+            assert result.get('rolled_back') is False and result.get('recovery_needed') is True,result
+            if after_crash!='post_commit_tamper':
+                assert r.snapshot(f)==preserved and r.rows(f.ledger,'SELECT * FROM asset WHERE id=1001')==foreign
             assert (f.base/'.review-write.lock').exists()
             assert all(row['retryable'] is False for row in result['failures'])
+            with sqlite3.connect(f.ledger) as db:
+                assert db.execute('SELECT state FROM _face_admin_scanner_leases WHERE id=?',(op,)).fetchone()==('recovery_needed',)
+            control=json.loads((state_dir/'library-processing-control.json').read_text())
+            assert control.get('paused') is False and 'archive_lease' not in control
         r.integrity(f)
         print('PASS',kind,crash or 'no-crash',after_crash or '',flush=True)
     finally:f.stop()
 
 
+def scanner_lease_expiry_and_user_pause():
+    f=a.Fixture(1)
+    try:
+        state_dir=f.ledger.parent/'state'
+        state_dir.mkdir(parents=True,exist_ok=True)
+        # 1. Stale active lease from a crashed process is recovered on startup without blocking Peach or archive.
+        with sqlite3.connect(f.ledger) as db:
+            db.execute("""CREATE TABLE IF NOT EXISTS _face_admin_scanner_leases (
+                id TEXT PRIMARY KEY, action TEXT NOT NULL, state TEXT NOT NULL,
+                scope TEXT NOT NULL, acquired_at INTEGER NOT NULL, expires_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+            )""")
+            db.execute("INSERT INTO _face_admin_scanner_leases VALUES('stale-op','archive','active','{}',1,2,1)")
+        (state_dir/'library-processing-control.json').write_text(json.dumps({
+            'paused': True,
+            'archive_lease': {'holder': 'face-file-operations', 'operation_id': 'stale-op', 'acquired_at': 1, 'expires_at': 2},
+        }))
+        (f.base/'file-operations-rust/scanner-coordination.json').write_text(json.dumps({
+            'operation_id': 'stale-op', 'state': 'active', 'acquired_at': 1, 'expires_at': 2,
+        }))
+        f.stop();f.start()
+        with sqlite3.connect(f.ledger) as db:
+            state=db.execute("SELECT state FROM _face_admin_scanner_leases WHERE id='stale-op'").fetchone()[0]
+            assert state in ('expired','recovered'),state
+        control=json.loads((state_dir/'library-processing-control.json').read_text())
+        assert control.get('paused') is False and 'archive_lease' not in control,control
+        # 2. User-initiated pause in Peach control file is preserved across archive execution.
+        (state_dir/'library-processing-control.json').write_text(json.dumps({'paused': True, 'job_id': 'user-manual-pause'}))
+        f.confirm();preview=f.preview();result=f.apply(preview)
+        assert result['ok'] and result['moved']==1,result
+        control=json.loads((state_dir/'library-processing-control.json').read_text())
+        assert control=={'paused': True, 'job_id': 'user-manual-pause'},control
+        print('PASS stale scanner lease recovery and user pause preservation',flush=True)
+    finally:f.stop()
+
+
 if __name__=='__main__':
     preview_isolates_one_collision()
-    late_case()
-    for kind in ('manual','field_owner','foreign_key','non_fk','unexpected_reference','uppercase_reference','mixed_reference','plural_reference','fake_fts_reference','source_links','receipt_signature','source_changed','missing_receipt','committed_receipt','file_identity','before_reserve'):late_case(kind)
-    for phase in ('compensation_intent','compensation_ledger_fenced','compensation_file_restored'):late_case(crash=phase)
-
-    for changed in ('remove_index','manual_reference'):late_case(crash='compensation_ledger_fenced',after_crash=changed)
+    late_case('pure')
+    late_case('before_reserve')
+    for phase in ('ledger_committed_unrecorded','final_receipt_unreleased'):
+        late_case('pure',crash=phase)
+        late_case('before_reserve',crash=phase)
+    late_case('pure',crash='ledger_committed_unrecorded',after_crash='post_commit_tamper')
+    for kind in ('manual','field_owner','foreign_key','non_fk','unexpected_reference','uppercase_reference','mixed_reference','plural_reference','fake_fts_reference','source_links','receipt_signature','source_changed','missing_receipt','committed_receipt','file_identity'):late_case(kind)
+    late_case('rollback_pure')
+    for phase in ('compensation_intent','compensation_ledger_fenced','compensation_file_restored'):late_case('rollback_pure',crash=phase)
+    for changed in ('remove_index','manual_reference'):late_case('rollback_pure',crash='compensation_ledger_fenced',after_crash=changed)
+    scanner_lease_expiry_and_user_pause()
