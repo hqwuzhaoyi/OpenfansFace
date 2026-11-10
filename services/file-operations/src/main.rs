@@ -414,6 +414,28 @@ async fn archive_post(
             .map_err(|_| Error::new(503, "unavailable", "归档预览读取失败"))??,
         ));
     }
+    if matches!(command.as_str(), "review-page" | "review-status")
+        && app.config.fixture.is_none()
+        && app.worker.has_pending()
+    {
+        let permit = app
+            .status_reads
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::new(503, "unavailable", "读取服务不可用"))?;
+        let config = app.config;
+        let body = payload["body"].clone();
+        return Ok(Json(
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                let mut engine = Engine::open_preview(config)?;
+                review_sessions::execute(&mut engine, &command, body)
+            })
+            .await
+            .map_err(|_| Error::new(503, "unavailable", "核对读取失败"))??,
+        ));
+    }
     let (reply, wait) = oneshot::channel();
     app.worker.try_send(Work {
         command: Command::Archive {

@@ -68,6 +68,13 @@ fn candidate_names(data: &Value) -> BTreeSet<String> {
     names
 }
 fn tasks(config: &Config, aliases: &Value) -> Result<Vec<Value>> {
+    tasks_filtered(config, aliases, None)
+}
+fn tasks_filtered(
+    config: &Config,
+    aliases: &Value,
+    only_vids: Option<&BTreeSet<String>>,
+) -> Result<Vec<Value>> {
     let path = config.base.join("processing/processing.db");
     if !path.exists() {
         return Ok(vec![]);
@@ -92,12 +99,27 @@ fn tasks(config: &Config, aliases: &Value) -> Result<Vec<Value>> {
         .chain(history.as_array().unwrap())
         .filter_map(|r| r["vid"].as_str().map(str::to_owned))
         .collect();
+    let conn = db::open(&path)?;
+    let raw_rows = if let Some(filter) = only_vids {
+        if filter.is_empty() {
+            return Ok(vec![]);
+        }
+        let placeholders = std::iter::repeat_n("?", filter.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT * FROM tasks WHERE stage!='excluded' AND vid IN ({placeholders}) ORDER BY priority DESC,is_new DESC,created_at DESC,vid"
+        );
+        db::rows(&conn, &sql, rusqlite::params_from_iter(filter.iter()))?
+    } else {
+        db::rows(
+            &conn,
+            "SELECT * FROM tasks WHERE stage!='excluded' ORDER BY priority DESC,is_new DESC,created_at DESC,vid",
+            [],
+        )?
+    };
     let mut out = vec![];
-    for row in db::rows(
-        &db::open(&path)?,
-        "SELECT * FROM tasks WHERE stage!='excluded' ORDER BY priority DESC,is_new DESC,created_at DESC,vid",
-        [],
-    )? {
+    for row in raw_rows {
         let id = row["vid"].as_str().unwrap_or("");
         if excluded_vids.contains(id) || paths.contains(row["path"].as_str().unwrap_or("")) {
             continue;
@@ -108,6 +130,48 @@ fn tasks(config: &Config, aliases: &Value) -> Result<Vec<Value>> {
         out.push(t)
     }
     Ok(out)
+}
+fn waiting_count(config: &Config) -> Result<usize> {
+    let path = config.base.join("processing/processing.db");
+    if !path.exists() {
+        return Ok(0);
+    }
+    let queue = review::read(config, "integration-queue.json", json!([]))?.1;
+    let history = review::read(config, "archive-history.json", json!([]))?.1;
+    let sources = review::sources(config)?;
+    let paths: BTreeSet<_> = queue
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| {
+            r["vid"]
+                .as_str()
+                .and_then(|v| review::source(config, v, &sources))
+        })
+        .collect();
+    let excluded_vids: BTreeSet<String> = queue
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(history.as_array().unwrap())
+        .filter_map(|r| r["vid"].as_str().map(str::to_owned))
+        .collect();
+    let conn = db::open(&path)?;
+    let mut count = 0usize;
+    for row in db::rows(
+        &conn,
+        "SELECT vid,path,stage,manual FROM tasks WHERE stage!='excluded'",
+        [],
+    )? {
+        let id = row["vid"].as_str().unwrap_or("");
+        if excluded_vids.contains(id) || paths.contains(row["path"].as_str().unwrap_or("")) {
+            continue;
+        }
+        if row["stage"] != "review" && review::number(&row["manual"]).unwrap_or(0) == 0 {
+            count += 1;
+        }
+    }
+    Ok(count)
 }
 fn canonical_fields(value: &mut Value, key: &str, aliases: &Value) -> Result<()> {
     if ["name", "creator", "suggested"].contains(&key) && value.is_string() {
@@ -421,10 +485,11 @@ pub fn validate(config: &Config, body: &Value) -> Result<Vec<Value>> {
     let session = body["review_session"].as_str().ok_or_else(expired)?;
     read(config, session)?;
     let ids = review::vids(&body["vids"])?;
+    let id_set: BTreeSet<String> = ids.iter().cloned().collect();
     let conn = schema(config)?;
     let mut rows = vec![];
     let material = shared_metadata::MaterialReader::new(config)?;
-    let current = tasks(config, material.aliases())?;
+    let current = tasks_filtered(config, material.aliases(), Some(&id_set))?;
     let health = HealthReader::new(config)?;
     let dispositions = dispositions(config)?;
     for vid in ids {
@@ -486,99 +551,122 @@ pub fn execute(engine: &mut Engine, command: &str, body: Value) -> Result<Value>
         .as_str()
         .filter(|v| !v.is_empty())
         .map(str::to_owned);
-    let material = shared_metadata::MaterialReader::new(config)?;
-    let live = tasks(config, material.aliases())?;
-    let health = HealthReader::new(config)?;
-    let dispositions = dispositions(config)?;
     let created = id.is_none();
-    let id = match id {
-        Some(id) => id,
-        None => {
-            if command == "review-status" {
-                return Err(expired());
+    let need_live_diff = created || command == "review-status";
+    let (id, snapshot, changed_count, waiting, refreshing) = if !need_live_diff {
+        let id = id.unwrap();
+        let snapshot = amended(config, &id, read(config, &id)?)?;
+        let waiting = waiting_count(config)?;
+        (id, snapshot, 0usize, waiting, 0usize)
+    } else {
+        let material = shared_metadata::MaterialReader::new(config)?;
+        let live = tasks(config, material.aliases())?;
+        let health = HealthReader::new(config)?;
+        let dispositions = dispositions(config)?;
+        let id = match id {
+            Some(id) => id,
+            None => {
+                if command == "review-status" {
+                    return Err(expired());
+                }
+                let id = uuid::Uuid::new_v4().to_string();
+                let mut evidence = live
+                    .iter()
+                    .filter(|t| available(t))
+                    .map(|t| evidence(config, t, &material, &health, &dispositions))
+                    .collect::<Result<Vec<_>>>()?;
+                evidence.retain(|e| e["health"]["hidden"] != true);
+                for (index, e) in evidence.iter_mut().enumerate() {
+                    let key = if e["pending_seen"] == true {
+                        "pending_order"
+                    } else {
+                        "deferred_order"
+                    };
+                    e[key] = json!(index);
+                }
+                let snapshot = json!({"schema_version":1,"evidence":evidence,"clusters":review::read(config,"clusters.json",json!([]))?.1});
+                let raw = serde_json::to_string(&snapshot)?;
+                if raw.len() > 64 * 1024 * 1024 {
+                    return Err(Error::new(
+                        503,
+                        "review_scope_limit",
+                        "核对记录过多，请缩小处理范围",
+                    ));
+                }
+                conn.execute("DELETE FROM review_sessions WHERE expires<=unixepoch()", [])?;
+                conn.execute(
+                    "INSERT INTO review_sessions VALUES(?,?,?)",
+                    params![id, now(&conn)? + TTL, raw],
+                )?;
+                id
             }
-            let id = uuid::Uuid::new_v4().to_string();
-            let mut evidence = live
+        };
+        let snapshot = amended(config, &id, read(config, &id)?)?;
+        let evidence = snapshot["evidence"].as_array().unwrap();
+        let visible: Vec<_> = evidence
+            .iter()
+            .filter(|e| e["completed"] != true)
+            .map(|e| e["task"].clone())
+            .collect();
+        let mut changed_count = 0;
+        if !created {
+            let visible_by_id: BTreeMap<_, _> = visible
                 .iter()
-                .filter(|t| available(t))
-                .map(|t| evidence(config, t, &material, &health, &dispositions))
-                .collect::<Result<Vec<_>>>()?;
-            evidence.retain(|e| e["health"]["hidden"] != true);
-            for (index, e) in evidence.iter_mut().enumerate() {
-                let key = if e["pending_seen"] == true {
-                    "pending_order"
-                } else {
-                    "deferred_order"
-                };
-                e[key] = json!(index);
+                .map(|t| (t["vid"].as_str().unwrap_or(""), t))
+                .collect();
+            let live_ids: BTreeSet<_> = live
+                .iter()
+                .map(|t| t["vid"].as_str().unwrap_or(""))
+                .collect();
+            for t in &live {
+                if available(t)
+                    && health.state(config, t)?["hidden"] != true
+                    && !visible_by_id
+                        .get(t["vid"].as_str().unwrap_or(""))
+                        .is_some_and(|v| {
+                            v["data"] == t["data"]
+                                && v["path"] == t["path"]
+                                && v["size"] == t["size"]
+                                && v["mtime_ns"] == t["mtime_ns"]
+                                && v["deferred"] == t["deferred"]
+                                && v["note"] == t["note"]
+                        })
+                {
+                    changed_count += 1
+                }
             }
-            let snapshot = json!({"schema_version":1,"evidence":evidence,"clusters":review::read(config,"clusters.json",json!([]))?.1});
-            let raw = serde_json::to_string(&snapshot)?;
-            if raw.len() > 64 * 1024 * 1024 {
-                return Err(Error::new(
-                    503,
-                    "review_scope_limit",
-                    "核对记录过多，请缩小处理范围",
-                ));
+            for e in evidence.iter().filter(|e| e["completed"] != true) {
+                if !live_ids.contains(e["task"]["vid"].as_str().unwrap_or(""))
+                    || material.state(config, &e["scope"])?["material"] != e["material"]
+                    || health.state(config, &e["task"])? != e["health"]
+                {
+                    changed_count += 1
+                }
             }
-            conn.execute("DELETE FROM review_sessions WHERE expires<=unixepoch()", [])?;
-            conn.execute(
-                "INSERT INTO review_sessions VALUES(?,?,?)",
-                params![id, now(&conn)? + TTL, raw],
-            )?;
-            id
         }
+        let waiting = live
+            .iter()
+            .filter(|t| t["stage"] != "review" && review::number(&t["manual"]).unwrap_or(0) == 0)
+            .count();
+        let refreshing = live
+            .iter()
+            .filter(|t| {
+                available(t)
+                    && t["stage"] != "review"
+                    && review::number(&t["manual"]).unwrap_or(0) == 0
+            })
+            .count();
+        (id, snapshot, changed_count, waiting, refreshing)
     };
-    let snapshot = amended(config, &id, read(config, &id)?)?;
     let evidence = snapshot["evidence"].as_array().unwrap();
     let visible: Vec<_> = evidence
         .iter()
         .filter(|e| e["completed"] != true)
         .map(|e| e["task"].clone())
         .collect();
-    let mut changed_count = 0;
-    if !created {
-        let visible_by_id: BTreeMap<_, _> = visible
-            .iter()
-            .map(|t| (t["vid"].as_str().unwrap_or(""), t))
-            .collect();
-        let live_ids: BTreeSet<_> = live
-            .iter()
-            .map(|t| t["vid"].as_str().unwrap_or(""))
-            .collect();
-        for t in &live {
-            if available(t)
-                && health.state(config, t)?["hidden"] != true
-                && !visible_by_id
-                    .get(t["vid"].as_str().unwrap_or(""))
-                    .is_some_and(|v| {
-                        v["data"] == t["data"]
-                            && v["path"] == t["path"]
-                            && v["size"] == t["size"]
-                            && v["mtime_ns"] == t["mtime_ns"]
-                            && v["deferred"] == t["deferred"]
-                            && v["note"] == t["note"]
-                    })
-            {
-                changed_count += 1
-            }
-        }
-        for e in evidence.iter().filter(|e| e["completed"] != true) {
-            if !live_ids.contains(e["task"]["vid"].as_str().unwrap_or(""))
-                || material.state(config, &e["scope"])?["material"] != e["material"]
-                || health.state(config, &e["task"])? != e["health"]
-            {
-                changed_count += 1
-            }
-        }
-    }
-    let waiting = live
-        .iter()
-        .filter(|t| t["stage"] != "review" && review::number(&t["manual"]).unwrap_or(0) == 0)
-        .count();
     if command == "review-status" {
         return Ok(
-            json!({"session":id,"has_updates":changed_count>0,"changed":changed_count,"waiting":waiting,"refreshing":live.iter().filter(|t|available(t)&&t["stage"]!="review"&&review::number(&t["manual"]).unwrap_or(0)==0).count()}),
+            json!({"session":id,"has_updates":changed_count>0,"changed":changed_count,"waiting":waiting,"refreshing":refreshing}),
         );
     }
     let s = |key: &str| body[key].as_str().unwrap_or("");

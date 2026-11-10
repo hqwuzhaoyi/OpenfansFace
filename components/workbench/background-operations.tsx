@@ -153,7 +153,26 @@ export type ArchiveTask = {
   error?: string;
 };
 
-export type BackgroundTask = PersonBatchTask | PersonFileTask | ArchiveTask;
+export type ReviewMutationTask = {
+  id: string;
+  kind: "review-mutation";
+  action: "confirm" | "defer" | "restore" | "undo";
+  title: string;
+  subtitle: string;
+  vids: string[];
+  creator?: string;
+  status: BackgroundTaskStatus;
+  createdAt: number;
+  startedAt?: number;
+  finishedAt?: number;
+  error?: string;
+};
+
+export type BackgroundTask =
+  | PersonBatchTask
+  | PersonFileTask
+  | ArchiveTask
+  | ReviewMutationTask;
 
 export type BackgroundTaskEvent =
   | {
@@ -198,6 +217,14 @@ interface BackgroundOperationsContextValue {
     sizeGb?: string;
     personName?: string;
   }) => string;
+  trackReviewMutation: <T>(input: {
+    action: "confirm" | "defer" | "restore" | "undo";
+    title: string;
+    subtitle: string;
+    vids: string[];
+    creator?: string;
+    promise: Promise<T>;
+  }) => Promise<T>;
   cancelQueuedTask: (taskId: string) => void;
   dismissTask: (taskId: string) => void;
   clearCompleted: () => void;
@@ -505,6 +532,64 @@ export function BackgroundOperationsProvider({
       return task.id;
     },
     [],
+  );
+
+  const trackReviewMutation = useCallback(
+    async <T,>({
+      action,
+      title,
+      subtitle,
+      vids,
+      creator,
+      promise,
+    }: {
+      action: "confirm" | "defer" | "restore" | "undo";
+      title: string;
+      subtitle: string;
+      vids: string[];
+      creator?: string;
+      promise: Promise<T>;
+    }): Promise<T> => {
+      const id = makeUuid();
+      const now = Date.now();
+      const task: ReviewMutationTask = {
+        id,
+        kind: "review-mutation",
+        action,
+        title,
+        subtitle,
+        vids,
+        creator,
+        status: "running",
+        createdAt: now,
+        startedAt: now,
+      };
+      setTasks((prev) => [...prev, task]);
+      try {
+        const result = await promise;
+        deleteWorkbenchCache("integration:plan");
+        if (creator) {
+          deleteWorkbenchCache("persons:library:" + creator);
+        }
+        updateTask(id, (t) => ({
+          ...t,
+          status: "complete",
+          finishedAt: Date.now(),
+        }));
+        return result;
+      } catch (e) {
+        const message = (e as Error).message || "人工确认操作失败";
+        setOpen(true);
+        updateTask(id, (t) => ({
+          ...t,
+          status: "failed",
+          error: message,
+          finishedAt: Date.now(),
+        }));
+        throw e;
+      }
+    },
+    [updateTask],
   );
 
   const cancelQueuedTask = useCallback((taskId: string) => {
@@ -983,17 +1068,19 @@ export function BackgroundOperationsProvider({
     [emit, updateTask],
   );
 
-  // Serial Queue Runner Effect
+  // Serial Queue Runner Effect (only for heavy file operations; review-mutation runs independently)
   useEffect(() => {
     if (runningIdRef.current) return;
-    const runningTask = tasks.find((t) => t.status === "running");
-    const nextTask = runningTask || tasks.find((t) => t.status === "queued");
+    const fileTasks = tasks.filter((t) => t.kind !== "review-mutation");
+    const runningTask = fileTasks.find((t) => t.status === "running");
+    const nextTask =
+      runningTask || fileTasks.find((t) => t.status === "queued");
     if (!nextTask) return;
 
     // Do not start a new queued task if an earlier task is stuck in recovery_needed
     if (
       nextTask.status === "queued" &&
-      tasks.some((t) => t.status === "recovery_needed")
+      fileTasks.some((t) => t.status === "recovery_needed")
     ) {
       return;
     }
@@ -1157,8 +1244,24 @@ export function BackgroundOperationsProvider({
 
     for (const task of tasks) {
       if (!isActiveStatus(task.status)) continue;
-      activeWrite = true;
       const lockStatus = task.status === "running" ? "running" : "queued";
+      if (task.kind === "review-mutation") {
+        const label =
+          task.action === "confirm"
+            ? "归名中"
+            : task.action === "defer"
+              ? "暂缓中"
+              : task.action === "restore"
+                ? "恢复中"
+                : "撤销中";
+        for (const vid of task.vids) {
+          if (!vidsMap.has(vid)) {
+            vidsMap.set(vid, { label, status: lockStatus, taskId: task.id });
+          }
+        }
+        continue;
+      }
+      activeWrite = true;
 
       if (task.kind === "person-batch") {
         const label =
@@ -1230,6 +1333,7 @@ export function BackgroundOperationsProvider({
       enqueuePersonBatch,
       enqueuePersonFile,
       enqueueArchive,
+      trackReviewMutation,
       cancelQueuedTask,
       dismissTask,
       clearCompleted,
@@ -1245,6 +1349,7 @@ export function BackgroundOperationsProvider({
       enqueuePersonBatch,
       enqueuePersonFile,
       enqueueArchive,
+      trackReviewMutation,
       cancelQueuedTask,
       dismissTask,
       clearCompleted,
@@ -1262,6 +1367,29 @@ export function BackgroundOperationsProvider({
 }
 
 function buildActivityItems(task: BackgroundTask): AgentActivityItem[] {
+  if (task.kind === "review-mutation") {
+    return [
+      {
+        id: `${task.id}-review`,
+        type: "step",
+        status:
+          task.status === "complete"
+            ? "complete"
+            : task.status === "running"
+              ? "active"
+              : "pending",
+        label:
+          task.action === "confirm"
+            ? `写入待归档队列${task.creator ? ` · ${task.creator}` : ""}`
+            : task.action === "defer"
+              ? "移入暂缓核对列表"
+              : task.action === "restore"
+                ? "恢复至待确认列表"
+                : "从待归档队列撤回",
+        meta: `${task.vids.length} 个视频`,
+      },
+    ];
+  }
   if (task.kind === "person-batch") {
     const completedSet = new Set([
       ...(task.progress?.completed || []),
@@ -1344,6 +1472,7 @@ function buildActivityItems(task: BackgroundTask): AgentActivityItem[] {
 }
 
 function TaskIcon({ task }: { task: BackgroundTask }) {
+  if (task.kind === "review-mutation") return <Check className="size-3.5" />;
   if (task.kind === "archive") return <Archive className="size-3.5" />;
   if (task.kind === "person-batch") {
     return task.action === "merge" ? (
