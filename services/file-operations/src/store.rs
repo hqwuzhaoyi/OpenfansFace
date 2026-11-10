@@ -85,6 +85,15 @@ impl Store {
             _ownership: ownership,
         })
     }
+    pub fn open_preview(config: &Config) -> Result<Self> {
+        let path = config.state_dir().join("executor.lock");
+        let ownership = crate::control::open_executor(&path)?;
+        let conn = db::open(&config.state_db())?;
+        Ok(Self {
+            db: conn,
+            _ownership: ownership,
+        })
+    }
     pub fn remember_gate(&self, id: &str, evidence: &Value) -> Result<()> {
         self.db.execute("INSERT INTO gates(id,evidence) VALUES(?,?) ON CONFLICT(id) DO UPDATE SET evidence=excluded.evidence",params![id,serde_json::to_string(evidence)?])?;
         Ok(())

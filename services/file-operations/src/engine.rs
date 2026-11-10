@@ -25,6 +25,10 @@ impl Engine {
         }
         Ok(engine)
     }
+    pub fn open_preview(config: Config) -> Result<Self> {
+        let store = Store::open_preview(&config)?;
+        Ok(Self { config, store })
+    }
     pub fn preview(&mut self, request: Request) -> Result<Value> {
         crate::person_batch::reject_child(&self.store, &request.id)?;
         validate(&request)?;

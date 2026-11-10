@@ -113,6 +113,25 @@ async fn post(
             "体检发布只允许后台调度器执行",
         ));
     }
+    if envelope.mode == "preview" && app.config.fixture.is_none() && app.worker.has_pending() {
+        let permit = app
+            .status_reads
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::new(503, "unavailable", "读取服务不可用"))?;
+        let config = app.config;
+        let request = envelope.request;
+        return Ok(Json(
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                let mut engine = Engine::open_preview(config)?;
+                engine.preview(request)
+            })
+            .await
+            .map_err(|_| Error::new(503, "unavailable", "预览读取失败"))??,
+        ));
+    }
     let (reply, wait) = oneshot::channel();
     app.worker.try_send(Work {
         command: Command::Files(Box::new(envelope)),
@@ -470,6 +489,24 @@ async fn batch_post(
     Json(body): Json<Value>,
 ) -> Result<Json<Value>> {
     authorize(&app.config, &headers)?;
+    if body["mode"] == "preview" && app.config.fixture.is_none() && app.worker.has_pending() {
+        let permit = app
+            .status_reads
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::new(503, "unavailable", "读取服务不可用"))?;
+        let config = app.config;
+        return Ok(Json(
+            tokio::task::spawn_blocking(move || {
+                let _permit = permit;
+                let mut engine = Engine::open_preview(config)?;
+                person_batch::execute(&mut engine, body)
+            })
+            .await
+            .map_err(|_| Error::new(503, "unavailable", "批次预览读取失败"))??,
+        ));
+    }
     let (reply, wait) = oneshot::channel();
     app.worker.try_send(Work {
         command: Command::Batch(body),
