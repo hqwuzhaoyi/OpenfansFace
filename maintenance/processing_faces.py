@@ -195,8 +195,63 @@ def reference_features(base, vid, source, accepted_receipts=None):
     return []
 
 
+NON_PERSON_NAMES = {'_unsorted', 'Unknown', '未知', '迷奸系列', '九九 圣水精液食物合集'}
+
+
+def _build_video_track(face_items):
+    """Pool intra-video face detections into a dominant coherent unit track vector."""
+    import numpy as np
+    if not face_items:
+        return None
+    ordered = sorted(face_items, key=lambda item: -item[0])[:24]
+    scores = np.asarray([item[0] for item in ordered], dtype=np.float32)
+    embs = np.stack([item[1] for item in ordered]).astype(np.float32)
+    if len(embs) == 1:
+        vec = embs[0] / (np.linalg.norm(embs[0]) + 1e-9)
+        return vec.astype(np.float32), 1, float(scores[0]), 1.0
+    sim = embs @ embs.T
+    weighted_deg = (sim >= .50).astype(np.float32) @ scores
+    seed = int(weighted_deg.argmax())
+    inl_mask = sim[seed] >= .50
+    inl_embs = embs[inl_mask]
+    inl_scores = scores[inl_mask]
+    weights = inl_scores[:, None]
+    center = (inl_embs * weights).sum(axis=0)
+    center = (center / (np.linalg.norm(center) + 1e-9)).astype(np.float32)
+    coherence = float((inl_embs @ center).mean()) if len(inl_embs) > 1 else 1.0
+    return center, int(inl_mask.sum()), float(inl_scores.max()), coherence
+
+
+def _extract_query_tracks(embs):
+    """Extract up to 2 coherent face tracks from a query video's frame embeddings."""
+    import numpy as np
+    if len(embs) == 0:
+        return []
+    if len(embs) == 1:
+        v = embs[0] / (np.linalg.norm(embs[0]) + 1e-9)
+        return [(v.astype(np.float32), 1)]
+    tracks = []
+    remaining = np.arange(len(embs))
+    for _ in range(2):
+        if len(remaining) == 0:
+            break
+        sub = embs[remaining]
+        sim = sub @ sub.T
+        counts = (sim >= .50).sum(axis=1)
+        seed = int(counts.argmax())
+        inl_local = sim[seed] >= .50
+        if tracks and int(inl_local.sum()) < 2:
+            break
+        inl_idx = remaining[inl_local]
+        vec = embs[inl_idx].mean(axis=0)
+        vec = (vec / (np.linalg.norm(vec) + 1e-9)).astype(np.float32)
+        tracks.append((vec, int(len(inl_idx))))
+        remaining = remaining[~inl_local]
+    return tracks
+
+
 def compute_staged_references(base, root, state=None):
-    """Pure computation of reference templates staged into `processing/tmp/references-<uuid>.npz`."""
+    """Pure computation of multi-prototype video-track reference templates staged into `processing/tmp/references-<uuid>.npz`."""
     import numpy as np
     base = Path(base)
     root = Path(root)
@@ -205,20 +260,29 @@ def compute_staged_references(base, root, state=None):
     report = state.get('report') if isinstance(state.get('report'), dict) else read_json(base / 'report.json', {})
     renames = state.get('renames') if isinstance(state.get('renames'), dict) else read_json(base / 'person-renames.json', {})
     if isinstance(state.get('assigned'), dict):
-        assigned = dict(state['assigned'])
+        assigned = {
+            vid: canonical_person(creator, renames)
+            for vid, creator in state['assigned'].items()
+            if isinstance(creator, str) and creator.strip()
+        }
     else:
         assigned = {
             v['vid']: canonical_person(v['creator'], renames)
             for v in read_json(base / 'integration-queue.json', []) + read_json(base / 'archive-history.json', [])
-            if v.get('file_state') != 'staged'
+            if v.get('file_state') != 'staged' and v.get('creator')
         }
     con = sqlite3.connect('file:' + str(base / 'faces.db') + '?mode=ro', uri=True)
     try:
+        video_cols = {row[1] for row in con.execute('PRAGMA table_info(videos)')}
         if isinstance(state.get('sources'), dict):
             sources = dict(state['sources'])
         else:
             sources = dict(con.execute('SELECT vid,path FROM videos'))
             sources.update(read_json(base / 'video-path-overrides.json', {}))
+        video_meta = (
+            dict(con.execute('SELECT vid,size FROM videos').fetchall())
+            if 'size' in video_cols else {}
+        )
         columns = {row[1] for row in con.execute('PRAGMA table_info(faces)')}
         rows = con.execute('SELECT vid,score,emb,thumb FROM faces ORDER BY score DESC').fetchall() if 'emb' in columns else []
     finally:
@@ -232,12 +296,41 @@ def compute_staged_references(base, root, state=None):
                     sources.setdefault(vid, path)
             finally:
                 queue.close()
+    prefix = str(root) + '/pikpak/creators/'
     for vid, path in sources.items():
         file = mapped(path, root) or mapped(vid, root)
-        prefix = str(root) + '/pikpak/creators/'
         if file and file.startswith(prefix):
-            assigned.setdefault(vid, file[len(prefix):].split('/')[0])
-    by_thumb, by_name = {}, {}
+            person = canonical_person(file[len(prefix):].split('/')[0], renames)
+            if person and person not in NON_PERSON_NAMES:
+                assigned.setdefault(vid, person)
+
+    # Link faces.db videos that were moved into pikpak/creators/<person>/ by (filename, size)
+    creators_root = root / 'pikpak/creators'
+    if creators_root.is_dir() and rows:
+        disk_by_name_size = {}
+        for cdir in creators_root.iterdir():
+            if not cdir.is_dir() or cdir.name.startswith('.'):
+                continue
+            person = canonical_person(cdir.name, renames)
+            if not person or person in NON_PERSON_NAMES:
+                continue
+            for p in cdir.rglob('*'):
+                if p.is_file() and p.suffix.lower() in ('.mp4', '.mkv', '.mov', '.avi', '.webm', '.ts', '.m4v'):
+                    try:
+                        st = p.stat()
+                        disk_by_name_size[(p.name, st.st_size)] = person
+                    except OSError:
+                        pass
+        for vid in {r[0] for r in rows}:
+            if vid not in assigned or assigned.get(vid) in NON_PERSON_NAMES:
+                raw_path = sources.get(vid) or vid
+                bn = os.path.basename(str(raw_path).replace('\\', '/'))
+                sz = video_meta.get(vid)
+                if bn and sz is not None and (bn, int(sz)) in disk_by_name_size:
+                    assigned[vid] = disk_by_name_size[(bn, int(sz))]
+
+    by_thumb = {}
+    by_name_vids = {}
     for vid, score, blob, thumb in rows:
         if not blob or len(blob) != 2048:
             continue
@@ -247,37 +340,97 @@ def compute_staged_references(base, root, state=None):
         vector = vector / (np.linalg.norm(vector) + 1e-9)
         if thumb:
             by_thumb.setdefault(thumb, []).append(vector)
-        name = assigned.get(vid)
-        if name and score >= .7 and len(by_name.get(name, [])) < 200:
-            by_name.setdefault(name, []).append(vector)
+        name = canonical_person(assigned.get(vid, ''), renames) if assigned.get(vid) else None
+        if name and name not in NON_PERSON_NAMES and score >= .68:
+            vid_map = by_name_vids.setdefault(name, {})
+            if len(vid_map.get(vid, [])) < 24:
+                vid_map.setdefault(vid, []).append((float(score), vector))
+
     accepted_receipts = state.get('accepted_receipts') if isinstance(state.get('accepted_receipts'), dict) else None
-    for vid, name in assigned.items():
+    for vid, raw_name in assigned.items():
+        name = canonical_person(raw_name, renames)
+        if not name or name in NON_PERSON_NAMES:
+            continue
         source = next((p for value in (sources.get(vid), vid) if (p := mapped(value, root)) and Path(p).is_file()), None)
         if source:
-            by_name.setdefault(name, []).extend(reference_features(base, vid, source, accepted_receipts=accepted_receipts))
+            feats = reference_features(base, vid, source, accepted_receipts=accepted_receipts)
+            if feats:
+                vid_map = by_name_vids.setdefault(name, {})
+                if vid not in vid_map:
+                    vid_map[vid] = [(0.80, (v / (np.linalg.norm(v) + 1e-9)).astype(np.float32)) for v in feats[:24]]
+
     anchors = {}
     for person in report.get('identities', []):
+        p_name = canonical_person(person.get('name', ''), renames)
+        if not p_name or p_name in NON_PERSON_NAMES:
+            continue
         vectors = by_thumb.get(person.get('rep_thumb'), [])
         if vectors and all(float(vectors[0] @ v) > .995 for v in vectors[1:]):
-            anchors[canonical_person(person['name'], renames)] = vectors[0]
+            anchors[p_name] = vectors[0]
+
     names, vectors = [], []
-    for name in sorted(set(by_name) | set(anchors)):
-        candidates = by_name.get(name, [])[:240]
-        anchor = anchors.get(name)
-        if anchor is not None:
-            names.append(name); vectors.append(anchor)
-        if len(candidates) < 5:
+    for name in sorted(set(by_name_vids) | set(anchors)):
+        if not name or name in NON_PERSON_NAMES:
             continue
-        matrix = np.stack(candidates)
-        if anchor is None:
-            similarity = matrix @ matrix.T
-            seed = int((similarity >= .50).sum(axis=1).argmax())
-            selected = matrix[similarity[seed] >= .50]
-        else:
-            selected = matrix[matrix @ anchor >= .45]
-        if len(selected) >= 5:
-            center = selected.mean(axis=0); center /= np.linalg.norm(center) + 1e-9
-            names.append(name); vectors.append(center)
+        vid_map = by_name_vids.get(name, {})
+        tracks = []
+        for vid, face_items in vid_map.items():
+            built = _build_video_track(face_items)
+            if built is not None:
+                tracks.append(built)
+
+        if not tracks:
+            anchor = anchors.get(name)
+            if anchor is not None:
+                names.append(name)
+                vectors.append((anchor / (np.linalg.norm(anchor) + 1e-9)).astype(np.float32))
+            continue
+
+        total_inlier_faces = sum(t[1] for t in tracks)
+        if len(tracks) == 1:
+            vt, n_inl, max_sc, coh = tracks[0]
+            if n_inl >= 5 or (n_inl >= 2 and max_sc >= .72 and coh >= .55):
+                names.append(name)
+                vectors.append(vt)
+            continue
+
+        T = np.stack([t[0] for t in tracks]).astype(np.float32)
+        sim_t = T @ T.T
+        deg = (sim_t >= .45).sum(axis=1)
+        seed_t = int(deg.argmax())
+        inl_mask = sim_t[seed_t] >= .44
+        n_inl_vids = int(inl_mask.sum())
+
+        # Multi-model / male-producer studio folder purity gate
+        if len(T) >= 8 and (n_inl_vids / len(T)) < .22:
+            continue
+        if n_inl_vids < 2 and total_inlier_faces < 5:
+            continue
+
+        inl_T = T[inl_mask]
+        c1 = inl_T.mean(axis=0)
+        c1 = (c1 / (np.linalg.norm(c1) + 1e-9)).astype(np.float32)
+        person_protos = [c1]
+        names.append(name)
+        vectors.append(c1)
+
+        # Extract up to 3 diverse pose/appearance sub-prototypes from remaining inlier video tracks
+        rem = inl_T[(inl_T @ c1) < .85]
+        for _ in range(3):
+            if len(rem) < 2:
+                break
+            s_rem = rem @ rem.T
+            sd = int((s_rem >= .55).sum(axis=1).argmax())
+            cluster_mask = s_rem[sd] >= .55
+            if int(cluster_mask.sum()) >= 2:
+                ck = rem[cluster_mask].mean(axis=0)
+                ck = (ck / (np.linalg.norm(ck) + 1e-9)).astype(np.float32)
+                if max(float(ck @ p) for p in person_protos) < .88:
+                    person_protos.append(ck)
+                    names.append(name)
+                    vectors.append(ck)
+            rem = rem[~cluster_mask]
+
     matrix = np.stack(vectors).astype(np.float32) if vectors else np.zeros((0, 512), np.float32)
     version = hashlib.sha256(json.dumps(names, ensure_ascii=False).encode() + matrix.tobytes()).hexdigest()
     staged_file = base / 'processing/tmp' / f'references-{uuid.uuid4()}.npz'
@@ -449,6 +602,75 @@ def extract_features(task, base, root, progress=None):
     return result, False, successful
 
 
+def score_face_candidates(embs, thumbs, timestamps, ref_names, ref_matrix):
+    """Score query video face embeddings against multi-prototype reference gallery using track-frame hybrid similarity."""
+    import numpy as np
+    if len(embs) == 0 or len(ref_matrix) == 0:
+        return []
+    q_tracks = _extract_query_tracks(embs)
+    scores = embs @ ref_matrix.T
+    raw_candidates = []
+    unique_names = [n for n in sorted(set(ref_names)) if n and n not in NON_PERSON_NAMES]
+    for name in unique_names:
+        mask = ref_names == name
+        protos = ref_matrix[mask]
+        per_face = scores[:, mask].max(axis=1)
+        best = int(per_face.argmax())
+        max_frame = float(per_face[best])
+        top2_frame = float(np.sort(per_face)[-2:].mean()) if len(per_face) >= 2 else max_frame
+        track_sim = max((float((t_vec @ protos.T).max()) for t_vec, _ in q_tracks), default=max_frame)
+        best_track_support = max((t_sup for t_vec, t_sup in q_tracks if float((t_vec @ protos.T).max()) >= .48), default=0)
+        if len(per_face) >= 2:
+            hybrid = max(top2_frame, .55 * track_sim + .45 * max_frame)
+        else:
+            hybrid = max_frame
+        support = int(max((per_face >= .48).sum(), best_track_support))
+        raw_candidates.append(dict(
+            name=str(name),
+            hybrid=hybrid,
+            max_frame=max_frame,
+            track_sim=track_sim,
+            support=max(1, support) if hybrid >= .48 else 0,
+            best=best,
+        ))
+    if not raw_candidates:
+        return []
+    raw_candidates.sort(key=lambda c: -c['hybrid'])
+    if len(raw_candidates) >= 15:
+        cohort_slice = [c['hybrid'] for c in raw_candidates[5:min(35, len(raw_candidates))]]
+        bg_mean = float(np.mean(cohort_slice))
+    else:
+        bg_mean = 0.35
+
+    matches = []
+    for cand in raw_candidates:
+        hybrid = cand['hybrid']
+        track_sim = cand['track_sim']
+        support = cand['support']
+        admitted = False
+        if hybrid >= .50:
+            # Suppress single-frame hubness noise when gallery is large
+            if len(raw_candidates) >= 20 and hybrid < .525 and support < 2 and (hybrid - bg_mean) < .09:
+                admitted = False
+            else:
+                admitted = True
+        elif len(embs) >= 2 and track_sim >= .485 and support >= 2 and hybrid >= .485 and (hybrid - bg_mean) >= .10:
+            admitted = True
+        if admitted:
+            best = cand['best']
+            matches.append(dict(
+                name=cand['name'],
+                source='face',
+                score=round(float(max(hybrid, .50 if track_sim >= .485 else hybrid)), 4),
+                support=int(support),
+                thumb=str(thumbs[best]) if len(thumbs) > best else '',
+                timestamp=float(timestamps[best]) if len(timestamps) > best else 0.0,
+                detail='人脸相似度候选，需人工核对',
+            ))
+    matches.sort(key=lambda m: (-m['score'], -m['support'], m['name']))
+    return matches
+
+
 def analyze(task, base, root):
     import numpy as np
     progress = stage_progress(task, base)
@@ -457,17 +679,7 @@ def analyze(task, base, root):
     with np.load(task.get('_references_path', Path(base) / 'processing/references.npz'), allow_pickle=False) as refs:
         renames = read_json(Path(base) / 'person-renames.json', {})
         names, matrix, version = np.asarray([canonical_person(str(name), renames) for name in refs['names']]), refs['embeddings'], str(refs['version'])
-    matches = []
-    if len(features['embeddings']) and len(matrix):
-        scores = features['embeddings'] @ matrix.T
-        for name in sorted(set(names)):
-            per_face = scores[:, names == name].max(axis=1)
-            best = int(per_face.argmax()); score = float(per_face[best])
-            if score >= .50:
-                matches.append(dict(name=str(name), source='face', score=round(score, 4),
-                                    support=int((per_face >= .50).sum()), thumb=str(features['thumbs'][best]),
-                                    timestamp=float(features['timestamps'][best]), detail='人脸相似度候选，需人工核对'))
-    matches.sort(key=lambda m: -m['score'])
+    matches = score_face_candidates(features['embeddings'], features['thumbs'], features['timestamps'], names, matrix)
     unknown_group = None
     if not matches and len(features['embeddings']) >= 2:
         vectors = features['embeddings']; similarities = vectors @ vectors.T
