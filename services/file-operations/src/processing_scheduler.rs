@@ -1727,6 +1727,7 @@ fn load_active_state(config: &Config, conn: &Connection, now: f64) -> Result<Act
             .and_then(|s| serde_json::from_str::<Value>(s).ok())
             .unwrap_or_else(|| json!({}));
         row["data"] = canonical_person_fields(parsed_data, "", &aliases);
+        crate::processing_result::re_resolve_task_data(&mut row["data"]);
         tasks.push(row);
     }
     let events = db::rows(conn, "SELECT * FROM events ORDER BY id DESC LIMIT 12", [])?

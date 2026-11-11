@@ -259,7 +259,10 @@ pub fn resolve_candidates(candidates: &[Value]) -> Value {
             continue;
         };
         let source = candidate["source"].as_str().unwrap_or("");
-        let pos = if let Some(idx) = grouped.iter().position(|e| e.name == name) {
+        let pos = if let Some(idx) = grouped
+            .iter()
+            .position(|e| e.name == name || e.name.eq_ignore_ascii_case(name))
+        {
             idx
         } else {
             grouped.push(Entry {
@@ -271,7 +274,15 @@ pub fn resolve_candidates(candidates: &[Value]) -> Value {
             grouped.len() - 1
         };
         let entry = &mut grouped[pos];
-        if !entry.sources.iter().any(|s| s == source) {
+        if entry.name != name
+            && (matches!(source, "face" | "folder")
+                || candidate["confirmed"] == true
+                || (entry.name.bytes().all(|b| !b.is_ascii_uppercase())
+                    && name.bytes().any(|b| b.is_ascii_uppercase())))
+        {
+            entry.name = name.to_owned();
+        }
+        if !source.is_empty() && !entry.sources.iter().any(|s| s == source) {
             entry.sources.push(source.to_owned());
         }
         entry.evidence.push(candidate.clone());
@@ -280,14 +291,37 @@ pub fn resolve_candidates(candidates: &[Value]) -> Value {
             entry.score = Some(current.max(score));
         }
     }
+    for entry in &mut grouped {
+        for ev in &mut entry.evidence {
+            if ev.is_object() {
+                ev["name"] = json!(entry.name);
+            }
+        }
+    }
+    let is_confirmed_wm = |e: &Entry| {
+        e.evidence
+            .iter()
+            .any(|ev| ev["source"].as_str() == Some("watermark") && ev["confirmed"] == true)
+    };
+    let is_wm = |e: &Entry| e.sources.iter().any(|s| s == "watermark");
+    let is_folder = |e: &Entry| e.sources.iter().any(|s| s == "folder");
     grouped.sort_by(|a, b| {
-        let a_wm = a.sources.iter().any(|s| s == "watermark");
-        let b_wm = b.sources.iter().any(|s| s == "watermark");
-        (!a_wm)
-            .cmp(&(!b_wm))
+        (!is_confirmed_wm(a))
+            .cmp(&(!is_confirmed_wm(b)))
+            .then_with(|| (!is_wm(a)).cmp(&(!is_wm(b))))
+            .then_with(|| (!is_folder(a)).cmp(&(!is_folder(b))))
             .then_with(|| (-(a.score.unwrap_or(0.0))).total_cmp(&(-(b.score.unwrap_or(0.0)))))
+            .then_with(|| {
+                if is_wm(a) && is_wm(b) {
+                    b.name.chars().count().cmp(&a.name.chars().count())
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
             .then_with(|| a.name.cmp(&b.name))
     });
+    let confirmed_wm_count = grouped.iter().filter(|e| is_confirmed_wm(e)).count();
+    let wm_count = grouped.iter().filter(|e| is_wm(e)).count();
     let values: Vec<Value> = grouped
         .iter()
         .map(|e| {
@@ -299,23 +333,46 @@ pub fn resolve_candidates(candidates: &[Value]) -> Value {
             })
         })
         .collect();
-    let kind = if values.is_empty() {
-        "none"
-    } else if values.len() > 1 {
-        "conflict"
+    let (kind, suggested) = if values.is_empty() {
+        ("none", Value::Null)
+    } else if confirmed_wm_count == 1 {
+        ("suggested", json!(values[0]["name"]))
+    } else if wm_count == 1 && confirmed_wm_count == 0 {
+        ("suggested", json!(values[0]["name"]))
+    } else if wm_count > 1 {
+        ("conflict", Value::Null)
+    } else if values.len() == 1 {
+        ("suggested", json!(values[0]["name"]))
     } else {
-        "suggested"
-    };
-    let suggested = if values.len() == 1 {
-        json!(values[0]["name"])
-    } else {
-        Value::Null
+        ("conflict", Value::Null)
     };
     json!({
         "candidates": values,
         "kind": kind,
         "suggested": suggested,
     })
+}
+
+pub fn re_resolve_task_data(data: &mut Value) {
+    let Some(candidates) = data["candidates"].as_array() else {
+        return;
+    };
+    if candidates.is_empty() || !candidates.iter().all(|c| c["evidence"].is_array()) {
+        return;
+    }
+    let flat: Vec<Value> = candidates
+        .iter()
+        .filter_map(|c| c["evidence"].as_array())
+        .flatten()
+        .cloned()
+        .collect();
+    if flat.is_empty() {
+        return;
+    }
+    let resolved = resolve_candidates(&flat);
+    data["candidates"] = resolved["candidates"].clone();
+    data["kind"] = resolved["kind"].clone();
+    data["suggested"] = resolved["suggested"].clone();
 }
 
 fn resolve_stage_data(
@@ -1404,19 +1461,33 @@ mod tests {
     }
 
     #[test]
-    fn multiple_candidates_resolve_as_conflict_and_rank_watermark_first() {
+    fn multiple_candidates_resolve_with_watermark_priority() {
         let resolved = resolve_candidates(&[
             json!({"name": "Bob", "source": "folder"}),
             json!({"name": "Alice", "source": "watermark"}),
             json!({"name": "Alice", "source": "face", "score": 0.6}),
         ]);
-        assert_eq!(resolved["kind"], "conflict");
-        assert!(resolved["suggested"].is_null());
+        assert_eq!(resolved["kind"], "suggested");
+        assert_eq!(resolved["suggested"], "Alice");
         let candidates = resolved["candidates"].as_array().unwrap();
         assert_eq!(candidates.len(), 2);
         assert_eq!(candidates[0]["name"], "Alice");
         assert_eq!(candidates[0]["score"], 0.6);
         assert_eq!(candidates[1]["name"], "Bob");
+
+        let multi_wm = resolve_candidates(&[
+            json!({"name": "Bob", "source": "watermark"}),
+            json!({"name": "Alice", "source": "watermark"}),
+        ]);
+        assert_eq!(multi_wm["kind"], "conflict");
+        assert!(multi_wm["suggested"].is_null());
+
+        let multi_face = resolve_candidates(&[
+            json!({"name": "Bob", "source": "face", "score": 0.55}),
+            json!({"name": "Alice", "source": "face", "score": 0.62}),
+        ]);
+        assert_eq!(multi_face["kind"], "conflict");
+        assert!(multi_face["suggested"].is_null());
         assert_eq!(resolve_candidates(&[])["kind"], "none");
     }
 }

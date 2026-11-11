@@ -33,6 +33,15 @@ fn schema(config: &Config) -> Result<rusqlite::Connection> {
 fn now(conn: &rusqlite::Connection) -> Result<i64> {
     Ok(conn.query_row("SELECT unixepoch()", [], |r| r.get(0))?)
 }
+fn has_watermark_candidate(data: &Value) -> bool {
+    data["candidates"].as_array().is_some_and(|cs| {
+        cs.iter().any(|c| {
+            c["sources"]
+                .as_array()
+                .is_some_and(|ss| ss.iter().any(|s| s == "watermark"))
+        })
+    })
+}
 pub fn available(t: &Value) -> bool {
     review::number(&t["manual"]).unwrap_or(0) != 0
         || t["stage"] == "review"
@@ -127,6 +136,7 @@ fn tasks_filtered(
         let mut t = public(row)?;
         t["__review_raw_people"] = json!(candidate_names(&t["data"]));
         canonical_fields(&mut t["data"], "", aliases)?;
+        crate::processing_result::re_resolve_task_data(&mut t["data"]);
         out.push(t)
     }
     Ok(out)
@@ -576,6 +586,7 @@ pub fn execute(engine: &mut Engine, command: &str, body: Value) -> Result<Value>
                     .map(|t| evidence(config, t, &material, &health, &dispositions))
                     .collect::<Result<Vec<_>>>()?;
                 evidence.retain(|e| e["health"]["hidden"] != true);
+                evidence.sort_by_key(|e| !has_watermark_candidate(&e["task"]["data"]));
                 for (index, e) in evidence.iter_mut().enumerate() {
                     let key = if e["pending_seen"] == true {
                         "pending_order"

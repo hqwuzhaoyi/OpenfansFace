@@ -55,7 +55,9 @@ class ProcessingTests(unittest.TestCase):
     def test_multiple_candidates_are_one_conflicted_video(self):
         result = resolve_candidates([dict(name='Alice', source='watermark'), dict(name='Alice', source='face', score=.6), dict(name='Bob', source='folder')])
         self.assertEqual(len(result['candidates']), 2)
-        self.assertEqual(result['kind'], 'conflict'); self.assertIsNone(result['suggested'])
+        self.assertEqual(result['kind'], 'suggested'); self.assertEqual(result['suggested'], 'Alice')
+        conflict = resolve_candidates([dict(name='Alice', source='watermark'), dict(name='Bob', source='watermark')])
+        self.assertEqual(conflict['kind'], 'conflict'); self.assertIsNone(conflict['suggested'])
         self.assertEqual(resolve_candidates([])['kind'], 'none')
 
     def test_new_video_priority_and_pause(self):

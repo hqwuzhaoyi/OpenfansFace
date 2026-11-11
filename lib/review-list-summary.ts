@@ -15,7 +15,7 @@ export function candidateReasons(candidate:IdentityCandidate):Reason[]{
 }
 export function reviewListSummary(task:ProcessingTask){
   const candidates=(task.data.candidates||[]).map(candidate=>({name:candidate.name,reasons:candidateReasons(candidate)}))
-  const conflict=task.data.kind==='conflict'||candidates.length>1
+  const conflict=task.data.kind==='conflict'||(!task.data.kind&&candidates.length>1)
   const evidence=(task.data.candidates||[]).flatMap(candidate=>candidate.evidence||[])
   const confirmed=new Set(evidence.filter(e=>e.source==='watermark'&&e.confirmed===true&&e.key).map(e=>e.key))
   const unconfirmed=new Set(evidence.filter(e=>e.source==='watermark'&&e.confirmed!==true&&e.key).map(e=>e.key))

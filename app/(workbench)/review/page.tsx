@@ -72,7 +72,8 @@ export default function Review() {
   const blockedIds=new Set((data?.blocked||[]).map(item=>item.vid))
   const selected=new Set(chosen.map(t=>t.vid)),originalFocus=(inspected[scope]&&!pendingVids.has(inspected[scope].vid)?inspected[scope]:undefined)||rows.find(t=>t.vid===linkFocus)||rows[0],focused=originalFocus?{...originalFocus,review_blocked:data?.blocked?.find(item=>item.vid===originalFocus.vid)?.message}:undefined,hiddenCount=chosen.filter(t=>!rows.some(r=>r.vid===t.vid)).length
   const actionTargets=chosen.length>0?chosen:(focused?[focused]:[])
-  const defaultCreator=data?.group?.kind==='suggested'?data.group.label:(focused?.data.suggested||(focused?.data.candidates?.length===1?focused.data.candidates[0].name:''))
+  const preferredTaskCreator=(task?:ProcessingTask)=>task?.data.suggested||task?.data.candidates?.find(c=>c.sources?.includes('watermark'))?.name||(task?.data.candidates?.length===1?task.data.candidates[0].name:undefined)
+  const defaultCreator=data?.group?.kind==='suggested'?data.group.label:(preferredTaskCreator(focused)||'')
   const creator=drafts[scope]?.creator!==undefined?drafts[scope].creator!:defaultCreator,watermarkKey=drafts[scope]?.watermarkKey||''
   const setCreator=(creator:string)=>setDrafts(current=>({...current,[scope]:{...current[scope],creator,watermarkKey:''}}))
   const setWatermarkKey=(watermarkKey:string)=>setDrafts(current=>({...current,[scope]:{creator:current[scope]?.creator,watermarkKey}}))
@@ -181,11 +182,11 @@ export default function Review() {
         map.set(c.name,prev)
       }
     }
-    return [...map.entries()].sort((a,b)=>b[1].count-a[1].count||(b[1].sim||0)-(a[1].sim||0)).map(([name,info])=>{
+    return [...map.entries()].sort((a,b)=>Number(b[1].sources.has('watermark'))-Number(a[1].sources.has('watermark'))||b[1].count-a[1].count||(b[1].sim||0)-(a[1].sim||0)).map(([name,info])=>{
       const existing=people.find(p=>p.name===name)
       const parts=[`${info.count}/${actionTargets.length} 命中`]
+      if(info.sources.has('watermark'))parts.push('水印线索')
       if(info.sim!==undefined)parts.push(`相似度 ${info.sim.toFixed(2)}`)
-      else if(info.sources.has('watermark'))parts.push('水印线索')
       return {name,rep_thumb:existing?.rep_thumb||info.thumb||null,aliases:existing?.aliases,sim:info.sim,match_count:info.count,match_reason:parts.join(' · ')}
     })
   })():[]
@@ -208,7 +209,7 @@ export default function Review() {
   const chooseGroup=(key:string)=>{const targetScope=reviewSelectionKey(key,view==='deferred');if(!(selections[targetScope]?.length)){initializedScopesRef.current.delete(`${targetScope}:0`);forceSelectAllScopeRef.current=targetScope}setGroup(key);setPage(0);setLinkFocus('');setPreviewOpen(false)}
   const toggle=(tasks:ProcessingTask[])=>{setSelections(current=>({...current,[scope]:toggleReviewSelection(current[scope]||[],tasks)}));setWatermarkKey('')}
   const clear=()=>setSelections(current=>({...current,[scope]:[]}))
-  const inspect=(task:ProcessingTask)=>{setReference(null);if(!previewOpen){returnFocus.current=document.activeElement as HTMLElement;setInstantEntry(!!document.activeElement?.matches(':focus-visible')||matchMedia('(prefers-reduced-motion: reduce)').matches)}setInspected(current=>({...current,[scope]:task}));setDetailMode('video');if(!wide)setPreviewOpen(true)}
+  const inspect=(task:ProcessingTask)=>{setReference(null);if(!previewOpen){returnFocus.current=document.activeElement as HTMLElement;setInstantEntry(!!document.activeElement?.matches(':focus-visible')||matchMedia('(prefers-reduced-motion: reduce)').matches)}setInspected(current=>({...current,[scope]:task}));if(data?.group?.kind!=='suggested'&&chosen.length<=1)setDrafts(current=>({...current,[scope]:{creator:preferredTaskCreator(task),watermarkKey:''}}));setDetailMode('video');if(!wide)setPreviewOpen(true)}
   const openSelection=()=>{if(!previewOpen){returnFocus.current=document.activeElement as HTMLElement;setInstantEntry(!!document.activeElement?.matches(':focus-visible')||matchMedia('(prefers-reduced-motion: reduce)').matches)}if(!chosen.length&&focused)setSelections(current=>({...current,[scope]:[focused]}));if(!creator&&defaultCreator)setCreator(defaultCreator);setReference(null);setSubmitError('');setDetailMode('selection');if(!wide)setPreviewOpen(true);else requestAnimationFrame(()=>selectionHeading.current?.focus())}
   const stepFocus=(delta:-1|1)=>{
     if(!rows.length)return
@@ -217,7 +218,7 @@ export default function Review() {
     const nextTask=rows[nextIdx]
     if(!nextTask)return
     setInspected(current=>({...current,[scope]:nextTask}))
-    if(chosen.length<=1)setSelections(current=>({...current,[scope]:[nextTask]}))
+    if(chosen.length<=1){setSelections(current=>({...current,[scope]:[nextTask]}));if(data?.group?.kind!=='suggested')setDrafts(current=>({...current,[scope]:{creator:preferredTaskCreator(nextTask),watermarkKey:''}}))}
     requestAnimationFrame(()=>{document.querySelector<HTMLElement>(`[data-vid="${CSS.escape(nextTask.vid)}"]`)?.scrollIntoView({block:'nearest'})})
   }
   const advanceAfterComplete=(vids:string[])=>{
@@ -237,7 +238,7 @@ export default function Review() {
     if(nextRow){
       setInspected(current=>{const next=Object.fromEntries(Object.entries(current).filter(([,task])=>!completedSet.has(task.vid)));next[scope]=nextRow;return next})
       setSelections(current=>{const cleaned=removeReviewSelection(current,vids);const remainingChosen=cleaned[scope]||[];cleaned[scope]=remainingChosen.length>0?remainingChosen:[nextRow];return cleaned})
-      setDrafts(current=>({...current,[scope]:{creator:data?.group?.kind==='suggested'?data.group.label:(nextRow.data.suggested||(nextRow.data.candidates?.length===1?nextRow.data.candidates[0].name:undefined)),watermarkKey:''}}))
+      setDrafts(current=>({...current,[scope]:{creator:data?.group?.kind==='suggested'?data.group.label:preferredTaskCreator(nextRow),watermarkKey:''}}))
       setLinkFocus('')
       requestAnimationFrame(()=>{document.querySelector<HTMLElement>(`[data-vid="${CSS.escape(nextRow.vid)}"]`)?.scrollIntoView({block:'nearest'})})
       return
