@@ -608,6 +608,19 @@ export function BackgroundOperationsProvider({
     setTasks((prev) => prev.filter((t) => !isTerminalStatus(t.status)));
   }, []);
 
+  // Auto-clear when all tasks have completed and the popover is closed
+  useEffect(() => {
+    if (open || tasks.length === 0) return;
+    const allComplete = tasks.every((t) => t.status === "complete");
+    if (!allComplete) return;
+    const timer = setTimeout(() => {
+      setTasks((prev) =>
+        prev.every((t) => t.status === "complete") ? [] : prev,
+      );
+    }, 3000);
+    return () => clearTimeout(timer);
+  }, [tasks, open]);
+
   // Execute a PersonBatchTask
   const runPersonBatchTask = useCallback(
     async (initialTask: PersonBatchTask) => {
@@ -1489,7 +1502,11 @@ function TaskIcon({ task }: { task: BackgroundTask }) {
   return <Pencil className="size-3.5" />;
 }
 
-function BackgroundOperationsDock() {
+export function BackgroundOperationsDock({
+  mobile = false,
+}: {
+  mobile?: boolean;
+}) {
   const {
     tasks,
     open,
@@ -1500,7 +1517,17 @@ function BackgroundOperationsDock() {
     reconcileTask,
   } = useBackgroundOperations();
   const router = useRouter();
+  const [isMobileViewport, setIsMobileViewport] = useState(false);
 
+  useEffect(() => {
+    const mql = window.matchMedia("(max-width: 767px)");
+    const update = () => setIsMobileViewport(mql.matches);
+    update();
+    mql.addEventListener("change", update);
+    return () => mql.removeEventListener("change", update);
+  }, []);
+
+  if (mobile !== isMobileViewport) return null;
   if (tasks.length === 0) return null;
 
   const runningTask = tasks.find((t) => t.status === "running");
@@ -1537,13 +1564,18 @@ function BackgroundOperationsDock() {
       : [];
 
   return (
-    <div className="bg-ops-dock" role="region" aria-label="后台文件操作状态">
+    <div
+      className={mobile ? "bg-ops-dock bg-ops-dock-mobile" : "bg-ops-dock"}
+      role="region"
+      aria-label="后台文件操作状态"
+    >
       <MorphPopover open={open} onOpenChange={setOpen}>
         <MorphPopoverTrigger>
           <button
             type="button"
             className="bg-ops-trigger"
             data-state={stateTone}
+            data-mobile={mobile || undefined}
             aria-label={`后台任务：${pillLabel}`}
           >
             <span className="bg-ops-trigger-icon" data-tone={stateTone}>
@@ -1556,22 +1588,24 @@ function BackgroundOperationsDock() {
               )}
             </span>
 
-            {activeAvatars.length > 0 && (
+            {!mobile && activeAvatars.length > 0 && (
               <AvatarGroup members={activeAvatars} size="sm" max={3} />
             )}
 
-            <ActionSwapText
-              value={pillLabel}
-              animation="roll"
-              className="bg-ops-trigger-label"
-            >
-              {pillLabel}
-            </ActionSwapText>
+            {!mobile && (
+              <ActionSwapText
+                value={pillLabel}
+                animation="roll"
+                className="bg-ops-trigger-label"
+              >
+                {pillLabel}
+              </ActionSwapText>
+            )}
 
             <span className="bg-ops-trigger-count">
               {queuedCount > 0 ? (
                 <>
-                  <span>排队</span>
+                  {!mobile && <span>排队</span>}
                   <DigitSwap value={queuedCount} />
                 </>
               ) : (
@@ -1586,7 +1620,7 @@ function BackgroundOperationsDock() {
         </MorphPopoverTrigger>
 
         <MorphPopoverContent
-          side="top"
+          side={mobile ? "bottom" : "top"}
           align="end"
           sideOffset={10}
           radius={14}

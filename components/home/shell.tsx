@@ -9,6 +9,7 @@ import { usePrivacy } from '@/components/privacy-provider'
 import { MotionConfig } from 'motion/react'
 import { workbenchNavigation } from '@/lib/workbench-navigation'
 import { useTheme, type ThemeMode } from '@/components/theme-provider'
+import { BackgroundOperationsDock } from '@/components/workbench/background-operations'
 import {
   AnimatedSidebar,
   AnimatedSidebarClose,
@@ -171,16 +172,19 @@ function MobileTopBar({ pathname }: { pathname: string }) {
         <span>OpenfansFace</span>
       </Link>
       {currentNav && <span className="home-mobile-current">{currentNav.label}</span>}
-      <PrivacyControl mobile />
-      <button
-        type="button"
-        aria-label={`切换主题（当前：${modeLabel}）`}
-        title={`主题：${modeLabel}`}
-        onClick={cycleMode}
-        className="home-mobile-theme"
-      >
-        <Icon size={16} />
-      </button>
+      <div className="home-mobile-actions">
+        <BackgroundOperationsDock mobile />
+        <PrivacyControl mobile />
+        <button
+          type="button"
+          aria-label={`切换主题（当前：${modeLabel}）`}
+          title={`主题：${modeLabel}`}
+          onClick={cycleMode}
+          className="home-mobile-theme"
+        >
+          <Icon size={16} />
+        </button>
+      </div>
     </div>
   )
 }

@@ -272,6 +272,25 @@
   text-overflow: ellipsis;
 }
 
+.home-mobile-actions {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.home-mobile-actions .privacy-control-mobile,
+.home-mobile-actions .home-mobile-theme {
+  margin-left: 0;
+}
+
+@media (max-width: 420px) {
+  .home-mobile-brand span {
+    display: none;
+  }
+}
+
 .home-mobile-theme {
   margin-left: auto;
 }

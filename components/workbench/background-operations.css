@@ -7,6 +7,22 @@
   align-items: center;
 }
 
+.bg-ops-dock-mobile {
+  position: static;
+  z-index: auto;
+  flex-shrink: 0;
+}
+
+.bg-ops-trigger[data-mobile="true"] {
+  min-height: 44px;
+  height: 44px;
+  padding: 0 10px;
+  gap: 6px;
+  border-radius: 8px;
+  box-shadow: none;
+  background: var(--background);
+}
+
 .bg-ops-trigger {
   display: inline-flex;
   align-items: center;
