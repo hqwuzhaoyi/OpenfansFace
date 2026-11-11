@@ -42,6 +42,11 @@ def attempt_directory(base, task):
     attempt = str(uuid.UUID(task['run_id']))
     directory = Path(base) / 'processing/attempts' / attempt
     directory.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(directory.parent, 0o777)
+        os.chmod(directory, 0o777)
+    except OSError:
+        pass
     return directory
 
 

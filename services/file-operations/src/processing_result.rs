@@ -291,6 +291,58 @@ pub fn resolve_candidates(candidates: &[Value]) -> Value {
             entry.score = Some(current.max(score));
         }
     }
+    let mut merge_into: Vec<Option<usize>> = vec![None; grouped.len()];
+    for i in 0..grouped.len() {
+        let is_unconfirmed_wm_only = grouped[i].sources.len() == 1
+            && grouped[i].sources[0] == "watermark"
+            && !grouped[i]
+                .evidence
+                .iter()
+                .any(|ev| ev["source"].as_str() == Some("watermark") && ev["confirmed"] == true);
+        if !is_unconfirmed_wm_only {
+            continue;
+        }
+        let stem = grouped[i]
+            .name
+            .trim_end_matches(['_', '-', '.', ' '])
+            .to_lowercase();
+        let stem_len = stem.chars().count();
+        if stem_len < 3 {
+            continue;
+        }
+        let best_target = (0..grouped.len())
+            .filter(|&j| {
+                j != i
+                    && grouped[j].sources.iter().any(|s| s == "watermark")
+                    && {
+                        let target_lower = grouped[j].name.to_lowercase();
+                        target_lower.chars().count() > stem_len && target_lower.starts_with(&stem)
+                    }
+            })
+            .max_by_key(|&j| (grouped[j].name.chars().count(), j));
+        merge_into[i] = best_target;
+    }
+    if merge_into.iter().any(Option::is_some) {
+        let mut merged_entries: Vec<Option<Entry>> = grouped.into_iter().map(Some).collect();
+        for i in 0..merged_entries.len() {
+            let Some(mut target) = merge_into[i] else {
+                continue;
+            };
+            while let Some(next) = merge_into[target] {
+                if next == target {
+                    break;
+                }
+                target = next;
+            }
+            if target != i
+                && let Some(source_entry) = merged_entries[i].take()
+                && let Some(target_entry) = merged_entries[target].as_mut()
+            {
+                target_entry.evidence.extend(source_entry.evidence);
+            }
+        }
+        grouped = merged_entries.into_iter().flatten().collect();
+    }
     for entry in &mut grouped {
         for ev in &mut entry.evidence {
             if ev.is_object() {

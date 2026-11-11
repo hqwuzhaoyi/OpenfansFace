@@ -170,5 +170,22 @@ class ProcessingTests(unittest.TestCase):
         self.assertTrue(self.db.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] >= 1)
         faces.close()
 
+    def test_truncated_ocr_watermark_prefixes_merge_into_longest_handle(self):
+        def runner(task, base, root):
+            if task['stage'] == 'text':
+                return dict(candidates=[
+                    dict(key='wm1', text='@xxapple_e2', token='xxapple_e2', platform='unknown', kind='account'),
+                    dict(key='wm2', text='@xxapple_e', token='xxapple_e', platform='unknown', kind='account'),
+                    dict(key='wm3', text='@xxapp', token='xxapp', platform='unknown', kind='account'),
+                ])
+            return dict(matches=[], face_count=0, thumbs=[], reference_people=0)
+        self.assertTrue(process_one(self.base, self.root, runner))
+        self.assertTrue(process_one(self.base, self.root, runner))
+        data = json.loads(self.db.execute('SELECT data FROM tasks').fetchone()[0])
+        self.assertEqual(data['kind'], 'suggested')
+        self.assertEqual(data['suggested'], 'xxapple_e2')
+        self.assertEqual([c['name'] for c in data['candidates']], ['xxapple_e2'])
+        self.assertEqual(len(data['candidates'][0]['evidence']), 3)
+
 
 if __name__ == '__main__': unittest.main()

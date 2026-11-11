@@ -93,12 +93,16 @@ def cached_features(base, task):
 def save_npz(file, **data):
     import numpy as np
     file.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(file.parent, 0o777)
+    except OSError:
+        pass
     fd, temporary = tempfile.mkstemp(prefix='.' + file.name, dir=file.parent)
     try:
         with os.fdopen(fd, 'wb') as out:
             np.savez_compressed(out, **data)
             out.flush(); os.fsync(out.fileno())
-        os.chmod(temporary, 0o644)
+        os.chmod(temporary, 0o666)
         os.replace(temporary, file)
         directory = os.open(file.parent, os.O_RDONLY)
         try: os.fsync(directory)
