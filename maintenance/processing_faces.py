@@ -165,6 +165,12 @@ def reference_features(base, vid, source, accepted_receipts=None):
                     continue
                 if accepted and (int(cached['source_dev']) != int(receipt_identity.get('dev', -1)) or int(cached['source_ino']) != int(receipt_identity.get('ino', -1))):
                     continue
+                vectors = cached['embeddings'][:24].copy()
+                if len(vectors) == 0 or vectors.ndim != 2 or vectors.shape[1] != 512 or not np.isfinite(vectors).all():
+                    continue
+                norms = np.linalg.norm(vectors, axis=1)
+                if np.any(norms < .99) or np.any(norms > 1.01):
+                    continue
                 same_origin = str(cached['path']) == str(source)
                 if accepted:
                     same_origin = same_origin and int(cached['source_dev']) == stat.st_dev and int(cached['source_ino']) == stat.st_ino
@@ -183,12 +189,6 @@ def reference_features(base, vid, source, accepted_receipts=None):
                     after = source.stat()
                     if any(getattr(after, 'st_' + key) != getattr(stat, 'st_' + key) for key in ('dev', 'ino', 'size', 'mtime_ns')):
                         continue
-                vectors = cached['embeddings'][:24].copy()
-                if vectors.ndim != 2 or vectors.shape[1] != 512 or not np.isfinite(vectors).all():
-                    continue
-                norms = np.linalg.norm(vectors, axis=1)
-                if np.any(norms < .99) or np.any(norms > 1.01):
-                    continue
                 return list(vectors)
         except (OSError, ValueError, KeyError):
             continue
@@ -297,37 +297,21 @@ def compute_staged_references(base, root, state=None):
             finally:
                 queue.close()
     prefix = str(root) + '/pikpak/creators/'
+    share_prefix = str(root) + '/pikpak/share/收藏/'
     for vid, path in sources.items():
         file = mapped(path, root) or mapped(vid, root)
-        if file and file.startswith(prefix):
+        if not file:
+            continue
+        if file.startswith(prefix):
             person = canonical_person(file[len(prefix):].split('/')[0], renames)
             if person and person not in NON_PERSON_NAMES:
                 assigned.setdefault(vid, person)
-
-    # Link faces.db videos that were moved into pikpak/creators/<person>/ by (filename, size)
-    creators_root = root / 'pikpak/creators'
-    if creators_root.is_dir() and rows:
-        disk_by_name_size = {}
-        for cdir in creators_root.iterdir():
-            if not cdir.is_dir() or cdir.name.startswith('.'):
-                continue
-            person = canonical_person(cdir.name, renames)
-            if not person or person in NON_PERSON_NAMES:
-                continue
-            for p in cdir.rglob('*'):
-                if p.is_file() and p.suffix.lower() in ('.mp4', '.mkv', '.mov', '.avi', '.webm', '.ts', '.m4v'):
-                    try:
-                        st = p.stat()
-                        disk_by_name_size[(p.name, st.st_size)] = person
-                    except OSError:
-                        pass
-        for vid in {r[0] for r in rows}:
-            if vid not in assigned or assigned.get(vid) in NON_PERSON_NAMES:
-                raw_path = sources.get(vid) or vid
-                bn = os.path.basename(str(raw_path).replace('\\', '/'))
-                sz = video_meta.get(vid)
-                if bn and sz is not None and (bn, int(sz)) in disk_by_name_size:
-                    assigned[vid] = disk_by_name_size[(bn, int(sz))]
+        elif file.startswith(share_prefix):
+            parts = file[len(share_prefix):].split('/')
+            if len(parts) >= 2:
+                person = canonical_person(parts[0], renames)
+                if person and person not in NON_PERSON_NAMES:
+                    assigned.setdefault(vid, person)
 
     by_thumb = {}
     by_name_vids = {}
@@ -347,17 +331,24 @@ def compute_staged_references(base, root, state=None):
                 vid_map.setdefault(vid, []).append((float(score), vector))
 
     accepted_receipts = state.get('accepted_receipts') if isinstance(state.get('accepted_receipts'), dict) else None
+    faces_cache_dir = base / 'processing/faces'
+    existing_legacy_caches = {p.name for p in faces_cache_dir.iterdir()} if faces_cache_dir.is_dir() else set()
     for vid, raw_name in assigned.items():
         name = canonical_person(raw_name, renames)
         if not name or name in NON_PERSON_NAMES:
+            continue
+        if vid in by_name_vids.get(name, {}):
+            continue
+        has_receipt = isinstance(accepted_receipts, dict) and bool(accepted_receipts.get(vid))
+        has_legacy = (hashlib.sha256(vid.encode()).hexdigest() + '.npz') in existing_legacy_caches
+        if accepted_receipts is not None and not has_receipt and not has_legacy:
             continue
         source = next((p for value in (sources.get(vid), vid) if (p := mapped(value, root)) and Path(p).is_file()), None)
         if source:
             feats = reference_features(base, vid, source, accepted_receipts=accepted_receipts)
             if feats:
                 vid_map = by_name_vids.setdefault(name, {})
-                if vid not in vid_map:
-                    vid_map[vid] = [(0.80, (v / (np.linalg.norm(v) + 1e-9)).astype(np.float32)) for v in feats[:24]]
+                vid_map[vid] = [(0.80, (v / (np.linalg.norm(v) + 1e-9)).astype(np.float32)) for v in feats[:24]]
 
     anchors = {}
     for person in report.get('identities', []):
