@@ -29,7 +29,7 @@ def inference_status():
     selected = backend()
     if selected == 'cpu':
         return {'backend': 'cpu', 'available': None, 'model_ready': None, 'name': '本机 CPU', 'fallback': False}
-    state = {'backend': selected, 'available': False, 'name': 'GPU 检测 + 本机 CPU 识别', 'fallback': False}
+    state = {'backend': selected, 'available': False, 'name': 'WSL RTX 4070 Ti GPU 检测与识别', 'fallback': False}
     try:
         ready = client().ready()
         state.update(available=ready.get('model_ready') is True and ready.get('accepting') is True,
@@ -77,7 +77,10 @@ class Detector:
             hashlib.sha256(encoded).hexdigest(), image.shape[1], image.shape[0], encoded)
         result = self.client.detect(request)
         result.require_current(self.binding)
-        self.execution = {**result.execution, 'backend': 'gpu-detection', 'recognition_provider': 'CPUExecutionProvider',
-                          'service_instance': result.service_instance}
+        has_gpu_emb = any('embedding' in f for f in result.faces)
+        has_high_score_without_emb = any(f.get('score', 0) >= 0.7 and 'embedding' not in f for f in result.faces)
+        rec_provider = 'CUDAExecutionProvider' if (has_gpu_emb or not has_high_score_without_emb) else 'CPUExecutionProvider'
+        self.execution = {**result.execution, 'backend': 'gpu-detection', 'detection_provider': 'CUDAExecutionProvider',
+                          'recognition_provider': rec_provider, 'service_instance': result.service_instance}
         self.timings.append({**result.timing, 'bytes': len(encoded)})
         return result.faces

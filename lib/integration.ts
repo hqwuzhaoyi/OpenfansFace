@@ -9,6 +9,7 @@ import { copyPeachLedger } from "./peach"
 import Database from "better-sqlite3"
 import { canonicalPersonFields } from './person-names'
 import { invalidatePersonStats } from './person-library-stats'
+import { bumpRedisCacheEpoch, cachedRedisJson, redisDelPrefix, redisGetJson, redisSetJson } from './redis'
 
 const cache: { ledgerTs: number; walkTs: number; integrated?: Record<string, any> } = {
   ledgerTs: 0, walkTs: 0,
@@ -23,11 +24,17 @@ export async function integratedStatsAsync(): Promise<Record<string, { files: nu
   if (pendingWalk) return pendingWalk
   const generation = walkGeneration
   const work = (async () => {
+    const remote = await redisGetJson<Record<string, { files: number; gb: number }>>('stats:integrated')
+    if (remote && generation === walkGeneration) {
+      cache.integrated = remote
+      cache.walkTs = Date.now() / 1000
+      return remote
+    }
     const dirs: Record<string, { files: number; gb: number }> = {}
     const entries = (await fs.promises.readdir(CREATORS, {withFileTypes:true})).filter(e=>e.isDirectory())
     let cursor = 0
-    // Bound concurrent NAS operations instead of creating one promise per media file.
-    await Promise.all(Array.from({length:Math.min(4,entries.length)},async()=>{
+    // Bound concurrent NAS operations so background stats never starve libuv video stream workers.
+    await Promise.all(Array.from({length:Math.min(2,entries.length)},async()=>{
       while (cursor < entries.length) {
         const entry=entries[cursor++], stack=[path.join(CREATORS,entry.name)]
         let files=0, bytes=0
@@ -45,7 +52,11 @@ export async function integratedStatsAsync(): Promise<Record<string, { files: nu
         dirs[entry.name]={files,gb:+(bytes/2**30).toFixed(1)}
       }
     }))
-    if(generation===walkGeneration){cache.integrated=dirs;cache.walkTs=Date.now()/1000}
+    if(generation===walkGeneration){
+      cache.integrated=dirs
+      cache.walkTs=Date.now()/1000
+      void redisSetJson('stats:integrated', dirs, 600)
+    }
     return dirs
   })()
   pendingWalk=work
@@ -122,22 +133,50 @@ export function diskUsage(mount: string) {
 }
 
 export async function peachPersons() {
-  const p = await peachLedgerPath()
-  let links: Record<string, number> = {}
-  const aliases: Record<string, string[]> = {}
-  let con: Database.Database | null = null
-  try {
-    con = new Database(p, { readonly: true })
-    const ents = con.prepare("SELECT id, canonical_name FROM entity WHERE kind='creator'").all() as any[]
-    const linkRows = con.prepare(
-      "SELECT e.canonical_name AS cn, COUNT(*) AS n FROM asset_entity ca JOIN entity e ON e.id=ca.entity_id WHERE ca.role='creator' GROUP BY e.id").all() as { cn: string; n: number }[]
-    for (const r of linkRows) links[r.cn] = r.n
-    for (const e of ents) {
-      aliases[e.canonical_name] = (con.prepare("SELECT alias FROM entity_alias WHERE entity_id=?").all(e.id) as any[]).map((a) => a.alias)
-    }
-  } catch (e) { console.error("ledger open failed", e) }
-  finally { con?.close() }
-  return { links, aliases }
+  let ok = false
+  return cachedRedisJson(
+    'peach:persons',
+    300,
+    async () => {
+      const p = await peachLedgerPath()
+      let links: Record<string, number> = {}
+      const aliases: Record<string, string[]> = {}
+      let con: Database.Database | null = null
+      try {
+        con = new Database(p, { readonly: true })
+        const ents = con.prepare("SELECT id, canonical_name FROM entity WHERE kind='creator'").all() as any[]
+        const linkRows = con.prepare(
+          "SELECT e.canonical_name AS cn, COUNT(*) AS n FROM asset_entity ca JOIN entity e ON e.id=ca.entity_id WHERE ca.role='creator' GROUP BY e.id").all() as { cn: string; n: number }[]
+        for (const r of linkRows) links[r.cn] = r.n
+        for (const e of ents) {
+          aliases[e.canonical_name] = (con.prepare("SELECT alias FROM entity_alias WHERE entity_id=?").all(e.id) as any[]).map((a) => a.alias)
+        }
+        ok = true
+      } catch (e) { console.error("ledger open failed", e) }
+      finally { con?.close() }
+      return { links, aliases }
+    },
+    (res) => ok && (Object.keys(res.links).length > 0 || Object.keys(res.aliases).length > 0),
+  )
 }
 
-export function invalidateIntegrationCache() { cache.ledgerTs = 0; cache.walkTs = 0; cache.integrated = undefined; walkGeneration++; pendingWalk=undefined; pendingLedger=undefined;invalidatePersonStats() }
+function resetIntegrationCacheState() {
+  cache.ledgerTs = 0
+  cache.walkTs = 0
+  cache.integrated = undefined
+  walkGeneration++
+  pendingWalk = undefined
+  pendingLedger = undefined
+  invalidatePersonStats()
+  bumpRedisCacheEpoch()
+}
+
+export function invalidateIntegrationCache() {
+  resetIntegrationCacheState()
+  void redisDelPrefix('')
+}
+
+export async function invalidateIntegrationCacheAsync(): Promise<void> {
+  resetIntegrationCacheState()
+  await redisDelPrefix('')
+}

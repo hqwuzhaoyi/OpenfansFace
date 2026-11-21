@@ -194,11 +194,66 @@ fn reference_file_guard_from(
 /// Request-local reader: snapshot batches reuse source indexes and business inputs,
 /// while each admission constructs a fresh reader. No process-wide material cache.
 type VideoRows = BTreeMap<String, Vec<(usize, Value)>>;
+
+#[derive(Default)]
+struct IndexedLinks {
+    links: Vec<Value>,
+    by_person: BTreeMap<String, Vec<usize>>,
+    by_vid: BTreeMap<String, Vec<usize>>,
+    always_check: Vec<usize>,
+}
+
+#[derive(Default)]
+struct IndexedMap {
+    entries: Vec<(String, Value)>,
+    by_key: BTreeMap<String, usize>,
+    by_person: BTreeMap<String, Vec<usize>>,
+    by_vid: BTreeMap<String, Vec<usize>>,
+    always_check: Vec<usize>,
+}
+
+#[derive(Default)]
+struct IndexedDecisions {
+    approved: Vec<Value>,
+    approved_idx: BTreeMap<String, Vec<usize>>,
+    rejected: Vec<Value>,
+    rejected_idx: BTreeMap<String, Vec<usize>>,
+}
+
+fn index_row_people_and_vids(
+    idx: usize,
+    row: &Value,
+    aliases: &Value,
+    by_person: &mut BTreeMap<String, Vec<usize>>,
+    by_vid: &mut BTreeMap<String, Vec<usize>>,
+    always_check: &mut Vec<usize>,
+) {
+    let mut needs_check = false;
+    for key in ["creator", "person", "name"] {
+        if let Some(name) = row[key].as_str() {
+            match review::creator_with_aliases(&json!(name), aliases) {
+                Ok(c) => by_person.entry(c).or_default().push(idx),
+                Err(e) if e.status == 400 => {}
+                Err(_) => needs_check = true,
+            }
+        }
+    }
+    if let Some(vid) = row["vid"].as_str() {
+        by_vid.entry(vid.to_owned()).or_default().push(idx);
+    }
+    if needs_check {
+        always_check.push(idx);
+    }
+}
+
 pub struct MaterialReader {
     sources: BTreeMap<String, String>,
     aliases: Value,
-    documents: BTreeMap<&'static str, Value>,
+    external_profile_invalid: bool,
     arrays: BTreeMap<&'static str, VideoRows>,
+    links: BTreeMap<&'static str, IndexedLinks>,
+    maps: BTreeMap<&'static str, IndexedMap>,
+    decisions: IndexedDecisions,
     manual: Option<BTreeMap<String, Value>>,
     canonical_cache: std::cell::RefCell<BTreeMap<String, Result<String>>>,
     file_guards: std::cell::RefCell<BTreeMap<String, Result<Value>>>,
@@ -206,8 +261,15 @@ pub struct MaterialReader {
 }
 impl MaterialReader {
     pub fn new(config: &Config) -> Result<Self> {
-        let mut documents = BTreeMap::new();
+        Self::new_for_vids(config, None)
+    }
+    pub fn new_for_vids(config: &Config, only_vids: Option<&BTreeSet<String>>) -> Result<Self> {
+        let aliases = read(config, "person-renames.json", false)?;
+        let mut external_profile_invalid = false;
         let mut arrays = BTreeMap::new();
+        let mut links = BTreeMap::new();
+        let mut maps = BTreeMap::new();
+        let mut decisions = IndexedDecisions::default();
         for (name, array) in BUSINESS {
             if [
                 "person-renames.json",
@@ -218,47 +280,148 @@ impl MaterialReader {
             {
                 continue;
             }
-            let value = read(config, name, *array)?;
+            let mut value = read(config, name, *array)?;
             if *array {
                 let mut index: BTreeMap<String, Vec<(usize, Value)>> = BTreeMap::new();
-                for (position, row) in value.as_array().unwrap().iter().enumerate() {
-                    if let Some(vid) = row["vid"].as_str() {
-                        index
-                            .entry(vid.into())
-                            .or_default()
-                            .push((position, row.clone()));
+                if let Value::Array(rows) = value {
+                    for (position, row) in rows.into_iter().enumerate() {
+                        if let Some(vid) = row["vid"].as_str() {
+                            index
+                                .entry(vid.into())
+                                .or_default()
+                                .push((position, row));
+                        }
                     }
                 }
                 arrays.insert(*name, index);
+            } else if name.starts_with("external-profiles/") {
+                if !value.as_object().unwrap().is_empty() && !value["links"].is_array() {
+                    external_profile_invalid = true;
+                }
+                let mut indexed = IndexedLinks::default();
+                if let Value::Array(rows) = value {
+                    for (idx, row) in rows.into_iter().enumerate() {
+                        index_row_people_and_vids(
+                            idx,
+                            &row,
+                            &aliases,
+                            &mut indexed.by_person,
+                            &mut indexed.by_vid,
+                            &mut indexed.always_check,
+                        );
+                        indexed.links.push(row);
+                    }
+                }
+                links.insert(*name, indexed);
+            } else if *name == "review-decisions.json" {
+                if let Value::Object(mut obj) = value {
+                    if let Some(Value::Array(approved)) = obj.remove("approved") {
+                        for (idx, v) in approved.into_iter().enumerate() {
+                            if let Some(id) = v.as_str() {
+                                decisions.approved_idx.entry(id.to_owned()).or_default().push(idx);
+                            }
+                            decisions.approved.push(v);
+                        }
+                    }
+                    if let Some(Value::Array(rejected)) = obj.remove("rejected") {
+                        for (idx, v) in rejected.into_iter().enumerate() {
+                            if let Some(id) = v.as_str() {
+                                decisions.rejected_idx.entry(id.to_owned()).or_default().push(idx);
+                            }
+                            decisions.rejected.push(v);
+                        }
+                    }
+                }
+            } else if let Value::Object(obj) = std::mem::replace(&mut value, Value::Null) {
+                let mut indexed = IndexedMap::default();
+                for (idx, (k, v)) in obj.into_iter().enumerate() {
+                    if *name == "watermarks/mappings.json" || *name == "person-rejections.json" {
+                        index_row_people_and_vids(
+                            idx,
+                            &v,
+                            &aliases,
+                            &mut indexed.by_person,
+                            &mut indexed.by_vid,
+                            &mut indexed.always_check,
+                        );
+                    } else {
+                        match review::creator_with_aliases(&json!(k), &aliases) {
+                            Ok(c) => indexed.by_person.entry(c).or_default().push(idx),
+                            Err(e) if e.status == 400 => {}
+                            Err(_) => indexed.always_check.push(idx),
+                        }
+                    }
+                    indexed.by_key.insert(k.clone(), idx);
+                    indexed.entries.push((k, v));
+                }
+                maps.insert(*name, indexed);
             }
-            documents.insert(*name, value);
         }
         let path = config.base.join("processing/processing.db");
         let manual = if path.exists() {
-            let conn = db::open(&path)?;
-            let columns = db::columns(&conn, "tasks")?;
-            let selected: Vec<_> = ["vid", "manual", "deferred", "note"]
-                .into_iter()
-                .filter(|key| columns.iter().any(|c| c == key))
-                .collect();
-            Some(
-                db::rows(
-                    &conn,
-                    &format!("SELECT {} FROM tasks ORDER BY vid", selected.join(",")),
-                    [],
-                )?
-                .into_iter()
-                .filter_map(|row| row["vid"].as_str().map(|vid| (vid.to_owned(), row.clone())))
-                .collect(),
-            )
+            match only_vids {
+                Some(filter) if filter.is_empty() => Some(BTreeMap::new()),
+                Some(filter) if filter.len() <= 64 => {
+                    let conn = db::open_readonly(&path)?;
+                    let columns = db::columns(&conn, "tasks")?;
+                    let selected: Vec<_> = ["vid", "manual", "deferred", "note"]
+                        .into_iter()
+                        .filter(|key| columns.iter().any(|c| c == key))
+                        .collect();
+                    let placeholders = std::iter::repeat_n("?", filter.len())
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    let sql = format!(
+                        "SELECT {} FROM tasks WHERE vid IN ({placeholders}) ORDER BY vid",
+                        selected.join(",")
+                    );
+                    Some(
+                        db::rows(&conn, &sql, rusqlite::params_from_iter(filter.iter()))?
+                            .into_iter()
+                            .filter_map(|row| {
+                                let vid = row["vid"].as_str().map(str::to_owned)?;
+                                Some((vid, row))
+                            })
+                            .collect(),
+                    )
+                }
+                _ => {
+                    let conn = db::open_readonly(&path)?;
+                    let columns = db::columns(&conn, "tasks")?;
+                    let selected: Vec<_> = ["vid", "manual", "deferred", "note"]
+                        .into_iter()
+                        .filter(|key| columns.iter().any(|c| c == key))
+                        .collect();
+                    Some(
+                        db::rows(
+                            &conn,
+                            &format!("SELECT {} FROM tasks ORDER BY vid", selected.join(",")),
+                            [],
+                        )?
+                        .into_iter()
+                        .filter_map(|row| {
+                            let vid = row["vid"].as_str().map(str::to_owned)?;
+                            Some((vid, row))
+                        })
+                        .collect(),
+                    )
+                }
+            }
         } else {
             None
         };
+        let sources = match only_vids {
+            Some(filter) if filter.len() <= 64 => review::sources_for_vids(config, filter)?,
+            _ => review::sources(config)?,
+        };
         Ok(Self {
-            sources: review::sources(config)?,
-            aliases: read(config, "person-renames.json", false)?,
-            documents,
+            sources,
+            aliases,
+            external_profile_invalid,
             arrays,
+            links,
+            maps,
+            decisions,
             manual,
             canonical_cache: std::cell::RefCell::new(BTreeMap::new()),
             file_guards: std::cell::RefCell::new(BTreeMap::new()),
@@ -311,6 +474,10 @@ impl MaterialReader {
         result
     }
     pub fn state(&self, config: &Config, scope: &Value) -> Result<Value> {
+        let material = self.material_only(config, scope)?;
+        Ok(json!({"version":model::hash(&material),"scope":scope,"material":material}))
+    }
+    pub fn material_only(&self, config: &Config, scope: &Value) -> Result<Value> {
         if !scope.is_object() {
             return Err(bad("缺少核对范围"));
         }
@@ -333,6 +500,13 @@ impl MaterialReader {
                     .collect::<Result<Vec<_>>>()?
             );
         }
+        if self.external_profile_invalid {
+            return Err(Error::new(
+                503,
+                "metadata_contract",
+                "账号核对资料无法读取，请恢复后重新核对",
+            ));
+        }
         for (name, array) in BUSINESS {
             if [
                 "person-renames.json",
@@ -343,17 +517,6 @@ impl MaterialReader {
             {
                 continue;
             }
-            let value = &self.documents[name];
-            if name.starts_with("external-profiles/")
-                && !value.as_object().unwrap().is_empty()
-                && !value["links"].is_array()
-            {
-                return Err(Error::new(
-                    503,
-                    "metadata_contract",
-                    "账号核对资料无法读取，请恢复后重新核对",
-                ));
-            }
             let selected = if *array {
                 let mut selected = vids
                     .iter()
@@ -362,40 +525,97 @@ impl MaterialReader {
                 selected.sort_by_key(|(index, _)| *index);
                 json!(selected.into_iter().map(|(_, row)| row).collect::<Vec<_>>())
             } else if name.starts_with("external-profiles/") {
-                json!(
-                    value["links"]
-                        .as_array()
-                        .unwrap_or(&vec![])
-                        .iter()
-                        .filter_map(|r| {
-                            match relevant_using(r, &people, &vids, |n| self.canonical(n)) {
-                                Ok(true) => Some(Ok(r.clone())),
-                                Ok(false) => None,
-                                Err(e) => Some(Err(e)),
-                            }
-                        })
-                        .collect::<Result<Vec<_>>>()?
-                )
+                let indexed = &self.links[name];
+                let mut matched = BTreeSet::new();
+                for person in &people {
+                    if let Some(idxs) = indexed.by_person.get(person) {
+                        matched.extend(idxs.iter().copied());
+                    }
+                }
+                for vid in &vids {
+                    if let Some(idxs) = indexed.by_vid.get(vid) {
+                        matched.extend(idxs.iter().copied());
+                    }
+                }
+                for &idx in &indexed.always_check {
+                    if relevant_using(&indexed.links[idx], &people, &vids, |n| self.canonical(n))? {
+                        matched.insert(idx);
+                    }
+                }
+                json!(matched.into_iter().map(|idx| indexed.links[idx].clone()).collect::<Vec<_>>())
             } else if *name == "review-decisions.json" {
-                json!({"approved":value["approved"].as_array().unwrap_or(&vec![]).iter().filter(|v|v.as_str().is_some_and(|id|vids.contains(id))).collect::<Vec<_>>(),"rejected":value["rejected"].as_array().unwrap_or(&vec![]).iter().filter(|v|v.as_str().is_some_and(|id|vids.contains(id))).collect::<Vec<_>>()})
+                let mut app_idx = BTreeSet::new();
+                let mut rej_idx = BTreeSet::new();
+                for vid in &vids {
+                    if let Some(idxs) = self.decisions.approved_idx.get(vid) {
+                        app_idx.extend(idxs.iter().copied());
+                    }
+                    if let Some(idxs) = self.decisions.rejected_idx.get(vid) {
+                        rej_idx.extend(idxs.iter().copied());
+                    }
+                }
+                json!({
+                    "approved": app_idx.into_iter().map(|i| &self.decisions.approved[i]).collect::<Vec<_>>(),
+                    "rejected": rej_idx.into_iter().map(|i| &self.decisions.rejected[i]).collect::<Vec<_>>(),
+                })
             } else {
+                let indexed = &self.maps[name];
                 let mut out = serde_json::Map::new();
-                for (k, v) in value.as_object().unwrap() {
-                    let keep = if *name == "watermarks/mappings.json" {
-                        scope["all_watermark_rules"] == true
-                            || keys.contains(k)
-                            || relevant_using(v, &people, &vids, |n| self.canonical(n))?
-                    } else if *name == "person-rejections.json" {
-                        v["vid"].as_str().is_some_and(|id| vids.contains(id))
-                            && relevant_using(v, &people, &vids, |n| self.canonical(n))?
-                    } else {
-                        match self.canonical(k) {
-                            Ok(c) => people.contains(&c),
-                            Err(e) if e.status == 400 => false,
-                            Err(e) => return Err(e),
+                if *name == "watermarks/mappings.json" && scope["all_watermark_rules"] == true {
+                    for (k, v) in &indexed.entries {
+                        out.insert(k.clone(), v.clone());
+                    }
+                } else {
+                    let mut matched = BTreeSet::new();
+                    if *name == "watermarks/mappings.json" {
+                        for k in &keys {
+                            if let Some(&idx) = indexed.by_key.get(k) {
+                                matched.insert(idx);
+                            }
                         }
-                    };
-                    if keep {
+                        for person in &people {
+                            if let Some(idxs) = indexed.by_person.get(person) {
+                                matched.extend(idxs.iter().copied());
+                            }
+                        }
+                        for vid in &vids {
+                            if let Some(idxs) = indexed.by_vid.get(vid) {
+                                matched.extend(idxs.iter().copied());
+                            }
+                        }
+                        for &idx in &indexed.always_check {
+                            if relevant_using(&indexed.entries[idx].1, &people, &vids, |n| {
+                                self.canonical(n)
+                            })? {
+                                matched.insert(idx);
+                            }
+                        }
+                    } else if *name == "person-rejections.json" {
+                        for vid in &vids {
+                            if let Some(idxs) = indexed.by_vid.get(vid) {
+                                for &idx in idxs {
+                                    if relevant_using(&indexed.entries[idx].1, &people, &vids, |n| {
+                                        self.canonical(n)
+                                    })? {
+                                        matched.insert(idx);
+                                    }
+                                }
+                            }
+                        }
+                    } else {
+                        for person in &people {
+                            if let Some(idxs) = indexed.by_person.get(person) {
+                                matched.extend(idxs.iter().copied());
+                            }
+                        }
+                        for &idx in &indexed.always_check {
+                            if self.canonical(&indexed.entries[idx].0).is_ok_and(|c| people.contains(&c)) {
+                                matched.insert(idx);
+                            }
+                        }
+                    }
+                    for idx in matched {
+                        let (k, v) = &indexed.entries[idx];
                         out.insert(k.clone(), v.clone());
                     }
                 }
@@ -410,11 +630,16 @@ impl MaterialReader {
                     .collect::<Vec<_>>()
             );
         }
-        Ok(json!({"version":model::hash(&material),"scope":scope,"material":material}))
+        Ok(material)
     }
 }
 pub fn material_state(config: &Config, scope: &Value) -> Result<Value> {
-    MaterialReader::new(config)?.state(config, scope)
+    let vids_filter = if scope.is_object() {
+        names(&scope["vids"]).ok().map(|v| v.into_iter().collect())
+    } else {
+        None
+    };
+    MaterialReader::new_for_vids(config, vids_filter.as_ref())?.state(config, scope)
 }
 pub fn check_state(config: &Config, scope: &Value, version: &str) -> Result<Value> {
     let state = material_state(config, scope)?;
@@ -455,7 +680,7 @@ pub fn analysis_state(config: &Config) -> Result<Value> {
         .collect();
     let path = config.base.join("faces.db");
     if path.exists() {
-        let conn = db::open(&path)?;
+        let conn = db::open_readonly(&path)?;
         let tx = conn.unchecked_transaction()?;
         input.insert(
             "videos".into(),
@@ -463,31 +688,8 @@ pub fn analysis_state(config: &Config) -> Result<Value> {
         );
         input.insert(
             "faces".into(),
-            json!(table_digest(&tx, "SELECT * FROM faces ORDER BY rowid")?),
+            json!(faces_digest_and_references(&tx, &thumbnails, &mut reference)?),
         );
-        let columns = db::columns(&tx, "faces")?;
-        if columns.iter().any(|column| column == "emb") {
-            let thumb = if columns.iter().any(|column| column == "thumb") {
-                "thumb"
-            } else {
-                "NULL AS thumb"
-            };
-            for row in db::rows(
-                &tx,
-                &format!("SELECT DISTINCT vid,{thumb} FROM faces WHERE length(emb)=2048"),
-                [],
-            )? {
-                if let Some(vid) = row["vid"].as_str() {
-                    reference.embedded.insert(vid.to_owned());
-                    if row["thumb"]
-                        .as_str()
-                        .is_some_and(|thumb| thumbnails.contains(thumb))
-                    {
-                        reference.anchored.insert(vid.to_owned());
-                    }
-                }
-            }
-        }
         tx.commit()?;
     }
     let sources = review::indexed_sources(config)?;
@@ -511,7 +713,34 @@ pub fn analysis_state(config: &Config) -> Result<Value> {
         "assigned_feature_caches".into(),
         crate::processing_result::assigned_reference_inputs(config)?,
     );
-    Ok(json!({"version":model::hash(&input)}))
+    let out = json!({"version":model::hash(&input)});
+    model::trim_allocator();
+    Ok(out)
+}
+fn feed_value_ref(digest: &mut sha2::Sha256, value: rusqlite::types::ValueRef<'_>) {
+    use rusqlite::types::ValueRef;
+    use sha2::Digest;
+    match value {
+        ValueRef::Null => digest.update([0u8]),
+        ValueRef::Integer(i) => {
+            digest.update([1u8]);
+            digest.update(i.to_le_bytes());
+        }
+        ValueRef::Real(f) => {
+            digest.update([2u8]);
+            digest.update(f.to_bits().to_le_bytes());
+        }
+        ValueRef::Text(bytes) => {
+            digest.update([3u8]);
+            digest.update(bytes.len().to_be_bytes());
+            digest.update(bytes);
+        }
+        ValueRef::Blob(bytes) => {
+            digest.update([4u8]);
+            digest.update(bytes.len().to_be_bytes());
+            digest.update(bytes);
+        }
+    }
 }
 fn table_digest(conn: &rusqlite::Connection, sql: &str) -> Result<String> {
     use sha2::{Digest, Sha256};
@@ -521,11 +750,62 @@ fn table_digest(conn: &rusqlite::Connection, sql: &str) -> Result<String> {
     let mut digest = Sha256::new();
     while let Some(row) = rows.next()? {
         for index in 0..count {
-            let value = format!("{:?}", row.get_ref(index)?);
-            digest.update(value.len().to_be_bytes());
-            digest.update(value.as_bytes());
+            feed_value_ref(&mut digest, row.get_ref(index)?);
         }
         digest.update(b"row");
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+fn faces_digest_and_references(
+    conn: &rusqlite::Connection,
+    thumbnails: &BTreeSet<String>,
+    reference: &mut ReferenceGuards,
+) -> Result<String> {
+    use rusqlite::types::ValueRef;
+    use sha2::{Digest, Sha256};
+    let mut statement = conn.prepare("SELECT * FROM faces ORDER BY rowid")?;
+    let count = statement.column_count();
+    let mut vid_col = None;
+    let mut emb_col = None;
+    let mut thumb_col = None;
+    for (idx, name) in statement.column_names().into_iter().enumerate() {
+        match name {
+            "vid" => vid_col = Some(idx),
+            "emb" => emb_col = Some(idx),
+            "thumb" => thumb_col = Some(idx),
+            _ => {}
+        }
+    }
+    let mut rows = statement.query([])?;
+    let mut digest = Sha256::new();
+    while let Some(row) = rows.next()? {
+        for index in 0..count {
+            feed_value_ref(&mut digest, row.get_ref(index)?);
+        }
+        digest.update(b"row");
+        if let (Some(vid_i), Some(emb_i)) = (vid_col, emb_col) {
+            let is_2048 = match row.get_ref(emb_i)? {
+                ValueRef::Blob(b) => b.len() == 2048,
+                ValueRef::Text(s) => std::str::from_utf8(s).is_ok_and(|t| t.chars().count() == 2048),
+                _ => false,
+            };
+            if is_2048
+                && let ValueRef::Text(v_bytes) = row.get_ref(vid_i)?
+                && let Ok(vid) = std::str::from_utf8(v_bytes)
+            {
+                if !reference.embedded.contains(vid) {
+                    reference.embedded.insert(vid.to_owned());
+                }
+                if let Some(thumb_i) = thumb_col
+                    && let ValueRef::Text(t_bytes) = row.get_ref(thumb_i)?
+                    && let Ok(thumb) = std::str::from_utf8(t_bytes)
+                    && thumbnails.contains(thumb)
+                    && !reference.anchored.contains(vid)
+                {
+                    reference.anchored.insert(vid.to_owned());
+                }
+            }
+        }
     }
     Ok(format!("{:x}", digest.finalize()))
 }
@@ -867,9 +1147,11 @@ fn prepare(config: &Config, body: &Value, id: &str) -> Result<Prepared> {
                         .is_some_and(|rows| rows.contains(candidate));
                 let path = config.base.join("processing/processing.db");
                 if !found && path.exists() {
-                    for task in
-                        db::rows(&db::open(&path)?, "SELECT * FROM tasks WHERE vid=?", [vid])?
-                    {
+                    for task in db::rows(
+                        &db::open_readonly(&path)?,
+                        "SELECT * FROM tasks WHERE vid=?",
+                        [vid],
+                    )? {
                         let data = review::task_data(&task)?;
                         if matches_file(&task)
                             && data["watermark"]["candidates"]
@@ -1050,4 +1332,70 @@ pub fn execute(engine: &mut Engine, command: &str, mut body: Value) -> Result<Va
         })?)?
     };
     engine.apply(plan.request, plan.version)
+}
+
+#[cfg(test)]
+mod perf_tests {
+    use super::*;
+
+    #[test]
+    fn faces_single_pass_digest_and_scoped_material_state_are_exact() {
+        let root = fs::canonicalize("/tmp")
+            .unwrap()
+            .join(format!("face-shared-meta-{}", uuid::Uuid::new_v4()));
+        let base = root.join("base");
+        let media = root.join("media");
+        fs::create_dir_all(base.join("processing")).unwrap();
+        fs::create_dir_all(media.join("pikpak")).unwrap();
+        let config = Config {
+            base: base.clone(),
+            media: media.clone(),
+            ledger: root.join("ledger.db"),
+            bind: "127.0.0.1:0".into(),
+            token: None,
+            fixture: None,
+            parity_root: None,
+        };
+        let faces = rusqlite::Connection::open(base.join("faces.db")).unwrap();
+        faces
+            .execute_batch(
+                "CREATE TABLE videos(vid TEXT PRIMARY KEY, path TEXT);
+                 CREATE TABLE faces(vid TEXT, thumb TEXT, emb BLOB);",
+            )
+            .unwrap();
+        let emb = vec![0u8; 2048];
+        faces
+            .execute(
+                "INSERT INTO faces VALUES('v1', 't1.jpg', ?), ('v2', 't2.jpg', ?)",
+                rusqlite::params![emb, vec![1u8; 16]],
+            )
+            .unwrap();
+        let mut thumbs = BTreeSet::new();
+        thumbs.insert("t1.jpg".to_string());
+        let mut refs = ReferenceGuards::default();
+        let digest1 = faces_digest_and_references(&faces, &thumbs, &mut refs).unwrap();
+        assert_eq!(digest1, table_digest(&faces, "SELECT * FROM faces ORDER BY rowid").unwrap());
+        assert!(refs.embedded.contains("v1"));
+        assert!(!refs.embedded.contains("v2"));
+        assert!(refs.anchored.contains("v1"));
+        faces
+            .execute("UPDATE faces SET thumb='t3.jpg' WHERE vid='v1'", [])
+            .unwrap();
+        let mut refs2 = ReferenceGuards::default();
+        let digest2 = faces_digest_and_references(&faces, &thumbs, &mut refs2).unwrap();
+        assert_ne!(digest1, digest2);
+        assert!(refs2.embedded.contains("v1"));
+        assert!(!refs2.anchored.contains("v1"));
+
+        let scope = json!({"people": ["Alice"], "vids": ["v1"], "watermark_keys": []});
+        let full = MaterialReader::new(&config).unwrap().state(&config, &scope).unwrap();
+        let scoped = material_state(&config, &scope).unwrap();
+        assert_eq!(full, scoped);
+        assert_eq!(
+            MaterialReader::new(&config).unwrap().material_only(&config, &scope).unwrap(),
+            full["material"]
+        );
+        drop(faces);
+        fs::remove_dir_all(root).unwrap();
+    }
 }

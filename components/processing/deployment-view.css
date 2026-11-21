@@ -1,0 +1,586 @@
+/* Deployment View styles */
+
+.ws-deploy-root {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4, 16px);
+  width: 100%;
+  max-width: 1700px;
+  margin: 0 auto;
+  padding: 24px;
+}
+
+.ws-deploy-pinned-banner {
+  padding: var(--space-4, 16px);
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg, 12px);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ws-deploy-banner-top {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.ws-deploy-banner-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--foreground);
+}
+
+.ws-deploy-banner-stats {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  font-size: 12px;
+  color: var(--muted-foreground);
+}
+
+.ws-deploy-banner-stat-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.ws-deploy-banner-stat-item strong {
+  color: var(--foreground);
+}
+
+.ws-deploy-banner-hashes {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 16px;
+  font-size: 12px;
+  color: var(--muted-foreground);
+  font-family: var(--font-mono, ui-monospace, monospace);
+  padding-top: 6px;
+  border-top: 1px solid var(--border);
+}
+
+.ws-deploy-hash-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* Toolbar */
+.ws-deploy-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 10px;
+}
+
+.ws-deploy-toolbar-left {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex: 1;
+  min-width: 0;
+}
+
+.ws-deploy-toolbar-left .ws-tabs {
+  border-bottom: 0;
+  min-width: 0;
+}
+
+.ws-deploy-toolbar-left .ws-search {
+  max-width: 280px;
+}
+
+.ws-deploy-toolbar-right {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* Deploy Matrix Table / List */
+.ws-deploy-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.ws-deploy-node-card {
+  padding: 16px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg, 12px);
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  transition: border-color 0.16s var(--ease-out-ui, cubic-bezier(0.23, 1, 0.32, 1));
+}
+
+.ws-deploy-node-card:hover {
+  border-color: color-mix(in oklab, var(--foreground) 18%, var(--border));
+}
+
+.ws-deploy-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.ws-deploy-node-info {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.ws-deploy-node-icon {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  border-radius: var(--radius-md, 8px);
+  background: var(--muted);
+  border: 1px solid var(--border);
+  color: var(--foreground);
+}
+
+.ws-deploy-node-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--foreground);
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.ws-deploy-node-sub {
+  font-size: 12px;
+  color: var(--muted-foreground);
+  font-family: var(--font-mono, monospace);
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.ws-deploy-version-matrix {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  background: var(--muted);
+  border: 1px solid var(--border);
+  padding: 6px 12px;
+  border-radius: var(--radius-md, 8px);
+  font-size: 12px;
+}
+
+.ws-deploy-version-label {
+  color: var(--muted-foreground);
+  font-size: 12px;
+}
+
+.ws-deploy-version-val {
+  font-family: var(--font-mono, monospace);
+  font-weight: 500;
+  color: var(--foreground);
+}
+
+.ws-deploy-version-arrow {
+  color: var(--muted-foreground);
+}
+
+/* 6-Stage Stepper */
+.ws-deploy-stepper-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ws-deploy-stepper-track {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  position: relative;
+  width: 100%;
+  padding: 8px 4px;
+}
+
+.ws-deploy-step-item {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  position: relative;
+  z-index: 2;
+  flex: 1;
+}
+
+.ws-deploy-step-node {
+  width: 28px;
+  height: 28px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 600;
+  border: 2px solid transparent;
+  transition: all 0.2s ease;
+}
+
+.ws-deploy-step-node.completed {
+  background: var(--wb-success, #10b981);
+  color: #ffffff;
+  border-color: var(--wb-success, #10b981);
+}
+
+.ws-deploy-step-node.active {
+  background: var(--primary, #3b82f6);
+  color: var(--primary-foreground, #ffffff);
+  border-color: var(--primary, #3b82f6);
+  box-shadow: 0 0 0 4px color-mix(in oklab, var(--primary, #3b82f6) 20%, transparent);
+}
+
+.ws-deploy-step-node.failed {
+  background: var(--wb-danger, #ef4444);
+  color: #ffffff;
+  border-color: var(--wb-danger, #ef4444);
+}
+
+.ws-deploy-step-node.pending {
+  background: var(--muted);
+  color: var(--muted-foreground);
+  border-color: var(--border);
+}
+
+.ws-deploy-step-label {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--muted-foreground);
+  white-space: nowrap;
+}
+
+.ws-deploy-step-label.active {
+  color: var(--primary);
+  font-weight: 600;
+}
+
+.ws-deploy-step-label.failed {
+  color: var(--wb-danger, #ef4444);
+  font-weight: 600;
+}
+
+.ws-deploy-step-connector {
+  position: absolute;
+  top: 21px;
+  left: 5%;
+  right: 5%;
+  height: 2px;
+  background: var(--border);
+  z-index: 1;
+}
+
+/* Card Bottom Metrics & Actions */
+.ws-deploy-card-footer {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.ws-deploy-metrics {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px 16px;
+  font-size: 12px;
+  color: var(--muted-foreground);
+}
+
+.ws-deploy-metric-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.ws-deploy-metric-val {
+  font-family: var(--font-mono, monospace);
+  color: var(--foreground);
+  font-weight: 500;
+}
+
+.ws-deploy-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* Diagnostic Drawer Panel */
+.ws-deploy-drawer-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  padding: 24px;
+  background: var(--background);
+  color: var(--foreground);
+  width: 520px;
+  max-width: 90vw;
+  height: 100%;
+  overflow-y: auto;
+}
+
+.ws-deploy-drawer-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.ws-deploy-drawer-title {
+  font-size: 16px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ws-deploy-diag-section {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.ws-deploy-diag-section-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--muted-foreground);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+
+.ws-deploy-diag-card {
+  padding: 12px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md, 8px);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ws-deploy-diag-row {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+}
+
+.ws-deploy-diag-key {
+  color: var(--muted-foreground);
+}
+
+.ws-deploy-diag-val {
+  font-family: var(--font-mono, monospace);
+  font-weight: 500;
+  color: var(--foreground);
+  word-break: break-all;
+}
+
+.ws-deploy-hash-row {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.ws-deploy-hash-box {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  background: var(--muted);
+  border: 1px solid var(--border);
+  padding: 6px 10px;
+  border-radius: var(--radius-sm, 6px);
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  word-break: break-all;
+}
+
+.ws-deploy-failure-card {
+  background: var(--wb-danger-bg, rgba(239, 68, 68, 0.08));
+  border: 1px solid color-mix(in oklab, var(--wb-danger, #ef4444) 30%, transparent);
+  border-radius: var(--radius-md, 8px);
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ws-deploy-failure-title {
+  color: var(--wb-danger, #ef4444);
+  font-weight: 600;
+  font-size: 13px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.ws-deploy-failure-msg {
+  font-size: 12px;
+  color: var(--muted-foreground);
+  font-family: var(--font-mono, monospace);
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+/* Rollback Modal */
+.ws-deploy-modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: var(--wb-overlay, rgba(0, 0, 0, 0.7));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+  padding: 16px;
+}
+
+.ws-deploy-modal-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg, 12px);
+  width: 100%;
+  max-width: 480px;
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  box-shadow: var(--wb-shadow);
+  outline: none;
+}
+
+.ws-deploy-modal-title {
+  font-size: 16px;
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--foreground);
+}
+
+.ws-deploy-modal-desc {
+  font-size: 13px;
+  color: var(--muted-foreground);
+  line-height: 1.5;
+}
+
+.ws-deploy-modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+}
+
+/* Mobile responsiveness */
+@media (max-width: 768px) {
+  .ws-deploy-root {
+    padding: 14px 10px;
+    gap: 14px;
+  }
+  .ws-deploy-toolbar {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: center;
+    gap: 10px 8px;
+  }
+  .ws-deploy-toolbar-left {
+    display: contents;
+  }
+  .ws-deploy-toolbar .ws-tabs {
+    grid-column: 1 / -1;
+    border-bottom: 1px solid var(--border);
+    width: 100%;
+    min-width: 0;
+  }
+  .ws-deploy-toolbar .ws-search {
+    max-width: none;
+    width: 100%;
+    min-width: 0;
+  }
+  .ws-deploy-toolbar-right {
+    width: auto;
+  }
+  .ws-deploy-toolbar-right button {
+    min-height: 40px;
+    padding-inline: 12px;
+  }
+  .ws-deploy-card-header {
+    flex-direction: column;
+    align-items: flex-start;
+  }
+  .ws-deploy-version-matrix {
+    width: 100%;
+    justify-content: space-between;
+  }
+  .ws-deploy-card-footer {
+    flex-direction: column;
+    align-items: stretch;
+  }
+  .ws-deploy-actions {
+    width: 100%;
+  }
+  .ws-deploy-actions button {
+    flex: 1;
+    min-height: 44px;
+  }
+  .ws-deploy-modal-actions button {
+    min-height: 44px;
+    flex: 1;
+  }
+  .ws-deploy-failure-card button {
+    min-height: 44px;
+    width: 100%;
+  }
+  .ws-deploy-drawer-header button {
+    min-width: 44px;
+    min-height: 44px;
+  }
+  .ws-deploy-hash-box button {
+    min-width: 44px;
+    min-height: 44px;
+  }
+  .ws-deploy-drawer-panel {
+    width: 100vw;
+    max-width: 100vw;
+    padding: 16px;
+  }
+}
+
+@media (max-width: 640px) {
+  .ws-deploy-stepper-track {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 12px 8px;
+    padding: 6px 0;
+  }
+  .ws-deploy-step-connector {
+    display: none;
+  }
+}

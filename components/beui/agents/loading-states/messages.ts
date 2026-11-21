@@ -1,5 +1,6 @@
 export const loadingStatesMessages = {
   thinking: "Thinking…",
+  churning: "Churning",
   inProgress: "{label}…",
 };
 

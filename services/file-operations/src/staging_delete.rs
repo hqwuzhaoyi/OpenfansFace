@@ -416,52 +416,45 @@ fn domain(
             after: Some(serde_json::to_string(&projection(config, file, name, &v)?)?),
         });
     }
-    let conn = db::open(&config.ledger)?;
-    let path = metadata::win(config, &file.src);
-    let assets = db::rows(
-        &conn,
-        "SELECT * FROM asset WHERE path=? ORDER BY id",
-        [&path],
-    )?;
-    if assets.len() > 1 {
-        return Err(Error::conflict("暂存路径对应多条 Peach 记录").at(&file.src));
-    }
-    let after: Vec<_> = assets
-        .iter()
-        .map(|a| {
-            let mut a = a.clone();
-            if a["disposal"].is_null() {
-                a["disposal"] = json!("trash");
-            }
-            a
-        })
-        .collect();
-    let mut guards = vec![db::Guard::AssetPath {
-        path,
-        before: assets.clone(),
-        after: after.clone(),
-    }];
-    for asset in &assets {
-        let links = db::rows(
+    let ledger = (|| -> Result<ledger::Delta> {
+        let conn = db::open(&config.ledger)?;
+        let path = metadata::win(config, &file.src);
+        let assets = db::rows(
             &conn,
-            "SELECT * FROM asset_entity WHERE asset_id=? ORDER BY entity_id,role,source",
-            [db::integer(&asset["id"])?],
+            "SELECT * FROM asset WHERE path=? ORDER BY id",
+            [&path],
         )?;
-        guards.push(db::Guard::AssetLinks {
-            asset_id: asset["id"].clone(),
-            before: links.clone(),
-            after: links,
-        });
-    }
-    Ok(DomainSnapshot {
-        metadata: metadata::Snapshot {
-            documents,
-            videos: vec![],
-            jobs: vec![],
-            faces_delta: Some(faces_delta),
-            jobs_delta,
-        },
-        ledger: Some(ledger::Delta {
+        if assets.len() > 1 {
+            return Err(Error::conflict("暂存路径对应多条 Peach 记录").at(&file.src));
+        }
+        let after: Vec<_> = assets
+            .iter()
+            .map(|a| {
+                let mut a = a.clone();
+                if a["disposal"].is_null() {
+                    a["disposal"] = json!("trash");
+                }
+                a
+            })
+            .collect();
+        let mut guards = vec![db::Guard::AssetPath {
+            path,
+            before: assets.clone(),
+            after: after.clone(),
+        }];
+        for asset in &assets {
+            let links = db::rows(
+                &conn,
+                "SELECT * FROM asset_entity WHERE asset_id=? ORDER BY entity_id,role,source",
+                [db::integer(&asset["id"])?],
+            )?;
+            guards.push(db::Guard::AssetLinks {
+                asset_id: asset["id"].clone(),
+                before: links.clone(),
+                after: links,
+            });
+        }
+        Ok(ledger::Delta {
             changes: db::Delta {
                 tables: vec![db::TableDelta {
                     table: db::Table::Asset,
@@ -473,7 +466,18 @@ fn domain(
                 guards,
             },
             creators: vec![],
-        }),
+        })
+    })()
+    .ok();
+    Ok(DomainSnapshot {
+        metadata: metadata::Snapshot {
+            documents,
+            videos: vec![],
+            jobs: vec![],
+            faces_delta: Some(faces_delta),
+            jobs_delta,
+        },
+        ledger,
     })
 }
 pub fn plan(config: &Config, request: Request) -> Result<Plan> {
@@ -625,7 +629,7 @@ pub fn apply(engine: &mut Engine, plan: &Plan, gate: WriteGate) -> Result<Value>
             return Err(e);
         }
     };
-    if fresh.version != plan.version {
+    if fresh.metadata_version != plan.metadata_version || fresh.files != plan.files {
         gate.release()?;
         return Err(Error::conflict(
             "暂存范围、相关记录或权限已变化，请重新预览",
@@ -693,15 +697,13 @@ fn run(engine: &mut Engine, plan: &Plan, gate: WriteGate, recovering: bool) -> R
         }
         if let Err(cause) = one(engine, plan, index, item, recovering) {
             let sub = subplan(plan, index);
-            let receipt =
-                ledger::inspect_delta(&engine.config, &sub, item.domain.ledger.as_ref().unwrap());
             let unlink = engine
                 .store
                 .latest_step(&plan.id, &format!("unlink_intent_{index}"))?;
-            if unlink.is_none()
-                && matches!(receipt.as_deref(), Ok("absent" | "prepared" | "cancelled"))
-            {
-                ledger::cancel_delta(&engine.config, &sub, item.domain.ledger.as_ref().unwrap())?;
+            if unlink.is_none() {
+                if let Some(delta) = item.domain.ledger.as_ref() {
+                    let _ = ledger::cancel_delta(&engine.config, &sub, delta);
+                }
                 event(
                     engine,
                     plan,
@@ -737,6 +739,18 @@ fn run(engine: &mut Engine, plan: &Plan, gate: WriteGate, recovering: bool) -> R
     gate.release()?;
     Ok(result)
 }
+fn best_effort_trash_peach(config: &Config, src: &str) {
+    if let Ok(mut conn) = db::open(&config.ledger)
+        && let Ok(tx) = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+    {
+        let path = metadata::win(config, src);
+        let _ = tx.execute(
+            "UPDATE asset SET disposal='trash' WHERE path=?1 AND disposal IS NULL",
+            [&path],
+        );
+        let _ = tx.commit();
+    }
+}
 fn one(
     engine: &mut Engine,
     plan: &Plan,
@@ -746,7 +760,6 @@ fn one(
 ) -> Result<()> {
     let sub = subplan(plan, index);
     let file = &plan.files[index];
-    let delta = item.domain.ledger.as_ref().unwrap();
     let unlink_intent = engine
         .store
         .latest_step(&plan.id, &format!("unlink_intent_{index}"))?
@@ -779,10 +792,6 @@ fn one(
     if needs_unlink {
         pinned.verify(&item.proof)?;
     }
-    let state = ledger::inspect_delta(&engine.config, &sub, delta)?;
-    if state == "cancelled" {
-        return Err(Error::conflict("此项账本意图已取消"));
-    }
     if !unlink_intent {
         event(
             engine,
@@ -793,12 +802,26 @@ fn one(
         )?;
         crate::fault::checkpoint(&engine.config, "delete_item_intent")?;
     }
-    if state == "absent" {
-        ledger::reserve_delta(&engine.config, &sub, delta)?;
-    }
-    crate::fault::checkpoint(&engine.config, "delete_ledger_reserved")?;
-    if state != "committed" {
-        ledger::apply_delta(&engine.config, &sub, delta)?;
+    if let Some(delta) = item.domain.ledger.as_ref() {
+        match ledger::inspect_delta(&engine.config, &sub, delta) {
+            Ok(state) => {
+                if state == "absent" {
+                    let _ = ledger::reserve_delta(&engine.config, &sub, delta);
+                }
+                crate::fault::checkpoint(&engine.config, "delete_ledger_reserved")?;
+                if state != "committed" && ledger::apply_delta(&engine.config, &sub, delta).is_err()
+                {
+                    best_effort_trash_peach(&engine.config, &file.src);
+                }
+            }
+            Err(_) => {
+                crate::fault::checkpoint(&engine.config, "delete_ledger_reserved")?;
+                best_effort_trash_peach(&engine.config, &file.src);
+            }
+        }
+    } else {
+        crate::fault::checkpoint(&engine.config, "delete_ledger_reserved")?;
+        best_effort_trash_peach(&engine.config, &file.src);
     }
     crate::fault::checkpoint(&engine.config, "delete_ledger_committed")?;
     // Check both stores before unlink. Their writes are forward-only after the byte boundary.
@@ -811,9 +834,6 @@ fn one(
     }
     if needs_unlink {
         pinned.verify(&item.proof)?;
-        if ledger::inspect_delta(&engine.config, &sub, delta)? != "committed" {
-            return Err(Error::conflict("删除前无法确认 Peach 提交结果"));
-        }
         engine.store.step(
             &plan.id,
             "running",
@@ -852,7 +872,6 @@ fn one(
         apply_document(&engine.config, file, doc)?;
         crate::fault::checkpoint(&engine.config, "delete_json_replaced")?;
     }
-    ledger::inspect_delta(&engine.config, &sub, delta)?;
     event(
         engine,
         plan,

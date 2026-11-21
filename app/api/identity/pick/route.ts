@@ -1,3 +1,5 @@
+import { invalidateIntegrationCacheAsync } from "@/lib/integration"
+
 const CAL = () => process.env.CALIBRATOR_URL
 
 export async function POST(req: Request) {
@@ -9,5 +11,8 @@ export async function POST(req: Request) {
     headers: { "Content-Type": "application/json" },
     body,
   })
+  if (r.ok) {
+    await invalidateIntegrationCacheAsync()
+  }
   return new Response(r.body, { status: r.status, headers: { "Content-Type": "application/json" } })
 }

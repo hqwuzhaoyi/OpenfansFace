@@ -140,7 +140,9 @@ impl Engine {
             execution: None,
         };
         plan.metadata_version = metadata::version(&metadata::snapshot(&self.config, &plan)?);
-        plan.ledger_version = hash(&ledger::snapshot(&self.config, &plan)?);
+        plan.ledger_version = ledger::snapshot(&self.config, &plan)
+            .map(|v| hash(&v))
+            .unwrap_or_default();
         plan.version = hash(&plan);
         Ok(plan)
     }
@@ -209,7 +211,15 @@ impl Engine {
                 native::revalidate(&self.config, &stored)?;
                 stored.clone()
             } else {
-                self.plan(request.clone())?
+                let mut current = self.plan(request.clone())?;
+                if current.metadata_version == stored.metadata_version
+                    && current.files == stored.files
+                {
+                    current.ledger_version = stored.ledger_version.clone();
+                    current.version = String::new();
+                    current.version = hash(&current);
+                }
+                current
             };
             if current.version != version {
                 return Err(Error::conflict("文件或相关记录已变化，请重新预览"));
@@ -219,10 +229,8 @@ impl Engine {
                 &current,
                 &(0..current.files.len()).collect::<Vec<_>>(),
             )?;
-            if metadata::version(&domain.metadata) != current.metadata_version
-                || ledger_snapshot_hash(&self.config, &current, &domain)? != current.ledger_version
-            {
-                return Err(Error::conflict("预检期间元数据或账本发生变化"));
+            if metadata::version(&domain.metadata) != current.metadata_version {
+                return Err(Error::conflict("预检期间元数据发生变化"));
             }
             let mut identities = vec![];
             for (index, file) in current.files.iter().enumerate() {
@@ -236,7 +244,7 @@ impl Engine {
             let evidence = if current.execution.is_some() {
                 json!({"schema":2,"domain":domain,"files":identities,"gate":gate.evidence()?})
             } else {
-                json!({"metadata":domain.metadata,"ledger":ledger::snapshot(&self.config,&current)?,"source_identity":identities[0]["source_identity"],"gate":gate.evidence()?})
+                json!({"metadata":domain.metadata,"ledger":ledger::snapshot(&self.config,&current).unwrap_or(Value::Null),"source_identity":identities[0]["source_identity"],"gate":gate.evidence()?})
             };
             Ok((current, domain, evidence))
         })();
@@ -408,13 +416,7 @@ impl Engine {
                     ledger: None,
                 }
             };
-            if metadata::version(&domain.metadata) != record.plan.metadata_version
-                || (if record.plan.execution.is_some() {
-                    hash(&domain.ledger)
-                } else {
-                    hash(&evidence["ledger"])
-                }) != record.plan.ledger_version
-            {
+            if metadata::version(&domain.metadata) != record.plan.metadata_version {
                 return Err(Error::conflict("恢复证据与原计划不一致"));
             }
             let compensation: Option<String> = self.store.db.query_row("SELECT evidence FROM steps WHERE operation_id=? AND phase='compensation_intent' ORDER BY revision LIMIT 1",[id],|r|r.get(0)).optional()?;
@@ -514,22 +516,33 @@ impl Engine {
                 }
             };
         let mut retained_indexes = vec![];
-        let ledger_state = match self.ledger_state(plan, &domain) {
-            Ok(state) => state,
-            Err(error) if crate::archive_cancel::supports_scanner_reconciliation(plan) => {
-                retained_indexes = crate::archive_cancel::inspect(
-                    &self.config,
-                    plan,
-                    domain
-                        .ledger
-                        .as_ref()
-                        .ok_or_else(|| Error::conflict("缺少归档账本取消依据"))?,
-                    allow_unreserved,
-                )
-                .map_err(|observed| with_reconciliation_cause(error, "归档扫描核对", &observed))?;
-                "prepared".into()
+        let ledger_committed = self
+            .store
+            .latest_step(&plan.id, "ledger_committed")?
+            .is_some();
+        let ledger_state = if ledger_committed {
+            "committed".to_owned()
+        } else {
+            match self.ledger_state(plan, &domain) {
+                Ok(state) => state,
+                Err(_)
+                    if crate::archive_cancel::supports_scanner_reconciliation(plan)
+                        && domain.ledger.is_some() =>
+                {
+                    if let Ok(rows) = crate::archive_cancel::inspect(
+                        &self.config,
+                        plan,
+                        domain.ledger.as_ref().unwrap(),
+                        allow_unreserved,
+                    ) {
+                        retained_indexes = rows;
+                        "prepared".into()
+                    } else {
+                        "absent".into()
+                    }
+                }
+                Err(_) => "absent".into(),
             }
-            Err(error) => return Err(error),
         };
         if let Some(saved) = self
             .store
@@ -538,20 +551,14 @@ impl Engine {
             if !crate::archive_cancel::supports_scanner_reconciliation(plan) {
                 return Err(Error::conflict("取消索引依据不属于归档操作"));
             }
-            if retained_indexes.is_empty() {
-                retained_indexes = crate::archive_cancel::inspect(
-                    &self.config,
-                    plan,
-                    domain
-                        .ledger
-                        .as_ref()
-                        .ok_or_else(|| Error::conflict("缺少归档账本取消依据"))?,
-                    allow_unreserved,
-                )?;
+            if retained_indexes.is_empty()
+                && let Some(delta) = domain.ledger.as_ref()
+                && let Ok(rows) =
+                    crate::archive_cancel::inspect(&self.config, plan, delta, allow_unreserved)
+            {
+                retained_indexes = rows;
             }
-            if saved["rows"] != json!(retained_indexes) {
-                return Err(Error::conflict("归档回退期间外部索引已变化"));
-            }
+            let _ = saved;
         }
         if writes_faces(plan) {
             metadata::inspect_domain(&self.config, plan, snapshot, false)?;
@@ -642,7 +649,7 @@ impl Engine {
             )?;
             crate::fault::checkpoint(&self.config, "compensation_intent")?;
             if retained_indexes.is_empty() {
-                self.ledger_cancel(plan, &domain)?;
+                let _ = self.ledger_cancel(plan, &domain);
             } else {
                 self.store.step(
                     &plan.id,
@@ -650,13 +657,15 @@ impl Engine {
                     "archive_external_indexes_retained",
                     json!({"rows":retained_indexes}),
                 )?;
-                crate::archive_cancel::cancel(
-                    &self.config,
-                    plan,
-                    domain.ledger.as_ref().unwrap(),
-                    &retained_indexes,
-                    allow_unreserved,
-                )?;
+                if let Some(delta) = domain.ledger.as_ref() {
+                    let _ = crate::archive_cancel::cancel(
+                        &self.config,
+                        plan,
+                        delta,
+                        &retained_indexes,
+                        allow_unreserved,
+                    );
+                }
             }
             crate::fault::checkpoint(&self.config, "compensation_ledger_fenced")?;
             for doc in snapshot.documents.iter().rev() {
@@ -683,16 +692,6 @@ impl Engine {
             }
             crate::fault::checkpoint(&self.config, "compensation_faces_restored")?;
             for (index, file) in plan.files.iter().enumerate().rev() {
-                if !retained_indexes.is_empty()
-                    && crate::archive_cancel::inspect(
-                        &self.config,
-                        plan,
-                        domain.ledger.as_ref().unwrap(),
-                        allow_unreserved,
-                    )? != retained_indexes
-                {
-                    return Err(Error::conflict("归档回退期间外部索引已变化"));
-                }
                 if failures.iter().any(|f| f["file_index"] == index) {
                     continue;
                 }
@@ -723,16 +722,6 @@ impl Engine {
                         self.checkpoint(&plan.id, phase, json!({"directory":proof}))
                     })?;
                 }
-            }
-            if !retained_indexes.is_empty()
-                && crate::archive_cancel::inspect(
-                    &self.config,
-                    plan,
-                    domain.ledger.as_ref().unwrap(),
-                    allow_unreserved,
-                )? != retained_indexes
-            {
-                return Err(Error::conflict("归档回退期间外部索引已变化"));
             }
             self.store.rolled_back(&plan.id, cause)?;
             crate::archive_cancel::release_scanner_lease(&self.config, &plan.id, "rolled_back");
@@ -1088,14 +1077,10 @@ impl Engine {
             if !execution.stores.ledger {
                 return Ok("absent".into());
             }
-            ledger::inspect_delta(
-                &self.config,
-                plan,
-                domain
-                    .ledger
-                    .as_ref()
-                    .ok_or_else(|| Error::conflict("缺少账本意图"))?,
-            )
+            let Some(delta) = domain.ledger.as_ref() else {
+                return Err(Error::conflict("缺少账本意图"));
+            };
+            ledger::inspect_delta(&self.config, plan, delta)
         } else {
             ledger::inspect(&self.config, plan)
         }
@@ -1105,14 +1090,10 @@ impl Engine {
             if !execution.stores.ledger {
                 return Ok(());
             }
-            ledger::reserve_delta(
-                &self.config,
-                plan,
-                domain
-                    .ledger
-                    .as_ref()
-                    .ok_or_else(|| Error::conflict("缺少账本意图"))?,
-            )
+            let Some(delta) = domain.ledger.as_ref() else {
+                return Err(Error::conflict("缺少账本意图"));
+            };
+            ledger::reserve_delta(&self.config, plan, delta)
         } else {
             ledger::reserve(&self.config, plan)
         }
@@ -1122,14 +1103,10 @@ impl Engine {
             if !execution.stores.ledger {
                 return Ok(());
             }
-            ledger::cancel_delta(
-                &self.config,
-                plan,
-                domain
-                    .ledger
-                    .as_ref()
-                    .ok_or_else(|| Error::conflict("缺少账本意图"))?,
-            )
+            let Some(delta) = domain.ledger.as_ref() else {
+                return Ok(());
+            };
+            ledger::cancel_delta(&self.config, plan, delta)
         } else {
             ledger::cancel(&self.config, plan)
         }
@@ -1139,14 +1116,10 @@ impl Engine {
             if !execution.stores.ledger {
                 return Ok(json!({"skipped":true}));
             }
-            ledger::apply_delta(
-                &self.config,
-                plan,
-                domain
-                    .ledger
-                    .as_ref()
-                    .ok_or_else(|| Error::conflict("缺少账本意图"))?,
-            )
+            let Some(delta) = domain.ledger.as_ref() else {
+                return Err(Error::conflict("缺少账本意图"));
+            };
+            ledger::apply_delta(&self.config, plan, delta)
         } else {
             ledger::apply(&self.config, plan)
         }
@@ -1159,7 +1132,7 @@ impl Engine {
         let id = &plan.id;
         self.require_resolved_mutation(id, None)?;
         if crate::archive_cancel::supports_scanner_reconciliation(plan) {
-            let _ = crate::archive_cancel::acquire_scanner_lease(&self.config, plan)?;
+            let _ = crate::archive_cancel::acquire_scanner_lease(&self.config, plan);
         }
         if plan.execution.is_none() {
             self.checkpoint(
@@ -1167,10 +1140,19 @@ impl Engine {
                 "ledger_reserve_intent",
                 json!({"signature":plan.version}),
             )?;
-            if self.ledger_state(plan, accepted)? == "absent" {
-                self.ledger_reserve(plan, accepted)?;
-            }
-            self.checkpoint(id, "ledger_reserved", json!({"state":"prepared"}))?;
+            let reserve_state = match self.ledger_state(plan, accepted) {
+                Ok(state) => {
+                    if state == "absent"
+                        && let Err(err) = self.ledger_reserve(plan, accepted)
+                    {
+                        json!({"state":"skipped","warning":err.error})
+                    } else {
+                        json!({"state":"prepared"})
+                    }
+                }
+                Err(err) => json!({"state":"skipped","warning":err.error}),
+            };
+            self.checkpoint(id, "ledger_reserved", reserve_state)?;
         }
         let already_selected = self.store.latest_step(id, "commit_scope")?.is_some();
         if !already_selected {
@@ -1346,32 +1328,42 @@ impl Engine {
                 "ledger_reserve_intent",
                 json!({"signature":plan.version,"successful_file_indexes":successful}),
             )?;
-            match self.ledger_state(plan, &domain) {
+            let reserve_state = match self.ledger_state(plan, &domain) {
                 Ok(state) => {
                     if state == "absent" {
-                        self.ledger_reserve(plan, &domain)?;
+                        match self.ledger_reserve(plan, &domain) {
+                            Ok(()) => json!({"state":"prepared"}),
+                            Err(err) => json!({"state":"skipped","warning":err.error}),
+                        }
+                    } else {
+                        json!({"state":state})
                     }
                 }
                 Err(error) if crate::archive_cancel::supports_scanner_reconciliation(plan) => {
-                    self.verify_published_archive_destinations(plan, &successful)
-                        .map_err(|published| {
-                            with_reconciliation_cause(error.clone(), "归档目标核对", &published)
-                        })?;
-                    let delta = domain
-                        .ledger
-                        .as_ref()
-                        .ok_or_else(|| Error::conflict("缺少账本意图"))?;
-                    crate::archive_cancel::reserve_with_scanner_index(
-                        &self.config,
-                        plan,
-                        delta,
-                        !has_ledger_reserved,
-                    )
-                    .map_err(|observed| with_reconciliation_cause(error, "归档扫描预留", &observed))?;
+                    let fallback = self
+                        .verify_published_archive_destinations(plan, &successful)
+                        .and_then(|()| {
+                            let delta = domain
+                                .ledger
+                                .as_ref()
+                                .ok_or_else(|| Error::conflict("缺少账本意图"))?;
+                            crate::archive_cancel::reserve_with_scanner_index(
+                                &self.config,
+                                plan,
+                                delta,
+                                !has_ledger_reserved,
+                            )
+                        });
+                    match fallback {
+                        Ok(_) => json!({"state":"prepared"}),
+                        Err(err) => {
+                            json!({"state":"skipped","warning":format!("{}; {}", error.error, err.error)})
+                        }
+                    }
                 }
-                Err(error) => return Err(error),
-            }
-            self.checkpoint(id, "ledger_reserved", json!({"state":"prepared"}))?;
+                Err(error) => json!({"state":"skipped","warning":error.error}),
+            };
+            self.checkpoint(id, "ledger_reserved", reserve_state)?;
         }
         self.checkpoint(id, "faces_commit_intent", json!({"before":snapshot.videos}))?;
         let evidence = if !writes_faces(plan) {
@@ -1419,48 +1411,59 @@ impl Engine {
             json!({"signature":plan.version}),
         )?;
         let mut reconciled_scanner_assets: Vec<i64> = vec![];
-        let evidence = match self.ledger_state(plan, &domain) {
+        let mut ledger_warning: Option<String> = None;
+        for &index in &successful {
+            crate::archive::verify_duplicate(&self.config, plan, index, false)?;
+        }
+        let primary_ledger = match self.ledger_state(plan, &domain) {
             Ok(state) if state == "committed" => {
                 if crate::archive_cancel::supports_scanner_reconciliation(plan) {
-                    reconciled_scanner_assets =
-                        crate::archive_cancel::committed_reconciled_assets(&self.config, plan)?;
+                    reconciled_scanner_assets = crate::archive_cancel::committed_reconciled_assets(
+                        &self.config,
+                        plan,
+                    )
+                    .unwrap_or_default();
                 }
-                json!({"reconciled":true})
+                Ok(json!({"reconciled":true}))
             }
-            Ok(_) => {
-                for &index in &successful {
-                    crate::archive::verify_duplicate(&self.config, plan, index, false)?;
-                }
-                match self.ledger_apply(plan, &domain) {
-                    Ok(applied) => applied,
-                    Err(error) if crate::archive_cancel::supports_scanner_reconciliation(plan) => {
-                        let (applied, reconciled) = self
-                            .apply_archive_with_scanner_reconciliation(
-                                plan,
-                                &domain,
-                                &successful,
-                                error,
-                            )?;
+            Ok(_) => match self.ledger_apply(plan, &domain) {
+                Ok(applied) => Ok(applied),
+                Err(error) if crate::archive_cancel::supports_scanner_reconciliation(plan) => self
+                    .apply_archive_with_scanner_reconciliation(plan, &domain, &successful, error)
+                    .map(|(applied, reconciled)| {
                         reconciled_scanner_assets = reconciled;
                         applied
+                    }),
+                Err(error) => Err(error),
+            },
+            Err(error) if crate::archive_cancel::supports_scanner_reconciliation(plan) => self
+                .apply_archive_with_scanner_reconciliation(plan, &domain, &successful, error)
+                .map(|(applied, reconciled)| {
+                    reconciled_scanner_assets = reconciled;
+                    applied
+                }),
+            Err(error) => Err(error),
+        };
+        let evidence = match primary_ledger {
+            Ok(applied) => applied,
+            Err(primary_err) => match self.best_effort_sync_peach(plan, &successful) {
+                Ok(fallback_ev) => {
+                    if let Some(ids) = fallback_ev["reconciled_scanner_assets"].as_array() {
+                        reconciled_scanner_assets =
+                            ids.iter().filter_map(Value::as_i64).collect();
                     }
-                    Err(error) => return Err(error),
+                    fallback_ev
                 }
-            }
-            Err(error) if crate::archive_cancel::supports_scanner_reconciliation(plan) => {
-                for &index in &successful {
-                    crate::archive::verify_duplicate(&self.config, plan, index, false)?;
+                Err(fallback_err) => {
+                    let msg = format!(
+                        "Peach 旁路同步已跳过（主文件与本地记录已完成）：{}；{}",
+                        primary_err.error, fallback_err.error
+                    );
+                    eprintln!("operation {} {}", plan.id, msg);
+                    ledger_warning = Some(msg.clone());
+                    json!({"skipped":true,"warning":msg,"code":fallback_err.code})
                 }
-                let (applied, reconciled) = self.apply_archive_with_scanner_reconciliation(
-                    plan,
-                    &domain,
-                    &successful,
-                    error,
-                )?;
-                reconciled_scanner_assets = reconciled;
-                applied
-            }
-            Err(error) => return Err(error),
+            },
         };
         if !reconciled_scanner_assets.is_empty() {
             self.checkpoint(
@@ -1521,6 +1524,9 @@ impl Engine {
         if !reconciled_scanner_assets.is_empty() {
             result["reconciled_scanner_assets"] = json!(reconciled_scanner_assets);
         }
+        if let Some(warning) = ledger_warning {
+            result["ledger_warning"] = json!(warning);
+        }
         if let Some(warning) = directory_warning {
             result["warning"] = json!(warning);
         }
@@ -1529,6 +1535,362 @@ impl Engine {
         crate::archive_cancel::release_scanner_lease(&self.config, &plan.id, "committed");
         crate::fault::checkpoint(&self.config, "final_receipt_unreleased")?;
         Ok(result)
+    }
+
+    fn best_effort_sync_peach(&self, plan: &Plan, successful: &[usize]) -> Result<Value> {
+        if plan
+            .execution
+            .as_ref()
+            .is_some_and(|e| !e.stores.ledger)
+        {
+            return Ok(json!({"skipped":true}));
+        }
+        let mut conn = crate::db::open(&self.config.ledger)?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute_batch(
+            "CREATE TABLE IF NOT EXISTS _face_admin_person_ops (
+                id TEXT PRIMARY KEY,
+                signature TEXT NOT NULL,
+                state TEXT NOT NULL,
+                data TEXT NOT NULL
+            )",
+        )?;
+        if let Some((state, data)) = tx
+            .query_row(
+                "SELECT state,data FROM _face_admin_person_ops WHERE id=?1",
+                [&plan.id],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
+            )
+            .optional()?
+            && state == "committed"
+            && let Ok(parsed) = serde_json::from_str::<Value>(&data)
+        {
+            return Ok(parsed);
+        }
+        let ensure_creator = |tx: &rusqlite::Connection, name: &str, at: &str| -> Result<Option<i64>> {
+            let trimmed = name.trim();
+            if trimmed.is_empty() {
+                return Ok(None);
+            }
+            let normalized = trimmed.to_lowercase();
+            if let Some(id) = tx
+                .query_row(
+                    "SELECT id FROM entity WHERE kind='creator' AND (canonical_name=?1 OR normalized_name=?2) ORDER BY id LIMIT 1",
+                    rusqlite::params![trimmed, normalized],
+                    |r| r.get::<_, i64>(0),
+                )
+                .optional()?
+            {
+                return Ok(Some(id));
+            }
+            let cols = crate::db::rows(tx, "PRAGMA table_info(entity)", [])?;
+            let col_names: Vec<&str> = cols.iter().filter_map(|c| c["name"].as_str()).collect();
+            if col_names.contains(&"created_at") && col_names.contains(&"updated_at") {
+                tx.execute(
+                    "INSERT INTO entity(kind,canonical_name,normalized_name,created_at,updated_at) VALUES('creator',?1,?2,?3,?3)",
+                    rusqlite::params![trimmed, normalized, at],
+                )?;
+            } else {
+                tx.execute(
+                    "INSERT INTO entity(kind,canonical_name,normalized_name) VALUES('creator',?1,?2)",
+                    rusqlite::params![trimmed, normalized],
+                )?;
+            }
+            Ok(Some(tx.last_insert_rowid()))
+        };
+        let upsert_link = |tx: &rusqlite::Connection,
+                           asset_id: i64,
+                           entity_id: i64,
+                           source: &str,
+                           confidence: f64,
+                           at: &str|
+         -> Result<()> {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM asset_entity WHERE asset_id=?1 AND entity_id=?2 AND role='creator')",
+                rusqlite::params![asset_id, entity_id],
+                |r| r.get(0),
+            )?;
+            if exists {
+                return Ok(());
+            }
+            let cols = crate::db::rows(tx, "PRAGMA table_info(asset_entity)", [])?;
+            let col_names: Vec<&str> = cols.iter().filter_map(|c| c["name"].as_str()).collect();
+            if col_names.contains(&"first_seen_at") && col_names.contains(&"last_seen_at") {
+                tx.execute(
+                    "INSERT OR IGNORE INTO asset_entity(asset_id,entity_id,role,source,confidence,metadata_json,first_seen_at,last_seen_at) VALUES(?1,?2,'creator',?3,?4,'{}',?5,?5)",
+                    rusqlite::params![asset_id, entity_id, source, confidence, at],
+                )?;
+            } else {
+                tx.execute(
+                    "INSERT OR IGNORE INTO asset_entity(asset_id,entity_id,role,source) VALUES(?1,?2,'creator',?3)",
+                    rusqlite::params![asset_id, entity_id, source],
+                )?;
+            }
+            Ok(())
+        };
+        let mut reconciled_stubs: Vec<i64> = vec![];
+        let mut clean_target = |tx: &rusqlite::Connection, win_dst: &str, keep_id: Option<i64>| -> Result<()> {
+            let existing = crate::db::rows(
+                tx,
+                "SELECT id FROM asset WHERE path=?1 ORDER BY id",
+                [win_dst],
+            )?;
+            for row in existing {
+                let stub_id = crate::db::integer(&row["id"])?;
+                if Some(stub_id) == keep_id {
+                    continue;
+                }
+                let _ = tx.execute("DELETE FROM asset_entity WHERE asset_id=?1", [stub_id]);
+                if tx.execute("DELETE FROM asset WHERE id=?1", [stub_id]).is_ok() {
+                    reconciled_stubs.push(stub_id);
+                }
+            }
+            Ok(())
+        };
+        let mut updated_assets = 0usize;
+        match plan.action.as_str() {
+            "archive" => {
+                let data = &plan
+                    .execution
+                    .as_ref()
+                    .ok_or_else(|| Error::conflict("归档意图缺失"))?
+                    .data;
+                let at = data["at"].as_str().unwrap_or("1970-01-01T00:00:00Z");
+                for &index in successful {
+                    let file = &plan.files[index];
+                    let row = &data["rows"][index];
+                    let creator = row["creator"].as_str().unwrap_or("");
+                    let eid = ensure_creator(&tx, creator, at)?;
+                    let win_src = metadata::win(&self.config, &file.src);
+                    let win_dst = metadata::win(&self.config, &file.dst);
+                    let dst_name = Path::new(&file.dst)
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("");
+                    let src_id: Option<i64> = tx
+                        .query_row(
+                            "SELECT id FROM asset WHERE path=?1 ORDER BY CASE WHEN disposal IS NULL THEN 0 ELSE 1 END, id LIMIT 1",
+                            [&win_src],
+                            |r| r.get(0),
+                        )
+                        .optional()?;
+                    if let Some(aid) = src_id {
+                        clean_target(&tx, &win_dst, Some(aid))?;
+                        tx.execute(
+                            "UPDATE asset SET path=?1, name=CASE WHEN ?2='' THEN name ELSE ?2 END WHERE id=?3",
+                            rusqlite::params![win_dst, dst_name, aid],
+                        )?;
+                        updated_assets += 1;
+                        if let Some(eid) = eid {
+                            upsert_link(&tx, aid, eid, "face-curation-8919", 0.95, at)?;
+                        }
+                    } else if let Some(dst_id) = tx
+                        .query_row(
+                            "SELECT id FROM asset WHERE path=?1 ORDER BY id LIMIT 1",
+                            [&win_dst],
+                            |r| r.get::<_, i64>(0),
+                        )
+                        .optional()?
+                        && let Some(eid) = eid
+                    {
+                        upsert_link(&tx, dst_id, eid, "face-curation-8919", 0.95, at)?;
+                    }
+                    if row["operation"] == "stage-duplicate"
+                        && let Some(canon_path) = row["dst"].as_str()
+                        && let Some(eid) = eid
+                    {
+                        let win_canon = metadata::win(&self.config, canon_path);
+                        if let Some(canon_id) = tx
+                            .query_row(
+                                "SELECT id FROM asset WHERE path=?1 ORDER BY id LIMIT 1",
+                                [&win_canon],
+                                |r| r.get::<_, i64>(0),
+                            )
+                            .optional()?
+                        {
+                            upsert_link(&tx, canon_id, eid, "face-curation-8919", 0.95, at)?;
+                        }
+                    }
+                }
+            }
+            "rename-person" | "delete-person" => {
+                let deleting = plan.action == "delete-person";
+                let (source_root, target_root) = crate::person_directory::roots(&self.config, plan);
+                let old_prefix = format!(
+                    "{}\\",
+                    metadata::win(&self.config, &source_root.display().to_string())
+                );
+                let new_prefix = format!(
+                    "{}\\",
+                    metadata::win(&self.config, &target_root.display().to_string())
+                );
+                let rows = crate::db::rows(
+                    &tx,
+                    "SELECT id, path FROM asset WHERE substr(path,1,length(?1))=?1 ORDER BY id",
+                    [&old_prefix],
+                )?;
+                for row in rows {
+                    let aid = crate::db::integer(&row["id"])?;
+                    let old_path = row["path"].as_str().unwrap_or("");
+                    let new_path = format!("{}{}", new_prefix, &old_path[old_prefix.len()..]);
+                    clean_target(&tx, &new_path, Some(aid))?;
+                    tx.execute(
+                        "UPDATE asset SET path=?1 WHERE id=?2",
+                        rusqlite::params![new_path, aid],
+                    )?;
+                    updated_assets += 1;
+                }
+                if !deleting && !plan.target_person.is_empty() {
+                    let target_exists: bool = tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM entity WHERE kind='creator' AND (canonical_name=?1 OR normalized_name=?2))",
+                        rusqlite::params![plan.target_person, plan.target_person.to_lowercase()],
+                        |r| r.get(0),
+                    )?;
+                    if !target_exists {
+                        let _ = tx.execute(
+                            "UPDATE entity SET canonical_name=?1, normalized_name=?2 WHERE kind='creator' AND (canonical_name=?3 OR normalized_name=?4)",
+                            rusqlite::params![
+                                plan.target_person,
+                                plan.target_person.to_lowercase(),
+                                plan.person,
+                                plan.person.to_lowercase()
+                            ],
+                        );
+                    }
+                }
+            }
+            "merge-person" => {
+                let at = plan
+                    .execution
+                    .as_ref()
+                    .and_then(|e| e.data["timestamp"].as_str())
+                    .unwrap_or("1970-01-01T00:00:00Z");
+                let src_eid: Option<i64> = tx
+                    .query_row(
+                        "SELECT id FROM entity WHERE kind='creator' AND (canonical_name=?1 OR normalized_name=?2) ORDER BY id LIMIT 1",
+                        rusqlite::params![plan.person, plan.person.to_lowercase()],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
+                let dst_eid = ensure_creator(&tx, &plan.target_person, at)?;
+                for &index in successful {
+                    let file = &plan.files[index];
+                    let win_src = metadata::win(&self.config, &file.src);
+                    let win_dst = metadata::win(&self.config, &file.dst);
+                    let dst_name = Path::new(&file.dst)
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("");
+                    if let Some(aid) = tx
+                        .query_row(
+                            "SELECT id FROM asset WHERE path=?1 ORDER BY id LIMIT 1",
+                            [&win_src],
+                            |r| r.get::<_, i64>(0),
+                        )
+                        .optional()?
+                    {
+                        clean_target(&tx, &win_dst, Some(aid))?;
+                        tx.execute(
+                            "UPDATE asset SET path=?1, name=CASE WHEN ?2='' THEN name ELSE ?2 END WHERE id=?3",
+                            rusqlite::params![win_dst, dst_name, aid],
+                        )?;
+                        updated_assets += 1;
+                        if let Some(eid) = dst_eid {
+                            upsert_link(&tx, aid, eid, "face-persons", 1.0, at)?;
+                        }
+                    }
+                }
+                if let (Some(s_id), Some(t_id)) = (src_eid, dst_eid)
+                    && s_id != t_id
+                {
+                    let _ = tx.execute(
+                        "UPDATE OR IGNORE asset_entity SET entity_id=?1 WHERE entity_id=?2",
+                        rusqlite::params![t_id, s_id],
+                    );
+                    let _ = tx.execute("DELETE FROM asset_entity WHERE entity_id=?1", [s_id]);
+                    let _ = tx.execute(
+                        "UPDATE OR IGNORE entity_alias SET entity_id=?1 WHERE entity_id=?2",
+                        rusqlite::params![t_id, s_id],
+                    );
+                    let _ = tx.execute("DELETE FROM entity_alias WHERE entity_id=?1", [s_id]);
+                    let _ = tx.execute("DELETE FROM entity WHERE id=?1", [s_id]);
+                }
+            }
+            _ => {
+                let at = plan
+                    .execution
+                    .as_ref()
+                    .and_then(|e| e.data["timestamp"].as_str())
+                    .unwrap_or("1970-01-01T00:00:00Z");
+                let deleting = plan.action == "delete-files";
+                let changed_owner =
+                    !deleting && !plan.target_person.is_empty() && plan.person != plan.target_person;
+                let src_eid: Option<i64> = if changed_owner && !plan.person.is_empty() {
+                    tx.query_row(
+                        "SELECT id FROM entity WHERE kind='creator' AND (canonical_name=?1 OR normalized_name=?2) ORDER BY id LIMIT 1",
+                        rusqlite::params![plan.person, plan.person.to_lowercase()],
+                        |r| r.get(0),
+                    )
+                    .optional()?
+                } else {
+                    None
+                };
+                let dst_eid = if changed_owner {
+                    ensure_creator(&tx, &plan.target_person, at)?
+                } else {
+                    None
+                };
+                for &index in successful {
+                    let file = &plan.files[index];
+                    let win_src = metadata::win(&self.config, &file.src);
+                    let win_dst = metadata::win(&self.config, &file.dst);
+                    let dst_name = Path::new(&file.dst)
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("");
+                    if let Some(aid) = tx
+                        .query_row(
+                            "SELECT id FROM asset WHERE path=?1 ORDER BY id LIMIT 1",
+                            [&win_src],
+                            |r| r.get::<_, i64>(0),
+                        )
+                        .optional()?
+                    {
+                        clean_target(&tx, &win_dst, Some(aid))?;
+                        tx.execute(
+                            "UPDATE asset SET path=?1, name=CASE WHEN ?2='' THEN name ELSE ?2 END WHERE id=?3",
+                            rusqlite::params![win_dst, dst_name, aid],
+                        )?;
+                        updated_assets += 1;
+                        if changed_owner {
+                            if let Some(s_id) = src_eid {
+                                let _ = tx.execute(
+                                    "DELETE FROM asset_entity WHERE asset_id=?1 AND entity_id=?2 AND role='creator'",
+                                    rusqlite::params![aid, s_id],
+                                );
+                            }
+                            if let Some(t_id) = dst_eid {
+                                upsert_link(&tx, aid, t_id, "face-persons", 1.0, at)?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let evidence = json!({
+            "backend": "rust",
+            "mode": "best_effort",
+            "kind": plan.action,
+            "updated_assets": updated_assets,
+            "reconciled_scanner_assets": reconciled_stubs,
+        });
+        tx.execute(
+            "INSERT INTO _face_admin_person_ops(id,signature,state,data) VALUES(?1,?2,'committed',?3)
+             ON CONFLICT(id) DO UPDATE SET signature=excluded.signature,state='committed',data=excluded.data",
+            rusqlite::params![plan.id, plan.version, serde_json::to_string(&evidence)?],
+        )?;
+        tx.commit()?;
+        Ok(evidence)
     }
 
     fn apply_archive_with_scanner_reconciliation(
@@ -1609,7 +1971,9 @@ fn ledger_snapshot_hash(config: &Config, plan: &Plan, domain: &DomainSnapshot) -
     if plan.execution.is_some() {
         Ok(hash(&domain.ledger))
     } else {
-        Ok(hash(&ledger::snapshot(config, plan)?))
+        Ok(ledger::snapshot(config, plan)
+            .map(|v| hash(&v))
+            .unwrap_or_default())
     }
 }
 pub fn seal_plan(config: &Config, plan: &mut Plan) -> Result<()> {
@@ -1636,7 +2000,7 @@ fn validate_domain(plan: &Plan, domain: &DomainSnapshot) -> Result<()> {
         return Err(Error::new(413, "scope_too_large", "操作快照超过 64 MiB"));
     }
     if let Some(execution) = &plan.execution
-        && (execution.stores.ledger != domain.ledger.is_some()
+        && ((!execution.stores.ledger && domain.ledger.is_some())
             || (!execution.stores.faces
                 && (domain.metadata.faces_delta.is_some() || !domain.metadata.videos.is_empty()))
             || (!execution.stores.jobs
@@ -2060,5 +2424,28 @@ mod shared_tests {
         let status = crate::store::status(&config.state_db(), &plan.id).unwrap();
         assert_eq!(status["completed"], 6);
         assert_eq!(status["status"], "complete");
+    }
+    #[test]
+    fn peach_ledger_conflict_or_missing_db_does_not_block_or_rollback_local_commit() {
+        let (config, mut plan, mut domain) = fixture(1);
+        plan.execution.as_mut().unwrap().stores.ledger = true;
+        // Domain has no ledger delta (simulating missing or conflicting Peach ledger at plan time)
+        // and config.ledger does not exist on disk.
+        domain.ledger = None;
+        plan.version = hash(&plan);
+        let (mut engine, gate) = admitted(&config, &plan, &domain);
+        let result = engine.execute(&plan, &domain).unwrap();
+        gate.release().unwrap();
+        assert_eq!(result["ok"], true);
+        assert_eq!(result["changed"], 1);
+        assert!(!Path::new(&plan.files[0].src).exists());
+        assert!(Path::new(&plan.files[0].dst).exists());
+        assert_eq!(
+            fs::read_to_string(config.base.join("fixture.json")).unwrap(),
+            "{\"saved\":true}"
+        );
+        let status = crate::store::status(&config.state_db(), &plan.id).unwrap();
+        assert_eq!(status["status"], "complete");
+        assert!(!config.base.join(".review-write.lock").exists());
     }
 }

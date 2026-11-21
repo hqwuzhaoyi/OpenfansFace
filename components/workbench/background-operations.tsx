@@ -29,17 +29,40 @@ import {
   AgentActivity,
   type AgentActivityItem,
 } from "@/components/beui/agents/agent-activity";
-import { ActionSwapText } from "@/components/beui/motion/action-swap";
+import { AgentProgress } from "@/components/beui/agents/loading-states/agent-progress";
+import {
+  Alert,
+  AlertContent,
+  AlertDescription,
+  AlertIcon,
+} from "@/components/beui/motion/alert";
 import { AnimatedBadge } from "@/components/beui/motion/animated-badge";
-import { AvatarGroup } from "@/components/beui/motion/avatar-group";
 import { DigitSwap } from "@/components/beui/motion/digit-swap";
 import {
   MorphPopover,
   MorphPopoverContent,
   MorphPopoverTrigger,
 } from "@/components/beui/motion/popover-morph";
+import { ButtonGroup } from "@/components/ui/button-group";
 import { FILE_OPERATION_STORAGE_KEY } from "@/components/persons/file-actions";
 import { deleteWorkbenchCache } from "@/components/workbench/state";
+
+function invalidateReviewCaches({
+  resetSession = false,
+  includePeople = false,
+}: {
+  resetSession?: boolean;
+  includePeople?: boolean;
+} = {}) {
+  if (resetSession) {
+    deleteWorkbenchCache("review:session");
+  }
+  deleteWorkbenchCache("review:page:");
+  deleteWorkbenchCache("review:lastData");
+  if (includePeople) {
+    deleteWorkbenchCache("review:people");
+  }
+}
 import type { ArchiveResult } from "@/lib/archive-run-model";
 import { api } from "@/lib/face-api";
 import type {
@@ -153,7 +176,26 @@ export type ArchiveTask = {
   error?: string;
 };
 
-export type BackgroundTask = PersonBatchTask | PersonFileTask | ArchiveTask;
+export type ReviewMutationTask = {
+  id: string;
+  kind: "review-mutation";
+  action: "confirm" | "defer" | "restore" | "undo";
+  title: string;
+  subtitle: string;
+  vids: string[];
+  creator?: string;
+  status: BackgroundTaskStatus;
+  createdAt: number;
+  startedAt?: number;
+  finishedAt?: number;
+  error?: string;
+};
+
+export type BackgroundTask =
+  | PersonBatchTask
+  | PersonFileTask
+  | ArchiveTask
+  | ReviewMutationTask;
 
 export type BackgroundTaskEvent =
   | {
@@ -198,6 +240,14 @@ interface BackgroundOperationsContextValue {
     sizeGb?: string;
     personName?: string;
   }) => string;
+  trackReviewMutation: <T>(input: {
+    action: "confirm" | "defer" | "restore" | "undo";
+    title: string;
+    subtitle: string;
+    vids: string[];
+    creator?: string;
+    promise: Promise<T>;
+  }) => Promise<T>;
   cancelQueuedTask: (taskId: string) => void;
   dismissTask: (taskId: string) => void;
   clearCompleted: () => void;
@@ -507,6 +557,65 @@ export function BackgroundOperationsProvider({
     [],
   );
 
+  const trackReviewMutation = useCallback(
+    async <T,>({
+      action,
+      title,
+      subtitle,
+      vids,
+      creator,
+      promise,
+    }: {
+      action: "confirm" | "defer" | "restore" | "undo";
+      title: string;
+      subtitle: string;
+      vids: string[];
+      creator?: string;
+      promise: Promise<T>;
+    }): Promise<T> => {
+      const id = makeUuid();
+      const now = Date.now();
+      const task: ReviewMutationTask = {
+        id,
+        kind: "review-mutation",
+        action,
+        title,
+        subtitle,
+        vids,
+        creator,
+        status: "running",
+        createdAt: now,
+        startedAt: now,
+      };
+      setTasks((prev) => [...prev, task]);
+      try {
+        const result = await promise;
+        deleteWorkbenchCache("integration:plan");
+        if (creator) {
+          deleteWorkbenchCache("persons:library:" + creator);
+        }
+        invalidateReviewCaches();
+        updateTask(id, (t) => ({
+          ...t,
+          status: "complete",
+          finishedAt: Date.now(),
+        }));
+        return result;
+      } catch (e) {
+        const message = (e as Error).message || "人工确认操作失败";
+        setOpen(true);
+        updateTask(id, (t) => ({
+          ...t,
+          status: "failed",
+          error: message,
+          finishedAt: Date.now(),
+        }));
+        throw e;
+      }
+    },
+    [updateTask],
+  );
+
   const cancelQueuedTask = useCallback((taskId: string) => {
     setTasks((prev) =>
       prev.filter((t) => !(t.id === taskId && t.status === "queued")),
@@ -522,6 +631,19 @@ export function BackgroundOperationsProvider({
   const clearCompleted = useCallback(() => {
     setTasks((prev) => prev.filter((t) => !isTerminalStatus(t.status)));
   }, []);
+
+  // Auto-clear when all tasks have completed and the popover is closed
+  useEffect(() => {
+    if (open || tasks.length === 0) return;
+    const allComplete = tasks.every((t) => t.status === "complete");
+    if (!allComplete) return;
+    const timer = setTimeout(() => {
+      setTasks((prev) =>
+        prev.every((t) => t.status === "complete") ? [] : prev,
+      );
+    }, 3000);
+    return () => clearTimeout(timer);
+  }, [tasks, open]);
 
   // Execute a PersonBatchTask
   const runPersonBatchTask = useCallback(
@@ -642,6 +764,7 @@ export function BackgroundOperationsProvider({
         if (saved.target) {
           deleteWorkbenchCache("persons:library:" + saved.target);
         }
+        invalidateReviewCaches({ resetSession: true, includePeople: true });
 
         const nextStatus: BackgroundTaskStatus = saved.ok
           ? "complete"
@@ -807,6 +930,7 @@ export function BackgroundOperationsProvider({
         if (result.person) {
           deleteWorkbenchCache("persons:library:" + result.person);
         }
+        invalidateReviewCaches({ resetSession: true, includePeople: true });
 
         let settledTask: PersonFileTask | null = null;
         updateTask(initialTask.id, (t) => {
@@ -924,6 +1048,7 @@ export function BackgroundOperationsProvider({
           deleteWorkbenchCache("persons:library:" + creator);
         }
         deleteWorkbenchCache("integration:plan");
+        invalidateReviewCaches({ resetSession: true });
 
         const nextStatus: BackgroundTaskStatus = result.recovery_needed
           ? "recovery_needed"
@@ -983,17 +1108,19 @@ export function BackgroundOperationsProvider({
     [emit, updateTask],
   );
 
-  // Serial Queue Runner Effect
+  // Serial Queue Runner Effect (only for heavy file operations; review-mutation runs independently)
   useEffect(() => {
     if (runningIdRef.current) return;
-    const runningTask = tasks.find((t) => t.status === "running");
-    const nextTask = runningTask || tasks.find((t) => t.status === "queued");
+    const fileTasks = tasks.filter((t) => t.kind !== "review-mutation");
+    const runningTask = fileTasks.find((t) => t.status === "running");
+    const nextTask =
+      runningTask || fileTasks.find((t) => t.status === "queued");
     if (!nextTask) return;
 
     // Do not start a new queued task if an earlier task is stuck in recovery_needed
     if (
       nextTask.status === "queued" &&
-      tasks.some((t) => t.status === "recovery_needed")
+      fileTasks.some((t) => t.status === "recovery_needed")
     ) {
       return;
     }
@@ -1048,6 +1175,19 @@ export function BackgroundOperationsProvider({
               localStorage.removeItem(BATCH_STORAGE_KEY);
             } catch {}
           }
+          for (const person of target.people) {
+            deleteWorkbenchCache("persons:library:" + person);
+          }
+          if (target.target) {
+            deleteWorkbenchCache("persons:library:" + target.target);
+          }
+          for (const item of saved.completed || []) {
+            deleteWorkbenchCache("persons:library:" + item.person);
+          }
+          if (saved.target) {
+            deleteWorkbenchCache("persons:library:" + saved.target);
+          }
+          invalidateReviewCaches({ resetSession: true, includePeople: true });
           let settled: PersonBatchTask | null = null;
           updateTask(taskId, (t) => {
             if (t.kind !== "person-batch") return t;
@@ -1087,6 +1227,14 @@ export function BackgroundOperationsProvider({
               localStorage.removeItem(FILE_OPERATION_STORAGE_KEY);
             } catch {}
           }
+          deleteWorkbenchCache("persons:library:" + target.person);
+          if (target.targetPerson) {
+            deleteWorkbenchCache("persons:library:" + target.targetPerson);
+          }
+          if (receipt.result?.person) {
+            deleteWorkbenchCache("persons:library:" + receipt.result.person);
+          }
+          invalidateReviewCaches({ resetSession: true, includePeople: true });
           let settled: PersonFileTask | null = null;
           updateTask(taskId, (t) => {
             if (t.kind !== "person-file") return t;
@@ -1122,6 +1270,11 @@ export function BackgroundOperationsProvider({
                 localStorage.removeItem(ARCHIVE_STORAGE_KEY);
               } catch {}
             }
+            for (const creator of target.creators) {
+              deleteWorkbenchCache("persons:library:" + creator);
+            }
+            deleteWorkbenchCache("integration:plan");
+            invalidateReviewCaches({ resetSession: true });
             let settled: ArchiveTask | null = null;
             updateTask(taskId, (t) => {
               if (t.kind !== "archive") return t;
@@ -1157,8 +1310,24 @@ export function BackgroundOperationsProvider({
 
     for (const task of tasks) {
       if (!isActiveStatus(task.status)) continue;
-      activeWrite = true;
       const lockStatus = task.status === "running" ? "running" : "queued";
+      if (task.kind === "review-mutation") {
+        const label =
+          task.action === "confirm"
+            ? "归名中"
+            : task.action === "defer"
+              ? "暂缓中"
+              : task.action === "restore"
+                ? "恢复中"
+                : "撤销中";
+        for (const vid of task.vids) {
+          if (!vidsMap.has(vid)) {
+            vidsMap.set(vid, { label, status: lockStatus, taskId: task.id });
+          }
+        }
+        continue;
+      }
+      activeWrite = true;
 
       if (task.kind === "person-batch") {
         const label =
@@ -1230,6 +1399,7 @@ export function BackgroundOperationsProvider({
       enqueuePersonBatch,
       enqueuePersonFile,
       enqueueArchive,
+      trackReviewMutation,
       cancelQueuedTask,
       dismissTask,
       clearCompleted,
@@ -1245,6 +1415,7 @@ export function BackgroundOperationsProvider({
       enqueuePersonBatch,
       enqueuePersonFile,
       enqueueArchive,
+      trackReviewMutation,
       cancelQueuedTask,
       dismissTask,
       clearCompleted,
@@ -1256,12 +1427,130 @@ export function BackgroundOperationsProvider({
   return (
     <BackgroundOperationsContext.Provider value={value}>
       {children}
-      <BackgroundOperationsDock />
     </BackgroundOperationsContext.Provider>
   );
 }
 
+const REVIEW_MUTATION_STEP_LABEL: Record<
+  ReviewMutationTask["action"],
+  string
+> = {
+  confirm: "写入待归档队列",
+  defer: "移入暂缓核对列表",
+  restore: "恢复至待确认列表",
+  undo: "从待归档队列撤回",
+};
+
+const REVIEW_MUTATION_DONE_SUMMARY: Record<
+  ReviewMutationTask["action"],
+  string
+> = {
+  confirm: "已写入待归档队列",
+  defer: "已移入暂缓核对",
+  restore: "已恢复至待确认",
+  undo: "已从待归档队列撤回",
+};
+
+const PERSON_FILE_STEP_LABEL: Record<PersonFileAction, string> = {
+  "rename-file": "校验并重命名文件",
+  "move-files": "校验并移动媒体文件",
+  "delete-files": "校验并移入回收站",
+  "rename-person": "校验并重命名人物目录",
+  "merge-person": "合并人物目录文件",
+  "delete-person": "删除人物目录并移入回收站",
+};
+
+const PERSON_FILE_DONE_SUMMARY: Record<PersonFileAction, string> = {
+  "rename-file": "已完成文件重命名与账本同步",
+  "move-files": "已完成文件移动与账本同步",
+  "delete-files": "已移入回收站并同步账本",
+  "rename-person": "已完成人物重命名与账本同步",
+  "merge-person": "已完成人物合并与账本同步",
+  "delete-person": "已移入回收站并清理记录",
+};
+
+function getPersonFilePhaseFlags(task: PersonFileTask) {
+  const phase = task.phase || "";
+  const isComplete = task.status === "complete";
+  const filesDone =
+    isComplete ||
+    phase === "commit_scope" ||
+    phase === "successful_file_subset" ||
+    phase.startsWith("ledger_") ||
+    phase.startsWith("faces_") ||
+    phase.startsWith("jobs_") ||
+    phase.startsWith("json_") ||
+    phase.startsWith("source_directory_") ||
+    phase === "archive_scanner_indexes_reconciled";
+  const localIndexDone =
+    isComplete ||
+    phase === "ledger_commit_intent" ||
+    phase === "ledger_committed" ||
+    phase === "archive_scanner_indexes_reconciled" ||
+    phase.startsWith("source_directory_");
+  const peachDone =
+    isComplete ||
+    phase === "ledger_committed" ||
+    phase.startsWith("source_directory_");
+  return { filesDone, localIndexDone, peachDone };
+}
+
+function getActiveStageLabel(task: BackgroundTask): string {
+  if (task.kind === "review-mutation") {
+    return REVIEW_MUTATION_STEP_LABEL[task.action];
+  }
+  if (task.kind === "person-batch") {
+    if (task.progress?.active_person) {
+      return `正在处理 ${task.progress.active_person}`;
+    }
+    return task.action === "merge"
+      ? "合并人物目录并同步账本"
+      : "移入回收站并同步账本";
+  }
+  if (task.kind === "person-file") {
+    const { filesDone, localIndexDone, peachDone } =
+      getPersonFilePhaseFlags(task);
+    if (localIndexDone && !peachDone) return "同步 Peach 账本";
+    if (filesDone && !localIndexDone) return "更新本地记录与索引";
+    return PERSON_FILE_STEP_LABEL[task.action];
+  }
+  return task.progress?.stage || "核对归档并移动文件";
+}
+
+function getCompletedSummary(task: BackgroundTask): string {
+  if (task.kind === "review-mutation") {
+    return REVIEW_MUTATION_DONE_SUMMARY[task.action];
+  }
+  if (task.kind === "person-batch") {
+    return `已完成 ${task.result?.completed.length ?? task.plan.plans.length} 人处理`;
+  }
+  if (task.kind === "archive") {
+    return `已归档 ${task.result?.moved ?? task.vids.length} 个视频`;
+  }
+  return PERSON_FILE_DONE_SUMMARY[task.action];
+}
+
 function buildActivityItems(task: BackgroundTask): AgentActivityItem[] {
+  if (task.kind === "review-mutation") {
+    const baseLabel = REVIEW_MUTATION_STEP_LABEL[task.action];
+    return [
+      {
+        id: `${task.id}-review`,
+        type: "step",
+        status:
+          task.status === "complete"
+            ? "complete"
+            : task.status === "running"
+              ? "active"
+              : "pending",
+        label:
+          task.action === "confirm" && task.creator
+            ? `${baseLabel} · ${task.creator}`
+            : baseLabel,
+        meta: `${task.vids.length} 个视频`,
+      },
+    ];
+  }
   if (task.kind === "person-batch") {
     const completedSet = new Set([
       ...(task.progress?.completed || []),
@@ -1280,45 +1569,42 @@ function buildActivityItems(task: BackgroundTask): AgentActivityItem[] {
         label:
           task.action === "merge"
             ? `${p.person} → ${task.target}`
-            : `移入暂存 · ${p.person}`,
+            : `移入回收站 · ${p.person}`,
         meta: `${p.files.length} 个文件`,
       };
     });
   }
   if (task.kind === "person-file") {
-    const phase = task.phase || "";
-    const fileStepDone =
-      task.status === "complete" ||
-      phase.startsWith("ledger") ||
-      phase.startsWith("faces") ||
-      phase.startsWith("jobs") ||
-      phase.startsWith("json");
-    const ledgerDone =
-      task.status === "complete" ||
-      phase.startsWith("faces") ||
-      phase.startsWith("jobs") ||
-      phase.startsWith("json");
+    const { filesDone, localIndexDone, peachDone } =
+      getPersonFilePhaseFlags(task);
+    const isRunning = task.status === "running";
     return [
       {
         id: `${task.id}-files`,
         type: "step",
-        status: fileStepDone
+        status: filesDone ? "complete" : isRunning ? "active" : "pending",
+        label: PERSON_FILE_STEP_LABEL[task.action],
+        meta: `${task.plan.files.length} 个文件`,
+      },
+      {
+        id: `${task.id}-local`,
+        type: "step",
+        status: localIndexDone
           ? "complete"
-          : task.status === "running"
+          : filesDone && isRunning
             ? "active"
             : "pending",
-        label: "校验并搬移媒体文件",
-        meta: `${task.plan.files.length} 个文件`,
+        label: "更新本地记录与索引",
       },
       {
         id: `${task.id}-ledger`,
         type: "step",
-        status: ledgerDone
+        status: peachDone
           ? "complete"
-          : fileStepDone && task.status === "running"
+          : localIndexDone && isRunning
             ? "active"
             : "pending",
-        label: "同步 Peach 账本与本地索引",
+        label: "同步 Peach 账本",
       },
     ];
   }
@@ -1337,13 +1623,14 @@ function buildActivityItems(task: BackgroundTask): AgentActivityItem[] {
           : task.status === "running"
             ? "active"
             : "pending",
-      label: task.progress?.stage || "移动视频至人物目录并同步 Peach 账本",
+      label: task.progress?.stage || "移动视频至人物目录并保存记录",
       meta: `${doneCount} / ${totalCount}`,
     },
   ];
 }
 
 function TaskIcon({ task }: { task: BackgroundTask }) {
+  if (task.kind === "review-mutation") return <Check className="size-3.5" />;
   if (task.kind === "archive") return <Archive className="size-3.5" />;
   if (task.kind === "person-batch") {
     return task.action === "merge" ? (
@@ -1360,7 +1647,51 @@ function TaskIcon({ task }: { task: BackgroundTask }) {
   return <Pencil className="size-3.5" />;
 }
 
-function BackgroundOperationsDock() {
+function TaskActivityFeedback({
+  task,
+  items,
+  isRunning,
+  isComplete,
+  isError,
+}: {
+  task: BackgroundTask;
+  items: AgentActivityItem[];
+  isRunning: boolean;
+  isComplete: boolean;
+  isError: boolean;
+}) {
+  const [mountNow] = useState(() => Date.now());
+  const activeStageLabel = getActiveStageLabel(task);
+  const initialSeconds = task.startedAt
+    ? Math.max(0, (mountNow - task.startedAt) / 1000)
+    : 0;
+
+  return (
+    <AgentActivity
+      items={items}
+      status={isRunning ? "working" : "complete"}
+      defaultOpen={isRunning || isError}
+      collapseOnComplete={!isError}
+      activeLabel={activeStageLabel}
+      renderWorkingStatus={({ label }) => (
+        <AgentProgress
+          label={typeof label === "string" ? label : activeStageLabel}
+          initialSeconds={initialSeconds}
+          labels={{ inProgress: "{label}，进行中" }}
+          className="w-full min-w-0 gap-2 text-[12px] [&>span:nth-child(2)]:min-w-0 [&>span:nth-child(2)]:flex-1 [&>span:nth-child(2)]:truncate"
+        />
+      )}
+      summary={isComplete ? getCompletedSummary(task) : "查看执行步骤明细"}
+      maxHeight={148}
+    />
+  );
+}
+
+export function BackgroundOperationsDock({
+  mobile = false,
+}: {
+  mobile?: boolean;
+}) {
   const {
     tasks,
     open,
@@ -1371,7 +1702,17 @@ function BackgroundOperationsDock() {
     reconcileTask,
   } = useBackgroundOperations();
   const router = useRouter();
+  const [isMobileViewport, setIsMobileViewport] = useState(false);
 
+  useEffect(() => {
+    const mql = window.matchMedia("(max-width: 767px)");
+    const update = () => setIsMobileViewport(mql.matches);
+    update();
+    mql.addEventListener("change", update);
+    return () => mql.removeEventListener("change", update);
+  }, []);
+
+  if (mobile !== isMobileViewport) return null;
   if (tasks.length === 0) return null;
 
   const runningTask = tasks.find((t) => t.status === "running");
@@ -1398,23 +1739,23 @@ function BackgroundOperationsDock() {
         ? `${errorTasks.length} 项操作需核对`
         : `已完成 ${completedCount} 项操作`;
 
-  const activeAvatars =
-    runningTask?.kind === "person-batch"
-      ? runningTask.people.slice(0, 3).map((name) => ({
-          id: name,
-          name,
-          src: runningTask.thumbs[name] || undefined,
-        }))
-      : [];
+  const badgeCount = queuedCount > 0 ? queuedCount : tasks.length;
 
   return (
-    <div className="bg-ops-dock" role="region" aria-label="后台文件操作状态">
+    <div
+      className={mobile ? "bg-ops-dock bg-ops-dock-mobile" : "bg-ops-dock bg-ops-dock-rail"}
+      role="region"
+      aria-label="后台文件操作状态"
+    >
       <MorphPopover open={open} onOpenChange={setOpen}>
         <MorphPopoverTrigger>
           <button
             type="button"
             className="bg-ops-trigger"
             data-state={stateTone}
+            data-variant={mobile ? "mobile" : "rail"}
+            data-mobile={mobile || undefined}
+            title={`后台任务：${pillLabel}`}
             aria-label={`后台任务：${pillLabel}`}
           >
             <span className="bg-ops-trigger-icon" data-tone={stateTone}>
@@ -1427,38 +1768,29 @@ function BackgroundOperationsDock() {
               )}
             </span>
 
-            {activeAvatars.length > 0 && (
-              <AvatarGroup members={activeAvatars} size="sm" max={3} />
-            )}
-
-            <ActionSwapText
-              value={pillLabel}
-              animation="roll"
-              className="bg-ops-trigger-label"
-            >
-              {pillLabel}
-            </ActionSwapText>
-
-            <span className="bg-ops-trigger-count">
-              {queuedCount > 0 ? (
-                <>
-                  <span>排队</span>
+            {mobile ? (
+              <span className="bg-ops-trigger-count">
+                {queuedCount > 0 ? (
                   <DigitSwap value={queuedCount} />
-                </>
-              ) : (
-                <>
-                  <DigitSwap value={completedCount} />
-                  <span>/</span>
-                  <DigitSwap value={tasks.length} />
-                </>
-              )}
-            </span>
+                ) : (
+                  <>
+                    <DigitSwap value={completedCount} />
+                    <span>/</span>
+                    <DigitSwap value={tasks.length} />
+                  </>
+                )}
+              </span>
+            ) : (
+              <span className="bg-ops-rail-badge" data-tone={stateTone}>
+                <DigitSwap value={badgeCount} />
+              </span>
+            )}
           </button>
         </MorphPopoverTrigger>
 
         <MorphPopoverContent
-          side="top"
-          align="end"
+          side={mobile ? "bottom" : "top"}
+          align={mobile ? "end" : "start"}
           sideOffset={10}
           radius={14}
           className="bg-ops-panel"
@@ -1470,11 +1802,11 @@ function BackgroundOperationsDock() {
                 <DigitSwap value={tasks.length} />
               </AnimatedBadge>
             </div>
-            <div className="bg-ops-panel-actions">
+            <ButtonGroup className="bg-ops-action-group">
               {completedCount > 0 && (
                 <button
                   type="button"
-                  className="bg-ops-text-btn"
+                  className="bg-ops-group-btn"
                   onClick={clearCompleted}
                 >
                   清除已完成
@@ -1482,13 +1814,14 @@ function BackgroundOperationsDock() {
               )}
               <button
                 type="button"
-                className="bg-ops-text-btn"
+                className="bg-ops-group-btn"
                 aria-label="收起后台任务面板"
+                title="收起"
                 onClick={() => setOpen(false)}
               >
                 <X className="size-3.5" />
               </button>
-            </div>
+            </ButtonGroup>
           </div>
 
           <div className="bg-ops-list">
@@ -1501,6 +1834,17 @@ function BackgroundOperationsDock() {
                 task.status === "failed" ||
                 task.status === "recovery_needed" ||
                 task.status === "rolled_back";
+              const hasPrimaryAction =
+                isQueued ||
+                isError ||
+                (isComplete &&
+                  task.kind === "person-batch" &&
+                  task.action === "merge" &&
+                  !!task.target) ||
+                (isComplete &&
+                  task.kind === "person-file" &&
+                  !!(task.result?.person || task.person));
+              const hasDismissAction = isComplete || isError;
 
               return (
                 <div
@@ -1545,34 +1889,28 @@ function BackgroundOperationsDock() {
                   </div>
 
                   {(isRunning || isComplete || isError) && (
-                    <AgentActivity
+                    <TaskActivityFeedback
+                      task={task}
                       items={items}
-                      status={isRunning ? "working" : "complete"}
-                      defaultOpen={isRunning || isError}
-                      collapseOnComplete={!isError}
-                      activeLabel={
-                        task.kind === "person-batch" &&
-                        task.progress?.active_person
-                          ? `正在处理 ${task.progress.active_person}…`
-                          : "正在同步文件与 Peach 账本…"
-                      }
-                      summary={
-                        isComplete
-                          ? task.kind === "person-batch"
-                            ? `已完成 ${task.result?.completed.length ?? task.plan.plans.length} 人处理`
-                            : task.kind === "archive"
-                              ? `已归档 ${task.result?.moved ?? task.vids.length} 个视频`
-                              : "文件与账本已同步"
-                          : "查看执行步骤明细"
-                      }
-                      maxHeight={148}
+                      isRunning={isRunning}
+                      isComplete={isComplete}
+                      isError={isError}
                     />
                   )}
 
                   {isError && task.error && (
-                    <p className="bg-ops-card-error" role="alert">
-                      {task.error}
-                    </p>
+                    <Alert
+                      variant="warning"
+                      className="rounded-lg p-2.5 text-[11.5px]"
+                      contentClassName="gap-2"
+                    >
+                      <AlertIcon className="mt-0.5 size-3.5 [&>svg]:size-3.5" />
+                      <AlertContent className="space-y-0">
+                        <AlertDescription className="text-current leading-[1.45]">
+                          {task.error}
+                        </AlertDescription>
+                      </AlertContent>
+                    </Alert>
                   )}
 
                   <div className="bg-ops-card-foot">
@@ -1587,80 +1925,78 @@ function BackgroundOperationsDock() {
                       )}
                     </span>
 
-                    <div className="inline-flex items-center gap-1.5">
-                      {isQueued && (
-                        <button
-                          type="button"
-                          className="bg-ops-text-btn"
-                          data-variant="outline"
-                          onClick={() => cancelQueuedTask(task.id)}
-                        >
-                          取消排队
-                        </button>
-                      )}
-
-                      {isError && (
-                        <button
-                          type="button"
-                          className="bg-ops-text-btn"
-                          data-variant="outline"
-                          onClick={() => void reconcileTask(task.id)}
-                        >
-                          <RefreshCw className="size-3" />
-                          核对恢复
-                        </button>
-                      )}
-
-                      {isComplete &&
-                        task.kind === "person-batch" &&
-                        task.action === "merge" &&
-                        task.target && (
+                    {(hasPrimaryAction || hasDismissAction) && (
+                      <ButtonGroup className="bg-ops-action-group">
+                        {isQueued && (
                           <button
                             type="button"
-                            className="bg-ops-text-btn"
-                            data-variant="outline"
-                            onClick={() => {
-                              router.push(
-                                `/persons/${encodeURIComponent(task.target!)}`,
-                              );
-                              setOpen(false);
-                            }}
+                            className="bg-ops-group-btn"
+                            onClick={() => cancelQueuedTask(task.id)}
                           >
-                            查看 {task.target}
-                            <ArrowUpRight className="size-3" />
+                            取消排队
                           </button>
                         )}
 
-                      {isComplete &&
-                        task.kind === "person-file" &&
-                        (task.result?.person || task.person) && (
+                        {isError && (
                           <button
                             type="button"
-                            className="bg-ops-text-btn"
-                            data-variant="outline"
-                            onClick={() => {
-                              router.push(
-                                `/persons/${encodeURIComponent(task.result?.person || task.person)}`,
-                              );
-                              setOpen(false);
-                            }}
+                            className="bg-ops-group-btn"
+                            onClick={() => void reconcileTask(task.id)}
                           >
-                            查看目录
-                            <ArrowUpRight className="size-3" />
+                            <RefreshCw className="size-3" />
+                            核对恢复
                           </button>
                         )}
 
-                      {(isComplete || isError) && (
-                        <button
-                          type="button"
-                          className="bg-ops-text-btn"
-                          aria-label="移除此条记录"
-                          onClick={() => dismissTask(task.id)}
-                        >
-                          清除
-                        </button>
-                      )}
-                    </div>
+                        {isComplete &&
+                          task.kind === "person-batch" &&
+                          task.action === "merge" &&
+                          task.target && (
+                            <button
+                              type="button"
+                              className="bg-ops-group-btn"
+                              onClick={() => {
+                                router.push(
+                                  `/persons/${encodeURIComponent(task.target!)}`,
+                                );
+                                setOpen(false);
+                              }}
+                            >
+                              查看 {task.target}
+                              <ArrowUpRight className="size-3" />
+                            </button>
+                          )}
+
+                        {isComplete &&
+                          task.kind === "person-file" &&
+                          (task.result?.person || task.person) && (
+                            <button
+                              type="button"
+                              className="bg-ops-group-btn"
+                              onClick={() => {
+                                router.push(
+                                  `/persons/${encodeURIComponent(task.result?.person || task.person)}`,
+                                );
+                                setOpen(false);
+                              }}
+                            >
+                              查看目录
+                              <ArrowUpRight className="size-3" />
+                            </button>
+                          )}
+
+                        {hasDismissAction && (
+                          <button
+                            type="button"
+                            className="bg-ops-group-btn"
+                            aria-label="移除此条记录"
+                            onClick={() => dismissTask(task.id)}
+                          >
+                            清除
+                          </button>
+                        )}
+                      </ButtonGroup>
+                    )}
                   </div>
                 </div>
               );

@@ -10,12 +10,16 @@ export function candidateReasons(candidate:IdentityCandidate):Reason[]{
     else if(evidence.source==='face')reasons.push({kind:'face',confirmed:false,text:`人脸相似度 ${finite(evidence.score)?evidence.score.toFixed(3):'未记录'}${finite(evidence.support)?` · ${evidence.support} 张脸支持`:''}`})
     else if(evidence.detail)reasons.push({kind:'other',confirmed:false,text:evidence.detail})
   }
+  if(!reasons.length&&finite((candidate as {score?:unknown}).score)){
+    const score=(candidate as {score:number}).score
+    reasons.push({kind:'face',confirmed:false,text:`人脸相似度 ${score.toFixed(3)}`})
+  }
   if(!reasons.length)reasons.push({kind:'other',confirmed:false,text:'候选依据未记录，请查看详情核对'})
   return [...new Map(reasons.map(reason=>[reason.kind+':'+reason.text,reason])).values()]
 }
 export function reviewListSummary(task:ProcessingTask){
   const candidates=(task.data.candidates||[]).map(candidate=>({name:candidate.name,reasons:candidateReasons(candidate)}))
-  const conflict=task.data.kind==='conflict'||candidates.length>1
+  const conflict=task.data.kind==='conflict'||(!task.data.kind&&candidates.length>1)
   const evidence=(task.data.candidates||[]).flatMap(candidate=>candidate.evidence||[])
   const confirmed=new Set(evidence.filter(e=>e.source==='watermark'&&e.confirmed===true&&e.key).map(e=>e.key))
   const unconfirmed=new Set(evidence.filter(e=>e.source==='watermark'&&e.confirmed!==true&&e.key).map(e=>e.key))

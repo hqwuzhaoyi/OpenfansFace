@@ -259,7 +259,10 @@ pub fn resolve_candidates(candidates: &[Value]) -> Value {
             continue;
         };
         let source = candidate["source"].as_str().unwrap_or("");
-        let pos = if let Some(idx) = grouped.iter().position(|e| e.name == name) {
+        let pos = if let Some(idx) = grouped
+            .iter()
+            .position(|e| e.name == name || e.name.eq_ignore_ascii_case(name))
+        {
             idx
         } else {
             grouped.push(Entry {
@@ -271,7 +274,15 @@ pub fn resolve_candidates(candidates: &[Value]) -> Value {
             grouped.len() - 1
         };
         let entry = &mut grouped[pos];
-        if !entry.sources.iter().any(|s| s == source) {
+        if entry.name != name
+            && (matches!(source, "face" | "folder")
+                || candidate["confirmed"] == true
+                || (entry.name.bytes().all(|b| !b.is_ascii_uppercase())
+                    && name.bytes().any(|b| b.is_ascii_uppercase())))
+        {
+            entry.name = name.to_owned();
+        }
+        if !source.is_empty() && !entry.sources.iter().any(|s| s == source) {
             entry.sources.push(source.to_owned());
         }
         entry.evidence.push(candidate.clone());
@@ -280,14 +291,89 @@ pub fn resolve_candidates(candidates: &[Value]) -> Value {
             entry.score = Some(current.max(score));
         }
     }
+    let mut merge_into: Vec<Option<usize>> = vec![None; grouped.len()];
+    for i in 0..grouped.len() {
+        let is_unconfirmed_wm_only = grouped[i].sources.len() == 1
+            && grouped[i].sources[0] == "watermark"
+            && !grouped[i]
+                .evidence
+                .iter()
+                .any(|ev| ev["source"].as_str() == Some("watermark") && ev["confirmed"] == true);
+        if !is_unconfirmed_wm_only {
+            continue;
+        }
+        let stem = grouped[i]
+            .name
+            .trim_end_matches(['_', '-', '.', ' '])
+            .to_lowercase();
+        let stem_len = stem.chars().count();
+        if stem_len < 3 {
+            continue;
+        }
+        let best_target = (0..grouped.len())
+            .filter(|&j| {
+                j != i
+                    && grouped[j].sources.iter().any(|s| s == "watermark")
+                    && {
+                        let target_lower = grouped[j].name.to_lowercase();
+                        target_lower.chars().count() > stem_len && target_lower.starts_with(&stem)
+                    }
+            })
+            .max_by_key(|&j| (grouped[j].name.chars().count(), j));
+        merge_into[i] = best_target;
+    }
+    if merge_into.iter().any(Option::is_some) {
+        let mut merged_entries: Vec<Option<Entry>> = grouped.into_iter().map(Some).collect();
+        for i in 0..merged_entries.len() {
+            let Some(mut target) = merge_into[i] else {
+                continue;
+            };
+            while let Some(next) = merge_into[target] {
+                if next == target {
+                    break;
+                }
+                target = next;
+            }
+            if target != i
+                && let Some(source_entry) = merged_entries[i].take()
+                && let Some(target_entry) = merged_entries[target].as_mut()
+            {
+                target_entry.evidence.extend(source_entry.evidence);
+            }
+        }
+        grouped = merged_entries.into_iter().flatten().collect();
+    }
+    for entry in &mut grouped {
+        for ev in &mut entry.evidence {
+            if ev.is_object() {
+                ev["name"] = json!(entry.name);
+            }
+        }
+    }
+    let is_confirmed_wm = |e: &Entry| {
+        e.evidence
+            .iter()
+            .any(|ev| ev["source"].as_str() == Some("watermark") && ev["confirmed"] == true)
+    };
+    let is_wm = |e: &Entry| e.sources.iter().any(|s| s == "watermark");
+    let is_folder = |e: &Entry| e.sources.iter().any(|s| s == "folder");
     grouped.sort_by(|a, b| {
-        let a_wm = a.sources.iter().any(|s| s == "watermark");
-        let b_wm = b.sources.iter().any(|s| s == "watermark");
-        (!a_wm)
-            .cmp(&(!b_wm))
+        (!is_confirmed_wm(a))
+            .cmp(&(!is_confirmed_wm(b)))
+            .then_with(|| (!is_wm(a)).cmp(&(!is_wm(b))))
+            .then_with(|| (!is_folder(a)).cmp(&(!is_folder(b))))
             .then_with(|| (-(a.score.unwrap_or(0.0))).total_cmp(&(-(b.score.unwrap_or(0.0)))))
+            .then_with(|| {
+                if is_wm(a) && is_wm(b) {
+                    b.name.chars().count().cmp(&a.name.chars().count())
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
             .then_with(|| a.name.cmp(&b.name))
     });
+    let confirmed_wm_count = grouped.iter().filter(|e| is_confirmed_wm(e)).count();
+    let wm_count = grouped.iter().filter(|e| is_wm(e)).count();
     let values: Vec<Value> = grouped
         .iter()
         .map(|e| {
@@ -299,23 +385,46 @@ pub fn resolve_candidates(candidates: &[Value]) -> Value {
             })
         })
         .collect();
-    let kind = if values.is_empty() {
-        "none"
-    } else if values.len() > 1 {
-        "conflict"
+    let (kind, suggested) = if values.is_empty() {
+        ("none", Value::Null)
+    } else if confirmed_wm_count == 1 {
+        ("suggested", json!(values[0]["name"]))
+    } else if wm_count == 1 && confirmed_wm_count == 0 {
+        ("suggested", json!(values[0]["name"]))
+    } else if wm_count > 1 {
+        ("conflict", Value::Null)
+    } else if values.len() == 1 {
+        ("suggested", json!(values[0]["name"]))
     } else {
-        "suggested"
-    };
-    let suggested = if values.len() == 1 {
-        json!(values[0]["name"])
-    } else {
-        Value::Null
+        ("conflict", Value::Null)
     };
     json!({
         "candidates": values,
         "kind": kind,
         "suggested": suggested,
     })
+}
+
+pub fn re_resolve_task_data(data: &mut Value) {
+    let Some(candidates) = data["candidates"].as_array() else {
+        return;
+    };
+    if candidates.is_empty() || !candidates.iter().all(|c| c["evidence"].is_array()) {
+        return;
+    }
+    let flat: Vec<Value> = candidates
+        .iter()
+        .filter_map(|c| c["evidence"].as_array())
+        .flatten()
+        .cloned()
+        .collect();
+    if flat.is_empty() {
+        return;
+    }
+    let resolved = resolve_candidates(&flat);
+    data["candidates"] = resolved["candidates"].clone();
+    data["kind"] = resolved["kind"].clone();
+    data["suggested"] = resolved["suggested"].clone();
 }
 
 fn resolve_stage_data(
@@ -606,6 +715,9 @@ pub fn execute(engine: &mut Engine, body: Value) -> Result<Value> {
 fn open(config: &Config) -> Result<rusqlite::Connection> {
     db::open(&config.base.join("processing/processing.db"))
 }
+fn open_readonly(config: &Config) -> Result<rusqlite::Connection> {
+    db::open_readonly(&config.base.join("processing/processing.db"))
+}
 fn receipt(
     conn: &rusqlite::Connection,
     id: &str,
@@ -640,7 +752,7 @@ fn row(conn: &rusqlite::Connection, sql: &str, id: &str) -> Result<Value> {
         .next()
         .ok_or_else(|| stale("任务或执行记录已不存在"))
 }
-fn current(conn: &rusqlite::Connection, config: &Config, s: &Submission) -> Result<Value> {
+fn current_db(conn: &rusqlite::Connection, s: &Submission) -> Result<Value> {
     let t = row(conn, "SELECT * FROM tasks WHERE vid=?", &s.task.vid)?;
     for (key, expected) in [
         ("vid", &s.task.vid),
@@ -670,12 +782,14 @@ fn current(conn: &rusqlite::Connection, config: &Config, s: &Submission) -> Resu
             |r| r.get(0),
         )
         .optional()?;
-    if generation
-        .map(|g| serde_json::from_str::<Value>(&g))
-        .transpose()?
-        .as_ref()
-        != Some(&json!(s.task.coordinator_generation))
-    {
+    let current_gen = generation
+        .map(|g| match serde_json::from_str::<Value>(&g) {
+            Ok(Value::String(s)) => s,
+            Ok(Value::Number(n)) => n.to_string(),
+            _ => g.trim_matches('"').to_string(),
+        })
+        .unwrap_or_default();
+    if current_gen != s.task.coordinator_generation {
         return Err(stale("协调器已更换执行代次"));
     }
     let run = row(
@@ -703,6 +817,9 @@ fn current(conn: &rusqlite::Connection, config: &Config, s: &Submission) -> Resu
     {
         return Err(stale("批次成员或文件版本已变化"));
     }
+    Ok(t)
+}
+fn current_external(config: &Config, s: &Submission) -> Result<()> {
     for name in ["integration-queue.json", "archive-history.json"] {
         if review::read(config, name, json!([]))?
             .1
@@ -730,6 +847,11 @@ fn current(conn: &rusqlite::Connection, config: &Config, s: &Submission) -> Resu
     {
         return Err(stale("参考模型输入已变化"));
     }
+    Ok(())
+}
+fn current(conn: &rusqlite::Connection, config: &Config, s: &Submission) -> Result<Value> {
+    let t = current_db(conn, s)?;
+    current_external(config, s)?;
     Ok(t)
 }
 pub fn artifact_hash(path: &Path) -> Result<String> {
@@ -789,7 +911,7 @@ pub fn assigned_reference_inputs(config: &Config) -> Result<Value> {
     if !config.base.join("processing/processing.db").exists() {
         return Ok(json!(out));
     }
-    let conn = open(config)?;
+    let conn = open_readonly(config)?;
     let exists: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE name='_face_admin_processing_results')",
         [],
@@ -798,24 +920,44 @@ pub fn assigned_reference_inputs(config: &Config) -> Result<Value> {
     if !exists {
         return Ok(json!(out));
     }
-    let mut query=conn.prepare("SELECT id,result FROM _face_admin_processing_results WHERE json_extract(result,'$.vid')=? AND json_type(result,'$.data.face.feature_cache')='text' ORDER BY id")?;
-    for vid in &assigned {
-        let mut rows = query.query([vid])?;
-        while let Some(row) = rows.next()? {
-            let id: String = row.get(0)?;
-            let raw: String = row.get(1)?;
-            let result: Value = serde_json::from_str(&raw)?;
-            if let Some(path) = result["data"]["face"]["feature_cache"].as_str() {
-                if !Path::new(path).starts_with(config.base.join("processing/attempts")) {
-                    continue;
-                }
-                let digest = match artifact_hash(Path::new(path)) {
-                    Ok(v) => json!(v),
-                    Err(e) if e.code == "source_changed" => json!({"missing":true}),
-                    Err(e) => return Err(e),
-                };
-                out.push(json!({"id":id,"task":result["task"],"source_identity":result["source_identity"],"face_version":result["data"]["face"]["version"],"path":path,"expected":result["data"]["face"]["feature_cache_sha256"],"current":digest}));
+    let attempts_dir = config.base.join("processing/attempts");
+    let mut by_vid: std::collections::BTreeMap<String, Vec<Value>> =
+        std::collections::BTreeMap::new();
+    let mut query = conn.prepare(
+        "SELECT id,json_extract(result,'$.vid'),result FROM _face_admin_processing_results WHERE json_type(result,'$.vid')='text' AND json_type(result,'$.data.face.feature_cache')='text' ORDER BY id",
+    )?;
+    let mut rows = query.query([])?;
+    while let Some(row) = rows.next()? {
+        let vid: String = row.get(1)?;
+        if !assigned.contains(&vid) {
+            continue;
+        }
+        let id: String = row.get(0)?;
+        let raw: String = row.get(2)?;
+        let result: Value = serde_json::from_str(&raw)?;
+        if let Some(path) = result["data"]["face"]["feature_cache"].as_str() {
+            if !Path::new(path).starts_with(&attempts_dir) {
+                continue;
             }
+            let digest = match artifact_hash(Path::new(path)) {
+                Ok(v) => json!(v),
+                Err(e) if e.code == "source_changed" => json!({"missing":true}),
+                Err(e) => return Err(e),
+            };
+            by_vid.entry(vid).or_default().push(json!({
+                "id": id,
+                "task": result["task"],
+                "source_identity": result["source_identity"],
+                "face_version": result["data"]["face"]["version"],
+                "path": path,
+                "expected": result["data"]["face"]["feature_cache_sha256"],
+                "current": digest,
+            }));
+        }
+    }
+    for vid in &assigned {
+        if let Some(entries) = by_vid.remove(vid) {
+            out.extend(entries);
         }
     }
     Ok(json!(out))
@@ -1161,7 +1303,7 @@ fn patch_document(config: &Config, e: &Evidence, rollback: bool) -> Result<()> {
     files::atomic_write(&path, serde_json::to_string_pretty(&current)?.as_bytes())
 }
 fn finish(engine: &mut Engine, plan: &Plan, e: &Evidence) -> Result<Value> {
-    let result = receipt(&open(&engine.config)?, &plan.id, Some(&plan.version))?
+    let result = receipt(&open_readonly(&engine.config)?, &plan.id, Some(&plan.version))?
         .ok_or_else(|| Error::new(503, "outcome_unknown", "分析事务回执尚未确认"))?;
     // No task before/after comparison: a later stage, coordinator restart or human action is valid.
     if e.after.is_some() && document(&engine.config)?.get(&e.vid).cloned() != e.after {
@@ -1183,7 +1325,7 @@ fn resolve(
     cause: Option<Error>,
 ) -> Result<Value> {
     let result = (|| {
-        if receipt(&open(&engine.config)?, &plan.id, Some(&plan.version))?.is_some() {
+        if receipt(&open_readonly(&engine.config)?, &plan.id, Some(&plan.version))?.is_some() {
             return finish(engine, plan, e);
         }
         patch_document(&engine.config, e, true)?;
@@ -1242,48 +1384,47 @@ pub fn recover(engine: &mut Engine, plan: &Plan, gate: WriteGate) -> Result<()> 
 }
 pub fn apply(engine: &mut Engine, plan: &Plan, gate: WriteGate) -> Result<Value> {
     let s = submission(plan)?;
-    let mut conn = match open(&engine.config) {
-        Ok(c) => c,
-        Err(e) => {
-            gate.release()?;
-            return Err(e);
-        }
-    };
-    let tx = match conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate) {
-        Ok(tx) => tx,
-        Err(e) => {
-            gate.release()?;
-            return Err(e.into());
-        }
-    };
-    let prepared = (|| -> Result<Evidence> {
-        let task = current(&tx, &engine.config, &s)?;
-        let (data, group, next_stage) = prepare_data(&engine.config, &tx, &s, &task)?;
-        let before = document(&engine.config)?.get(&s.task.vid).cloned();
-        let after = if s.task.stage == "text" {
-            Some(data["watermark"].clone())
-        } else {
-            before.clone()
+    // Phase 1: prepare and verify without holding a processing.db write lock.
+    let (e, prepared_task_data) = {
+        let ro = match open_readonly(&engine.config) {
+            Ok(c) => c,
+            Err(e) => {
+                gate.release()?;
+                return Err(e);
+            }
         };
-        Ok(Evidence {
-            gate: gate.evidence()?,
-            vid: s.task.vid.clone(),
-            before,
-            after,
-            group,
-            result: json!({"ok":true,"accepted":true,"id":plan.id,"vid":s.task.vid,"run_id":s.task.run_id,"stage":s.task.stage,"next_stage":next_stage,"task":s.task,"source_identity":files::identity(&review::safe_source(&engine.config,&s.task.path)?),"data":data}),
-        })
-    })();
-    let e = match prepared {
-        Ok(e) => e,
-        Err(error) => {
-            drop(tx);
-            gate.release()?;
-            return Err(error);
+        let prepared = (|| -> Result<(Evidence, Value)> {
+            let task = current(&ro, &engine.config, &s)?;
+            let task_data = task["data"].clone();
+            let (data, group, next_stage) = prepare_data(&engine.config, &ro, &s, &task)?;
+            let before = document(&engine.config)?.get(&s.task.vid).cloned();
+            let after = if s.task.stage == "text" {
+                Some(data["watermark"].clone())
+            } else {
+                before.clone()
+            };
+            Ok((
+                Evidence {
+                    gate: gate.evidence()?,
+                    vid: s.task.vid.clone(),
+                    before,
+                    after,
+                    group,
+                    result: json!({"ok":true,"accepted":true,"id":plan.id,"vid":s.task.vid,"run_id":s.task.run_id,"stage":s.task.stage,"next_stage":next_stage,"task":s.task,"source_identity":files::identity(&review::safe_source(&engine.config,&s.task.path)?),"data":data}),
+                },
+                task_data,
+            ))
+        })();
+        match prepared {
+            Ok(v) => v,
+            Err(error) => {
+                drop(ro);
+                gate.release()?;
+                return Err(error);
+            }
         }
     };
     if let Err(error) = engine.store.admit(plan, serde_json::to_value(&e)?) {
-        drop(tx);
         let failure = Error::new(
             503,
             "recovery_required",
@@ -1302,14 +1443,20 @@ pub fn apply(engine: &mut Engine, plan: &Plan, gate: WriteGate) -> Result<Value>
         )?;
         patch_document(&engine.config, &e, false)?;
         crate::fault::checkpoint(&engine.config, "processing_json_published")?;
-        // Check actual file again at the database commit boundary, with the lease transaction held.
-        current(&tx, &engine.config, &s)?;
+        // Re-check external state & feature cache before acquiring the short DB write lock.
+        current_external(&engine.config, &s)?;
         let data = &e.result["data"];
         let next_stage = required(&e.result, "next_stage")?;
         if let Some(path) = data["face"]["feature_cache"].as_str()
             && data["face"]["feature_cache_sha256"] != artifact_hash(Path::new(path))?
         {
             return Err(stale("发布期间特征缓存已变化"));
+        }
+        let mut conn = open(&engine.config)?;
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let latest_task = current_db(&tx, &s)?;
+        if latest_task["data"] != prepared_task_data {
+            return Err(stale("任务分析数据在发布期间已变化"));
         }
         let now: f64 = tx.query_row("SELECT unixepoch('now','subsec')", [], |r| r.get(0))?;
         let execution = if s.task.stage == "face" {
@@ -1353,13 +1500,21 @@ pub fn apply(engine: &mut Engine, plan: &Plan, gate: WriteGate) -> Result<Value>
                 params![required(group, "id")?, required(group, "version")?, bytes],
             )?;
         }
-        tx.execute_batch("CREATE TABLE IF NOT EXISTS _face_admin_processing_results(id TEXT PRIMARY KEY,signature TEXT NOT NULL,result TEXT NOT NULL)")?;
+        let has_receipt_table: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='_face_admin_processing_results')",
+            [],
+            |r| r.get(0),
+        )?;
+        if !has_receipt_table {
+            tx.execute_batch("CREATE TABLE IF NOT EXISTS _face_admin_processing_results(id TEXT PRIMARY KEY,signature TEXT NOT NULL,result TEXT NOT NULL)")?;
+        }
         tx.execute(
             "INSERT INTO _face_admin_processing_results(id,signature,result) VALUES(?,?,?)",
             params![plan.id, plan.version, serde_json::to_string(&e.result)?],
         )?;
         crate::fault::checkpoint(&engine.config, "processing_db_commit_intent")?;
         tx.commit()?;
+        drop(conn);
         crate::fault::checkpoint(&engine.config, "processing_db_committed")?;
         Ok(())
     })();
@@ -1404,19 +1559,172 @@ mod tests {
     }
 
     #[test]
-    fn multiple_candidates_resolve_as_conflict_and_rank_watermark_first() {
+    fn multiple_candidates_resolve_with_watermark_priority() {
         let resolved = resolve_candidates(&[
             json!({"name": "Bob", "source": "folder"}),
             json!({"name": "Alice", "source": "watermark"}),
             json!({"name": "Alice", "source": "face", "score": 0.6}),
         ]);
-        assert_eq!(resolved["kind"], "conflict");
-        assert!(resolved["suggested"].is_null());
+        assert_eq!(resolved["kind"], "suggested");
+        assert_eq!(resolved["suggested"], "Alice");
         let candidates = resolved["candidates"].as_array().unwrap();
         assert_eq!(candidates.len(), 2);
         assert_eq!(candidates[0]["name"], "Alice");
         assert_eq!(candidates[0]["score"], 0.6);
         assert_eq!(candidates[1]["name"], "Bob");
+
+        let multi_wm = resolve_candidates(&[
+            json!({"name": "Bob", "source": "watermark"}),
+            json!({"name": "Alice", "source": "watermark"}),
+        ]);
+        assert_eq!(multi_wm["kind"], "conflict");
+        assert!(multi_wm["suggested"].is_null());
+
+        let multi_face = resolve_candidates(&[
+            json!({"name": "Bob", "source": "face", "score": 0.55}),
+            json!({"name": "Alice", "source": "face", "score": 0.62}),
+        ]);
+        assert_eq!(multi_face["kind"], "conflict");
+        assert!(multi_face["suggested"].is_null());
         assert_eq!(resolve_candidates(&[])["kind"], "none");
+    }
+
+    #[test]
+    fn assigned_reference_inputs_single_pass_preserves_vid_and_id_order() {
+        let root = fs::canonicalize("/tmp")
+            .unwrap()
+            .join(format!("face-assigned-ref-{}", uuid::Uuid::new_v4()));
+        let base = root.join("base");
+        let media = root.join("media");
+        fs::create_dir_all(base.join("processing/attempts/run-b")).unwrap();
+        fs::create_dir_all(base.join("processing/attempts/run-a")).unwrap();
+        fs::create_dir_all(&media).unwrap();
+        let config = Config {
+            base: base.clone(),
+            media,
+            ledger: root.join("ledger.db"),
+            bind: "127.0.0.1:0".into(),
+            token: None,
+            fixture: None,
+            parity_root: None,
+        };
+        fs::write(
+            base.join("integration-queue.json"),
+            json!([{"vid": "vid-2"}, {"vid": "vid-1"}]).to_string(),
+        )
+        .unwrap();
+        let feat_a = base.join("processing/attempts/run-a/features.npz");
+        let feat_b = base.join("processing/attempts/run-b/features.npz");
+        fs::write(&feat_a, b"npz-a").unwrap();
+        fs::write(&feat_b, b"npz-b").unwrap();
+
+        let conn = rusqlite::Connection::open(base.join("processing/processing.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE _face_admin_processing_results(id TEXT PRIMARY KEY, signature TEXT NOT NULL, result TEXT NOT NULL);",
+        )
+        .unwrap();
+        for (id, vid, path) in [
+            ("id-2", "vid-1", feat_b.to_string_lossy().to_string()),
+            ("id-1", "vid-1", feat_a.to_string_lossy().to_string()),
+            ("id-3", "vid-2", feat_b.to_string_lossy().to_string()),
+            ("id-unassigned", "vid-999", feat_a.to_string_lossy().to_string()),
+        ] {
+            let rec = json!({
+                "vid": vid,
+                "task": {"vid": vid},
+                "source_identity": {"size": "5"},
+                "data": {"face": {"version": "v1", "feature_cache": path, "feature_cache_sha256": "expected"}},
+            });
+            conn.execute(
+                "INSERT INTO _face_admin_processing_results VALUES(?,'sig',?)",
+                params![id, rec.to_string()],
+            )
+            .unwrap();
+        }
+        let rows = assigned_reference_inputs(&config).unwrap();
+        let arr = rows.as_array().unwrap();
+        // 2 legacy_cache entries (vid-1, vid-2) + 3 receipt entries ordered (vid-1: id-1, id-2), (vid-2: id-3)
+        assert_eq!(arr.len(), 5);
+        assert_eq!(arr[0]["vid"], "vid-1");
+        assert!(arr[0].get("legacy_cache").is_some());
+        assert_eq!(arr[1]["vid"], "vid-2");
+        assert!(arr[1].get("legacy_cache").is_some());
+        assert_eq!(arr[2]["id"], "id-1");
+        assert_eq!(arr[3]["id"], "id-2");
+        assert_eq!(arr[4]["id"], "id-3");
+        drop(conn);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn current_db_rejects_lease_expiry_at_commit_boundary() {
+        let root = fs::canonicalize("/tmp")
+            .unwrap()
+            .join(format!("face-pr-lease-{}", uuid::Uuid::new_v4()));
+        let base = root.join("base");
+        let media = root.join("media");
+        fs::create_dir_all(&base).unwrap();
+        fs::create_dir_all(&media).unwrap();
+        let config = Config {
+            base: base.clone(),
+            media,
+            ledger: root.join("ledger.db"),
+            bind: "127.0.0.1:0".into(),
+            token: None,
+            fixture: None,
+            parity_root: None,
+        };
+        let conn = crate::processing_scheduler::open_or_init(&config).unwrap();
+        let now: f64 = conn
+            .query_row("SELECT unixepoch('now','subsec')", [], |r| r.get(0))
+            .unwrap();
+        let future_lease = now + 120.0;
+        conn.execute(
+            "INSERT OR REPLACE INTO settings VALUES('coordinator_generation','\"gen-1\"')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO tasks(vid,path,name,size,mtime_ns,stage,retry_stage,batch_id,created_at,updated_at,run_id,lease_expires_at,coordinator_generation) VALUES('v1','/tmp/v1.mp4','v1.mp4',10,'100','text','text','b1',?,?, 'run-1', ?, 'gen-1')",
+            params![now, now, future_lease],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO batch_items(batch_id,vid,name,path,size,mtime_ns,added_at) VALUES('b1','v1','v1.mp4','/tmp/v1.mp4',10,'100',?)",
+            [now],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO processing_runs(id,vid,name,batch_id,stage,started_at,status) VALUES('run-1','v1','v1.mp4','b1','text',?,'running')",
+            [now],
+        )
+        .unwrap();
+        let sub = Submission {
+            operation_id: "op-1".into(),
+            scope: json!({"vids":["v1"]}),
+            version: "v".into(),
+            reference_input_version: None,
+            task: Task {
+                vid: "v1".into(),
+                path: "/tmp/v1.mp4".into(),
+                size: 10,
+                mtime_ns: "100".into(),
+                stage: "text".into(),
+                run_id: "run-1".into(),
+                batch_id: "b1".into(),
+                lease_expires_at: future_lease,
+                coordinator_generation: "gen-1".into(),
+            },
+            data: json!({}),
+            next_stage: None,
+        };
+        assert!(current_db(&conn, &sub).is_ok());
+        // Simulate concurrent lease revocation between Phase 1 read and Phase 3 commit.
+        conn.execute("UPDATE tasks SET lease_expires_at=? WHERE vid='v1'", [now - 1.0])
+            .unwrap();
+        let err = current_db(&conn, &sub).unwrap_err();
+        assert_eq!(err.status, 409);
+        drop(conn);
+        fs::remove_dir_all(root).unwrap();
     }
 }

@@ -8,6 +8,7 @@ use crate::{
     review,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -118,26 +119,54 @@ pub fn open_or_init(config: &Config) -> Result<Connection> {
             | OpenFlags::SQLITE_OPEN_CREATE
             | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
-    conn.busy_timeout(Duration::from_secs(15))?;
+    conn.busy_timeout(Duration::from_secs(30))?;
     conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;")?;
-    conn.execute_batch(SCHEMA)?;
-    ensure_columns(&conn)?;
-    conn.execute(
-        "INSERT OR IGNORE INTO settings VALUES ('paused','false')",
-        [],
-    )?;
-    conn.execute(
-        "INSERT OR IGNORE INTO settings VALUES ('concurrency','1')",
-        [],
-    )?;
-    let version = setting(&conn, "batch_ledger_version")?
-        .and_then(|v| v.as_i64())
+    let schema_ready = conn
+        .prepare("SELECT run_id, lease_expires_at, coordinator_generation FROM tasks LIMIT 0")
+        .is_ok()
+        && conn
+            .prepare("SELECT execution FROM processing_runs LIMIT 0")
+            .is_ok()
+        && conn
+            .prepare("SELECT batch_id FROM batch_items LIMIT 0")
+            .is_ok()
+        && conn
+            .prepare("SELECT id FROM face_groups LIMIT 0")
+            .is_ok()
+        && conn
+            .prepare("SELECT id FROM events LIMIT 0")
+            .is_ok();
+    if !schema_ready {
+        conn.execute_batch(SCHEMA)?;
+        ensure_columns(&conn)?;
+    }
+    crate::agent_registry::init_tables(&conn)?;
+    crate::agent_deployment::init_tables(&conn)?;
+    let has_defaults: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM settings WHERE key IN ('paused', 'concurrency', 'batch_ledger_version')",
+            [],
+            |r| r.get(0),
+        )
         .unwrap_or(0);
-    if version == 0 {
-        for row in db::rows(&conn, "SELECT * FROM tasks", [])? {
-            ensure_member(&conn, &row, true)?;
+    if has_defaults < 3 {
+        conn.execute(
+            "INSERT OR IGNORE INTO settings VALUES ('paused','false')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO settings VALUES ('concurrency','1')",
+            [],
+        )?;
+        let version = setting(&conn, "batch_ledger_version")?
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        if version == 0 {
+            for row in db::rows(&conn, "SELECT * FROM tasks", [])? {
+                ensure_member(&conn, &row, true)?;
+            }
+            set_setting(&conn, "batch_ledger_version", &json!(1))?;
         }
-        set_setting(&conn, "batch_ledger_version", &json!(1))?;
     }
     Ok(conn)
 }
@@ -148,7 +177,7 @@ pub fn open_existing(config: &Config, missing_message: &str) -> Result<Connectio
         return Err(unavailable(missing_message));
     }
     let conn = db::open(&path)?;
-    conn.busy_timeout(Duration::from_secs(15))?;
+    conn.busy_timeout(Duration::from_secs(30))?;
     ensure_columns(&conn)?;
     Ok(conn)
 }
@@ -286,6 +315,21 @@ pub fn reconcile(
             by_vid.insert(v.to_owned(), row);
         }
     }
+    let mut existing_members: BTreeMap<(String, String), (i64, i64)> = BTreeMap::new();
+    {
+        let mut stmt = conn.prepare("SELECT batch_id, vid, excluded, completed FROM batch_items")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                (r.get::<_, String>(0)?, r.get::<_, String>(1)?),
+                (r.get::<_, i64>(2)?, r.get::<_, i64>(3)?),
+            ))
+        })?;
+        for row in rows {
+            let (key, val) = row?;
+            existing_members.insert(key, val);
+        }
+    }
+    let stamp = now_sec(conn)?;
     let mut active = BTreeSet::new();
     for item in items {
         let item_vid = item["vid"]
@@ -318,7 +362,7 @@ pub fn reconcile(
             .unwrap_or(item_vid)
             .to_owned();
         active.insert(vid.clone());
-        let stamp = now_sec(conn)?;
+        let mut changed = false;
         if let Some(before) = &before {
             let b_stage = before["stage"].as_str().unwrap_or("");
             let b_path = before["path"].as_str().unwrap_or("");
@@ -347,11 +391,18 @@ pub fn reconcile(
                     "UPDATE tasks SET stage=?,updated_at=?,run_id='',lease_expires_at=0 WHERE vid=?",
                     params![next_stage, stamp, vid],
                 )?;
+                changed = true;
             } else if b_path != item_path || b_size != item_size || b_mtime != item_mtime_ns {
                 conn.execute(
                     "UPDATE batch_items SET excluded=1 WHERE batch_id=? AND vid=? AND completed=0",
                     params![b_batch, vid],
                 )?;
+                if let Some((excluded, completed)) =
+                    existing_members.get_mut(&(b_batch.to_owned(), vid.clone()))
+                    && *completed == 0
+                {
+                    *excluded = 1;
+                }
                 conn.execute(
                     "UPDATE tasks SET path=?,name=?,size=?,mtime_ns=?,duration=?,stage='queued',retry_stage='text',
                     text_attempts=0,face_attempts=0,next_retry=0,error=NULL,data='{}',manual=0,deferred=0,run_id='',
@@ -367,6 +418,7 @@ pub fn reconcile(
                         vid,
                     ],
                 )?;
+                changed = true;
             }
         } else {
             conn.execute(
@@ -386,16 +438,50 @@ pub fn reconcile(
                     i64::from(bootstrapped),
                 ],
             )?;
+            changed = true;
         }
-        if let Some(row) = db::rows(conn, "SELECT * FROM tasks WHERE vid=?", [&vid])?
-            .into_iter()
-            .next()
-        {
-            ensure_member(conn, &row, false)?;
-            if let Some(p) = row["path"].as_str() {
-                by_path.insert(p.to_owned(), row.clone());
+        if changed {
+            if let Some(row) = db::rows(conn, "SELECT * FROM tasks WHERE vid=?", [&vid])?
+                .into_iter()
+                .next()
+            {
+                ensure_member(conn, &row, false)?;
+                let r_batch = row["batch_id"].as_str().unwrap_or("").to_owned();
+                let r_excluded = i64::from(row["stage"].as_str() == Some("excluded"));
+                let r_completed = row["data"]
+                    .as_str()
+                    .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                    .and_then(|d| d["ready"].as_bool())
+                    .map(i64::from)
+                    .unwrap_or(0);
+                existing_members.insert((r_batch, vid.clone()), (r_excluded, r_completed));
+                if let Some(p) = row["path"].as_str() {
+                    by_path.insert(p.to_owned(), row.clone());
+                }
+                by_vid.insert(vid, row);
             }
-            by_vid.insert(vid, row);
+        } else if let Some(before) = &before {
+            let b_batch = before["batch_id"].as_str().unwrap_or("");
+            let b_stage = before["stage"].as_str().unwrap_or("");
+            let expected_excluded = i64::from(b_stage == "excluded");
+            let member_ok = existing_members
+                .get(&(b_batch.to_owned(), vid.clone()))
+                .is_some_and(|&(existing_excluded, completed)| {
+                    completed != 0 || existing_excluded == expected_excluded
+                });
+            if !member_ok {
+                ensure_member(conn, before, false)?;
+                let b_completed = before["data"]
+                    .as_str()
+                    .and_then(|s| serde_json::from_str::<Value>(s).ok())
+                    .and_then(|d| d["ready"].as_bool())
+                    .map(i64::from)
+                    .unwrap_or(0);
+                existing_members.insert(
+                    (b_batch.to_owned(), vid),
+                    (expected_excluded, b_completed),
+                );
+            }
         }
     }
     let non_excluded = db::rows(
@@ -408,7 +494,6 @@ pub fn reconcile(
             continue;
         };
         if !active.contains(vid) {
-            let stamp = now_sec(conn)?;
             let b_batch = row["batch_id"].as_str().unwrap_or("");
             conn.execute(
                 "UPDATE tasks SET stage='excluded',updated_at=?,run_id='',lease_expires_at=0 WHERE vid=?",
@@ -556,10 +641,13 @@ fn mapped_path(config: &Config, raw: &str) -> Option<String> {
         .map(|(_, rest)| format!("{root_str}/pikpak/{rest}"))
 }
 
-fn source_item(config: &Config, vid: &str, stored: &str) -> Option<Value> {
-    let real_root = fs::canonicalize(&config.media).ok()?;
-    let creators_root = fs::canonicalize(config.media.join("pikpak/creators"))
-        .unwrap_or_else(|_| real_root.join("pikpak/creators"));
+fn source_item_with_roots(
+    config: &Config,
+    vid: &str,
+    stored: &str,
+    real_root: &Path,
+    creators_root: &Path,
+) -> Option<Value> {
     let mut candidates = vec![stored];
     if vid != stored {
         candidates.push(vid);
@@ -578,8 +666,8 @@ fn source_item(config: &Config, vid: &str, stored: &str) -> Option<Value> {
         let Ok(real) = fs::canonicalize(file) else {
             continue;
         };
-        if !real.starts_with(&real_root)
-            || real.starts_with(&creators_root)
+        if !real.starts_with(real_root)
+            || real.starts_with(creators_root)
             || real
                 .components()
                 .any(|c| c.as_os_str() == ".face-cleanup-staging")
@@ -653,7 +741,7 @@ fn read_ledger_assets(config: &Config) -> Result<Vec<Value>> {
     if !config.ledger.exists() {
         return Err(unavailable("媒体账本不存在"));
     }
-    let conn = db::open(&config.ledger)?;
+    let conn = db::open_readonly(&config.ledger)?;
     let rows = db::rows(
         &conn,
         "SELECT id,path,name,size,duration,disposal,mtime FROM asset WHERE medium IS NULL OR medium='video'",
@@ -684,13 +772,19 @@ fn discover_inner(config: &Config, conn: &mut Connection, body: &Value) -> Resul
     let mut sources = BTreeMap::new();
     let faces_path = config.base.join("faces.db");
     if faces_path.exists() {
-        let faces = db::open(&faces_path)?;
-        for row in db::rows(&faces, "SELECT vid,path FROM videos", [])? {
-            if let (Some(vid), Some(path)) = (row["vid"].as_str(), row["path"].as_str()) {
-                sources.insert(vid.to_owned(), path.to_owned());
+        let faces = db::open_readonly(&faces_path)?;
+        let mut stmt = faces.prepare("SELECT vid,path FROM videos")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            if let (Some(vid), Some(path)) = (row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?) {
+                sources.insert(vid, path);
             }
         }
     }
+    let real_root = fs::canonicalize(&config.media).ok();
+    let creators_root = real_root.as_ref().map(|r| {
+        fs::canonicalize(config.media.join("pikpak/creators")).unwrap_or_else(|_| r.join("pikpak/creators"))
+    });
     let mut seen_paths = BTreeSet::new();
     for (vid, p) in &sources {
         if let Some(m) = mapped_path(config, p).or_else(|| mapped_path(config, vid)) {
@@ -711,7 +805,11 @@ fn discover_inner(config: &Config, conn: &mut Connection, body: &Value) -> Resul
         if seen_paths.contains(&path) || sources.contains_key(raw_path) {
             continue;
         }
-        if source_item(config, raw_path, &path).is_none() {
+        let item = match (&real_root, &creators_root) {
+            (Some(rr), Some(cr)) => source_item_with_roots(config, raw_path, &path, rr, cr),
+            _ => None,
+        };
+        if item.is_none() {
             continue;
         }
         sources.insert(raw_path.to_owned(), path.clone());
@@ -778,7 +876,10 @@ fn discover_inner(config: &Config, conn: &mut Connection, body: &Value) -> Resul
         if resolved.contains(vid) {
             continue;
         }
-        let Some(item) = source_item(config, vid, stored) else {
+        let Some(item) = (match (&real_root, &creators_root) {
+            (Some(rr), Some(cr)) => source_item_with_roots(config, vid, stored, rr, cr),
+            _ => None,
+        }) else {
             continue;
         };
         let item_path = item["path"].as_str().unwrap_or("");
@@ -919,20 +1020,46 @@ pub fn discover(config: &Config, body: &Value) -> Result<Value> {
     }
 }
 
-pub fn reap_expired_leases(conn: &Connection, now: f64) -> Result<usize> {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReapResult {
+    pub count: usize,
+    pub reaped_vids: Vec<String>,
+    pub coordinator_generation: i64,
+}
+
+pub fn bump_coordinator_generation(conn: &Connection) -> Result<i64> {
+    let current = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = 'coordinator_generation'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(1);
+    let next_gen = current + 1;
+    conn.execute(
+        "INSERT OR REPLACE INTO settings (key, value) VALUES ('coordinator_generation', ?)",
+        params![next_gen.to_string()],
+    )?;
+    Ok(next_gen)
+}
+
+pub fn reap_expired_leases(conn: &Connection, now: f64) -> Result<ReapResult> {
     let expired = db::rows(
         conn,
-        "SELECT * FROM tasks WHERE stage IN ('text','face') AND manual=0 AND lease_expires_at>0 AND lease_expires_at<=?",
+        "SELECT * FROM tasks WHERE stage IN ('text','face','ocr','detect','feature') AND manual=0 AND lease_expires_at>0 AND lease_expires_at<=?",
         params![now],
     )?;
     let mut count = 0usize;
+    let mut reaped_vids = Vec::new();
     for task in expired {
         let Some(vid) = task["vid"].as_str() else {
             continue;
         };
         let stage = task["stage"].as_str().unwrap_or("text");
         let run_id = task["run_id"].as_str().unwrap_or("");
-        let attempts_field = if stage == "text" {
+        let attempts_field = if stage == "text" || stage == "ocr" {
             "text_attempts"
         } else {
             "face_attempts"
@@ -946,10 +1073,17 @@ pub fn reap_expired_leases(conn: &Connection, now: f64) -> Result<usize> {
             0.0
         };
         let message = "执行租约已超时";
-        let updated = conn.execute(
+        let has_attempt_col = conn.prepare("SELECT attempt_id FROM tasks LIMIT 1").is_ok();
+        let update_sql = if has_attempt_col {
+            "UPDATE tasks SET stage=?,retry_stage=?,error=?,next_retry=?,run_id='',attempt_id='',lease_id='',assigned_node_id='',lease_expires_at=0,updated_at=?
+            WHERE vid=? AND stage=? AND manual=0"
+        } else {
             "UPDATE tasks SET stage=?,retry_stage=?,error=?,next_retry=?,run_id='',lease_expires_at=0,updated_at=?
-            WHERE vid=? AND stage=? AND run_id=? AND manual=0",
-            params![next_stage, stage, message, next_retry, now, vid, stage, run_id],
+            WHERE vid=? AND stage=? AND manual=0"
+        };
+        let updated = conn.execute(
+            update_sql,
+            params![next_stage, stage, message, next_retry, now, vid, stage],
         )?;
         if updated > 0 {
             event(conn, now, Some(vid), next_stage, message)?;
@@ -959,10 +1093,51 @@ pub fn reap_expired_leases(conn: &Connection, now: f64) -> Result<usize> {
                     params![next_stage, message, now, run_id],
                 )?;
             }
+            if let Some(node_id) = task["assigned_node_id"].as_str().filter(|s| !s.is_empty()) {
+                let id_col = if conn.prepare("SELECT node_id FROM agent_nodes LIMIT 1").is_ok() {
+                    "node_id"
+                } else {
+                    "id"
+                };
+                let _ = conn.execute(
+                    &format!("UPDATE agent_nodes SET running_tasks = MAX(0, running_tasks - 1), updated_at = ?1 WHERE {} = ?2", id_col),
+                    params![now, node_id],
+                );
+            }
+            reaped_vids.push(vid.to_string());
             count += 1;
         }
     }
-    Ok(count)
+
+    let coordinator_generation = if count > 0 {
+        let next_gen = bump_coordinator_generation(conn)?;
+        for vid in &reaped_vids {
+            let _ = conn.execute(
+                "UPDATE tasks SET coordinator_generation = ? WHERE vid = ?",
+                params![next_gen.to_string(), vid],
+            );
+            let _ = conn.execute(
+                "INSERT INTO events (at, vid, kind, message) VALUES (?, ?, 'lease_expired_reclaimed', ?)",
+                params![now, vid, format!("Task {} lease expired; bumped coordinator generation to {}", vid, next_gen)],
+            );
+        }
+        next_gen
+    } else {
+        conn.query_row(
+            "SELECT value FROM settings WHERE key = 'coordinator_generation'",
+            [],
+            |r| r.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|v| v.parse::<i64>().ok())
+        .unwrap_or(1)
+    };
+
+    Ok(ReapResult {
+        count,
+        reaped_vids,
+        coordinator_generation,
+    })
 }
 
 pub fn claim(config: &Config, body: &Value) -> Result<Value> {
@@ -980,7 +1155,7 @@ pub fn claim(config: &Config, body: &Value) -> Result<Value> {
         return Ok(json!({"task": Value::Null, "media_available": false}));
     }
     let now = now_sec(&tx)?;
-    let reaped = reap_expired_leases(&tx, now)?;
+    let reaped = reap_expired_leases(&tx, now)?.count;
     let paused = setting(&tx, "paused")?
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
@@ -1023,7 +1198,11 @@ pub fn claim(config: &Config, body: &Value) -> Result<Value> {
     };
     let run_id = uuid::Uuid::new_v4().to_string();
     let generation = setting(&tx, "coordinator_generation")?
-        .and_then(|v| v.as_str().map(str::to_owned))
+        .and_then(|v| {
+            v.as_str()
+                .map(str::to_owned)
+                .or_else(|| v.as_i64().map(|n| n.to_string()))
+        })
         .unwrap_or_else(|| "unstarted".into());
     let expiry = now + lease_ttl;
     let vid = task["vid"].as_str().unwrap_or("").to_owned();
@@ -1091,7 +1270,7 @@ pub fn heartbeat(config: &Config, body: &Value) -> Result<Value> {
 
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let now = now_sec(&tx)?;
-    let reaped = reap_expired_leases(&tx, now)?;
+    let reaped = reap_expired_leases(&tx, now)?.count;
     let expiry = now + lease_ttl;
     let mut renewed = Vec::new();
     let mut stale = Vec::new();
@@ -1323,9 +1502,8 @@ pub fn release_task(config: &Config, body: &Value) -> Result<Value> {
 pub fn recover(config: &Config) -> Result<Value> {
     let mut conn = open_or_init(config)?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let generation = uuid::Uuid::new_v4().to_string();
+    let next_gen = bump_coordinator_generation(&tx)?;
     let now = now_sec(&tx)?;
-    set_setting(&tx, "coordinator_generation", &json!(generation))?;
     tx.execute(
         "UPDATE processing_runs SET status='interrupted',finished_at=?,error='协调器重启或阶段意外中断' WHERE status='running'",
         params![now],
@@ -1333,14 +1511,14 @@ pub fn recover(config: &Config) -> Result<Value> {
     let recovered = tx.execute(
         "UPDATE tasks SET stage=CASE WHEN
         (stage='text' AND text_attempts>=3) OR (stage='face' AND face_attempts>=3) THEN 'error' ELSE 'retry' END,
-        next_retry=0,error='服务重启，中断阶段按重试上限恢复',run_id='',lease_expires_at=0,updated_at=?
+        next_retry=0,error='服务重启，中断阶段按重试上限恢复',run_id='',lease_expires_at=0,coordinator_generation=?,updated_at=?
         WHERE stage IN ('text','face')",
-        params![now],
+        params![next_gen.to_string(), now],
     )?;
     tx.commit()?;
     Ok(json!({
         "ok": true,
-        "coordinator_generation": generation,
+        "coordinator_generation": next_gen.to_string(),
         "recovered": recovered,
     }))
 }
@@ -1526,30 +1704,58 @@ pub fn settings(config: &Config) -> Result<Value> {
 }
 
 fn settings_with_conn(config: &Config, conn: &Connection) -> Result<Value> {
-    let beat = review::read(config, "processing/heartbeat.json", json!({}))?.1;
     let now = now_sec(conn)?;
-    let at = beat["at"]
-        .as_f64()
-        .or_else(|| beat["at"].as_i64().map(|n| n as f64))
-        .unwrap_or(0.0);
-    let age = now - at;
-    let online = (-30.0..90.0).contains(&age);
-    let protocol = beat["protocol"].as_i64().unwrap_or(0);
-    let supported = protocol >= 2;
-    let maximum = beat["max_concurrency"]
-        .as_i64()
-        .filter(|_| beat["max_concurrency"].is_i64() || beat["max_concurrency"].is_u64())
-        .unwrap_or(1)
-        .clamp(1, 4);
+
+    // Check multi-agent nodes in SQLite first
+    let agent_nodes_stat: Option<(i64, i64, f64)> = conn
+        .query_row(
+            "SELECT COUNT(*), COALESCE(SUM(cpu_cores), 4), COALESCE(MAX(last_heartbeat_at), 0.0)
+             FROM agent_nodes
+             WHERE status IN ('online', 'model_ready', 'accepting') AND (?1 - last_heartbeat_at) < 90.0",
+            params![now],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .ok();
+
+    let (online, supported, maximum, last_seen) = if let Some((_active_nodes, total_cores, max_hb)) =
+        agent_nodes_stat.filter(|(cnt, _, _)| *cnt > 0)
+    {
+        let max_val = total_cores.clamp(1, 64);
+        (
+            true,
+            true,
+            max_val,
+            if max_hb > 0.0 { json!(max_hb) } else { Value::Null },
+        )
+    } else {
+        // Fallback to legacy processing/heartbeat.json
+        let beat = review::read(config, "processing/heartbeat.json", json!({}))?.1;
+        let at = beat["at"]
+            .as_f64()
+            .or_else(|| beat["at"].as_i64().map(|n| n as f64))
+            .unwrap_or(0.0);
+        let age = now - at;
+        let online = (-30.0..90.0).contains(&age);
+        let protocol = beat["protocol"].as_i64().unwrap_or(0);
+        let supported = protocol >= 2;
+        let maximum = beat["max_concurrency"]
+            .as_i64()
+            .filter(|_| beat["max_concurrency"].is_i64() || beat["max_concurrency"].is_u64())
+            .unwrap_or(1)
+            .clamp(1, 4);
+        let last_seen = if at > 0.0 {
+            beat["at"].clone()
+        } else {
+            Value::Null
+        };
+        (online, supported, maximum, last_seen)
+    };
+
     let requested = setting(conn, "concurrency")?
         .and_then(|v| v.as_i64())
         .unwrap_or(1)
-        .clamp(1, 4);
-    let last_seen = if at > 0.0 {
-        beat["at"].clone()
-    } else {
-        Value::Null
-    };
+        .clamp(0, maximum);
+
     Ok(json!({
         "schema_version": 1,
         "requested": requested,
@@ -1567,13 +1773,13 @@ pub fn set_concurrency(config: &Config, body: &Value) -> Result<Value> {
     if current["supported"] != true || current["online"] != true {
         return Err(unavailable("当前后台尚未连接或未升级，暂不能修改并发"));
     }
-    let maximum = current["maximum"].as_i64().unwrap_or(1).clamp(1, 4);
+    let maximum = current["maximum"].as_i64().unwrap_or(1).clamp(1, 64);
     let requested = body
         .get("concurrency")
         .filter(|v| v.is_i64() || v.is_u64())
         .and_then(Value::as_i64)
-        .filter(|n| (1..=maximum).contains(n))
-        .ok_or_else(|| bad(format!("并发数必须为 1 至 {maximum} 的整数")))?;
+        .filter(|n| (0..=maximum).contains(n))
+        .ok_or_else(|| bad(format!("并发数必须为 0 至 {maximum} 的整数")))?;
 
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let now = now_sec(&tx)?;
@@ -1727,6 +1933,7 @@ fn load_active_state(config: &Config, conn: &Connection, now: f64) -> Result<Act
             .and_then(|s| serde_json::from_str::<Value>(s).ok())
             .unwrap_or_else(|| json!({}));
         row["data"] = canonical_person_fields(parsed_data, "", &aliases);
+        crate::processing_result::re_resolve_task_data(&mut row["data"]);
         tasks.push(row);
     }
     let events = db::rows(conn, "SELECT * FROM events ORDER BY id DESC LIMIT 12", [])?
@@ -2851,6 +3058,39 @@ fn safe_video_sources(config: &Config) -> BTreeMap<String, String> {
     sources
 }
 
+fn same_source_identity(
+    expected_path: Option<&str>,
+    expected_size: Option<i64>,
+    expected_mtime: Option<&str>,
+    expected_identity: &Value,
+    current_path: &Path,
+    current_size: i64,
+    current_mtime: &str,
+    current_identity: &Value,
+) -> bool {
+    let Some(exp_dev) = value_as_id_str(&expected_identity["dev"]) else {
+        return false;
+    };
+    let Some(exp_ino) = value_as_id_str(&expected_identity["ino"]) else {
+        return false;
+    };
+    if Some(current_size) != expected_size || expected_mtime != Some(current_mtime) {
+        return false;
+    }
+    if current_identity["ino"].as_str() != Some(exp_ino.as_str()) {
+        return false;
+    }
+    if current_identity["dev"].as_str() == Some(exp_dev.as_str()) {
+        return true;
+    }
+    // Network/FUSE mounts (such as NFSv4) reassign kernel st_dev on host reboot
+    // while keeping path, inode, byte size, and mtime_ns intact.
+    expected_path.is_some_and(|p| {
+        Path::new(p) == current_path
+            || fs::canonicalize(p).ok().as_deref() == Some(current_path)
+    })
+}
+
 pub fn verify_attempt_artifact(config: &Config, body: &Value) -> Result<Value> {
     let deny = || Ok(json!({"ok": true, "accepted": false, "valid": false, "file": Value::Null}));
     let Some(attempt) = body["attempt"].as_str() else {
@@ -2997,24 +3237,18 @@ pub fn verify_attempt_artifact(config: &Config, body: &Value) -> Result<Value> {
         return deny();
     };
     let current_id = files::identity(&source_stat);
-    let identity = &receipt["source_identity"];
-    let Some(expected_dev) = value_as_id_str(&identity["dev"]) else {
-        return deny();
-    };
-    let Some(expected_ino) = value_as_id_str(&identity["ino"]) else {
-        return deny();
-    };
-    let Some(expected_size) = review::number(&task["size"]) else {
-        return deny();
-    };
-    let Some(expected_mtime) = task["mtime_ns"].as_str() else {
-        return deny();
-    };
-    if current_id["dev"].as_str() != Some(expected_dev.as_str())
-        || current_id["ino"].as_str() != Some(expected_ino.as_str())
-        || i64::try_from(source_stat.len()).ok() != Some(expected_size)
-        || files::mtime_ns(&source_stat) != expected_mtime
-    {
+    let current_size = i64::try_from(source_stat.len()).unwrap_or(-1);
+    let current_mtime = files::mtime_ns(&source_stat);
+    if !same_source_identity(
+        task["path"].as_str(),
+        review::number(&task["size"]),
+        task["mtime_ns"].as_str(),
+        &receipt["source_identity"],
+        &current_source,
+        current_size,
+        &current_mtime,
+        &current_id,
+    ) {
         return deny();
     }
     let face = &receipt["data"]["face"];
@@ -3188,6 +3422,7 @@ pub fn cache_check(engine: &Engine, body: &Value) -> Result<Value> {
         }));
     }
     let current_identity = files::identity(&stat);
+    let current_path_canon = fs::canonicalize(path).unwrap_or_else(|_| PathBuf::from(path));
 
     let mut text_valid = false;
     let mut text_cached = Value::Null;
@@ -3228,13 +3463,18 @@ pub fn cache_check(engine: &Engine, body: &Value) -> Result<Value> {
                         .flatten()
                         .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
                         .is_some_and(|rec| {
-                            let id = &rec["source_identity"];
                             rec["ok"] == true
                                 && rec["accepted"] == true
-                                && value_as_id_str(&id["dev"]).as_deref()
-                                    == current_identity["dev"].as_str()
-                                && value_as_id_str(&id["ino"]).as_deref()
-                                    == current_identity["ino"].as_str()
+                                && same_source_identity(
+                                    rec["task"]["path"].as_str().or(Some(path)),
+                                    review::number(&rec["task"]["size"]).or(Some(size)),
+                                    rec["task"]["mtime_ns"].as_str().or(Some(mtime_ns)),
+                                    &rec["source_identity"],
+                                    &current_path_canon,
+                                    size,
+                                    mtime_ns,
+                                    &current_identity,
+                                )
                         });
                     if !receipt_ok {
                         attempt_ok = false;
@@ -3354,11 +3594,16 @@ pub fn cache_check(engine: &Engine, body: &Value) -> Result<Value> {
                     .unwrap_or(&rec["source_identity"]);
                 let rec_dev = value_as_id_str(&rec_id["dev"]);
                 let rec_ino = value_as_id_str(&rec_id["ino"]);
-                let same_origin = rec["task"]["path"].as_str() == Some(path)
-                    && review::number(&rec["task"]["size"]) == Some(size)
-                    && rec["task"]["mtime_ns"].as_str() == Some(mtime_ns)
-                    && rec_dev.as_deref() == current_identity["dev"].as_str()
-                    && rec_ino.as_deref() == current_identity["ino"].as_str();
+                let same_origin = same_source_identity(
+                    rec["task"]["path"].as_str(),
+                    review::number(&rec["task"]["size"]),
+                    rec["task"]["mtime_ns"].as_str(),
+                    rec_id,
+                    &current_path_canon,
+                    size,
+                    mtime_ns,
+                    &current_identity,
+                );
                 let relocated_ok = if same_origin {
                     true
                 } else if let (Some(dev), Some(ino)) = (rec_dev, rec_ino) {
@@ -3492,7 +3737,7 @@ pub fn reference_state(engine: &Engine) -> Result<Value> {
             .unwrap_or(false)
         && let Ok(rows) = db::rows(
             &conn,
-            "SELECT result FROM _face_admin_processing_results ORDER BY rowid DESC",
+            "SELECT result FROM _face_admin_processing_results WHERE json_type(result,'$.data.face.feature_cache')='text' ORDER BY rowid DESC",
             [],
         )
     {
@@ -5370,5 +5615,149 @@ mod tests {
         .unwrap();
         let sp_file = PathBuf::from(sp_out["file"].as_str().unwrap());
         assert!(sp_file.exists());
+    }
+
+    #[test]
+    fn verify_attempt_artifact_and_cache_tolerate_nfs_dev_shift_at_same_path() {
+        let env = TestEnv::new();
+        let engine = Engine::new(env.config.clone()).unwrap();
+        let conn = open_or_init(&env.config).unwrap();
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS _face_admin_processing_results (
+                id TEXT PRIMARY KEY,
+                request_hash TEXT NOT NULL,
+                result TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )",
+            [],
+        )
+        .unwrap();
+
+        let video = env.config.media.join("pikpak/inbox/nfs_v1.mp4");
+        fs::create_dir_all(video.parent().unwrap()).unwrap();
+        fs::write(&video, b"nfs-video-bytes").unwrap();
+        let meta = fs::metadata(&video).unwrap();
+        let vpath = video.to_string_lossy().into_owned();
+        let vsize = i64::try_from(meta.len()).unwrap();
+        let vmtime = files::mtime_ns(&meta);
+        let mut stale_dev_identity = files::identity(&meta);
+        let actual_dev = stale_dev_identity["dev"].as_str().unwrap().to_owned();
+        let shifted_dev = if actual_dev == "49" { "51" } else { "49" };
+        stale_dev_identity["dev"] = json!(shifted_dev);
+
+        let run_text = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let wm_dir = env
+            .config
+            .base
+            .join("processing/attempts")
+            .join(run_text)
+            .join("watermarks/evidence");
+        fs::create_dir_all(&wm_dir).unwrap();
+        fs::write(wm_dir.join("crop.jpg"), b"wm").unwrap();
+
+        let text_receipt = json!({
+            "ok": true,
+            "accepted": true,
+            "vid": "nfs-v1",
+            "stage": "text",
+            "task": {
+                "vid": "nfs-v1",
+                "run_id": run_text,
+                "stage": "text",
+                "path": vpath,
+                "size": vsize,
+                "mtime_ns": vmtime,
+            },
+            "source_identity": stale_dev_identity,
+            "data": {
+                "watermark": {
+                    "artifact_attempt": run_text,
+                    "candidates": [{"evidence": "crop.jpg"}]
+                }
+            }
+        });
+        conn.execute(
+            "INSERT INTO _face_admin_processing_results VALUES (?,'h-txt',?,'1')",
+            params![run_text, text_receipt.to_string()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let wm_root = env.config.base.join("watermarks");
+        fs::create_dir_all(&wm_root).unwrap();
+        fs::write(
+            wm_root.join("results.json"),
+            serde_json::to_vec(&json!({
+                "nfs-v1": {
+                    "vid": "nfs-v1",
+                    "path": vpath,
+                    "size": vsize,
+                    "mtime_ns": vmtime,
+                    "status": "done",
+                    "pipeline": "pipe-v1",
+                    "artifact_attempt": run_text,
+                    "candidates": [{"evidence": "crop.jpg"}]
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // Same path + same inode + same size + same mtime_ns must pass even when st_dev changed.
+        let verified = verify_attempt_artifact(
+            &env.config,
+            &json!({"attempt": run_text, "relative": "watermarks/evidence/crop.jpg"}),
+        )
+        .unwrap();
+        assert_eq!(verified["accepted"], true);
+
+        let cached = cache_check(
+            &engine,
+            &json!({
+                "vid": "nfs-v1",
+                "stage": "text",
+                "path": vpath,
+                "size": vsize,
+                "mtime_ns": vmtime,
+                "pipeline": "pipe-v1"
+            }),
+        )
+        .unwrap();
+        assert_eq!(cached["text_valid"], true);
+
+        // Moving to a different path with mismatched st_dev must NOT count as same-origin artifact.
+        let other_video = env.config.media.join("pikpak/inbox/other.mp4");
+        fs::write(&other_video, b"nfs-video-bytes").unwrap();
+        let moved_receipt = json!({
+            "ok": true,
+            "accepted": true,
+            "vid": "nfs-v2",
+            "stage": "text",
+            "task": {
+                "vid": "nfs-v2",
+                "run_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                "stage": "text",
+                "path": other_video.to_string_lossy(),
+                "size": vsize,
+                "mtime_ns": vmtime,
+            },
+            "source_identity": stale_dev_identity,
+            "data": {
+                "watermark": {
+                    "artifact_attempt": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                    "candidates": []
+                }
+            }
+        });
+        assert!(!same_source_identity(
+            moved_receipt["task"]["path"].as_str(),
+            Some(vsize),
+            Some(&vmtime),
+            &moved_receipt["source_identity"],
+            &fs::canonicalize(&video).unwrap(),
+            vsize,
+            &vmtime,
+            &files::identity(&meta),
+        ));
     }
 }

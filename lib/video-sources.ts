@@ -4,10 +4,11 @@ import { BASE, MEDIA2 } from './env'
 import { chooseSource } from './source-resolution'
 import { readJson } from './jsonio'
 
-let sourcesCache: { dbFp: string; overridesRef: any; entries: (readonly [string, string])[] } | null = null
+const EMPTY_OVERRIDES: Record<string, string> = Object.freeze({})
+let sourcesCache: { dbFp: string; overridesRef: any; map: Map<string, string> } | null = null
 export function readVideoSources(): Map<string,string> {
   const dbPath = `${BASE}/faces.db`
-  const overrides = readJson<Record<string,string>>(`${BASE}/video-path-overrides.json`,{})
+  const overrides = readJson<Record<string,string>>(`${BASE}/video-path-overrides.json`, EMPTY_OVERRIDES)
   let dbFp = ''
   try {
     const s = fs.statSync(dbPath)
@@ -16,7 +17,7 @@ export function readVideoSources(): Map<string,string> {
     dbFp = `${s.mtimeMs}:${s.size}:${s.ino}:${walFp}`
   } catch {}
   if (sourcesCache && dbFp && sourcesCache.dbFp === dbFp && sourcesCache.overridesRef === overrides) {
-    return new Map(sourcesCache.entries)
+    return sourcesCache.map
   }
   const db=new Database(dbPath,{readonly:true,fileMustExist:true})
   try{
@@ -24,8 +25,9 @@ export function readVideoSources(): Map<string,string> {
       ...(db.prepare('SELECT vid,path FROM videos').all() as {vid:string;path:string}[]).map(r=>[r.vid,r.path] as const),
       ...Object.entries(overrides),
     ]
-    if (dbFp) sourcesCache = { dbFp, overridesRef: overrides, entries }
-    return new Map(entries)
+    const map = new Map(entries)
+    if (dbFp) sourcesCache = { dbFp, overridesRef: overrides, map }
+    return map
   }
   finally{db.close()}
 }

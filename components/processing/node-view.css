@@ -1,0 +1,394 @@
+.ws-node-view {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 20px;
+  padding: 24px;
+  width: 100%;
+  max-width: 1700px;
+  min-width: 0;
+  margin: 0 auto;
+  box-sizing: border-box;
+}
+
+.ws-node-view-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+}
+
+.ws-node-view-header h2 {
+  font-size: 21px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  margin: 0;
+}
+
+.ws-node-view-header span {
+  display: block;
+  margin-top: 5px;
+  font-size: 12px;
+  color: var(--muted-foreground);
+}
+
+.ws-node-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.ws-node-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 16px;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 0;
+}
+
+.ws-node-toolbar .ws-tabs {
+  border-bottom: 0;
+  flex: 1;
+  min-width: 0;
+}
+
+.ws-node-toolbar .ws-search {
+  max-width: 320px;
+  margin-block: 6px;
+}
+
+@media (max-width: 960px) {
+  .ws-node-toolbar {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
+    padding-bottom: 10px;
+  }
+
+  .ws-node-toolbar .ws-tabs {
+    border-bottom: 1px solid var(--border);
+  }
+
+  .ws-node-toolbar .ws-search {
+    max-width: none;
+    width: 100%;
+    margin-block: 0;
+  }
+}
+
+/* Device Pool Cards */
+.ws-node-cards-list {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 20px;
+  min-width: 0;
+}
+
+.ws-device-card {
+  box-shadow: none;
+  border: 1px solid var(--border);
+  border-radius: var(--wb-card-radius, 12px);
+  padding: 0;
+  overflow: hidden;
+  min-width: 0;
+}
+
+.ws-device-card-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 18px 20px;
+  border-bottom: 1px solid var(--border);
+  background: var(--card);
+}
+
+.ws-device-info {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.ws-device-icon {
+  width: 40px;
+  height: 40px;
+  border-radius: 8px;
+  display: grid;
+  place-items: center;
+  background: var(--muted);
+  color: var(--foreground);
+  border: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.ws-device-icon[data-gpu="true"] {
+  color: var(--wb-success, #10b981);
+}
+
+.ws-device-title-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.ws-device-name {
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.ws-device-pool-badge {
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  background: var(--muted);
+  color: var(--muted-foreground);
+  border: 1px solid var(--border);
+}
+
+.ws-device-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--muted-foreground);
+}
+
+.ws-device-uuid {
+  font-family: monospace;
+  font-size: 11px;
+  padding: 1px 4px;
+  background: var(--muted);
+  border-radius: 3px;
+}
+
+.ws-device-task-count {
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--muted-foreground);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Dials Row */
+.ws-device-dials-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-around;
+  padding: 18px 20px;
+  background: var(--background);
+  border-bottom: 1px solid var(--border);
+  gap: 16px;
+}
+
+.ws-hw-dial {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+}
+
+.ws-dial-svg-wrapper {
+  position: relative;
+  width: 80px;
+  height: 80px;
+  display: grid;
+  place-items: center;
+}
+
+.ws-dial-svg {
+  position: absolute;
+  inset: 0;
+}
+
+.ws-dial-center {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  z-index: 1;
+}
+
+.ws-dial-label {
+  font-size: 10px;
+  color: var(--muted-foreground);
+}
+
+.ws-dial-val {
+  font-size: 15px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.2;
+}
+
+.ws-dial-val-muted {
+  color: var(--muted-foreground);
+  font-weight: 400;
+  font-size: 13px;
+}
+
+.ws-dial-ratio {
+  font-size: 11px;
+  color: var(--muted-foreground);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+/* Agents Table */
+.ws-agents-table {
+  padding: 0;
+}
+
+.ws-agents-table-head,
+.ws-agent-row {
+  display: grid;
+  grid-template-columns: minmax(180px, 1.5fr) 110px 80px 140px 140px;
+  align-items: center;
+  gap: 16px;
+  padding: 12px 20px;
+}
+
+.ws-agents-table-head {
+  font-size: 11px;
+  color: var(--muted-foreground);
+  border-bottom: 1px solid var(--border);
+  background: var(--card);
+}
+
+.ws-agent-row {
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+
+.ws-agent-row:last-child {
+  border-bottom: none;
+}
+
+.ws-agent-name-cell strong {
+  display: block;
+  font-size: 13px;
+  font-weight: 500;
+}
+
+.ws-agent-name-cell small {
+  color: var(--muted-foreground);
+  font-size: 11px;
+}
+
+.ws-agent-busy-tag {
+  color: var(--wb-warning, #f59e0b);
+  font-weight: 500;
+  font-variant-numeric: tabular-nums;
+}
+
+.ws-agent-idle-tag {
+  color: var(--muted-foreground);
+}
+
+.ws-agent-heartbeat-cell span {
+  display: block;
+  font-variant-numeric: tabular-nums;
+}
+
+.ws-agent-heartbeat-cell small {
+  color: var(--muted-foreground);
+  font-family: monospace;
+  font-size: 10px;
+}
+
+.ws-agent-action-cell button {
+  min-width: 100px;
+  gap: 6px;
+}
+
+/* 390px Mobile Viewport & Touch Target Optimization */
+@media (max-width: 767px) {
+  .ws-node-view {
+    padding: 14px 10px;
+    gap: 14px;
+  }
+
+  .ws-node-view-header {
+    flex-wrap: wrap;
+    gap: 10px;
+  }
+
+  .ws-node-header-actions button {
+    min-height: 44px;
+  }
+
+  .ws-node-toolbar {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
+  }
+
+  .ws-node-toolbar .ws-search {
+    max-width: none;
+    width: 100%;
+  }
+
+  .ws-device-card-header {
+    padding: 14px 12px;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 10px;
+  }
+
+  .ws-device-title-row {
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+
+  .ws-device-meta {
+    flex-wrap: wrap;
+    font-size: 11px;
+  }
+
+  /* 3-dial grid scaled for 390px */
+  .ws-device-dials-row {
+    padding: 14px 8px;
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 8px;
+  }
+
+  .ws-dial-svg-wrapper {
+    width: 64px;
+    height: 64px;
+  }
+
+  .ws-dial-svg {
+    width: 64px;
+    height: 64px;
+  }
+
+  .ws-dial-val {
+    font-size: 12px;
+  }
+
+  .ws-dial-label {
+    font-size: 9px;
+  }
+
+  .ws-dial-ratio {
+    font-size: 10px;
+  }
+
+  /* Table becomes stacked card items */
+  .ws-agents-table-head {
+    display: none;
+  }
+
+  .ws-agent-row {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 10px;
+    padding: 14px 12px;
+  }
+
+  .ws-agent-action-cell button {
+    width: 100%;
+    min-height: 44px;
+    justify-content: center;
+  }
+}

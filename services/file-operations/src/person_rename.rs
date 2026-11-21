@@ -200,7 +200,7 @@ pub fn snapshot(config: &Config, plan: &Plan, successful: &[usize]) -> Result<Do
     }
     Ok(DomainSnapshot {
         metadata: crate::person_metadata::snapshot(config, plan)?,
-        ledger: Some(crate::person_ledger::snapshot(config, plan)?),
+        ledger: crate::person_ledger::snapshot(config, plan).ok(),
     })
 }
 pub fn names(plan: &Plan) -> Vec<String> {

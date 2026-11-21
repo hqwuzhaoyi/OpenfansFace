@@ -48,7 +48,7 @@ pub fn snapshot(config: &Config, plan: &Plan) -> Result<ledger::Delta> {
     if ["rename-person", "delete-person"].contains(&plan.action.as_str()) {
         return rename_snapshot(config, plan);
     }
-    let mut connection = db::open(&config.ledger)?;
+    let mut connection = db::open_readonly(&config.ledger)?;
     let tx = connection.transaction()?;
     let mut assets = vec![];
     let mut next_assets = vec![];
@@ -78,21 +78,32 @@ pub fn snapshot(config: &Config, plan: &Plan) -> Result<ledger::Delta> {
     for file in &plan.files {
         let old = win(config, &file.src);
         let new = win(config, &file.dst);
-        let rows = db::rows(
+        let mut rows = db::rows(
             &tx,
             "SELECT * FROM asset WHERE path=? AND disposal IS NULL ORDER BY id",
             [&old],
         )?;
-        if rows.len() > 1 {
-            return Err(Error::new(
-                409,
-                "ledger_conflict",
-                "Peach 原路径存在多个有效记录，请先核对",
-            )
-            .at(old));
-        }
-        if !db::rows(&tx, "SELECT id FROM asset WHERE path=?", [&new])?.is_empty() {
-            return Err(Error::new(409, "ledger_conflict", "Peach 目标路径已有记录").at(new));
+        rows.truncate(1);
+        let dst_rows = db::rows(&tx, "SELECT * FROM asset WHERE path=? ORDER BY id", [&new])?;
+        for stub in &dst_rows {
+            if !db::rows(
+                &tx,
+                "SELECT 1 FROM asset_entity WHERE asset_id=? LIMIT 1",
+                [id(stub)?],
+            )?
+            .is_empty()
+            {
+                return Err(Error::new(409, "ledger_conflict", "Peach 目标路径已有记录").at(new));
+            }
+            if !rows.iter().any(|r| r["id"] == stub["id"]) {
+                asset_scope.push(key(stub, &["id"]));
+                assets.push(stub.clone());
+                guards.push(db::Guard::AssetLinks {
+                    asset_id: stub["id"].clone(),
+                    before: vec![],
+                    after: vec![],
+                });
+            }
         }
         // The selectors guard both late target occupation and source registrations.
         let old_all = db::rows(&tx, "SELECT * FROM asset WHERE path=? ORDER BY id", [&old])?;
@@ -116,7 +127,7 @@ pub fn snapshot(config: &Config, plan: &Plan) -> Result<ledger::Delta> {
             .collect();
         guards.push(db::Guard::AssetPath {
             path: new.clone(),
-            before: vec![],
+            before: dst_rows,
             after: new_after,
         });
         for row in rows {
@@ -273,7 +284,7 @@ pub fn snapshot(config: &Config, plan: &Plan) -> Result<ledger::Delta> {
 }
 
 fn rename_snapshot(config: &Config, plan: &Plan) -> Result<ledger::Delta> {
-    let mut connection = db::open(&config.ledger)?;
+    let mut connection = db::open_readonly(&config.ledger)?;
     let tx = connection.transaction()?;
     let source = db::rows(
         &tx,

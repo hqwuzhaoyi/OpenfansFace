@@ -44,3 +44,116 @@
 }
 /* Frequent progress updates stay immediate, including keyboard and reduced-motion use. */
 .ws-operations-status [data-slot="progress-indicator"] { transition: none; }
+
+.ws-operations-root {
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.ws-operations-tabs {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 0 20px;
+  border-bottom: 1px solid var(--border);
+  background: var(--background);
+  flex-shrink: 0;
+}
+
+.ws-operations-primary-tabs {
+  min-width: 0;
+}
+
+.ws-operations-primary-tabs [role="tablist"] {
+  padding-inline: 0;
+  border-bottom: 0;
+}
+
+.ws-subview-toggle {
+  margin-left: auto;
+  flex-shrink: 0;
+}
+
+.ws-operations-view-container {
+  flex: 1;
+  min-height: 0;
+  width: 100%;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  display: flex;
+  flex-direction: column;
+}
+
+.ws-operations-view-container > .pd-dashboard,
+.ws-operations-view-container > .ws-page {
+  height: 100%;
+  min-height: 0;
+  flex: 1;
+}
+
+@media (max-width: 767px) {
+  .ws-operations-tabs {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 0;
+    padding: 0;
+  }
+
+  .ws-operations-primary-tabs {
+    width: 100%;
+  }
+
+  .ws-operations-primary-list[role="tablist"] {
+    display: grid;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    width: 100%;
+    padding-inline: 8px;
+    gap: 2px;
+  }
+
+  .ws-operations-primary-list[role="tablist"] > [role="tab"] {
+    width: 100%;
+    min-height: 44px;
+    justify-content: center;
+    padding: 0 6px;
+    font-size: 13px;
+  }
+
+  .ws-subview-toggle {
+    margin-left: 0;
+    width: 100%;
+    padding: 6px 12px;
+    border-top: 1px solid var(--border);
+    background: color-mix(in oklab, var(--muted) 25%, var(--background));
+  }
+
+  .ws-subview-tablist[role="tablist"] {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    width: 100%;
+  }
+
+  .ws-subview-tablist[role="tablist"] [role="tab"] {
+    min-height: 36px;
+    font-size: 12px;
+  }
+
+  .ws-operations-view-container > .ws-page > .ws-header {
+    min-height: auto;
+    padding: 8px 12px;
+  }
+
+  .ws-operations-view-container > .ws-page > .ws-header > div:first-child {
+    display: none;
+  }
+
+  .ws-operations-view-container > .ws-page > .ws-header > .ws-actions {
+    width: 100%;
+    justify-content: flex-end;
+  }
+}

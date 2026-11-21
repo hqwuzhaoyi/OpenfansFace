@@ -46,7 +46,6 @@ pub fn preview_queue(config: &Config, queue: &Value) -> Result<Value> {
     } else {
         vec![]
     };
-    let ledger = db::open(&config.ledger)?;
     let mut related_documents = vec![];
     for (name, fallback) in [
         ("report.json", json!({})),
@@ -192,12 +191,12 @@ pub fn preview_queue(config: &Config, queue: &Value) -> Result<Value> {
                         json!(files::fingerprint(&dst.to_string_lossy(), &target));
                     row["operation"] = json!("stage-duplicate");
                     row["status"] = json!("ok");
-                    row["reason"] = json!("执行时完整校验内容，完全一致才把源文件移入暂存");
+                    row["reason"] = json!("执行时完整校验内容，完全一致才把源文件移入回收站");
                 } else {
                     return Err(Error::conflict("目标存在同名文件，需先处理冲突"));
                 }
             } else if item["resolution"]["kind"] == "stage-duplicate" {
-                return Err(Error::conflict("目标文件已变化，无法暂存重复件"));
+                return Err(Error::conflict("目标文件已变化，无法将重复件移入回收站"));
             }
             if row["operation"] != "stage-duplicate" && !targets.insert(dst.clone()) {
                 row["status"] = json!("dupe-target");
@@ -224,29 +223,6 @@ pub fn preview_queue(config: &Config, queue: &Value) -> Result<Value> {
                         || scoped_videos.iter().any(|v| v["vid"] == r["vid"])
                 })
                 .collect::<Vec<_>>();
-            let src_assets = db::rows(
-                &ledger,
-                "SELECT * FROM asset WHERE path=? ORDER BY id",
-                [metadata::win(config, src)],
-            )?;
-            let dst_assets = db::rows(
-                &ledger,
-                "SELECT * FROM asset WHERE path=? ORDER BY id",
-                [metadata::win(config, &dst.to_string_lossy())],
-            )?;
-            let creators = db::rows(
-                &ledger,
-                "SELECT * FROM entity WHERE kind='creator' AND (canonical_name=? OR normalized_name=?) ORDER BY id",
-                rusqlite::params![creator, creator.to_lowercase()],
-            )?;
-            let mut links = vec![];
-            for asset in src_assets.iter().chain(&dst_assets) {
-                links.extend(db::rows(
-                    &ledger,
-                    "SELECT * FROM asset_entity WHERE asset_id=? ORDER BY entity_id,role,source",
-                    [db::integer(&asset["id"])?],
-                )?);
-            }
             let documents = related_documents
                 .iter()
                 .map(|(name, value)| {
@@ -256,16 +232,8 @@ pub fn preview_queue(config: &Config, queue: &Value) -> Result<Value> {
                 })
                 .collect::<Vec<_>>();
             row["record_version"] = json!(hash(
-                &json!({"videos":scoped_videos,"destination_videos":destination_videos,"jobs":scoped_jobs,"source_assets":src_assets,"destination_assets":dst_assets,"entities":creators,"links":links,"documents":documents})
+                &json!({"videos":scoped_videos,"destination_videos":destination_videos,"jobs":scoped_jobs,"documents":documents})
             ));
-            if row["operation"] != "stage-duplicate" && !dst_assets.is_empty() {
-                return Err(Error::new(
-                    409,
-                    "ledger_conflict",
-                    "目标路径已有 Peach 账本记录，请先核对；此项未移动",
-                )
-                .at(dst.to_string_lossy()));
-            }
             let actual = if row["operation"] == "stage-duplicate" {
                 config
                     .media
@@ -371,7 +339,8 @@ pub fn plan(config: &Config, request: Request) -> Result<Plan> {
             },
         });
     }
-    let ledger = archive_ledger::prepare(config, &ledger_rows(&rows, &moves), at, &request.id)?;
+    let ledger =
+        archive_ledger::prepare(config, &ledger_rows(&rows, &moves), at, &request.id).unwrap_or(Value::Null);
     for (database, table) in [
         (config.base.join("faces.db"), "videos"),
         (config.base.join("processing/processing.db"), "tasks"),
@@ -523,15 +492,6 @@ pub fn revalidate(config: &Config, plan: &Plan) -> Result<()> {
         if files::read_optional(&config.base.join(&doc.name))? != doc.before {
             return Err(Error::conflict("相关归档记录已变化").at(doc.name));
         }
-    }
-    let ledger = archive_ledger::prepare(
-        config,
-        &ledger_rows(intent.data["rows"].as_array().unwrap(), &plan.files),
-        intent.data["at"].as_str().unwrap(),
-        &plan.id,
-    )?;
-    if ledger != intent.data["ledger"] {
-        return Err(Error::conflict("Peach 相关记录已变化"));
     }
     Ok(())
 }
@@ -736,7 +696,11 @@ pub fn snapshot(config: &Config, plan: &Plan, successful: &[usize]) -> Result<Do
                 None
             },
         },
-        ledger: Some(archive_ledger::delta(&data["ledger"], successful)?),
+        ledger: if data["ledger"].is_null() {
+            None
+        } else {
+            archive_ledger::delta(&data["ledger"], successful).ok()
+        },
     })
 }
 

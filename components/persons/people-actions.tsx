@@ -70,7 +70,7 @@ export function PeopleActionDialog({
   const selectTarget=(name:string)=>{setTarget(name);setPlan(null);setError('')}
   return <Dialog open onOpenChange={open=>!open&&!busy&&onClose()}><DialogContent className={`pw-modal pw-file-dialog pw-merge-dialog pw-people-dialog${merging?' pw-merge-rich-dialog':''}`} data-theme={theme} onCloseAutoFocus={event=>{if(result){event.preventDefault();document.querySelector<HTMLButtonElement>('[aria-label="刷新人物和视频"]')?.focus()}}} showCloseButton={!busy} onEscapeKeyDown={e=>busy&&e.preventDefault()} onInteractOutside={e=>busy&&e.preventDefault()}>
     <DialogTitle>{result?.ok&&merging?'合并完成':`${plan?'确认':''}${merging?'合并':'删除'}所选人物`} · {people.length} 人</DialogTitle>
-    <DialogDescription>{merging?result?.ok?`已保留「${target}」。视频、待归档任务和账号关联已合入，同名文件保留两份。`:'先查看人物视频，再选择保留人物。同名文件保留两份，账号关联和待归档任务一起合并。':'删除所选人物，并将其整个目录（含视频和附属文件）移入全局暂存区。待归档任务撤回，账号关联和识别映射移除，文件内容保留。'}</DialogDescription>
+    <DialogDescription>{merging?result?.ok?`已保留「${target}」。视频、待归档任务和账号关联已合入，同名文件保留两份。`:'先查看人物视频，再选择保留人物。同名文件保留两份，账号关联和待归档任务一起合并。':'删除所选人物，并将其整个目录（含视频和附属文件）移入回收站。待归档任务撤回，账号关联和识别映射移除，文件内容保留。'}</DialogDescription>
     <div ref={body} className="pw-people-dialog-body">
       {merging&&<MergeFlow people={people} target={target} applying={applying} progress={progress} result={result} totalVideos={result?.ok?finalCount:totalVideos} plan={plan} states={states} thumbs={thumbs} disabled={busy} onSelectTarget={selectTarget}/>}
       {merging&&!result&&<>
@@ -83,7 +83,7 @@ export function PeopleActionDialog({
             <strong>{merging?`保留 ${plan.request.target}，合入其余 ${plan.plans.length} 人`:`删除 ${plan.plans.length} 个人物`}</strong>
             <p>涉及 {plan.plans.reduce((sum,p)=>sum+p.files.length,0)} 个文件 · {(plan.plans.reduce((sum,p)=>sum+p.total_bytes,0)/2**20).toFixed(1)} MB</p>
             {merging&&targetDirectory&&<div className="pw-merge-target-path"><FolderOutput size={14}/><span>合并至文件夹</span><code>{targetDirectory}</code></div>}
-            <p>{merging?'同名文件会自动改名以保留两份，最终路径以合并结果为准。':'目录文件移入暂存区，人物将从列表移除。'}</p>
+            <p>{merging?'同名文件会自动改名以保留两份，最终路径以合并结果为准。':'目录文件移入回收站，人物将从列表移除。'}</p>
           </div>
           <div className="pw-batch-summary">{plan.plans.map(p=>{
             const srcDir=p.source_directory||states[p.person]?.data?.root||`creators/${p.person}`
@@ -129,6 +129,6 @@ export function PeopleActionDialog({
       </WorkbenchStep>
         {merging&&!result&&!applying&&<div className="pw-merge-people">{people.map(person=><MergePersonVideos key={person} name={person} state={states[person]} repThumb={thumbs[person]} target={target} disabled={busy} playing={playing} onPlay={setPlaying} onLoad={(name,offset)=>void load(name,offset)} onTarget={selectTarget}/>)}</div>}
     </div>
-    <div className="pw-modal-actions">{result?<Button disabled={busy} className="pw-primary" onClick={onClose}>{result.ok&&merging?'查看合并后的视频':'关闭并查看结果'}</Button>:<><Button disabled={busy} onClick={()=>plan?(setPlan(null),setError('')):onClose()}>{plan?'返回修改':'取消'}</Button><Button aria-busy={busy} className={plan&&!merging?'pw-danger':'pw-primary'} disabled={busy||(merging&&!target)} onClick={()=>void(plan?apply():preview())}>{busy&&<LoaderCircle size={14} aria-hidden className="pw-busy-icon" data-motion={mode}/>}<span>{busy?(plan?'正在处理所选人物…':'检查文件和关联…'):plan?(merging?'确认合并人物':'确认删除并移入暂存'):'预览变更'}</span></Button></>}</div>
+    <div className="pw-modal-actions">{result?<Button disabled={busy} className="pw-primary" onClick={onClose}>{result.ok&&merging?'查看合并后的视频':'关闭并查看结果'}</Button>:<><Button disabled={busy} onClick={()=>plan?(setPlan(null),setError('')):onClose()}>{plan?'返回修改':'取消'}</Button><Button aria-busy={busy} className={plan&&!merging?'pw-danger':'pw-primary'} disabled={busy||(merging&&!target)} onClick={()=>void(plan?apply():preview())}>{busy&&<LoaderCircle size={14} aria-hidden className="pw-busy-icon" data-motion={mode}/>}<span>{busy?(plan?'正在处理所选人物…':'检查文件和关联…'):plan?(merging?'确认合并人物':'确认删除并移入回收站'):'预览变更'}</span></Button></>}</div>
   </DialogContent></Dialog>
 }

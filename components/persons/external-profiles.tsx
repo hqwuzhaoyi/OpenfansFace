@@ -8,8 +8,11 @@ import { EASE_OUT } from '@/lib/beui/ease'
 import { WorkbenchButton as Button, WorkbenchCount as Count } from './ui'
 import { useWorkbenchMotion } from './motion'
 import { api } from '@/lib/face-api'
+import { readPersistedWorkbenchCache, readWorkbenchCache, writeWorkbenchCache } from '@/components/workbench/state'
 import { CREATOR_DIRECTORY_SOURCE, type CreatorDirectoryResult, type CreatorMatch } from '@/lib/creator-directory-model'
 import './external-profiles.css'
+
+const EXTERNAL_CACHE_TTL_MS = 120_000
 
 const labels: Record<CreatorMatch['basis'], string> = {
   'manual-link': '已手动关联',
@@ -32,16 +35,29 @@ export function ExternalProfiles({ name, token, platform,refreshKey=0,onManage,c
   const query = keyword ? new URLSearchParams({ q: keyword }).toString() : subject
   useEffect(() => {
     if (!query) return
+    const cacheKey = `external:${refreshKey}:${query}`
+    const cached = retry === 0 ? readPersistedWorkbenchCache<CreatorDirectoryResult>(cacheKey, EXTERNAL_CACHE_TTL_MS) : undefined
+    if (cached) {
+      setState({ query, data: cached })
+      return
+    }
     const controller = new AbortController()
     setState(previous=>previous?.query===query?previous:null)
     api<CreatorDirectoryResult>(`/api/persons/external?${query}`, { signal: controller.signal })
-      .then(data => { if (!controller.signal.aborted) setState({ query, data }) })
+      .then(data => {
+        if (!controller.signal.aborted) {
+          writeWorkbenchCache(cacheKey, data, { persist: true })
+          setState({ query, data })
+        }
+      })
       .catch(error => { if (!controller.signal.aborted) setState({ query, error: (error as Error).message }) })
     return () => controller.abort()
   }, [query, retry,refreshKey])
   if (!subject) return null
+  const cacheKey = query ? `external:${refreshKey}:${query}` : ''
+  const cachedCurrent = cacheKey && retry === 0 ? readWorkbenchCache<CreatorDirectoryResult>(cacheKey, EXTERNAL_CACHE_TTL_MS) : undefined
   // Never display the previous person's result while a new request is in flight.
-  const current = state?.query === query ? state : null
+  const current = state?.query === query ? state : cachedCurrent ? { query, data: cachedCurrent } : null
   if(compact)return current?.data?.matches.length?<CompactProfiles key={subject} data={current.data} onManage={onManage}/>:null
   const content = <section className="external-profiles" aria-label="关联账号资料">
     <header><strong>关联账号资料</strong>{onManage&&<button type="button" onClick={onManage}>管理关联</button>}<a href={CREATOR_DIRECTORY_SOURCE} target="_blank" rel="noopener noreferrer" referrerPolicy="no-referrer">来源：女菩萨 ↗</a></header>

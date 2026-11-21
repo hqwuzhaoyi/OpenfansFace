@@ -35,7 +35,7 @@ interface Plan { rows: Row[]; n: number; n_ok: number; total_gb: number; version
 type ApplyResult = ArchiveResult
 interface UndoItem { vid: string; source?: string; return_href?: string }
 const toastOptions = { position: 'top-right' as const }
-const rowStatus = (row: Row) => row.operation === 'stage-duplicate' ? '重复件待暂存' : statusTitle[row.status] || '需要核对'
+const rowStatus = (row: Row) => row.operation === 'stage-duplicate' ? '重复件待移入回收站' : statusTitle[row.status] || '需要核对'
 const waveTime = archiveTime
 
 export default function IntegrationPage(){return <WorkbenchMotion><Integration /></WorkbenchMotion>}
@@ -233,7 +233,7 @@ function Integration() {
     try {
       await api('/api/plan/resolve', { method: 'POST', body: JSON.stringify({ vids: targets.map(row => row.vid), version: plan.version, kind }) })
       await load()
-      toast.success(kind === 'rename' ? '已选择保留两份，归档时使用新文件名。' : '已选择暂存重复件，归档时完整校验内容。', toastOptions)
+      toast.success(kind === 'rename' ? '已选择保留两份，归档时使用新文件名。' : '已选择重复件移入回收站，归档时完整校验内容。', toastOptions)
     } catch (cause) { toast.error((cause as Error).message, toastOptions); await load() }
     finally { writing.current = false; setBusy(false) }
   }
@@ -295,8 +295,8 @@ function Integration() {
             <ArchiveVideoPlayer key={detailVideo.path || detailVideo.vid} video={detailVideo} detailVisibleOnMobile={mobileDetail} />
             <div className="archive-paths">
               <div className="archive-pathLine"><Folder size={16} /><PathText value={current.src || current.vid} label={history ? '现在位置' : pending?.src ? '当前位置' : '原记录路径（源文件未找到）'} /></div>
-              {pending?.dst && <><div className="archive-pathConnector"><ArrowDown size={14} /><span>{pending.operation === 'stage-duplicate' ? '保留已有目标，完整校验后暂存重复源文件' : '归档后移动到'}</span></div><div className="archive-pathLine"><Archive size={16} /><PathText value={pending.dst} label={pending.operation === 'stage-duplicate' ? '保留的目标文件' : '目标人物目录'} /></div></>}
-              {archived?.staged_path && <><div className="archive-pathConnector"><ArrowDown size={14} /><span>源文件保留，未删除</span></div><div className="archive-pathLine"><Archive size={16} /><PathText value={archived.staged_path} label="重复源文件暂存位置" /></div></>}
+              {pending?.dst && <><div className="archive-pathConnector"><ArrowDown size={14} /><span>{pending.operation === 'stage-duplicate' ? '保留已有目标，完整校验后将重复源文件移入回收站' : '归档后移动到'}</span></div><div className="archive-pathLine"><Archive size={16} /><PathText value={pending.dst} label={pending.operation === 'stage-duplicate' ? '保留的目标文件' : '目标人物目录'} /></div></>}
+              {archived?.staged_path && <><div className="archive-pathConnector"><ArrowDown size={14} /><span>源文件保留，未删除</span></div><div className="archive-pathLine"><Archive size={16} /><PathText value={archived.staged_path} label="重复源文件回收站位置" /></div></>}
             </div>
             <div className="archive-person"><span className="archive-avatar">{current.creator.slice(0, 1)}</span><div><small>已确认人物</small><strong>{current.creator}<ShieldCheck size={14} className="archive-good" /></strong></div><span>{history ? '归档已完成' : '可跨波次勾选归档'}</span></div>
             <div className={`archive-reason ${pending && pending.status !== 'ok' ? 'archive-warning' : 'archive-good'}`}>{pending && pending.status !== 'ok' ? <CircleAlert size={16} /> : <CheckCheck size={16} />}<span>{pending?.reason || '已完成文件移动与 Peach 账本更新。'}</span></div>
@@ -325,7 +325,7 @@ function Integration() {
       <AlertDialogContent><AlertDialogHeader><AlertDialogTitle>将这 {undoRequest?.vids.length || 0} 个视频退回待确认？</AlertDialogTitle><AlertDialogDescription>包含所有勾选波次中的对应视频，即使部分已被搜索或筛选隐藏。这里只撤回人物归名，不删除或移动文件。</AlertDialogDescription></AlertDialogHeader><AlertDialogFooter><AlertDialogCancel>保留归名，返回检查</AlertDialogCancel><AlertDialogAction onClick={() => { const request = undoRequest; setUndoRequest(null); if (request) void undo(request.vids, request.goBack) }}>确定退回待确认</AlertDialogAction></AlertDialogFooter></AlertDialogContent>
     </AlertDialog>
     <AlertDialog open={confirm} onOpenChange={setConfirm}>
-      <AlertDialogContent inert={!confirm} aria-hidden={!confirm||undefined} style={{pointerEvents:confirm?'auto':'none'}} data-instant={instant} onCloseAutoFocus={event=>{event.preventDefault();requestAnimationFrame(()=>(watchRef.current?runStatus.current:archiveTrigger.current)?.focus())}} className="archive-confirmDialog max-h-[90dvh] overflow-y-auto" onOpenAutoFocus={event => { event.preventDefault(); confirmButton.current?.focus() }} onKeyDownCapture={event => { if (event.key === 'Enter' && (event.repeat || event.nativeEvent.isComposing)) event.preventDefault() }}><AlertDialogHeader><AlertDialogTitle>归档 {readySelectedWaves.length} 波中的 {validChosen.length} 个视频？</AlertDialogTitle><AlertDialogDescription>将实际处理约 {selectGB} GB 文件，并同步 Peach 账本。{stagedCount ? `其中 ${stagedCount} 个重复源文件将完整校验后移入暂存，已有目标保留。` : '视频将移动到各自的人物目录，使用详情中的文件名。'}{hiddenSelected > 0 ? `包含被筛选隐藏的已选视频（共 ${hiddenSelected} 个，异常项不执行）。` : ''}</AlertDialogDescription></AlertDialogHeader>
+      <AlertDialogContent inert={!confirm} aria-hidden={!confirm||undefined} style={{pointerEvents:confirm?'auto':'none'}} data-instant={instant} onCloseAutoFocus={event=>{event.preventDefault();requestAnimationFrame(()=>(watchRef.current?runStatus.current:archiveTrigger.current)?.focus())}} className="archive-confirmDialog max-h-[90dvh] overflow-y-auto" onOpenAutoFocus={event => { event.preventDefault(); confirmButton.current?.focus() }} onKeyDownCapture={event => { if (event.key === 'Enter' && (event.repeat || event.nativeEvent.isComposing)) event.preventDefault() }}><AlertDialogHeader><AlertDialogTitle>归档 {readySelectedWaves.length} 波中的 {validChosen.length} 个视频？</AlertDialogTitle><AlertDialogDescription>将实际处理约 {selectGB} GB 文件，并同步 Peach 账本。{stagedCount ? `其中 ${stagedCount} 个重复源文件将完整校验后移入回收站，已有目标保留。` : '视频将移动到各自的人物目录，使用详情中的文件名。'}{hiddenSelected > 0 ? `包含被筛选隐藏的已选视频（共 ${hiddenSelected} 个，异常项不执行）。` : ''}</AlertDialogDescription></AlertDialogHeader>
         {invalid > 0 && <div className="archive-confirmIssues"><strong>{invalid} 个异常项留在待归档，本次不执行</strong><ul>{blocked.slice(0, 5).map(row => <li key={row.vid}>{row.name}：{rowStatus(row)}</li>)}</ul>{invalid > 5 && <p>另有 {invalid - 5} 个异常项。</p>}</div>}
         <div className="max-h-48 space-y-2 overflow-y-auto rounded-lg border bg-muted/30 p-3 text-sm">{[...new Set(validChosen.map(row => row.creator))].map(creator => <p key={creator} className="break-all">{creator} · {validChosen.filter(row => row.creator === creator).length} 个 → creators/{creator}/</p>)}</div>
         <AlertDialogFooter><AlertDialogCancel>返回继续检查（Esc）</AlertDialogCancel><AlertDialogAction ref={confirmButton} onClick={apply}><Check className="mr-1 h-4 w-4" />确认归档 {validChosen.length} 个（Enter）</AlertDialogAction></AlertDialogFooter>

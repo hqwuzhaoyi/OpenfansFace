@@ -46,7 +46,7 @@ fn snapshot_db(db: &Connection, config: &Config, plan: &Plan) -> Result<Value> {
     Ok(json!({"assets":assets,"entities":entities,"links":links,"old":old,"new":new}))
 }
 pub fn snapshot(config: &Config, plan: &Plan) -> Result<Value> {
-    let mut db = db::open(&config.ledger)?;
+    let mut db = db::open_readonly(&config.ledger)?;
     let tx = db.transaction()?;
     snapshot_db(&tx, config, plan)
 }

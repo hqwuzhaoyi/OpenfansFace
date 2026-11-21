@@ -9,10 +9,43 @@ use crate::{
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
 use std::{
-    collections::{BTreeMap, BTreeSet},
-    path::Path,
+    collections::{BTreeMap, BTreeSet, VecDeque},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock},
 };
 const TTL: i64 = 8 * 60 * 60;
+
+struct CachedSession {
+    db_path: PathBuf,
+    id: String,
+    expires: i64,
+    snapshot: Arc<Value>,
+}
+
+fn session_cache() -> &'static Mutex<VecDeque<CachedSession>> {
+    static CACHE: OnceLock<Mutex<VecDeque<CachedSession>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+fn session_cache_put(db_path: &Path, id: &str, expires: i64, snapshot: Arc<Value>) {
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    if let Ok(mut guard) = session_cache().lock() {
+        guard.retain(|entry| {
+            entry.expires > now_epoch && !(entry.db_path == db_path && entry.id == id)
+        });
+        if guard.len() >= 2 {
+            guard.pop_front();
+        }
+        guard.push_back(CachedSession {
+            db_path: db_path.to_path_buf(),
+            id: id.to_owned(),
+            expires,
+            snapshot,
+        });
+    }
+}
 fn expired() -> Error {
     Error::new(
         409,
@@ -30,8 +63,24 @@ fn changed() -> Error {
 fn schema(config: &Config) -> Result<rusqlite::Connection> {
     db::open(&config.state_db())
 }
+fn schema_readonly(config: &Config) -> Result<rusqlite::Connection> {
+    db::open_readonly(&config.state_db())
+}
+fn session_write_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
 fn now(conn: &rusqlite::Connection) -> Result<i64> {
     Ok(conn.query_row("SELECT unixepoch()", [], |r| r.get(0))?)
+}
+fn has_watermark_candidate(data: &Value) -> bool {
+    data["candidates"].as_array().is_some_and(|cs| {
+        cs.iter().any(|c| {
+            c["sources"]
+                .as_array()
+                .is_some_and(|ss| ss.iter().any(|s| s == "watermark"))
+        })
+    })
 }
 pub fn available(t: &Value) -> bool {
     review::number(&t["manual"]).unwrap_or(0) != 0
@@ -67,23 +116,35 @@ fn candidate_names(data: &Value) -> BTreeSet<String> {
     }
     names
 }
+#[cfg(test)]
 fn tasks(config: &Config, aliases: &Value) -> Result<Vec<Value>> {
+    tasks_filtered(config, aliases, None, false)
+}
+fn tasks_for_review(config: &Config, aliases: &Value) -> Result<Vec<Value>> {
+    tasks_filtered(config, aliases, None, true)
+}
+fn tasks_filtered(
+    config: &Config,
+    aliases: &Value,
+    only_vids: Option<&BTreeSet<String>>,
+    skip_unavailable_resolve: bool,
+) -> Result<Vec<Value>> {
     let path = config.base.join("processing/processing.db");
     if !path.exists() {
         return Ok(vec![]);
     }
     let queue = review::read(config, "integration-queue.json", json!([]))?.1;
     let history = review::read(config, "archive-history.json", json!([]))?.1;
-    let sources = review::sources(config)?;
-    let paths: BTreeSet<_> = queue
+    let queue_vids: BTreeSet<String> = queue
         .as_array()
         .unwrap()
         .iter()
-        .filter_map(|r| {
-            r["vid"]
-                .as_str()
-                .and_then(|v| review::source(config, v, &sources))
-        })
+        .filter_map(|r| r["vid"].as_str().map(str::to_owned))
+        .collect();
+    let sources = review::sources_for_vids(config, &queue_vids)?;
+    let paths: BTreeSet<_> = queue_vids
+        .iter()
+        .filter_map(|v| review::source(config, v, &sources))
         .collect();
     let excluded_vids: BTreeSet<String> = queue
         .as_array()
@@ -92,22 +153,81 @@ fn tasks(config: &Config, aliases: &Value) -> Result<Vec<Value>> {
         .chain(history.as_array().unwrap())
         .filter_map(|r| r["vid"].as_str().map(str::to_owned))
         .collect();
+    let conn = db::open_readonly(&path)?;
+    let raw_rows = if let Some(filter) = only_vids {
+        if filter.is_empty() {
+            return Ok(vec![]);
+        }
+        let placeholders = std::iter::repeat_n("?", filter.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT * FROM tasks WHERE stage!='excluded' AND vid IN ({placeholders}) ORDER BY priority DESC,is_new DESC,created_at DESC,vid"
+        );
+        db::rows(&conn, &sql, rusqlite::params_from_iter(filter.iter()))?
+    } else {
+        db::rows(
+            &conn,
+            "SELECT * FROM tasks WHERE stage!='excluded' ORDER BY priority DESC,is_new DESC,created_at DESC,vid",
+            [],
+        )?
+    };
     let mut out = vec![];
-    for row in db::rows(
-        &db::open(&path)?,
-        "SELECT * FROM tasks WHERE stage!='excluded' ORDER BY priority DESC,is_new DESC,created_at DESC,vid",
-        [],
-    )? {
+    for row in raw_rows {
         let id = row["vid"].as_str().unwrap_or("");
         if excluded_vids.contains(id) || paths.contains(row["path"].as_str().unwrap_or("")) {
             continue;
         }
         let mut t = public(row)?;
-        t["__review_raw_people"] = json!(candidate_names(&t["data"]));
-        canonical_fields(&mut t["data"], "", aliases)?;
+        if !skip_unavailable_resolve || available(&t) {
+            t["__review_raw_people"] = json!(candidate_names(&t["data"]));
+            canonical_fields(&mut t["data"], "", aliases)?;
+            crate::processing_result::re_resolve_task_data(&mut t["data"]);
+        }
         out.push(t)
     }
     Ok(out)
+}
+fn waiting_count(config: &Config) -> Result<usize> {
+    let path = config.base.join("processing/processing.db");
+    if !path.exists() {
+        return Ok(0);
+    }
+    let queue = review::read(config, "integration-queue.json", json!([]))?.1;
+    let history = review::read(config, "archive-history.json", json!([]))?.1;
+    let queue_vids: BTreeSet<String> = queue
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["vid"].as_str().map(str::to_owned))
+        .collect();
+    let sources = review::sources_for_vids(config, &queue_vids)?;
+    let paths: BTreeSet<_> = queue_vids
+        .iter()
+        .filter_map(|v| review::source(config, v, &sources))
+        .collect();
+    let excluded_vids: BTreeSet<String> = queue
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(history.as_array().unwrap())
+        .filter_map(|r| r["vid"].as_str().map(str::to_owned))
+        .collect();
+    let conn = db::open_readonly(&path)?;
+    let mut stmt = conn.prepare(
+        "SELECT vid,path FROM tasks WHERE stage!='excluded' AND stage!='review' AND manual=0",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut count = 0usize;
+    while let Some(row) = rows.next()? {
+        let id: String = row.get::<_, Option<String>>(0)?.unwrap_or_default();
+        let row_path: String = row.get::<_, Option<String>>(1)?.unwrap_or_default();
+        if excluded_vids.contains(&id) || paths.contains(&row_path) {
+            continue;
+        }
+        count += 1;
+    }
+    Ok(count)
 }
 fn canonical_fields(value: &mut Value, key: &str, aliases: &Value) -> Result<()> {
     if ["name", "creator", "suggested"].contains(&key) && value.is_string() {
@@ -212,7 +332,7 @@ impl HealthReader {
     }
 }
 fn dispositions(config: &Config) -> Result<BTreeMap<String, Value>> {
-    let conn = schema(config)?;
+    let conn = schema_readonly(config)?;
     let mut result = BTreeMap::new();
     for row in db::rows(
         &conn,
@@ -239,7 +359,7 @@ pub fn validate_undo(config: &Config, body: &Value) -> Result<()> {
         return Ok(());
     };
     read(config, session)?;
-    let conn = schema(config)?;
+    let conn = schema_readonly(config)?;
     let queue = review::read(config, "integration-queue.json", json!([]))?.1;
     for vid in review::vids(&body["vids"])? {
         let batch = queue
@@ -310,11 +430,30 @@ fn evidence(
         .unwrap()
         .remove("__review_raw_people");
     Ok(
-        json!({"task":displayed,"group":group(t),"scope":scope,"material":material.state(config,&scope)?["material"],"text":text_evidence(t),"health":health.state(config,t)?,"disposition":dispositions.get(t["vid"].as_str().unwrap_or("")),"pending_seen":review::number(&t["deferred"]).unwrap_or(0)==0,"deferred_seen":review::number(&t["deferred"]).unwrap_or(0)!=0}),
+        json!({"task":displayed,"group":group(t),"scope":scope,"material":material.material_only(config,&scope)?,"text":text_evidence(t),"health":health.state(config,t)?,"disposition":dispositions.get(t["vid"].as_str().unwrap_or("")),"pending_seen":review::number(&t["deferred"]).unwrap_or(0)==0,"deferred_seen":review::number(&t["deferred"]).unwrap_or(0)!=0}),
     )
 }
-fn read(config: &Config, id: &str) -> Result<Value> {
-    let conn = schema(config)?;
+fn read(config: &Config, id: &str) -> Result<Arc<Value>> {
+    let db_path = config.state_db();
+    let conn = schema_readonly(config)?;
+    let expires: Option<i64> = conn
+        .query_row(
+            "SELECT expires FROM review_sessions WHERE id=? AND expires>unixepoch()",
+            [id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    let expires = expires.ok_or_else(expired)?;
+    if let Ok(mut guard) = session_cache().lock()
+        && let Some(pos) = guard
+            .iter()
+            .position(|entry| entry.db_path == db_path && entry.id == id && entry.expires == expires)
+    {
+        let hit = guard.remove(pos).unwrap();
+        let snapshot = hit.snapshot.clone();
+        guard.push_back(hit);
+        return Ok(snapshot);
+    }
     let raw: Option<String> = conn
         .query_row(
             "SELECT snapshot FROM review_sessions WHERE id=? AND expires>unixepoch()",
@@ -326,25 +465,51 @@ fn read(config: &Config, id: &str) -> Result<Value> {
     if value["schema_version"] != 1 {
         return Err(expired());
     }
-    Ok(value)
+    let arc = Arc::new(value);
+    session_cache_put(&db_path, id, expires, arc.clone());
+    Ok(arc)
 }
+struct AmendedSnapshot {
+    base: Arc<Value>,
+    overrides: BTreeMap<usize, Value>,
+}
+impl AmendedSnapshot {
+    fn base_evidence(&self) -> &[Value] {
+        self.base["evidence"].as_array().map_or(&[], Vec::as_slice)
+    }
+    fn iter(&self) -> impl Iterator<Item = &Value> {
+        let base = self.base_evidence();
+        (0..base.len()).map(|i| self.overrides.get(&i).unwrap_or(&base[i]))
+    }
+    fn clusters(&self) -> &Value {
+        &self.base["clusters"]
+    }
+}
+
 // Only this session's durable, completed operations amend its presentation. Evidence is never replaced by latest model output.
-fn amended(config: &Config, id: &str, mut snapshot: Value) -> Result<Value> {
-    let conn = schema(config)?;
-    let positions: BTreeMap<String, usize> = snapshot["evidence"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .enumerate()
-        .filter_map(|(i, e)| e["task"]["vid"].as_str().map(|vid| (vid.into(), i)))
-        .collect();
-    let mut next_pending = snapshot["evidence"].as_array().unwrap().len() as u64;
-    let mut next_deferred = next_pending;
-    for row in db::rows(
+fn amended(config: &Config, id: &str, snapshot: Arc<Value>) -> Result<AmendedSnapshot> {
+    let conn = schema_readonly(config)?;
+    let ops = db::rows(
         &conn,
         "SELECT plan FROM operations WHERE status='complete' AND json_extract(plan,'$.request.payload.review_session')=? ORDER BY rowid",
         [id],
-    )? {
+    )?;
+    if ops.is_empty() {
+        return Ok(AmendedSnapshot {
+            base: snapshot,
+            overrides: BTreeMap::new(),
+        });
+    }
+    let base_evidence = snapshot["evidence"].as_array().unwrap();
+    let positions: BTreeMap<&str, usize> = base_evidence
+        .iter()
+        .enumerate()
+        .filter_map(|(i, e)| e["task"]["vid"].as_str().map(|vid| (vid, i)))
+        .collect();
+    let mut overrides: BTreeMap<usize, Value> = BTreeMap::new();
+    let mut next_pending = base_evidence.len() as u64;
+    let mut next_deferred = next_pending;
+    for row in ops {
         let plan: Value = serde_json::from_str(row["plan"].as_str().unwrap())?;
         let body = &plan["request"]["payload"];
         let action = plan["action"].as_str().unwrap_or("");
@@ -355,7 +520,9 @@ fn amended(config: &Config, id: &str, mut snapshot: Value) -> Result<Value> {
             .filter_map(|v| v.as_str().and_then(|id| positions.get(id)).copied())
             .collect();
         for index in selected {
-            let e = &mut snapshot["evidence"][index];
+            let e = overrides
+                .entry(index)
+                .or_insert_with(|| base_evidence[index].clone());
             e["disposition"] = plan["id"].clone();
             match action {
                 "queue-confirm" => e["completed"] = json!(true),
@@ -403,7 +570,10 @@ fn amended(config: &Config, id: &str, mut snapshot: Value) -> Result<Value> {
             }
         }
     }
-    Ok(snapshot)
+    Ok(AmendedSnapshot {
+        base: snapshot,
+        overrides,
+    })
 }
 fn set_manual(e: &mut Value, key: &str, value: Value) {
     e["task"][key] = value.clone();
@@ -421,10 +591,11 @@ pub fn validate(config: &Config, body: &Value) -> Result<Vec<Value>> {
     let session = body["review_session"].as_str().ok_or_else(expired)?;
     read(config, session)?;
     let ids = review::vids(&body["vids"])?;
-    let conn = schema(config)?;
+    let id_set: BTreeSet<String> = ids.iter().cloned().collect();
+    let conn = schema_readonly(config)?;
     let mut rows = vec![];
     let material = shared_metadata::MaterialReader::new(config)?;
-    let current = tasks(config, material.aliases())?;
+    let current = tasks_filtered(config, material.aliases(), Some(&id_set), false)?;
     let health = HealthReader::new(config)?;
     let dispositions = dispositions(config)?;
     for vid in ids {
@@ -464,7 +635,7 @@ pub fn validate(config: &Config, body: &Value) -> Result<Vec<Value>> {
             || text_evidence(t) != e["text"]
             || health.state(config, t)? != e["health"]
             || dispositions.get(&vid).cloned().unwrap_or(Value::Null) != e["disposition"]
-            || material.state(config, &e["scope"])?["material"] != e["material"]
+            || material.material_only(config, &e["scope"])? != e["material"]
         {
             return Err(changed());
         }
@@ -481,104 +652,138 @@ pub fn execute(engine: &mut Engine, command: &str, body: Value) -> Result<Value>
         ));
     }
     let config = &engine.config;
-    let conn = schema(config)?;
     let id = body["session"]
         .as_str()
         .filter(|v| !v.is_empty())
         .map(str::to_owned);
-    let material = shared_metadata::MaterialReader::new(config)?;
-    let live = tasks(config, material.aliases())?;
-    let health = HealthReader::new(config)?;
-    let dispositions = dispositions(config)?;
     let created = id.is_none();
-    let id = match id {
-        Some(id) => id,
-        None => {
-            if command == "review-status" {
-                return Err(expired());
-            }
-            let id = uuid::Uuid::new_v4().to_string();
-            let mut evidence = live
-                .iter()
-                .filter(|t| available(t))
-                .map(|t| evidence(config, t, &material, &health, &dispositions))
-                .collect::<Result<Vec<_>>>()?;
-            evidence.retain(|e| e["health"]["hidden"] != true);
-            for (index, e) in evidence.iter_mut().enumerate() {
-                let key = if e["pending_seen"] == true {
-                    "pending_order"
-                } else {
-                    "deferred_order"
+    let need_live_diff = created || command == "review-status";
+    let (id, snapshot, changed_count, waiting, refreshing) = if !need_live_diff {
+        let id = id.unwrap();
+        let snapshot = amended(config, &id, read(config, &id)?)?;
+        let waiting = waiting_count(config)?;
+        (id, snapshot, 0usize, waiting, 0usize)
+    } else {
+        let material = shared_metadata::MaterialReader::new(config)?;
+        let live = tasks_for_review(config, material.aliases())?;
+        let health = HealthReader::new(config)?;
+        let id = match id {
+            Some(id) => id,
+            None => {
+                if command == "review-status" {
+                    return Err(expired());
+                }
+                let dispositions = dispositions(config)?;
+                let id = uuid::Uuid::new_v4().to_string();
+                let mut evidence = live
+                    .iter()
+                    .filter(|t| available(t))
+                    .map(|t| evidence(config, t, &material, &health, &dispositions))
+                    .collect::<Result<Vec<_>>>()?;
+                evidence.retain(|e| e["health"]["hidden"] != true);
+                evidence.sort_by_key(|e| !has_watermark_candidate(&e["task"]["data"]));
+                for (index, e) in evidence.iter_mut().enumerate() {
+                    let key = if e["pending_seen"] == true {
+                        "pending_order"
+                    } else {
+                        "deferred_order"
+                    };
+                    e[key] = json!(index);
+                }
+                let snapshot = json!({"schema_version":1,"evidence":evidence,"clusters":review::read(config,"clusters.json",json!([]))?.1});
+                let raw = serde_json::to_string(&snapshot)?;
+                if raw.len() > 64 * 1024 * 1024 {
+                    return Err(Error::new(
+                        503,
+                        "review_scope_limit",
+                        "核对记录过多，请缩小处理范围",
+                    ));
+                }
+                let expires = {
+                    let _guard = session_write_lock()
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    let mut conn = schema(config)?;
+                    let tx = conn
+                        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                    let expires = now(&tx)? + TTL;
+                    let has_expired: bool = tx.query_row(
+                        "SELECT EXISTS(SELECT 1 FROM review_sessions WHERE expires<=unixepoch())",
+                        [],
+                        |r| r.get(0),
+                    )?;
+                    if has_expired {
+                        tx.execute("DELETE FROM review_sessions WHERE expires<=unixepoch()", [])?;
+                    }
+                    tx.execute(
+                        "INSERT INTO review_sessions VALUES(?,?,?)",
+                        params![id, expires, raw],
+                    )?;
+                    tx.commit()?;
+                    expires
                 };
-                e[key] = json!(index);
+                session_cache_put(&config.state_db(), &id, expires, Arc::new(snapshot));
+                id
             }
-            let snapshot = json!({"schema_version":1,"evidence":evidence,"clusters":review::read(config,"clusters.json",json!([]))?.1});
-            let raw = serde_json::to_string(&snapshot)?;
-            if raw.len() > 64 * 1024 * 1024 {
-                return Err(Error::new(
-                    503,
-                    "review_scope_limit",
-                    "核对记录过多，请缩小处理范围",
-                ));
+        };
+        let snapshot = amended(config, &id, read(config, &id)?)?;
+        let mut changed_count = 0;
+        if !created {
+            let visible_by_id: BTreeMap<&str, &Value> = snapshot
+                .iter()
+                .filter(|e| e["completed"] != true)
+                .filter_map(|e| e["task"]["vid"].as_str().map(|vid| (vid, &e["task"])))
+                .collect();
+            let live_ids: BTreeSet<_> = live
+                .iter()
+                .map(|t| t["vid"].as_str().unwrap_or(""))
+                .collect();
+            for t in &live {
+                if available(t)
+                    && health.state(config, t)?["hidden"] != true
+                    && !visible_by_id
+                        .get(t["vid"].as_str().unwrap_or(""))
+                        .is_some_and(|v| {
+                            v["data"] == t["data"]
+                                && v["path"] == t["path"]
+                                && v["size"] == t["size"]
+                                && v["mtime_ns"] == t["mtime_ns"]
+                                && v["deferred"] == t["deferred"]
+                                && v["note"] == t["note"]
+                        })
+                {
+                    changed_count += 1
+                }
             }
-            conn.execute("DELETE FROM review_sessions WHERE expires<=unixepoch()", [])?;
-            conn.execute(
-                "INSERT INTO review_sessions VALUES(?,?,?)",
-                params![id, now(&conn)? + TTL, raw],
-            )?;
-            id
+            for e in snapshot.iter().filter(|e| e["completed"] != true) {
+                if !live_ids.contains(e["task"]["vid"].as_str().unwrap_or(""))
+                    || material.material_only(config, &e["scope"])? != e["material"]
+                    || health.state(config, &e["task"])? != e["health"]
+                {
+                    changed_count += 1
+                }
+            }
         }
+        let waiting = live
+            .iter()
+            .filter(|t| t["stage"] != "review" && review::number(&t["manual"]).unwrap_or(0) == 0)
+            .count();
+        let refreshing = live
+            .iter()
+            .filter(|t| {
+                available(t)
+                    && t["stage"] != "review"
+                    && review::number(&t["manual"]).unwrap_or(0) == 0
+            })
+            .count();
+        (id, snapshot, changed_count, waiting, refreshing)
     };
-    let snapshot = amended(config, &id, read(config, &id)?)?;
-    let evidence = snapshot["evidence"].as_array().unwrap();
-    let visible: Vec<_> = evidence
-        .iter()
-        .filter(|e| e["completed"] != true)
-        .map(|e| e["task"].clone())
-        .collect();
-    let mut changed_count = 0;
-    if !created {
-        let visible_by_id: BTreeMap<_, _> = visible
-            .iter()
-            .map(|t| (t["vid"].as_str().unwrap_or(""), t))
-            .collect();
-        let live_ids: BTreeSet<_> = live
-            .iter()
-            .map(|t| t["vid"].as_str().unwrap_or(""))
-            .collect();
-        for t in &live {
-            if available(t)
-                && health.state(config, t)?["hidden"] != true
-                && !visible_by_id
-                    .get(t["vid"].as_str().unwrap_or(""))
-                    .is_some_and(|v| {
-                        v["data"] == t["data"]
-                            && v["path"] == t["path"]
-                            && v["size"] == t["size"]
-                            && v["mtime_ns"] == t["mtime_ns"]
-                            && v["deferred"] == t["deferred"]
-                            && v["note"] == t["note"]
-                    })
-            {
-                changed_count += 1
-            }
-        }
-        for e in evidence.iter().filter(|e| e["completed"] != true) {
-            if !live_ids.contains(e["task"]["vid"].as_str().unwrap_or(""))
-                || material.state(config, &e["scope"])?["material"] != e["material"]
-                || health.state(config, &e["task"])? != e["health"]
-            {
-                changed_count += 1
-            }
-        }
+    if need_live_diff {
+        crate::model::trim_allocator();
     }
-    let waiting = live
-        .iter()
-        .filter(|t| t["stage"] != "review" && review::number(&t["manual"]).unwrap_or(0) == 0)
-        .count();
     if command == "review-status" {
         return Ok(
-            json!({"session":id,"has_updates":changed_count>0,"changed":changed_count,"waiting":waiting,"refreshing":live.iter().filter(|t|available(t)&&t["stage"]!="review"&&review::number(&t["manual"]).unwrap_or(0)==0).count()}),
+            json!({"session":id,"has_updates":changed_count>0,"changed":changed_count,"waiting":waiting,"refreshing":refreshing}),
         );
     }
     let s = |key: &str| body[key].as_str().unwrap_or("");
@@ -591,7 +796,8 @@ pub fn execute(engine: &mut Engine, command: &str, body: Value) -> Result<Value>
     let person = s("person");
     let cluster = s("cluster");
     let mut counts = json!({"all":0,"suggested":0,"conflict":0,"none":0,"manual":0,"deferred":0});
-    for t in &visible {
+    for e in snapshot.iter().filter(|e| e["completed"] != true) {
+        let t = &e["task"];
         if review::number(&t["deferred"]).unwrap_or(0) != 0 {
             counts["deferred"] = json!(counts["deferred"].as_u64().unwrap() + 1)
         } else {
@@ -600,7 +806,7 @@ pub fn execute(engine: &mut Engine, command: &str, body: Value) -> Result<Value>
             }
         }
     }
-    let mut scope: Vec<_> = evidence
+    let mut scope: Vec<_> = snapshot
         .iter()
         .filter(|e| {
             let t = &e["task"];
@@ -618,7 +824,7 @@ pub fn execute(engine: &mut Engine, command: &str, body: Value) -> Result<Value>
                         .is_some_and(|cs| cs.iter().any(|c| c["name"] == person))
                     || t["data"]["suggested"] == person)
                 && (cluster.is_empty()
-                    || snapshot["clusters"].as_array().is_some_and(|cs| {
+                    || snapshot.clusters().as_array().is_some_and(|cs| {
                         cs.iter().any(|c| {
                             c["cid"] == cluster
                                 && c["vids"]
@@ -643,7 +849,7 @@ pub fn execute(engine: &mut Engine, command: &str, body: Value) -> Result<Value>
     };
     let mut grouped: BTreeMap<String, Value> = BTreeMap::new();
     let mut totals: BTreeMap<String, usize> = BTreeMap::new();
-    for e in evidence {
+    for e in snapshot.iter() {
         *totals
             .entry(e["group"]["key"].as_str().unwrap_or("").into())
             .or_default() += 1;
@@ -711,28 +917,58 @@ pub fn execute(engine: &mut Engine, command: &str, body: Value) -> Result<Value>
         .map(|n| n / limit)
         .unwrap_or_else(|| s("page").parse::<usize>().unwrap_or(0))
         .min(rows.len().saturating_sub(1) / limit);
-    let mut delivered = vec![];
-    for e in rows
-        .iter()
-        .skip(page * limit)
-        .take(limit)
-        .filter(|e| is_remaining(e))
-    {
-        let raw = serde_json::to_string(e)?;
-        let token=conn.query_row("SELECT token FROM review_deliveries WHERE session=? AND vid=? AND evidence=? LIMIT 1",params![id,e["task"]["vid"].as_str(),raw],|r|r.get::<_,String>(0)).optional()?.unwrap_or_else(||uuid::Uuid::new_v4().to_string());
-        let mut task = e["task"].clone();
-        task["review_token"] = json!(token);
-        conn.execute(
-            "INSERT OR IGNORE INTO review_deliveries VALUES(?,?,?,?)",
-            params![token, id, task["vid"].as_str(), serde_json::to_string(e)?],
+    let (delivered, current_epoch) = {
+        let ro = schema_readonly(config)?;
+        let mut stmt = ro.prepare(
+            "SELECT token FROM review_deliveries WHERE session=? AND vid=? AND evidence=? LIMIT 1",
         )?;
-        delivered.push(task);
-    }
+        let mut delivered = vec![];
+        let mut missing: Vec<(String, Option<String>, String)> = vec![];
+        for e in rows
+            .iter()
+            .skip(page * limit)
+            .take(limit)
+            .filter(|e| is_remaining(e))
+        {
+            let raw = serde_json::to_string(e)?;
+            let vid = e["task"]["vid"].as_str();
+            let token = stmt
+                .query_row(params![&id, vid, &raw], |r| r.get::<_, String>(0))
+                .optional()?;
+            let token = match token {
+                Some(existing) => existing,
+                None => {
+                    let token = uuid::Uuid::new_v4().to_string();
+                    missing.push((token.clone(), vid.map(str::to_owned), raw));
+                    token
+                }
+            };
+            let mut task = e["task"].clone();
+            task["review_token"] = json!(token);
+            delivered.push(task);
+        }
+        let current_epoch = now(&ro)?;
+        drop(stmt);
+        drop(ro);
+        if !missing.is_empty() {
+            let mut rw = schema(config)?;
+            let tx = rw.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            {
+                let mut insert =
+                    tx.prepare("INSERT OR IGNORE INTO review_deliveries VALUES(?,?,?,?)")?;
+                for (token, vid, raw) in &missing {
+                    insert.execute(params![token, &id, vid.as_deref(), raw])?;
+                }
+            }
+            tx.commit()?;
+        }
+        (delivered, current_epoch)
+    };
     let pages = rows.len().div_ceil(limit);
     let has = |p: usize| rows.iter().skip(p * limit).take(limit).any(&is_remaining);
     let next = (page + 1..pages).find(|p| has(*p));
     let previous = (0..page).rev().find(|p| has(*p));
-    let folders: BTreeSet<_> = evidence
+    let folders: BTreeSet<_> = snapshot
         .iter()
         .filter_map(|e| {
             Path::new(e["task"]["path"].as_str()?)
@@ -741,7 +977,7 @@ pub fn execute(engine: &mut Engine, command: &str, body: Value) -> Result<Value>
         })
         .collect();
     let heartbeat = review::read(config, "processing/heartbeat.json", json!({}))?.1;
-    let age = now(&conn)? as f64 - heartbeat["at"].as_f64().unwrap_or(0.0);
+    let age = current_epoch as f64 - heartbeat["at"].as_f64().unwrap_or(0.0);
     Ok(
         json!({"session":id,"counts":counts,"groups":groups,"group":selected,"rows":delivered,"total":rows.len(),"remaining":rows.iter().filter(|e|is_remaining(e)).count(),"page":page,"limit":limit,"next_page":next,"previous_page":previous,"waiting":waiting,"online":(-30.0..90.0).contains(&age),"folders":folders,"focus_missing":focus_missing,"has_updates":changed_count>0}),
     )
@@ -806,6 +1042,168 @@ mod alias_snapshot_tests {
         assert_ne!(frozen["version"], changed["version"]);
         drop(jobs);
         drop(faces);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn amended_overlay_mutates_only_affected_items_without_cloning_base() {
+        let root = fs::canonicalize("/tmp")
+            .unwrap()
+            .join(format!("face-review-overlay-{}", uuid::Uuid::new_v4()));
+        let base = root.join("base");
+        let media = root.join("media");
+        fs::create_dir_all(base.join("file-operations-rust")).unwrap();
+        fs::create_dir_all(&media).unwrap();
+        let config = Config {
+            base,
+            media,
+            ledger: root.join("ledger.db"),
+            bind: "127.0.0.1:0".into(),
+            token: None,
+            fixture: None,
+            parity_root: None,
+        };
+        let store = crate::store::Store::start(&config).unwrap();
+        let session_id = "sess-1";
+        let plan = json!({
+            "id": "op-1",
+            "action": "review-note",
+            "request": {
+                "payload": {
+                    "review_session": session_id,
+                    "vids": ["v1"],
+                    "note": "updated note"
+                }
+            }
+        });
+        store
+            .db
+            .execute(
+                "INSERT INTO operations(id,request_hash,plan,status,phase) VALUES('op-1','h',?,'complete','complete')",
+                [plan.to_string()],
+            )
+            .unwrap();
+        drop(store);
+
+        let base_snap = Arc::new(json!({
+            "schema_version": 1,
+            "clusters": [],
+            "evidence": [
+                {"task": {"vid": "v1", "note": ""}, "material": {"manual_tasks": [{"vid": "v1", "note": ""}]}},
+                {"task": {"vid": "v2", "note": "keep"}, "material": {"manual_tasks": []}}
+            ]
+        }));
+        let overlay = amended(&config, session_id, base_snap.clone()).unwrap();
+        assert_eq!(overlay.overrides.len(), 1);
+        let items: Vec<&Value> = overlay.iter().collect();
+        assert_eq!(items[0]["task"]["note"], "updated note");
+        assert_eq!(items[0]["disposition"], "op-1");
+        assert_eq!(items[1]["task"]["note"], "keep");
+        assert!(std::ptr::eq(items[1], &base_snap["evidence"][1]));
+        assert_eq!(base_snap["evidence"][0]["task"]["note"], "");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn review_deliveries_reuses_tokens_without_re_writing() {
+        let root = fs::canonicalize("/tmp")
+            .unwrap()
+            .join(format!("face-review-deliveries-{}", uuid::Uuid::new_v4()));
+        let base = root.join("base");
+        let media = root.join("media");
+        fs::create_dir_all(base.join("file-operations-rust")).unwrap();
+        fs::create_dir_all(&media).unwrap();
+        let config = Config {
+            base: base.clone(),
+            media,
+            ledger: root.join("ledger.db"),
+            bind: "127.0.0.1:0".into(),
+            token: None,
+            fixture: None,
+            parity_root: None,
+        };
+        let store = crate::store::Store::start(&config).unwrap();
+        let session_id = "sess-nodup";
+        let snapshot = json!({
+            "schema_version": 1,
+            "clusters": [],
+            "evidence": [
+                {
+                    "task": {"vid": "v1", "name": "a.mp4", "path": "/tmp/a.mp4", "deferred": 0, "manual": 0, "data": {"kind": "none"}},
+                    "group": {"key": "none", "label": "无候选人物", "kind": "none"},
+                    "scope": {"vids": ["v1"], "people": [], "watermark_keys": []},
+                    "material": {},
+                    "text": {},
+                    "health": {"hidden": false},
+                    "disposition": null,
+                    "pending_seen": true,
+                    "deferred_seen": false,
+                    "pending_order": 0
+                },
+                {
+                    "task": {"vid": "v2", "name": "b.mp4", "path": "/tmp/b.mp4", "deferred": 0, "manual": 0, "data": {"kind": "none"}},
+                    "group": {"key": "none", "label": "无候选人物", "kind": "none"},
+                    "scope": {"vids": ["v2"], "people": [], "watermark_keys": []},
+                    "material": {},
+                    "text": {},
+                    "health": {"hidden": false},
+                    "disposition": null,
+                    "pending_seen": true,
+                    "deferred_seen": false,
+                    "pending_order": 1
+                }
+            ]
+        });
+        store
+            .db
+            .execute(
+                "INSERT INTO review_sessions VALUES(?, unixepoch() + 3600, ?)",
+                params![session_id, snapshot.to_string()],
+            )
+            .unwrap();
+        drop(store);
+
+        let observer = db::open_readonly(&config.state_db()).unwrap();
+        let ver_before: i64 = observer
+            .pragma_query_value(None, "data_version", |r| r.get(0))
+            .unwrap();
+
+        let mut engine = Engine::open_preview(config.clone()).unwrap();
+        let first = execute(&mut engine, "review-page", json!({"session": session_id})).unwrap();
+        let first_tokens: Vec<_> = first["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["review_token"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(first_tokens.len(), 2);
+
+        let ver_after_first: i64 = observer
+            .pragma_query_value(None, "data_version", |r| r.get(0))
+            .unwrap();
+        assert_ne!(
+            ver_before, ver_after_first,
+            "first page load should persist missing review_deliveries"
+        );
+
+        let second = execute(&mut engine, "review-page", json!({"session": session_id})).unwrap();
+        let second_tokens: Vec<_> = second["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["review_token"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(first_tokens, second_tokens);
+
+        let ver_after_second: i64 = observer
+            .pragma_query_value(None, "data_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(
+            ver_after_first, ver_after_second,
+            "revisiting a rendered review page must not write to SQLite"
+        );
+        drop(observer);
+        drop(engine);
         fs::remove_dir_all(root).unwrap();
     }
 }

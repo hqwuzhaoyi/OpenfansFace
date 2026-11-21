@@ -398,7 +398,7 @@ def main():
                         with _ACTIVE_RUN_LOCK:
                             active_run_ids = sorted(_ACTIVE_RUN_IDS)
                         hb_resp = native('processing-heartbeat', {
-                            'run_ids': active_run_ids,
+                            'run_ids': [],
                             'capacity': max_concurrency(),
                             'heartbeat': dict(
                                 pid=os.getpid(),

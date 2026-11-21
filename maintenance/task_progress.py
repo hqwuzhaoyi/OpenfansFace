@@ -21,7 +21,8 @@ class TaskProgress:
                          if isolated else self.base / 'jobs' / (kind + '.json'))
         self.scratch_file = self.base / 'processing/tmp' / ('progress-' + digest)
         self.file = self.scratch_file if in_compute_write_guard() else self.job_file
-        self.file.parent.mkdir(parents=True, exist_ok=True)
+        if in_compute_write_guard() or not os.environ.get('FILE_OPERATIONS_RUST_URL'):
+            self.file.parent.mkdir(parents=True, exist_ok=True)
         now = time.time()
         self.data = dict(id=identifier, kind=kind, title=title, status='running',
                          stage='准备中', current=current, vid=vid, done=None, total=None, unit='', failed=0,
@@ -38,12 +39,13 @@ class TaskProgress:
         self.write()
 
     def write(self):
-        if os.environ.get('FILE_OPERATIONS_RUST_URL'):
+        if os.environ.get('FILE_OPERATIONS_RUST_URL') and not in_compute_write_guard():
             try:
                 native('processing-stage-progress', {
                     'isolated': self.isolated,
                     'data': self.data,
                 }, timeout=5)
+                return
             except Exception:
                 pass
         target = self.scratch_file if in_compute_write_guard() else self.job_file

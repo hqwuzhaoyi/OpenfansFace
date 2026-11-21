@@ -198,7 +198,10 @@ fn preview(engine: &mut Engine, body: Value) -> Result<Value> {
         files::claim_owner_for(&engine.config, &child.id, &child.action)?;
     }
     // Persist all bindings atomically. No child can become independently executable.
-    let tx = engine.store.db.transaction()?;
+    let tx = engine
+        .store
+        .db
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     for plan in std::iter::once(&parent).chain(plans.iter()) {
         tx.execute("INSERT INTO operations(id,request_hash,plan,status,phase) VALUES(?,?,?,'not_started','preview')",params![plan.id,hash(&plan.request),serde_json::to_string(plan)?])?;
     }
@@ -209,8 +212,8 @@ fn verify_original(engine: &Engine, plan: &Plan) -> Result<()> {
     native::revalidate(&engine.config, plan)?;
     let mut current = plan.clone();
     engine::seal_plan(&engine.config, &mut current)?;
-    if current.version != plan.version {
-        return Err(Error::conflict("人物、文件或账本已变化，请重新预览"));
+    if current.metadata_version != plan.metadata_version {
+        return Err(Error::conflict("人物、文件或本地记录已变化，请重新预览"));
     }
     Ok(())
 }
@@ -432,7 +435,7 @@ pub fn execute(engine: &mut Engine, body: Value) -> Result<Value> {
 }
 pub fn progress(config: &Config, id: &str) -> Result<Value> {
     crate::model::validate_id(id)?;
-    let db = crate::db::open(&config.state_db())?;
+    let db = crate::db::open_readonly(&config.state_db())?;
     let record =
         store::record(&db, id)?.ok_or_else(|| Error::new(404, "not_found", "找不到此批次"))?;
     let parent = record.plan;

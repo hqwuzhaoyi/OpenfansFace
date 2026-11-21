@@ -264,7 +264,8 @@ class Result:
         if type(faces) is not list or len(faces) > MAX_FACES:
             raise ProtocolError('invalid_faces', 502)
         for face in faces:
-            fields(face, 'bbox score keypoints')
+            if type(face) is not dict or set(face) not in ({'bbox', 'score', 'keypoints'}, {'bbox', 'score', 'keypoints', 'embedding'}):
+                raise ProtocolError('invalid_fields')
             box, score, points = face['bbox'], face['score'], face['keypoints']
             if (type(box) is not list or len(box) != 4 or type(points) is not list or len(points) != 5 or
                     any(type(p) is not list or len(p) != 2 for p in points)):
@@ -272,6 +273,10 @@ class Result:
             numbers = box + [score] + [n for point in points for n in point]
             if any(type(n) not in (int, float) or not math.isfinite(n) for n in numbers):
                 raise ProtocolError('invalid_geometry', 502)
+            if 'embedding' in face:
+                emb = face['embedding']
+                if type(emb) is not list or len(emb) != 512 or any(type(n) not in (int, float) or not math.isfinite(n) for n in emb):
+                    raise ProtocolError('invalid_geometry', 502)
             # Model geometry may extend outside an image. Bound it, preserve original coordinates
             # for VM alignment, and require an actual intersection with the supplied frame.
             if (not 0 <= score <= 1 or not box[0] < box[2] or not box[1] < box[3] or

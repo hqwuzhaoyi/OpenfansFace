@@ -52,8 +52,46 @@ pub fn open(path: &Path) -> Result<Connection> {
         path,
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
-    db.busy_timeout(Duration::from_secs(3))?;
+    db.busy_timeout(Duration::from_secs(30))?;
     db.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;")?;
+    Ok(db)
+}
+
+pub fn open_readonly(path: &Path) -> Result<Connection> {
+    if let Some(root) = PARITY_ROOT.get() {
+        if path.starts_with(root.join("base")) || path == root.join("ledger.db") {
+            let encoded: String = path
+                .as_os_str()
+                .as_encoded_bytes()
+                .iter()
+                .map(|b| {
+                    if b.is_ascii_alphanumeric() || b"/._-".contains(b) {
+                        (*b as char).to_string()
+                    } else {
+                        format!("%{b:02X}")
+                    }
+                })
+                .collect();
+            return Ok(Connection::open_with_flags(
+                format!("file:{encoded}?immutable=1"),
+                OpenFlags::SQLITE_OPEN_READ_ONLY
+                    | OpenFlags::SQLITE_OPEN_URI
+                    | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )?);
+        }
+        if !path.starts_with(root.join("state")) {
+            return Err(Error::new(
+                403,
+                "read_only_parity",
+                "只读对照禁止打开快照之外的数据库",
+            ));
+        }
+    }
+    let db = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    db.busy_timeout(Duration::from_secs(15))?;
     Ok(db)
 }
 // Preserve SQLite integer / blob values in durable before-images without JS numeric loss.

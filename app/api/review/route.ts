@@ -1,9 +1,15 @@
 import { NextRequest, NextResponse } from 'next/server'
-import { nativeArchive,nativeArchiveEnabled } from '@/lib/archive-native-backend'
+import { nativeArchive } from '@/lib/archive-native-backend'
 import { ReviewError, validateVids } from '@/lib/review-logic'
 
 export async function GET(req: NextRequest) {
-  try { const params=req.nextUrl.searchParams; return NextResponse.json(await nativeArchive(params.has('status')?'review-status':'review-page',Object.fromEntries(params)),{headers:{'Cache-Control':'no-store'}}) }
+  try {
+    const params=req.nextUrl.searchParams, obj=Object.fromEntries(params)
+    if (params.has('status')) {
+      return NextResponse.json(await nativeArchive('review-status', obj), { headers: { 'Cache-Control': 'no-store' } })
+    }
+    return NextResponse.json(await nativeArchive('review-page', obj), { headers: { 'Cache-Control': 'no-store' } })
+  }
   catch (e:any) { return NextResponse.json({error:e.message,code:e.code},{status:e.status || 500}) }
 }
 export async function POST(req: NextRequest) {

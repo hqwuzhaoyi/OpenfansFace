@@ -76,7 +76,7 @@ pub fn prepare(config: &Config, body: &Value) -> Result<Prepared> {
         })
     {
         return Err(Error::conflict(
-            "体积不同，无法作为重复件暂存；请选择保留两份",
+            "体积不同，无法作为重复件移入回收站；请选择保留两份",
         ));
     }
     let (_, mut queue) = review::read(config, "integration-queue.json", json!([]))?;

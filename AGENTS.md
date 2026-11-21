@@ -27,6 +27,12 @@ This block is written and re-added by `next dev` — verify at `node_modules/nex
 - 动效用于操作反馈和状态变化：动态状态与退出动画使用现有 Motion，简单反馈使用 CSS / WAAPI。沿用 `EASE_OUT` / `--ease-out-ui`，通常 160–180ms，低于 300ms，使用 transform / opacity。搜索、排序、列表查看保持即时响应；键盘与 reduced-motion 模式即时更新。
 - 弹窗入场仅在打开时触发，切换鼠标与键盘不能重播。关闭后恢复触发点焦点；退出动画中的内容立即移出交互与焦点范围。
 
+### 设计与交互技能分工
+
+- **Emil Design Engineering**（`emil-design-eng`、`review-animations`、`animation-performance`、`remove-animations`、`break-ui` 等）：主导交互手感、克制动效（沿用 `EASE_OUT` / 160–180ms / `transform` + `opacity`，高频列表、搜索与筛选不加多余动效）与边界数据压测；动效与交互细节发生冲突时，以 Emil 和本节约定为准。
+- **Impeccable**（`critique`、`audit`、`distill`、`layout`、`polish`、`harden` 等及 `npx impeccable detect`）：用于已有界面的结构化巡检、精简多余二级标签与排版精修；不使用面向营销页的 `bolder` / `overdrive`，不覆盖既有 `app/globals.css` 语义色与 BEUI / ReUI 体系。
+- **Vercel Web Design Guidelines**（`web-design-guidelines`）：作为界面改动后的只读工程审计清单，核查媒体控件无障碍、键盘焦点与遮挡、`overscroll-behavior`、`tabular-nums` 及 Next.js hydration 安全。
+
 ## 人物工作台业务约定
 
 修改人物列表、账号关联、文件操作或合并流程前，先读 `docs/persons-workbench.md`；接口与一致性细节以该文档及当前实现为准。

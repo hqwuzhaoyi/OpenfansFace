@@ -119,13 +119,12 @@ pub fn sources(config: &Config) -> Result<BTreeMap<String, String>> {
     let mut out = indexed_sources(config)?;
     let path = config.base.join("processing/processing.db");
     if path.exists() {
-        for row in db::rows(
-            &db::open(&path)?,
-            "SELECT vid,path FROM tasks ORDER BY vid",
-            [],
-        )? {
-            if let (Some(id), Some(path)) = (row["vid"].as_str(), row["path"].as_str()) {
-                out.entry(id.into()).or_insert_with(|| path.into());
+        let conn = db::open(&path)?;
+        let mut stmt = conn.prepare("SELECT vid,path FROM tasks ORDER BY vid")?;
+        let mut rows = stmt.query([])?;
+        while let Some(row) = rows.next()? {
+            if let (Some(id), Some(path)) = (row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?) {
+                out.entry(id).or_insert(path);
             }
         }
     }
@@ -134,13 +133,12 @@ pub fn sources(config: &Config) -> Result<BTreeMap<String, String>> {
 /// Index/explicit overrides outrank analysis discovery; whole-report inputs exclude task-only paths.
 pub fn indexed_sources(config: &Config) -> Result<BTreeMap<String, String>> {
     let mut out = BTreeMap::new();
-    for row in db::rows(
-        &db::open(&config.base.join("faces.db"))?,
-        "SELECT vid,path FROM videos ORDER BY vid",
-        [],
-    )? {
-        if let (Some(id), Some(path)) = (row["vid"].as_str(), row["path"].as_str()) {
-            out.insert(id.into(), path.into());
+    let conn = db::open(&config.base.join("faces.db"))?;
+    let mut stmt = conn.prepare("SELECT vid,path FROM videos ORDER BY vid")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        if let (Some(id), Some(path)) = (row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?) {
+            out.insert(id, path);
         }
     }
     for (id, path) in read(config, "video-path-overrides.json", json!({}))?
@@ -150,6 +148,52 @@ pub fn indexed_sources(config: &Config) -> Result<BTreeMap<String, String>> {
     {
         if let Some(path) = path.as_str() {
             out.insert(id.clone(), path.into());
+        }
+    }
+    Ok(out)
+}
+/// Targeted equivalent of `sources(config)` when only a small set of `vids` will be queried.
+pub fn sources_for_vids(config: &Config, vids: &BTreeSet<String>) -> Result<BTreeMap<String, String>> {
+    if vids.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    if vids.len() > 64 {
+        return sources(config);
+    }
+    let mut out = BTreeMap::new();
+    let placeholders = std::iter::repeat_n("?", vids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let faces_conn = db::open(&config.base.join("faces.db"))?;
+    let sql = format!("SELECT vid,path FROM videos WHERE vid IN ({placeholders})");
+    let mut stmt = faces_conn.prepare(&sql)?;
+    let mut rows = stmt.query(rusqlite::params_from_iter(vids.iter()))?;
+    while let Some(row) = rows.next()? {
+        if let (Some(id), Some(path)) = (row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?) {
+            out.insert(id, path);
+        }
+    }
+    for (id, path) in read(config, "video-path-overrides.json", json!({}))?
+        .1
+        .as_object()
+        .unwrap()
+    {
+        if vids.contains(id)
+            && let Some(path) = path.as_str()
+        {
+            out.insert(id.clone(), path.into());
+        }
+    }
+    let path = config.base.join("processing/processing.db");
+    if path.exists() {
+        let conn = db::open(&path)?;
+        let sql = format!("SELECT vid,path FROM tasks WHERE vid IN ({placeholders})");
+        let mut stmt = conn.prepare(&sql)?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(vids.iter()))?;
+        while let Some(row) = rows.next()? {
+            if let (Some(id), Some(path)) = (row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?) {
+                out.entry(id).or_insert(path);
+            }
         }
     }
     Ok(out)

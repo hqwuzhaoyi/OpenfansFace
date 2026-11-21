@@ -1,28 +1,57 @@
 import fs from 'fs'
 import path from 'path'
 import { NextRequest } from 'next/server'
-import { fileStream, findMp4Hev1Patches } from '@/lib/file-stream'
+import { fileStream, findMp4Hev1PatchesAsync } from '@/lib/file-stream'
 import { MEDIA2 } from '@/lib/env'
 import { readVideoSources, videoSource } from '@/lib/video-sources'
 
-function handleVideoRequest(req: NextRequest, headOnly: boolean) {
+let cachedMediaRoot: { raw: string; real: string } | null = null
+async function resolveMediaRoot(): Promise<string | null> {
+  if (cachedMediaRoot && cachedMediaRoot.raw === MEDIA2) return cachedMediaRoot.real
+  try {
+    const real = await fs.promises.realpath(/*turbopackIgnore: true*/ MEDIA2)
+    cachedMediaRoot = { raw: MEDIA2, real }
+    return real
+  } catch {
+    return null
+  }
+}
+
+async function handleVideoRequest(req: NextRequest, headOnly: boolean) {
   const input = req.nextUrl.searchParams.get('p') || ''
-  const mapped = videoSource(input, readVideoSources())
+  if (!input) return new Response('not found', { status: 404 })
+  const mediaRoot = await resolveMediaRoot()
+  if (!mediaRoot) return new Response('not found', { status: 404 })
+
+  let mapped: string | null = null
+  const normalizedInput = input.replace(/\\/g, '/')
+  if (
+    !normalizedInput.split('/').includes('..') &&
+    (normalizedInput.startsWith(mediaRoot + '/') || normalizedInput.startsWith(MEDIA2.replace(/\/$/, '') + '/'))
+  ) {
+    try {
+      const directStat = await fs.promises.stat(/*turbopackIgnore: true*/ normalizedInput)
+      if (directStat.isFile()) mapped = normalizedInput
+    } catch {}
+  }
+  if (!mapped) {
+    mapped = videoSource(input, readVideoSources())
+  }
   if (!mapped) return new Response('not found', { status: 404 })
+
   let real: string
   try {
-    real = fs.realpathSync(/*turbopackIgnore: true*/ mapped)
-  } catch {
-    return new Response('not found', { status: 404 })
-  }
-  let mediaRoot: string
-  try {
-    mediaRoot = fs.realpathSync(/*turbopackIgnore: true*/ MEDIA2)
+    real = await fs.promises.realpath(/*turbopackIgnore: true*/ mapped)
   } catch {
     return new Response('not found', { status: 404 })
   }
   if (!real.startsWith(mediaRoot + '/')) return new Response('forbidden', { status: 403 })
-  const st = fs.statSync(/*turbopackIgnore: true*/ real)
+  let st: fs.Stats
+  try {
+    st = await fs.promises.stat(/*turbopackIgnore: true*/ real)
+  } catch {
+    return new Response('not found', { status: 404 })
+  }
   const size = st.size
   if (!st.isFile() || !size) return new Response('not found', { status: 404 })
   const types: Record<string, string> = {
@@ -76,7 +105,7 @@ function handleVideoRequest(req: NextRequest, headOnly: boolean) {
   }
   headers['Content-Length'] = String(end - start + 1)
   if (headOnly) return new Response(null, { status, headers })
-  const patches = findMp4Hev1Patches(real, size, st.mtimeMs)
+  const patches = await findMp4Hev1PatchesAsync(real, size, st.mtimeMs, start, end)
   return new Response(fileStream(real, { start, end, signal: req.signal, patches }), {
     status,
     headers,

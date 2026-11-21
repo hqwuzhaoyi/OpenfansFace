@@ -43,6 +43,7 @@ _ORIG_OS_RENAME = os.rename
 _ORIG_OS_REMOVE = os.remove
 _ORIG_OS_UNLINK = os.unlink
 _ORIG_SQLITE_CONNECT = sqlite3.connect
+_SYS_TMP = Path(tempfile.gettempdir()).resolve(strict=False)
 
 
 def in_compute_write_guard() -> bool:
@@ -89,8 +90,7 @@ def assert_compute_writable(path, base, root, run_id=None):
     if target == root_path or target.is_relative_to(root_path):
         raise PermissionError(f'Pure compute boundary forbade write inside media root: {target}')
 
-    sys_tmp = Path(tempfile.gettempdir()).resolve(strict=False)
-    for tmp_root in (sys_tmp, Path('/tmp').resolve(strict=False), Path('/private/tmp').resolve(strict=False)):
+    for tmp_root in (_SYS_TMP, Path('/tmp').resolve(strict=False), Path('/private/tmp').resolve(strict=False)):
         if target == tmp_root or target.is_relative_to(tmp_root):
             return
 
@@ -239,12 +239,16 @@ class ComputeRuntime:
                 options.inter_op_num_threads = 1
                 insight_root = str(model_home.parent.parent)
                 if backend_mode == 'gpu-detection':
-                    from insightface.model_zoo import get_model
+                    from insightface.model_zoo.arcface_onnx import ArcFaceONNX
                     recognition_path = model_home / 'w600k_r50.onnx'
-                    recognizer = get_model(
+                    rec_session = ort.InferenceSession(
                         str(recognition_path),
-                        providers=['CPUExecutionProvider'],
                         sess_options=options,
+                        providers=['CPUExecutionProvider'],
+                    )
+                    recognizer = ArcFaceONNX(
+                        model_file=str(recognition_path),
+                        session=rec_session,
                     )
                     recognizer.prepare(ctx_id=-1)
                     self.face_runtime = {
@@ -296,6 +300,7 @@ class ComputeRuntime:
 
 
 RUNTIME = ComputeRuntime()
+_COMPUTE_EXEC_LOCK = threading.Lock()
 
 
 class _ComputeHandler(BaseHTTPRequestHandler):
@@ -327,7 +332,17 @@ class _ComputeHandler(BaseHTTPRequestHandler):
 
         env_overrides = body.get('env')
         if isinstance(env_overrides, dict):
-            for key in ('FILE_OPERATIONS_RUST_URL', 'FILE_OPERATIONS_RUST_TOKEN', 'PROCESSING_FACE_BACKEND', 'INSIGHTFACE_HOME'):
+            for key in (
+                'FILE_OPERATIONS_RUST_URL',
+                'FILE_OPERATIONS_RUST_TOKEN',
+                'PROCESSING_FACE_BACKEND',
+                'INSIGHTFACE_HOME',
+                'PROCESSING_GPU_URL',
+                'PROCESSING_GPU_TOKEN',
+                'PROCESSING_GPU_PRIVATE_HTTP',
+                'PROCESSING_GPU_MODEL_SHA256',
+                'PROCESSING_GPU_PREPROCESS_VERSION',
+            ):
                 if key in env_overrides:
                     val = env_overrides[key]
                     if val is None:
@@ -359,13 +374,14 @@ class _ComputeHandler(BaseHTTPRequestHandler):
             if 'reference_input_version' in body and '_reference_input_version' not in task:
                 task['_reference_input_version'] = body['reference_input_version']
             try:
-                from processing_worker import text_stage
-                from processing_faces import analyze
-                with compute_write_guard(base, root, run_id=task.get('run_id')):
-                    if stage == 'text':
-                        result = text_stage(task, base, root)
-                    else:
-                        result = analyze(task, base, root)
+                with _COMPUTE_EXEC_LOCK:
+                    from processing_worker import text_stage
+                    from processing_faces import analyze
+                    with compute_write_guard(base, root, run_id=task.get('run_id')):
+                        if stage == 'text':
+                            result = text_stage(task, base, root)
+                        else:
+                            result = analyze(task, base, root)
                 self._send_json(200, {
                     'ok': True,
                     'result': result,
@@ -384,9 +400,10 @@ class _ComputeHandler(BaseHTTPRequestHandler):
             root = Path(body.get('root', ''))
             state = body.get('state')
             try:
-                from processing_faces import compute_staged_references
-                with compute_write_guard(base, root):
-                    staged = compute_staged_references(base, root, state=state)
+                with _COMPUTE_EXEC_LOCK:
+                    from processing_faces import compute_staged_references
+                    with compute_write_guard(base, root):
+                        staged = compute_staged_references(base, root, state=state)
                 self._send_json(200, {
                     'ok': True,
                     'result': staged,
@@ -533,7 +550,17 @@ class ResidentComputeClient:
     def _forwarded_env(self) -> dict:
         return {
             key: os.environ.get(key)
-            for key in ('FILE_OPERATIONS_RUST_URL', 'FILE_OPERATIONS_RUST_TOKEN', 'PROCESSING_FACE_BACKEND', 'INSIGHTFACE_HOME')
+            for key in (
+                'FILE_OPERATIONS_RUST_URL',
+                'FILE_OPERATIONS_RUST_TOKEN',
+                'PROCESSING_FACE_BACKEND',
+                'INSIGHTFACE_HOME',
+                'PROCESSING_GPU_URL',
+                'PROCESSING_GPU_TOKEN',
+                'PROCESSING_GPU_PRIVATE_HTTP',
+                'PROCESSING_GPU_MODEL_SHA256',
+                'PROCESSING_GPU_PREPROCESS_VERSION',
+            )
         }
 
     def run_stage(self, task: dict, base: Path, root: Path, timeout: float = 600.0) -> dict:
@@ -626,4 +653,5 @@ def main():
 
 
 if __name__ == '__main__':
+    sys.modules['processing_compute'] = sys.modules[__name__]
     main()

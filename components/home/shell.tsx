@@ -2,13 +2,16 @@
 
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
-import { useEffect, useRef, useState } from 'react'
 import { Clapperboard, Monitor, Moon, PanelLeft, Sun, X, Eye, EyeOff } from 'lucide-react'
 import { Button } from '@/components/beui/motion/button/base'
+import { Tabs, TabsList, TabsTrigger } from '@/components/beui/motion/tabs'
+import { Dock, DockItem, DockSeparator } from '@/components/beui/motion/dock'
+import { ThemeToggle } from '@/components/beui/motion/theme-toggle'
 import { usePrivacy } from '@/components/privacy-provider'
 import { MotionConfig } from 'motion/react'
 import { workbenchNavigation } from '@/lib/workbench-navigation'
 import { useTheme, type ThemeMode } from '@/components/theme-provider'
+import { BackgroundOperationsDock, useBackgroundOperations } from '@/components/workbench/background-operations'
 import {
   AnimatedSidebar,
   AnimatedSidebarClose,
@@ -57,91 +60,28 @@ function SidebarHeaderBrand() {
   )
 }
 
-function SidebarThemeControl() {
-  const { isMobile } = useAnimatedSidebar()
-  const { mode, resolved, setMode } = useTheme()
-  const [open, setOpen] = useState(false)
-  const wrapRef = useRef<HTMLDivElement>(null)
-  const triggerRef = useRef<HTMLButtonElement>(null)
-
-  useEffect(() => {
-    if (!open) return
-    const onPointerDown = (e: PointerEvent) => {
-      if (!wrapRef.current?.contains(e.target as Node)) setOpen(false)
-    }
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape') {
-        e.preventDefault()
-        setOpen(false)
-        triggerRef.current?.focus()
-      }
-    }
-    window.addEventListener('pointerdown', onPointerDown)
-    window.addEventListener('keydown', onKeyDown)
-    return () => {
-      window.removeEventListener('pointerdown', onPointerDown)
-      window.removeEventListener('keydown', onKeyDown)
-    }
-  }, [open])
-
-  if (isMobile) {
-    return (
-      <div className="home-theme-mobile" role="group" aria-label="界面主题">
+function MobileDrawerThemeTabs() {
+  const { mode, setMode } = useTheme()
+  return (
+    <Tabs
+      value={mode}
+      onValueChange={(next) => setMode(next as ThemeMode)}
+      variant="segment"
+      className="home-theme-mobile-tabs"
+    >
+      <TabsList aria-label="界面主题" className="home-theme-mobile-list">
         {THEME_OPTIONS.map(({ mode: itemMode, label, Icon }) => (
-          <button
+          <TabsTrigger
             key={itemMode}
-            type="button"
-            aria-pressed={mode === itemMode}
-            onClick={() => setMode(itemMode)}
+            value={itemMode}
+            icon={<Icon size={14} />}
             className="home-theme-seg"
           >
-            <Icon size={14} />
             <span>{label}</span>
-          </button>
+          </TabsTrigger>
         ))}
-      </div>
-    )
-  }
-
-  const currentLabel = THEME_OPTIONS.find(o => o.mode === mode)?.label ?? '深色'
-  const CurrentIcon = mode === 'system' ? Monitor : resolved === 'light' ? Sun : Moon
-
-  return (
-    <div ref={wrapRef} className="home-theme-rail">
-      <button
-        ref={triggerRef}
-        type="button"
-        aria-label={`主题：${currentLabel}`}
-        aria-expanded={open}
-        aria-haspopup="true"
-        title={`主题：${currentLabel}`}
-        onClick={() => setOpen(v => !v)}
-        className="home-theme-trigger"
-      >
-        <CurrentIcon size={17} />
-      </button>
-      {open && (
-        <div role="menu" aria-label="选择主题" className="home-theme-menu">
-          {THEME_OPTIONS.map(({ mode: itemMode, label, Icon }) => (
-            <button
-              key={itemMode}
-              type="button"
-              role="menuitemradio"
-              aria-checked={mode === itemMode}
-              onClick={() => {
-                setMode(itemMode)
-                setOpen(false)
-                triggerRef.current?.focus()
-              }}
-              className="home-theme-option"
-            >
-              <Icon size={14} />
-              <span>{label}</span>
-            </button>
-          ))}
-        </div>
-      )}
-    </div>
+      </TabsList>
+    </Tabs>
   )
 }
 
@@ -153,34 +93,86 @@ function PrivacyControl({ mobile = false }: { mobile?: boolean }) {
   </Button>
 }
 
+function SidebarUtilityDock() {
+  const { isMobile } = useAnimatedSidebar()
+  const { tasks, open: opsOpen } = useBackgroundOperations()
+
+  if (isMobile) {
+    return (
+      <>
+        <PrivacyControl />
+        <MobileDrawerThemeTabs />
+      </>
+    )
+  }
+
+  return (
+    <Dock orientation="vertical" size={36} className="home-footer-dock">
+      {tasks.length > 0 && (
+        <>
+          <DockItem active={opsOpen}>
+            <BackgroundOperationsDock />
+          </DockItem>
+          <DockSeparator orientation="vertical" />
+        </>
+      )}
+      <DockItem>
+        <PrivacyControl />
+      </DockItem>
+      <DockItem>
+        <ThemeToggle
+          variant="rectangle"
+          start="bottom-left"
+          labels={{ switchToLight: '切换为浅色主题', switchToDark: '切换为深色主题' }}
+          className="home-theme-trigger"
+          iconClassName="size-[17px]"
+        />
+      </DockItem>
+    </Dock>
+  )
+}
+
 function MobileTopBar({ pathname }: { pathname: string }) {
   const { isMobile } = useAnimatedSidebar()
-  const { mode, resolved, cycleMode } = useTheme()
+  const { tasks, open: opsOpen } = useBackgroundOperations()
   if (!isMobile) return null
   const currentNav = navigation.find(n => isNavActive(pathname, n.href))
-  const modeLabel = THEME_OPTIONS.find(o => o.mode === mode)?.label ?? '深色'
-  const Icon = mode === 'system' ? Monitor : resolved === 'light' ? Sun : Moon
 
   return (
     <div className="home-mobile-nav">
       <AnimatedSidebarTrigger aria-label="打开工作台导航" className="home-mobile-trigger">
         <PanelLeft size={18} />
       </AnimatedSidebarTrigger>
-      <Link href="/" className="home-mobile-brand" aria-label="返回首页">
-        <Clapperboard size={16} />
-        <span>OpenfansFace</span>
+      <Link href="/" className="home-mobile-brand" aria-label="返回首页" title="返回首页">
+        <span className="home-brand-mark home-brand-mark-sm">
+          <Clapperboard size={15} />
+        </span>
       </Link>
-      {currentNav && <span className="home-mobile-current">{currentNav.label}</span>}
-      <PrivacyControl mobile />
-      <button
-        type="button"
-        aria-label={`切换主题（当前：${modeLabel}）`}
-        title={`主题：${modeLabel}`}
-        onClick={cycleMode}
-        className="home-mobile-theme"
-      >
-        <Icon size={16} />
-      </button>
+      <span className="home-mobile-current">{currentNav ? currentNav.label : 'OpenfansFace'}</span>
+      <div className="home-mobile-actions">
+        <Dock size={36} className="home-mobile-dock">
+          {tasks.length > 0 && (
+            <>
+              <DockItem active={opsOpen} className="w-auto">
+                <BackgroundOperationsDock mobile />
+              </DockItem>
+              <DockSeparator />
+            </>
+          )}
+          <DockItem>
+            <PrivacyControl mobile />
+          </DockItem>
+          <DockItem>
+            <ThemeToggle
+              variant="rectangle"
+              start="top-right"
+              labels={{ switchToLight: '切换为浅色主题', switchToDark: '切换为深色主题' }}
+              className="home-mobile-theme"
+              iconClassName="size-[17px]"
+            />
+          </DockItem>
+        </Dock>
+      </div>
     </div>
   )
 }
@@ -220,8 +212,7 @@ export function HomeShell({ children }: { children: React.ReactNode }) {
             </AnimatedSidebarMenu>
           </AnimatedSidebarContent>
           <AnimatedSidebarFooter className="home-sidebar-footer">
-            <PrivacyControl />
-            <SidebarThemeControl />
+            <SidebarUtilityDock />
           </AnimatedSidebarFooter>
         </AnimatedSidebar>
         <AnimatedSidebarInset className={`home-inset ${isSplitPane ? 'home-inset-split' : ''}`}>

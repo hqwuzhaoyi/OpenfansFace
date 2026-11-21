@@ -679,7 +679,7 @@ fn inspect_delta_domain(
     jobs: bool,
 ) -> Result<bool> {
     validate_delta_domain(delta, jobs)?;
-    let mut conn = db::open(&domain_path(config, jobs))?;
+    let mut conn = db::open_readonly(&domain_path(config, jobs))?;
     let tx = conn.transaction()?;
     let receipt = db::receipt(&tx, &plan.id, &plan.version)?;
     let after = if let Some(receipt) = receipt {

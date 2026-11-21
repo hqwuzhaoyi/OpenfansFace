@@ -142,7 +142,7 @@ pub struct Envelope {
     pub request: Request,
     pub version: Option<String>,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileMove {
     pub vids: Vec<String>,
     pub src: String,
@@ -208,6 +208,30 @@ pub fn hash(value: &impl Serialize) -> String {
         "{:x}",
         Sha256::digest(serde_json::to_vec(value).expect("serializable intent"))
     )
+}
+
+/// Ask glibc to return freed heap pages to the OS after large snapshot/metadata passes.
+/// Rate-limited to avoid excessive madvise syscalls on fast request bursts.
+pub fn trim_allocator() {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{SystemTime, UNIX_EPOCH};
+        static LAST_TRIM_SEC: AtomicU64 = AtomicU64::new(0);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let prev = LAST_TRIM_SEC.load(Ordering::Relaxed);
+        if now.saturating_sub(prev) >= 5
+            && LAST_TRIM_SEC
+                .compare_exchange(prev, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            unsafe {
+                libc::malloc_trim(0);
+            }
+        }
+    }
 }
 pub fn validate_id(id: &str) -> Result<()> {
     let parsed = uuid::Uuid::parse_str(id)

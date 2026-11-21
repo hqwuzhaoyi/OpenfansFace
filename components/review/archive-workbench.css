@@ -186,6 +186,7 @@
 .archive-rowActionButtons { display:flex; flex-wrap:wrap; gap:6px; margin-top:7px; }
 .archive-rowActionButtons button { min-height:32px; padding:0 10px; border:1px solid var(--border); border-radius:8px; font-size:12px; background:var(--background); }
 .archive-rowActionButtons button:disabled { cursor:not-allowed; opacity:.45; }
+.archive-rowActionButtons button[aria-pressed=true] { cursor:default; opacity:.85; border-color:var(--border-strong); background:var(--accent); color:var(--foreground); }
 .archive-rowActions>small { display:block; margin-top:6px; font-size:10px; color:var(--muted-foreground); }
 .archive-waveVideo { display:block; padding-block:4px; }
 .archive-waveVideoMain { display:flex; align-items:center; gap:6px; min-height:42px; }

@@ -18,10 +18,15 @@ impl Config {
                 .map_err(|_| Error::new(503, "configuration", format!("缺少配置 {name}")))?;
             Ok(std::fs::canonicalize(value)?)
         }
+        fn optional_file(name: &str) -> Result<PathBuf> {
+            let value = env::var(name)
+                .map_err(|_| Error::new(503, "configuration", format!("缺少配置 {name}")))?;
+            Ok(std::fs::canonicalize(&value).unwrap_or_else(|_| PathBuf::from(value)))
+        }
         let config = Self {
             base: required("FACES_BASE")?,
             media: required("MEDIA2_ROOT")?,
-            ledger: required("PEACH_LEDGER_PATH")?,
+            ledger: optional_file("PEACH_LEDGER_PATH")?,
             bind: env::var("FILE_OPERATIONS_BIND").unwrap_or("127.0.0.1:8930".into()),
             token: env::var("FILE_OPERATIONS_RUST_TOKEN").ok(),
             parity_root: env::var("FILE_OPERATIONS_PARITY_ROOT")
@@ -33,11 +38,11 @@ impl Config {
                 .map(std::fs::canonicalize)
                 .transpose()?,
         };
-        if !config.base.is_dir() || !config.media.is_dir() || !config.ledger.is_file() {
+        if !config.base.is_dir() || !config.media.is_dir() {
             return Err(Error::new(
                 503,
                 "configuration",
-                "本地状态目录、媒体根目录和 Peach 数据库必须已存在",
+                "本地状态目录和媒体根目录必须已存在",
             ));
         }
         // Remote binding is an explicit authenticated deployment decision.

@@ -5,7 +5,7 @@ from unittest.mock import patch
 import numpy as np
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'maintenance'))
 from processing_store import connect
-from processing_faces import FACE_VERSION,save_npz,cache_path,build_references,reference_features
+from processing_faces import FACE_VERSION,save_npz,cache_path,build_references,reference_features,compute_staged_references,score_face_candidates
 
 class ReferenceTests(unittest.TestCase):
     def setUp(self):
@@ -67,5 +67,33 @@ class ReferenceTests(unittest.TestCase):
         save();self.assertEqual(self.build()['people'],1)
         for changed in ({'size':999},{'mtime_ns':'1'},{'path':'/old/path.mp4'},{'version':'old-model'}):
             with self.subTest(changed=changed):save(**changed);self.assertEqual(self.build()['people'],0)
+
+    def test_video_track_pooling_resists_single_video_frame_hijack_and_poisoned_anchor(self):
+        true_vec=np.zeros(512,np.float32);true_vec[1]=1.0
+        hijack_vec=np.zeros(512,np.float32);hijack_vec[2]=1.0
+        with sqlite3.connect(self.base/'faces.db') as db:
+            db.execute('DELETE FROM faces');db.execute('DELETE FROM videos')
+            # 1 polluted video with 18 frames + poisoned report.json anchor
+            db.execute('INSERT INTO videos VALUES (?,?)',('polluted-vid','/media/p.mp4'))
+            for i in range(18):
+                db.execute('INSERT INTO faces VALUES (?,?,?,?)',('polluted-vid',0.95,hijack_vec.tobytes(),'poison.jpg' if i==0 else f'p{i}.jpg'))
+            # 3 genuine videos with 2 frames each
+            for v_idx in range(3):
+                vid=f'true-vid-{v_idx}'
+                db.execute('INSERT INTO videos VALUES (?,?)',(vid,f'/media/t{v_idx}.mp4'))
+                for f_idx in range(2):
+                    db.execute('INSERT INTO faces VALUES (?,?,?,?)',(vid,0.85,true_vec.tobytes(),f't{v_idx}_{f_idx}.jpg'))
+        (self.base/'report.json').write_text(json.dumps({'identities':[{'name':'TargetPerson','rep_thumb':'poison.jpg'}]}))
+        assigned={'polluted-vid':'TargetPerson','true-vid-0':'TargetPerson','true-vid-1':'TargetPerson','true-vid-2':'TargetPerson'}
+        staged=compute_staged_references(self.base,self.root,{'input_version':'v1','assigned':assigned})
+        with np.load(staged['staged_path'],allow_pickle=False) as refs:
+            names,embs=refs['names'],refs['embeddings']
+        Path(staged['staged_path']).unlink(missing_ok=True)
+        self.assertEqual(list(names),['TargetPerson'])
+        self.assertGreater(float(embs[0]@true_vec),0.99)
+        self.assertLess(float(embs[0]@hijack_vec),0.05)
+        matches=score_face_candidates(np.stack([true_vec,true_vec]),['a.jpg','b.jpg'],[1.0,2.0],names,embs)
+        self.assertEqual(len(matches),1)
+        self.assertEqual(matches[0]['name'],'TargetPerson')
 
 if __name__=='__main__':unittest.main()

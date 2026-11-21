@@ -191,7 +191,7 @@ def main():
     parser.add_argument('--token-file', required=True)
     parser.add_argument('--release-manifest', help='Required by the deployment unit; validates code, lock and runtime')
     parser.add_argument('--detector-size', type=int, choices=(160, 640), default=640)
-    parser.add_argument('--arena-mib', type=int, choices=range(64, 257), default=128)
+    parser.add_argument('--arena-mib', type=int, choices=range(64, 513), default=512)
     parser.add_argument('--min-free-mib', type=int, default=600)
     parser.add_argument('--waiting', type=int, choices=(0, 1), default=1)
     args = parser.parse_args()

@@ -64,12 +64,11 @@ function useTabs() {
 
 // Settle without overshoot: a scrollable tab list would turn even a small
 // overshoot into a transient scrollbar and layout shift.
-// Scale stiffness and damping together for a quicker glide with the same feel.
+// Uses Emil's EASE_OUT (180ms < 300ms) for crisp, restrained indicator glides.
 const transition: Transition = {
-  type: "spring",
-  stiffness: 245,
-  damping: 36,
-  mass: 1.2,
+  type: "tween",
+  duration: 0.18,
+  ease: EASE_OUT,
 };
 
 export function Tabs({
@@ -97,9 +96,10 @@ export function Tabs({
   className?: string;
 }) {
   const [internal, setInternal] = useState(defaultValue ?? "");
+  const [keyboardInput, setKeyboardInput] = useState(false);
   const layoutId = useId();
   const systemReduce = useReducedMotion();
-  const reduce = instant || systemReduce;
+  const reduce = instant || systemReduce || keyboardInput;
   const controlled = value !== undefined;
   const current = controlled ? value : internal;
   const setValue = useCallback(
@@ -178,7 +178,12 @@ export function Tabs({
             inside fixed/scrolled containers it would replay scroll offsets as
             movement. The pill only ever travels within the list, so scoping
             projection to the Tabs wrapper is always correct. */}
-        <motion.div layoutRoot className={className}>
+        <motion.div
+          layoutRoot
+          className={className}
+          onPointerDownCapture={() => setKeyboardInput(false)}
+          onKeyDownCapture={() => setKeyboardInput(true)}
+        >
           {children}
         </motion.div>
       </TabsCtx.Provider>
@@ -189,7 +194,7 @@ export function Tabs({
 const listClasses: Record<Variant, string> = {
   pill: "inline-flex items-center gap-1 rounded-full bg-card p-1",
   underline: "inline-flex items-center gap-1 border-b border-border",
-  segment: "inline-flex items-center gap-0 rounded-lg bg-card p-0.5",
+  segment: "inline-flex items-center gap-0.5 rounded-lg bg-muted/70 p-0.5 border border-border/60",
 };
 
 export function TabsList({
@@ -233,9 +238,11 @@ export function TabsList({
     const max = Math.max(0, viewport.scrollWidth - viewport.clientWidth);
     const rtl = getComputedStyle(viewport).direction === "rtl";
     const fromLeft = Math.max(0, Math.min(max, rtl ? max + viewport.scrollLeft : viewport.scrollLeft));
-    // Keep the selected/focused label clear of the arrows over the faded edges.
-    const left = frame.left + (fromLeft > 1 ? 36 : 0);
-    const right = frame.right - (fromLeft < max - 1 ? 36 : 0);
+    const isCoarseOrMobile = typeof window !== "undefined" && window.matchMedia("(max-width: 767px), (pointer: coarse)").matches;
+    const pad = isCoarseOrMobile ? 16 : 36;
+    // Keep the selected/focused label clear of the faded edges.
+    const left = frame.left + (fromLeft > 1 ? pad : 0);
+    const right = frame.right - (fromLeft < max - 1 ? pad : 0);
     const delta = item.left < left ? item.left - left : item.right > right ? item.right - right : 0;
     // Scroll only this viewport; scrollIntoView can also move the whole page.
     if (delta) viewport.scrollBy({ left: delta, behavior: reduce ? "instant" : "smooth" });
@@ -410,14 +417,14 @@ export function TabsList({
     const viewport = viewportRef.current;
     if (viewport) viewport.scrollBy({ left: direction * viewport.clientWidth * 0.8, behavior: reduce ? "instant" : "smooth" });
   };
-  const controlClass = "absolute inset-y-0 z-20 inline-flex w-9 items-center justify-center text-foreground transition-opacity hover:opacity-70 focus-visible:outline-2 focus-visible:-outline-offset-4 focus-visible:outline-ring disabled:pointer-events-none disabled:opacity-0";
-  const surfaceClass = variant === "pill" ? "rounded-full bg-card" : variant === "segment" ? "rounded-lg bg-card" : "";
+  const controlClass = "hidden md:inline-flex pointer-coarse:hidden absolute inset-y-0 z-20 w-8 items-center justify-center text-foreground transition-opacity hover:opacity-70 focus-visible:outline-2 focus-visible:-outline-offset-4 focus-visible:outline-ring disabled:pointer-events-none disabled:opacity-0";
+  const surfaceClass = variant === "pill" ? "rounded-full bg-card" : variant === "segment" ? "rounded-lg bg-muted/70" : "";
 
   return (
     <div ref={rootRef} className={cn("relative isolate flex w-full max-w-full min-w-0 items-center", edges.overflow && surfaceClass, wrapperClassName)}>
       {edges.overflow && (
         <button type="button" aria-label="Scroll tabs left" aria-controls={viewportId} disabled={!edges.left} onClick={() => scroll(-1)} className={cn(controlClass, "left-0 rounded-l-full")}>
-          <ChevronLeft size={20} aria-hidden="true" />
+          <ChevronLeft size={18} aria-hidden="true" />
         </button>
       )}
       <motion.div
@@ -426,7 +433,7 @@ export function TabsList({
         layoutScroll
         className={cn("w-full min-w-0 overflow-x-auto [scrollbar-width:none] [&::-webkit-scrollbar]:hidden", edges.overflow && "[border-radius:inherit]")}
         style={edges.overflow ? {
-          maskImage: `linear-gradient(to right, ${edges.left ? "transparent, black 40px" : "black, black 0px"}, ${edges.right ? "black calc(100% - 40px), transparent" : "black 100%"})`,
+          maskImage: `linear-gradient(to right, ${edges.left ? "transparent, black 18px" : "black, black 0px"}, ${edges.right ? "black calc(100% - 18px), transparent" : "black 100%"})`,
         } : undefined}
         onFocusCapture={(event) => {
           if (event.target instanceof HTMLElement && event.target.getAttribute("role") === "tab") reveal(event.target);
@@ -437,14 +444,14 @@ export function TabsList({
         </div>
       </motion.div>
       {edges.overflow && edges.left && (
-        <span aria-hidden="true" className="pointer-events-none absolute inset-y-0 left-0 z-10 w-10 rounded-l-[inherit] backdrop-blur-[2px] [mask-image:linear-gradient(to_right,black,transparent)]" />
+        <span aria-hidden="true" className="hidden md:block pointer-coarse:hidden pointer-events-none absolute inset-y-0 left-0 z-10 w-8 rounded-l-[inherit] backdrop-blur-[2px] [mask-image:linear-gradient(to_right,black,transparent)]" />
       )}
       {edges.overflow && edges.right && (
-        <span aria-hidden="true" className="pointer-events-none absolute inset-y-0 right-0 z-10 w-10 rounded-r-[inherit] backdrop-blur-[2px] [mask-image:linear-gradient(to_left,black,transparent)]" />
+        <span aria-hidden="true" className="hidden md:block pointer-coarse:hidden pointer-events-none absolute inset-y-0 right-0 z-10 w-8 rounded-r-[inherit] backdrop-blur-[2px] [mask-image:linear-gradient(to_left,black,transparent)]" />
       )}
       {edges.overflow && (
         <button type="button" aria-label="Scroll tabs right" aria-controls={viewportId} disabled={!edges.right} onClick={() => scroll(1)} className={cn(controlClass, "right-0 rounded-r-full")}>
-          <ChevronRight size={20} aria-hidden="true" />
+          <ChevronRight size={18} aria-hidden="true" />
         </button>
       )}
     </div>
@@ -572,14 +579,20 @@ export function TabsTrigger({
     );
   }
 
-  const radius = variant === "pill" ? "rounded-full" : "rounded-md";
+  const radius = variant === "pill" ? "rounded-full" : "rounded-[6px]";
+  const indicatorTone =
+    variant === "segment"
+      ? "bg-background shadow-xs border border-border/60"
+      : "bg-primary";
+  const labelTone =
+    variant === "segment" ? "text-foreground" : "text-primary-foreground";
   // Tracked pills are placed in the list, so this wrapper must not be their
   // containing block. Server HTML can't measure, so until the first
   // measurement the pill fills the selected tab with CSS, like the others.
   const tracked = icons === "selected" && placed;
 
   return (
-    <div className={cn("shrink-0", !tracked && "relative")}>
+    <div data-tabs-item="" className={cn("shrink-0 flex", !tracked && "relative")}>
       {/* Distinct keys: reused across the swap, the CSS pill's leftover
           `transform: none` would hide the tracked pill's offset until the
           next value change. */}
@@ -587,8 +600,8 @@ export function TabsTrigger({
         <motion.span
           key="tracked"
           data-tabs-indicator=""
-          style={{ ...track, borderRadius: variant === "pill" ? 9999 : 8 }}
-          className={cn("absolute top-0 left-0 bg-primary", radius, indicatorClassName)}
+          style={{ ...track, borderRadius: variant === "pill" ? 9999 : 6 }}
+          className={cn("absolute top-0 left-0", indicatorTone, radius, indicatorClassName)}
         />
       ) : active ? (
         <motion.span
@@ -596,9 +609,10 @@ export function TabsTrigger({
           data-tabs-indicator=""
           layoutId={layoutId}
           layout
-          style={{ borderRadius: variant === "pill" ? 9999 : 8 }}
+          style={{ borderRadius: variant === "pill" ? 9999 : 6 }}
           className={cn(
-            "absolute inset-0 bg-primary",
+            "absolute inset-0",
+            indicatorTone,
             radius,
             indicatorClassName,
           )}
@@ -617,7 +631,7 @@ export function TabsTrigger({
           if (!event.defaultPrevented) setValue(value);
         }}
         className={cn(
-          "relative z-10 inline-flex items-center justify-center whitespace-nowrap bg-transparent px-3.5 py-1.5 text-sm font-medium outline-none",
+          "relative z-10 inline-flex w-full items-center justify-center whitespace-nowrap bg-transparent px-3 py-1.5 text-xs font-medium outline-none",
           "text-muted-foreground hover:text-foreground",
           radius,
           className,
@@ -628,7 +642,10 @@ export function TabsTrigger({
           data-tabs-label=""
           aria-hidden="true"
           inert
-          className="pointer-events-none absolute inset-0 inline-flex items-center justify-center text-primary-foreground [gap:inherit] [padding:inherit]"
+          className={cn(
+            "pointer-events-none absolute inset-0 inline-flex items-center justify-center [gap:inherit] [padding:inherit]",
+            labelTone,
+          )}
           style={{ clipPath: initialClip }}
         >
           {content}

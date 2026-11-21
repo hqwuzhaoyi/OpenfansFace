@@ -109,10 +109,7 @@ pub(crate) fn origin(config: &Config, path: &str, origins: &Value) -> Result<Val
             .to_str()
             .filter(|id| crate::model::validate_id(id).is_ok())
     {
-        let connection = rusqlite::Connection::open_with_flags(
-            config.state_db(),
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )?;
+        let connection = db::open_readonly(&config.state_db())?;
         let saved: Option<String> = connection
             .query_row(
                 "SELECT plan FROM operations WHERE id=? AND status='complete'",
@@ -509,7 +506,7 @@ pub fn snapshot(config: &Config, plan: &Plan, successful: &[usize]) -> Result<Do
     });
     Ok(DomainSnapshot {
         metadata,
-        ledger: Some(crate::person_ledger::snapshot(config, &domain_plan)?),
+        ledger: crate::person_ledger::snapshot(config, &domain_plan).ok(),
     })
 }
 pub fn list(config: &Config, offset: usize, query: &str) -> Result<Value> {

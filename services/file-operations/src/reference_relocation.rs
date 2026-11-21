@@ -112,7 +112,7 @@ pub fn diagnostic(config: &Config, body: &Value) -> Result<Value> {
         config.state_db(),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
-    db.busy_timeout(std::time::Duration::from_secs(2))?;
+    db.busy_timeout(std::time::Duration::from_secs(15))?;
     let schema: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
     if schema != 9 {
         return Err(rejected());

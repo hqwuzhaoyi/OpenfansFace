@@ -32,7 +32,7 @@ def create_manifest(release_id, revision, model_sha256, package=PACKAGE):
             'model_sha256': model_sha256, 'stage': 'detection', 'detector_size': 640,
             'preprocess_version': 'scrfd-640-bgr8-det0.5-nms0.4-v1',
             'python_abi': 'cp312', 'platform': 'linux-x86_64',
-            'admission': {'min_free_mib': 600, 'max_utilization_pct': 25, 'arena_mib': 128,
+            'admission': {'min_free_mib': 600, 'max_utilization_pct': 85, 'arena_mib': 512,
                           'concurrency': 1, 'waiting': 1}, 'retry_policy': retry_policy()}
 
 

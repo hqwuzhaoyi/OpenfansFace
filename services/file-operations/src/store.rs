@@ -25,6 +25,7 @@ impl Store {
             .map_err(|_| Error::new(503, "writer_busy", "另一个 Rust 执行器正在使用此状态目录"))?;
         crate::control::verify_path(&ownership, &path)?;
         let conn = Connection::open(config.state_db())?;
+        conn.busy_timeout(std::time::Duration::from_secs(30))?;
         let schema: i64 = conn.pragma_query_value(None, "user_version", |r| r.get(0))?;
         if schema > 9 {
             return Err(Error::new(
@@ -33,7 +34,7 @@ impl Store {
                 "操作日志由更新版本创建，拒绝降级写入",
             ));
         }
-        conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
+        conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
           CREATE TABLE IF NOT EXISTS operations (
             id TEXT PRIMARY KEY, request_hash TEXT NOT NULL, plan TEXT NOT NULL,
             status TEXT NOT NULL, phase TEXT NOT NULL, revision INTEGER NOT NULL DEFAULT 0,
@@ -52,7 +53,33 @@ impl Store {
           CREATE TABLE IF NOT EXISTS review_deliveries(token TEXT PRIMARY KEY, session TEXT NOT NULL, vid TEXT NOT NULL, evidence TEXT NOT NULL, FOREIGN KEY(session) REFERENCES review_sessions(id) ON DELETE CASCADE);
           CREATE INDEX IF NOT EXISTS review_delivery_session ON review_deliveries(session,vid);
           CREATE INDEX IF NOT EXISTS idx_operations_status ON operations(status,created_at,id);
+          CREATE INDEX IF NOT EXISTS idx_operations_complete_action ON operations(json_extract(plan,'$.action')) WHERE status='complete';
+          CREATE INDEX IF NOT EXISTS idx_operations_complete_review_session ON operations(json_extract(plan,'$.request.payload.review_session')) WHERE status='complete';
           PRAGMA user_version=9;")?;
+        let has_stat1: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='sqlite_stat1')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap_or(false);
+        let has_action_stat = has_stat1
+            && conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_stat1 WHERE idx='idx_operations_complete_action')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(false);
+        if !has_action_stat {
+            let _ = conn.execute_batch(
+                "ANALYZE idx_operations_status; ANALYZE idx_operations_complete_action; ANALYZE idx_operations_complete_review_session;",
+            );
+        }
+        let _ = conn.execute(
+            "DELETE FROM review_sessions WHERE expires <= unixepoch()",
+            [],
+        );
         let _ = conn.execute(
             "DELETE FROM operations WHERE status='not_started' AND created_at < datetime('now','-2 hours') AND NOT EXISTS(SELECT 1 FROM steps WHERE operation_id=operations.id) AND NOT EXISTS(SELECT 1 FROM gates WHERE id=operations.id)",
             [],
@@ -201,14 +228,18 @@ impl Store {
         Ok(())
     }
     pub fn step(&mut self, id: &str, status: &str, phase: &str, evidence: Value) -> Result<()> {
-        let tx = self.db.transaction()?;
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute("UPDATE operations SET status=?1,phase=?2,updated_at=CURRENT_TIMESTAMP WHERE id=?3 AND status!=?1",params![status,phase,id])?;
         tx.execute("INSERT INTO steps(operation_id,revision,phase,evidence) VALUES(?1,COALESCE((SELECT MAX(revision) FROM steps WHERE operation_id=?1),(SELECT revision FROM operations WHERE id=?1))+1,?2,?3)",params![id,phase,serde_json::to_string(&evidence)?])?;
         tx.commit()?;
         Ok(())
     }
     pub fn admit(&mut self, plan: &Plan, evidence: Value) -> Result<()> {
-        let tx = self.db.transaction()?;
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         tx.execute("UPDATE operations SET status='accepted',phase='accepted',revision=revision+1,evidence=?,updated_at=CURRENT_TIMESTAMP WHERE id=? AND status='not_started'",params![serde_json::to_string(&evidence)?,plan.id])?;
         tx.commit()?;
         Ok(())
@@ -258,7 +289,7 @@ pub(crate) fn record(db: &Connection, id: &str) -> Result<Option<Record>> {
     .transpose()
 }
 pub fn status(path: &Path, id: &str) -> Result<Value> {
-    let db = db::open(path)?;
+    let db = db::open_readonly(path)?;
     let Some(record) = record(&db, id)? else {
         if db.query_row(
             "SELECT EXISTS(SELECT 1 FROM fences WHERE id=?)",
@@ -343,5 +374,191 @@ pub fn read_committed_file(db: &Connection, id: &str, index: usize) -> Result<bo
         None => Ok(true), // Legacy single-file operations have no subset step.
         Some(Some(raw)) => Ok(serde_json::from_str::<Vec<usize>>(&raw)?.contains(&index)),
         Some(None) => Err(Error::conflict("持久化提交范围无效")),
+    }
+}
+
+#[cfg(test)]
+mod perf_index_tests {
+    use super::*;
+
+    #[test]
+    fn operations_partial_indexes_cover_review_queries_and_prune_expired_sessions() {
+        let root = fs::canonicalize("/tmp")
+            .unwrap()
+            .join(format!("face-store-idx-{}", uuid::Uuid::new_v4()));
+        let base = root.join("base");
+        let media = root.join("media");
+        fs::create_dir_all(&base).unwrap();
+        fs::create_dir_all(&media).unwrap();
+        let config = Config {
+            base,
+            media,
+            ledger: root.join("ledger.db"),
+            bind: "127.0.0.1:0".into(),
+            token: None,
+            fixture: None,
+            parity_root: None,
+        };
+        let store = Store::start(&config).unwrap();
+        for i in 0..100 {
+            store
+                .db
+                .execute(
+                    "INSERT INTO operations(id,request_hash,plan,status,phase) VALUES(?1,'h','{\"action\":\"processing-result\"}','complete','complete')",
+                    [format!("op-pr-{i}")],
+                )
+                .unwrap();
+        }
+        store
+            .db
+            .execute(
+                "INSERT INTO review_sessions VALUES('expired', 1, '{}'), ('active', unixepoch() + 3600, '{}')",
+                [],
+            )
+            .unwrap();
+        store
+            .db
+            .execute(
+                "INSERT INTO review_deliveries VALUES('t-exp', 'expired', 'v1', '{}'), ('t-act', 'active', 'v1', '{}')",
+                [],
+            )
+            .unwrap();
+        drop(store);
+        let reopened = Store::start(&config).unwrap();
+        let action_plan: Vec<String> = reopened
+            .db
+            .prepare("EXPLAIN QUERY PLAN SELECT id,plan FROM operations WHERE status='complete' AND json_extract(plan,'$.action') IN ('queue-confirm','queue-undo') ORDER BY rowid")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(
+            action_plan
+                .iter()
+                .any(|line| line.contains("idx_operations_complete_action")),
+            "expected idx_operations_complete_action in {action_plan:?}"
+        );
+        let session_plan: Vec<String> = reopened
+            .db
+            .prepare("EXPLAIN QUERY PLAN SELECT plan FROM operations WHERE status='complete' AND json_extract(plan,'$.request.payload.review_session')='s1' ORDER BY rowid")
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(
+            session_plan
+                .iter()
+                .any(|line| line.contains("idx_operations_complete_review_session")),
+            "expected idx_operations_complete_review_session in {session_plan:?}"
+        );
+        let sessions: i64 = reopened
+            .db
+            .query_row("SELECT COUNT(*) FROM review_sessions", [], |r| r.get(0))
+            .unwrap();
+        let deliveries: i64 = reopened
+            .db
+            .query_row("SELECT COUNT(*) FROM review_deliveries", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(sessions, 1);
+        assert_eq!(deliveries, 1);
+        drop(reopened);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn store_step_and_admit_succeed_under_concurrent_writer() {
+        let root = fs::canonicalize("/tmp")
+            .unwrap()
+            .join(format!("face-store-lock-{}", uuid::Uuid::new_v4()));
+        let base = root.join("base");
+        let media = root.join("media");
+        fs::create_dir_all(&base).unwrap();
+        fs::create_dir_all(&media).unwrap();
+        let config = Config {
+            base,
+            media,
+            ledger: root.join("ledger.db"),
+            bind: "127.0.0.1:0".into(),
+            token: None,
+            fixture: None,
+            parity_root: None,
+        };
+        let mut store = Store::start(&config).unwrap();
+        let plan = Plan {
+            id: "op-concurrent-step".into(),
+            request: crate::model::Request {
+                id: "op-concurrent-step".into(),
+                action: "delete-files".into(),
+                person: "Alice".into(),
+                files: vec![],
+                filename: String::new(),
+                target_person: None,
+                target_folder: None,
+                payload: None,
+            },
+            version: "v1".into(),
+            action: "delete-files".into(),
+            person: "Alice".into(),
+            target_person: String::new(),
+            files: vec![],
+            total_bytes: 0,
+            directories: vec![],
+            ledger_version: String::new(),
+            metadata_version: String::new(),
+            execution: None,
+        };
+        store.preview(&plan).unwrap();
+        store.admit(&plan, json!({"ok": true})).unwrap();
+        store
+            .step(
+                &plan.id,
+                "running",
+                "destination_publish_intent",
+                json!({"file_index": 0}),
+            )
+            .unwrap();
+
+        let state_db = config.state_db();
+        let writer = std::thread::spawn(move || {
+            for i in 0..20 {
+                let mut conn = db::open(&state_db).unwrap();
+                let tx = conn
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .unwrap();
+                tx.execute(
+                    "INSERT OR REPLACE INTO review_sessions VALUES(?, unixepoch() + 3600, '{}')",
+                    [format!("s-{i}")],
+                )
+                .unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                tx.commit().unwrap();
+            }
+        });
+
+        for i in 0..30 {
+            store
+                .step(
+                    &plan.id,
+                    "running",
+                    "source_removed",
+                    json!({"file_index": i}),
+                )
+                .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        writer.join().unwrap();
+        let step_count: i64 = store
+            .db
+            .query_row(
+                "SELECT COUNT(*) FROM steps WHERE operation_id=?",
+                [&plan.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(step_count, 31);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
     }
 }

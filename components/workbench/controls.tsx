@@ -5,7 +5,6 @@
 // https://beui.dev/components/motion/tabs
 import { useRef, useSyncExternalStore, type ReactNode } from 'react'
 import { Search, X } from 'lucide-react'
-import { MotionConfig } from 'motion/react'
 import { InputGroup, InputGroupAddon, InputGroupButton, InputGroupInput } from '@/components/ui/input-group'
 import { Tabs, TabsList, TabsTrigger } from '@/components/ui/tabs'
 import './workspace.css'
@@ -20,8 +19,55 @@ export function WorkspaceSearch({value,onChange,label,placeholder,children,disab
   </InputGroup>
 }
 
-export function WorkspaceTabs({value,onChange,label,items,disabled=false}:{value:string;onChange:(value:string)=>void;label:string;items:{value:string;label:string;count?:number}[];disabled?:boolean}) {
-  return <MotionConfig reducedMotion="always"><Tabs instant value={value} onValueChange={onChange} variant="underline" className="ws-tabs"><TabsList aria-label={label}>{items.map(item=><TabsTrigger key={item.value} value={item.value} disabled={disabled}>{item.label}{item.count!==undefined&&<span className="ws-count">{item.count}</span>}</TabsTrigger>)}</TabsList></Tabs></MotionConfig>
+export type WorkspaceTabItem = {
+  value: string
+  label: string
+  count?: number
+  icon?: ReactNode
+}
+
+export function WorkspaceTabs({
+  value,
+  onChange,
+  label,
+  items,
+  disabled = false,
+  variant = 'underline',
+  icons = 'always',
+  instant = false,
+  className = '',
+  listClassName = '',
+}: {
+  value: string
+  onChange: (value: string) => void
+  label: string
+  items: WorkspaceTabItem[]
+  disabled?: boolean
+  variant?: 'underline' | 'segment' | 'pill'
+  icons?: 'always' | 'selected'
+  instant?: boolean
+  className?: string
+  listClassName?: string
+}) {
+  return (
+    <Tabs
+      instant={instant}
+      value={value}
+      onValueChange={onChange}
+      variant={variant}
+      icons={icons}
+      className={`ws-tabs ws-tabs-${variant} ${className}`.trim()}
+    >
+      <TabsList aria-label={label} className={listClassName}>
+        {items.map((item) => (
+          <TabsTrigger key={item.value} value={item.value} icon={item.icon} disabled={disabled}>
+            <span>{item.label}</span>
+            {item.count !== undefined && <span className="ws-count">{item.count}</span>}
+          </TabsTrigger>
+        ))}
+      </TabsList>
+    </Tabs>
+  )
 }
 
 const wideQuery='(min-width: 1200px)'

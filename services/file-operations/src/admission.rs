@@ -164,7 +164,7 @@ impl Worker {
         self.snapshot(&self.gate.lock().unwrap())
     }
     fn snapshot(&self, gate: &Gate) -> Result<Value> {
-        let db = crate::db::open(&self.config.state_db())?;
+        let db = crate::db::open_readonly(&self.config.state_db())?;
         let schema: i64 = db.pragma_query_value(None, "user_version", |r| r.get(0))?;
         let unresolved: i64 = db.query_row("SELECT count(*) FROM operations WHERE status IN ('accepted','running','recovery_needed','rolling_back')", [], |r| r.get(0))?;
         let recovery_required: i64 = db.query_row(

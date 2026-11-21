@@ -26,7 +26,7 @@ import type { PersonFileAction, PersonFileResult, PersonFilePlan } from '@/lib/p
 import { PersonVideoDialog, type PlayerContextKind } from './video-player-modal'
 import { FolderInput, Merge } from 'lucide-react'
 import { sortedLibraryPeople, type PersonSort } from '@/lib/person-list-model'
-import { readWorkbenchCache, writeWorkbenchCache, deleteWorkbenchCache } from '@/components/workbench/state'
+import { readWorkbenchCache, readPersistedWorkbenchCache, writeWorkbenchCache, deleteWorkbenchCache } from '@/components/workbench/state'
 import { useBackgroundOperations } from '@/components/workbench/background-operations'
 import { AnimatedBadge } from '@/components/beui/motion/animated-badge'
 import './tokens.css'
@@ -34,6 +34,7 @@ import './workbench.css'
 
 interface Plan {rows:PlanRow[];version:string}
 type Undo = {kind:'queue';name:string;vid:string}|{kind:'reject';name:string;vid:string;id:string}
+const PERSONS_CACHE_TTL_MS=5*60*1000
 const sizeText=(size:number)=>size>=2**40?`${(size/2**40).toFixed(2)} TB`:size>=2**30?`${(size/2**30).toFixed(2)} GB`:size>=2**20?`${(size/2**20).toFixed(1)} MB`:size>=1024?`${(size/1024).toFixed(1)} KB`:`${size} B`
 const timeText=(duration?:number)=>duration&&Number.isFinite(duration)?`${Math.floor(duration/60)}:${String(Math.floor(duration%60)).padStart(2,'0')}`:'时长未记录'
 const queueVideo=(row:PlanRow):PersonVideo=>({vid:row.vid,path:row.src||row.vid,name:row.name,folder:'.',size:row.size,size_gb:row.size_gb,modified_at:'',thumb:row.thumb,evidence:[],state:'queued'})
@@ -42,12 +43,12 @@ export function PersonWorkbench({initialName=''}:{initialName?:string}) {return 
 function PersonWorkbenchContent({initialName=''}:{initialName?:string}) {
   const [selectedPeople,setSelectedPeople]=useState<string[]>([]),[peopleAction,setPeopleAction]=useState<PersonBatchAction|null>(null)
   const [accountPerson,setAccountPerson]=useState<string|null>(null),[accountsRevision,setAccountsRevision]=useState(0)
-  const [people,setPeople]=useState<LibraryPerson[]>(()=>readWorkbenchCache<LibraryPerson[]>('persons:list')??[]),[peopleError,setPeopleError]=useState(''),[peopleLoading,setPeopleLoading]=useState(()=>!readWorkbenchCache<LibraryPerson[]>('persons:list'))
-  const [peopleStats,setPeopleStats]=useState<Record<string,PersonDirectoryStats>>(()=>readWorkbenchCache<Record<string,PersonDirectoryStats>>('persons:stats')??{}),[statsLoaded,setStatsLoaded]=useState(()=>!!readWorkbenchCache<Record<string,PersonDirectoryStats>>('persons:stats')),[statsLoading,setStatsLoading]=useState(false),[statsError,setStatsError]=useState(''),[peopleSort,setPeopleSort]=useState<PersonSort>('recent')
+  const [people,setPeople]=useState<LibraryPerson[]>(()=>readWorkbenchCache<LibraryPerson[]>('persons:list',PERSONS_CACHE_TTL_MS)??[]),[peopleError,setPeopleError]=useState(''),[peopleLoading,setPeopleLoading]=useState(()=>!readWorkbenchCache<LibraryPerson[]>('persons:list',PERSONS_CACHE_TTL_MS))
+  const [peopleStats,setPeopleStats]=useState<Record<string,PersonDirectoryStats>>(()=>readWorkbenchCache<Record<string,PersonDirectoryStats>>('persons:stats',PERSONS_CACHE_TTL_MS)??{}),[statsLoaded,setStatsLoaded]=useState(()=>!!readWorkbenchCache<Record<string,PersonDirectoryStats>>('persons:stats',PERSONS_CACHE_TTL_MS)),[statsLoading,setStatsLoading]=useState(false),[statsError,setStatsError]=useState(''),[peopleSort,setPeopleSort]=useState<PersonSort>('recent')
   const statsSequence=useRef(0),statsAbort=useRef<AbortController|null>(null)
-  const [name,setName]=useState(()=>decodedName(initialName)||readWorkbenchCache<string>('persons:selected')||readWorkbenchCache<LibraryPerson[]>('persons:list')?.[0]?.name||''),[peopleQuery,setPeopleQuery]=useState('')
-  const [data,setData]=useState<PersonLibrary|null>(()=>{const initial=decodedName(initialName)||readWorkbenchCache<string>('persons:selected')||readWorkbenchCache<LibraryPerson[]>('persons:list')?.[0]?.name||'';return initial?readWorkbenchCache<PersonLibrary>('persons:library:'+initial)??null:null}),[loading,setLoading]=useState(false),[error,setError]=useState('')
-  const [plan,setPlan]=useState<Plan|null>(()=>readWorkbenchCache<Plan>('integration:plan')??null),[planError,setPlanError]=useState(''),[planLoading,setPlanLoading]=useState(false)
+  const [name,setName]=useState(()=>decodedName(initialName)||readWorkbenchCache<string>('persons:selected',PERSONS_CACHE_TTL_MS)||readWorkbenchCache<LibraryPerson[]>('persons:list',PERSONS_CACHE_TTL_MS)?.[0]?.name||''),[peopleQuery,setPeopleQuery]=useState('')
+  const [data,setData]=useState<PersonLibrary|null>(()=>{const initial=decodedName(initialName)||readWorkbenchCache<string>('persons:selected',PERSONS_CACHE_TTL_MS)||readWorkbenchCache<LibraryPerson[]>('persons:list',PERSONS_CACHE_TTL_MS)?.[0]?.name||'';return initial?readWorkbenchCache<PersonLibrary>('persons:library:'+initial,PERSONS_CACHE_TTL_MS)??null:null}),[loading,setLoading]=useState(false),[error,setError]=useState('')
+  const [plan,setPlan]=useState<Plan|null>(()=>readWorkbenchCache<Plan>('integration:plan',PERSONS_CACHE_TTL_MS)??null),[planError,setPlanError]=useState(''),[planLoading,setPlanLoading]=useState(false)
   const [tab,setTab]=useState<'owned'|'queued'>('owned'),[folder,setFolder]=useState('*'),[query,setQuery]=useState(''),[descending,setDescending]=useState(false)
   const [selected,setSelected]=useState<string[]>([]),[limit,setLimit]=useState(60),[recommendationLimit,setRecommendationLimit]=useState(20)
   const [later,setLater]=useState<string[]>([]),[mobile,setMobile]=useState<'people'|'library'|'suggestions'>('library')
@@ -58,44 +59,49 @@ function PersonWorkbenchContent({initialName=''}:{initialName?:string}) {
   const { resolved: theme } = useTheme()
   const nameRef=useRef(name),sequence=useRef(0),planSequence=useRef(0),mounted=useRef(true)
   nameRef.current=name
-  useEffect(()=>{if(name)writeWorkbenchCache('persons:selected',name)},[name])
+  useEffect(()=>{if(name)writeWorkbenchCache('persons:selected',name,{persist:true})},[name])
   useEffect(()=>{mounted.current=true;return()=>{mounted.current=false}},[])
   const loadStats=useCallback(async(force=false)=>{
     statsAbort.current?.abort();const controller=new AbortController();statsAbort.current=controller;const token=++statsSequence.current
-    if(force||!readWorkbenchCache('persons:stats'))setStatsLoading(true)
+    const persistedStats=!force?readPersistedWorkbenchCache<Record<string,PersonDirectoryStats>>('persons:stats',PERSONS_CACHE_TTL_MS):undefined
+    if(persistedStats){setPeopleStats(persistedStats);setStatsLoaded(true)}
+    if(force||!persistedStats)setStatsLoading(true)
     setStatsError('')
-    try{const result=await api<{stats:Record<string,PersonDirectoryStats>}>(`/api/persons/library?stats=1${force?'&refresh=1':''}`,{signal:controller.signal});if(mounted.current&&token===statsSequence.current){writeWorkbenchCache('persons:stats',result.stats);setPeopleStats(result.stats);setStatsLoaded(true)}}
+    try{const result=await api<{stats:Record<string,PersonDirectoryStats>}>(`/api/persons/library?stats=1${force?'&refresh=1':''}`,{signal:controller.signal});if(mounted.current&&token===statsSequence.current){writeWorkbenchCache('persons:stats',result.stats,{persist:true});setPeopleStats(result.stats);setStatsLoaded(true)}}
     catch(e){if(mounted.current&&!controller.signal.aborted&&token===statsSequence.current)setStatsError((e as Error).message)}
     finally{if(mounted.current&&!controller.signal.aborted&&token===statsSequence.current)setStatsLoading(false)}
   },[])
   useEffect(()=>{void loadStats();return()=>statsAbort.current?.abort()},[loadStats])
   const loadPeople=useCallback(async()=>{
-    if(!readWorkbenchCache('persons:list'))setPeopleLoading(true)
+    const persistedList=readPersistedWorkbenchCache<LibraryPerson[]>('persons:list',PERSONS_CACHE_TTL_MS)
+    if(persistedList){setPeople(persistedList);setPeopleLoading(false);const selected=readPersistedWorkbenchCache<string>('persons:selected',PERSONS_CACHE_TTL_MS);setName(current=>current||selected||persistedList[0]?.name||'')}
+    if(!persistedList)setPeopleLoading(true)
     setPeopleError('')
-    try {const result=await api<{persons:LibraryPerson[]}>('/api/persons/library');if(mounted.current){writeWorkbenchCache('persons:list',result.persons);setPeople(result.persons);setSelectedPeople(current=>current.filter(name=>result.persons.some(p=>p.name===name)));setName(current=>current||result.persons[0]?.name||'')}return result.persons}
+    try {const result=await api<{persons:LibraryPerson[]}>('/api/persons/library');if(mounted.current){writeWorkbenchCache('persons:list',result.persons,{persist:true});setPeople(result.persons);setSelectedPeople(current=>current.filter(name=>result.persons.some(p=>p.name===name)));setName(current=>current||result.persons[0]?.name||'')}return result.persons}
     catch(e){if(mounted.current)setPeopleError((e as Error).message)}finally{if(mounted.current)setPeopleLoading(false)}
   },[])
   useEffect(()=>{void loadPeople()},[loadPeople])
-  useEffect(()=>{if(initialName&&decodedName(initialName)!==nameRef.current){const nextName=decodedName(initialName);setData(readWorkbenchCache<PersonLibrary>('persons:library:'+nextName)??null);setName(nextName)}},[initialName])
+  useEffect(()=>{if(initialName&&decodedName(initialName)!==nameRef.current){const nextName=decodedName(initialName);setData(readPersistedWorkbenchCache<PersonLibrary>('persons:library:'+nextName,PERSONS_CACHE_TTL_MS)??null);setName(nextName)}},[initialName])
   const refresh=useCallback(async(target:string,signal?:AbortSignal)=>{
     const token=++sequence.current
-    const cached=readWorkbenchCache<PersonLibrary>('persons:library:'+target)
+    const cached=readPersistedWorkbenchCache<PersonLibrary>('persons:library:'+target,PERSONS_CACHE_TTL_MS)
+    if(cached)setData(current=>current??cached)
     if(!cached)setLoading(true)
     setError('')
-    try {const next=await api<PersonLibrary>(`/api/persons/library?name=${encodeURIComponent(target)}`,{signal});if(mounted.current&&nameRef.current===target&&token===sequence.current){writeWorkbenchCache('persons:library:'+target,next);writeWorkbenchCache('persons:library:'+next.name,next);setData(next);if(next.name!==target){setName(next.name);history.replaceState(null,'',`/persons/${encodeURIComponent(next.name)}`)};setSelected(prev=>prev.filter(id=>next.files.some(v=>v.vid===id)));setPeople(prev=>{const updated=prev.map(p=>p.name===target?{...p,queued:next.queued}:p);writeWorkbenchCache('persons:list',updated);return updated})}return next}
+    try {const next=await api<PersonLibrary>(`/api/persons/library?name=${encodeURIComponent(target)}`,{signal});if(mounted.current&&nameRef.current===target&&token===sequence.current){writeWorkbenchCache('persons:library:'+target,next,{persist:true});writeWorkbenchCache('persons:library:'+next.name,next,{persist:true});setData(next);if(next.name!==target){setName(next.name);history.replaceState(null,'',`/persons/${encodeURIComponent(next.name)}`)};setSelected(prev=>prev.filter(id=>next.files.some(v=>v.vid===id)));setPeople(prev=>{const updated=prev.map(p=>p.name===target?{...p,queued:next.queued}:p);writeWorkbenchCache('persons:list',updated,{persist:true});return updated})}return next}
     catch(e){if(!signal?.aborted&&mounted.current&&nameRef.current===target&&token===sequence.current)setError((e as Error).message);throw e}
     finally{if(mounted.current&&token===sequence.current&&!signal?.aborted)setLoading(false)}
   },[])
   useEffect(()=>{
-    setData(name?readWorkbenchCache<PersonLibrary>('persons:library:'+name)??null:null);setSelected([]);setQuery('');setFolder('*');setLater([]);setLimit(60);setRecommendationLimit(20);setUndo(null);setError('');setPlanError('')
+    setData(name?readWorkbenchCache<PersonLibrary>('persons:library:'+name,PERSONS_CACHE_TTL_MS)??null:null);setSelected([]);setQuery('');setFolder('*');setLater([]);setLimit(60);setRecommendationLimit(20);setUndo(null);setError('');setPlanError('')
     if(!name)return
     const controller=new AbortController();void refresh(name,controller.signal).catch(()=>{});return()=>controller.abort()
   },[name,refresh])
   const loadPlan=useCallback(async(target:string,signal?:AbortSignal)=>{
     const token=++planSequence.current
-    if(!readWorkbenchCache('integration:plan'))setPlanLoading(true)
+    if(!readWorkbenchCache('integration:plan',PERSONS_CACHE_TTL_MS))setPlanLoading(true)
     setPlanError('')
-    try{const next=await api<Plan>('/api/plan/preview',{signal});writeWorkbenchCache('integration:plan',next);if(mounted.current&&nameRef.current===target&&!signal?.aborted&&token===planSequence.current)setPlan(next);return next}
+    try{const next=await api<Plan>('/api/plan/preview',{signal});writeWorkbenchCache('integration:plan',next,{persist:true});if(mounted.current&&nameRef.current===target&&!signal?.aborted&&token===planSequence.current)setPlan(next);return next}
     catch(e){if(mounted.current&&nameRef.current===target&&!signal?.aborted&&token===planSequence.current)setPlanError((e as Error).message);throw e}
     finally{if(mounted.current&&nameRef.current===target&&!signal?.aborted&&token===planSequence.current)setPlanLoading(false)}
   },[])
@@ -107,7 +113,7 @@ function PersonWorkbenchContent({initialName=''}:{initialName?:string}) {
   const filtered=allFiles.filter(v=>(tab==='queued'||folder==='*'||v.folder===folder)&&`${v.name} ${v.path}`.toLowerCase().includes(query.toLowerCase())).sort((a,b)=>(descending?-1:1)*a.name.localeCompare(b.name,'zh-CN'))
   const visible=filtered.slice(0,limit),chosen=queueRows.filter(r=>selected.includes(r.vid)),canArchive=chosen.length>0&&chosen.every(r=>r.status==='ok')
   const candidates=[...(data?.recommendations||[])].sort((a,b)=>Number(later.includes(a.vid))-Number(later.includes(b.vid))||later.indexOf(a.vid)-later.indexOf(b.vid))
-  function selectPerson(next:string){if(next===name)return;setMessage('');setData(readWorkbenchCache<PersonLibrary>('persons:library:'+next)??null);setSelected([]);setName(next);setTab('owned');setMobile('library');history.replaceState(null,'',`/persons/${encodeURIComponent(next)}`)}
+  function selectPerson(next:string){if(next===name)return;setMessage('');setData(readWorkbenchCache<PersonLibrary>('persons:library:'+next,PERSONS_CACHE_TTL_MS)??null);setSelected([]);setName(next);setTab('owned');setMobile('library');history.replaceState(null,'',`/persons/${encodeURIComponent(next)}`)}
   function switchTab(next:'owned'|'queued'){setTab(next);setSelected([]);setQuery('');setFolder('*');setLimit(60)}
   function toggle(vid:string){if(lockedVids.has(vid))return;setSelected(prev=>prev.includes(vid)?prev.filter(v=>v!==vid):[...prev,vid])}
   function notify(text:string){setMessage(text)}
@@ -192,7 +198,7 @@ function PersonWorkbenchContent({initialName=''}:{initialName?:string}) {
   async function savedFileAction(result:PersonFileResult){
     setSelected([]);setUndo(null)
     deleteWorkbenchCache('persons:library:'+name)
-    notify(result.warning|| (fileAction?.action==='merge-person'?`已将 ${name} 合并到 ${result.person}`:fileAction?.action==='rename-person'?`人物已重命名为 ${result.person}`:result.staged?`已将 ${result.changed} 个视频移入全局暂存区`:`已更新 ${result.changed} 个文件，路径和记录已同步`))
+    notify(result.warning|| (fileAction?.action==='merge-person'?`已将 ${name} 合并到 ${result.person}`:fileAction?.action==='rename-person'?`人物已重命名为 ${result.person}`:result.staged?`已将 ${result.changed} 个视频移入回收站`:`已更新 ${result.changed} 个文件，路径和记录已同步`))
     await loadPeople();void loadStats(true)
     if(result.person!==name){deleteWorkbenchCache('persons:library:'+result.person);setData(null);setPlan(null);setName(result.person);setTab('owned');history.replaceState(null,'',`/persons/${encodeURIComponent(result.person)}`)}
     else await reloadAfterSave(name)
@@ -206,7 +212,7 @@ function PersonWorkbenchContent({initialName=''}:{initialName?:string}) {
     const next=result.target||(currentPeople?.some(p=>p.name===name)?name:currentPeople?.[0]?.name||'')
     if(next){setName(next);history.replaceState(null,'',`/persons/${encodeURIComponent(next)}`);await reloadAfterSave(next)}
     else {setName('');history.replaceState(null,'','/persons')}
-    notify(result.ok?peopleAction==='merge'?`已合并 ${result.completed.length} 个人物，保留 ${result.target}`:`已删除 ${result.completed.length} 个人物，目录文件已移入暂存区`:`已完成 ${result.completed.length} 项，剩余 ${result.remaining.length} 项未完成`)
+    notify(result.ok?peopleAction==='merge'?`已合并 ${result.completed.length} 个人物，保留 ${result.target}`:`已删除 ${result.completed.length} 个人物，目录文件已移入回收站`:`已完成 ${result.completed.length} 项，剩余 ${result.remaining.length} 项未完成`)
   }
   const manageFiles=(action:PersonFileAction,files:PersonVideo[])=>{if(pendingFilePlan){setFileAction({action:pendingFilePlan.action,files:[],resumePlan:pendingFilePlan});return};setMessage('');setUndo(null);setFileAction({action,files})}
   const count=tab==='owned'?data?.files.length:plan?queueRows.length:data?.queued??person?.queued

@@ -1,2 +1,5 @@
-import ProcessingTaskQueue from '@/components/processing/task-queue'
-export default ProcessingTaskQueue
+import Operations from '@/components/processing/operations'
+
+export default function Page() {
+  return <Operations defaultView="queue" />
+}

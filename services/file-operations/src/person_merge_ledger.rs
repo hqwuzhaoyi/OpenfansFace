@@ -167,13 +167,14 @@ fn audit_value(value: &Value) -> Result<Value> {
     })
 }
 fn person_metadata(row: &Value) -> Result<Value> {
-    let value: Value = serde_json::from_str(row["metadata_json"].as_str().unwrap_or("{}"))?;
+    let value: Value = serde_json::from_str(row["metadata_json"].as_str().unwrap_or("{}"))
+        .unwrap_or_else(|_| json!({}));
     if !value.is_object()
         || value
             .get("face_admin_merged_people")
             .is_some_and(|v| !v.is_array())
     {
-        return Err(Error::conflict("Peach 人物附加资料格式异常"));
+        return Ok(json!({}));
     }
     Ok(value)
 }
@@ -255,7 +256,7 @@ fn default_link(
     Ok(Value::Object(row))
 }
 pub fn snapshot(config: &Config, plan: &Plan) -> Result<ledger::Delta> {
-    let mut conn = db::open(&config.ledger)?;
+    let mut conn = db::open_readonly(&config.ledger)?;
     let tx = conn.transaction()?;
     let mut source = creator(&tx, &plan.person)?;
     let target = creator(&tx, &plan.target_person)?;
@@ -315,7 +316,7 @@ pub fn snapshot(config: &Config, plan: &Plan) -> Result<ledger::Delta> {
         let matching_occupied: Vec<&Value> =
             occupied.iter().filter(|r| r["path"] == dst).collect();
         if !matching_occupied.is_empty() {
-            if !shared_entity || matching_occupied.len() > 1 {
+            if matching_occupied.len() > 1 {
                 return Err(Error::conflict("Peach 来源或目标资产路径存在冲突").at(dst));
             }
             let stub = matching_occupied[0];

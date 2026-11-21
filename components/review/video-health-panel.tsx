@@ -55,7 +55,7 @@ export function VideoHealthPanel({ onBack }: { onBack?: () => void } = {}) {
       if (request !== storageSequence.current) return
       setStorage(result); setStorageError('')
     } catch (cause) {
-      if (request === storageSequence.current) { setStorage(null); setStorageError((cause as Error).message || '暂存目录读取失败') }
+      if (request === storageSequence.current) { setStorage(null); setStorageError((cause as Error).message || '回收站读取失败') }
     } finally {
       if (request === storageSequence.current) setStorageLoading(false)
     }
@@ -83,16 +83,16 @@ export function VideoHealthPanel({ onBack }: { onBack?: () => void } = {}) {
   const status = data?.status === 'running' ? '正在检查' : data?.error ? '检查需关注' : ['skipped', 'interrupted'].includes(data?.status || '') ? '本次未完成' : data?.completed_at ? '检查已完成' : '等待首次体检'
   const storageSummary = <>
     <WorkspaceCard className="staging-storage-card">
-      <div className="staging-storage-title"><Archive size={16} /><h2>暂存区</h2></div>
+      <div className="staging-storage-title"><Archive size={16} /><h2>回收站</h2></div>
       <dl className="staging-storage-stats">
-        <div><dt>暂存文件</dt><dd>{storage ? number.format(storage.files) : '—'}<span>个</span></dd></div>
+        <div><dt>回收站文件</dt><dd>{storage ? number.format(storage.files) : '—'}<span>个</span></dd></div>
         <div><dt><HardDrive size={12} />占用空间</dt><dd>{storage ? number.format(storage.gb) : '—'}<span>GB</span></dd></div>
       </dl>
-      {storageLoading && !storage && <p className="ws-muted" role="status">正在读取暂存目录…</p>}
+      {storageLoading && !storage && <p className="ws-muted" role="status">正在读取回收站…</p>}
       {storageError && <><WorkspaceMessage error>{storageError}</WorkspaceMessage><Button variant="outline" disabled={storageLoading} onClick={loadStorage}>重试读取</Button></>}
-      {storage?.files === 0 && <p className="ws-muted">暂存目录为空</p>}
+      {storage?.files === 0 && <p className="ws-muted">回收站为空</p>}
     </WorkspaceCard>
-    {storage && <WorkspaceSection title="暂存路径" defaultOpen={false}><WorkspacePath value={storage.path} label="暂存路径" /></WorkspaceSection>}
+    {storage && <WorkspaceSection title="回收站路径" defaultOpen={false}><WorkspacePath value={storage.path} label="回收站路径" /></WorkspaceSection>}
   </>
   const detail = selected && <>
     <div className="ws-detail-heading"><h2>检查详情</h2><Button variant="ghost" size="icon" aria-label="关闭检查详情" title="关闭详情" onClick={clearSelection}><X size={15} /></Button></div>
@@ -109,9 +109,9 @@ export function VideoHealthPanel({ onBack }: { onBack?: () => void } = {}) {
   </>
 
   return <main className="ws-page staging-page" aria-label="回收站工作区">
-    <header className="ws-header"><h1>视频体检</h1><div className="ws-actions">{onBack && <Button variant="outline" onClick={onBack}>暂存文件</Button>}<Button variant="outline" disabled={loading || storageLoading} onClick={() => { void loadHealth(); void loadStorage() }}><RefreshCw size={14} />刷新</Button></div></header>
+    <header className="ws-header"><h1>视频体检</h1><div className="ws-actions">{onBack && <Button variant="outline" onClick={onBack}>回收站文件</Button>}<Button variant="outline" disabled={loading || storageLoading} onClick={() => { void loadHealth(); void loadStorage() }}><RefreshCw size={14} />刷新</Button></div></header>
     <div className="staging-workarea">
-      <aside className="staging-storage" aria-label="暂存区概况">{storageSummary}</aside>
+      <aside className="staging-storage" aria-label="回收站概况">{storageSummary}</aside>
       <section id="video-health" className="ws-queue staging-health" aria-labelledby="staging-health-title">
         <div className="staging-health-heading"><div><Activity size={16} /><h2 id="staging-health-title">视频体检</h2></div>{data && <span className="staging-run-state" role="status" data-running={data.status === 'running'}>{status}</span>}</div>
         <div className="staging-health-summary" aria-label="体检统计">

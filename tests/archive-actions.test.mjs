@@ -1,6 +1,6 @@
 import {test} from 'node:test'
 import assert from 'node:assert/strict'
-import {archiveShortcut,canResolveArchiveRow,canStageArchiveRow} from '../lib/archive-actions.ts'
+import {archiveShortcut,canResolveArchiveRow,canStageArchiveRow,isArchiveResolutionApplied} from '../lib/archive-actions.ts'
 const page={editing:false,modal:false,nativeAction:false}
 test('same-size duplicate is eligible for staging, but creators records never get conflict actions',()=>{
  const duplicate={status:'duplicate',size:123,original_size:123,src:'/media/a.mp4'}
@@ -11,6 +11,9 @@ test('same-size duplicate is eligible for staging, but creators records never ge
  assert.equal(canStageArchiveRow({...duplicate,src:null}),false)
  assert.equal(canResolveArchiveRow({...duplicate,status:'organized',resolution:{kind:'rename',name:'old.mp4'}}),false)
  assert.equal(canStageArchiveRow({...duplicate,status:'organized',resolution:{kind:'stage-duplicate'}}),false)
+ assert.equal(isArchiveResolutionApplied({...duplicate,status:'ok',resolution:{kind:'stage-duplicate'}},'stage-duplicate'),true)
+ assert.equal(isArchiveResolutionApplied({...duplicate,status:'ok',resolution:{kind:'stage-duplicate'}},'rename'),false)
+ assert.equal(isArchiveResolutionApplied({...duplicate,status:'conflict',resolution:{kind:'rename',name:'dup.mp4'}},'rename'),false)
 })
 test('A selects the visible list and Enter requests confirmation, including checkbox focus',()=>{
  assert.equal(archiveShortcut({key:'a'},page),'all')
