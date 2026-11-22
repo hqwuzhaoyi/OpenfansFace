@@ -3,12 +3,12 @@ import path from 'path'
 import Database from 'better-sqlite3'
 import { BASE } from './env'
 import { reviewScope } from './review-scope'
-import { loadQueue, loadArchive, videoInfo, loadDecisions } from './review-store'
+import { loadQueue, loadActiveArchive, videoInfo, loadDecisions } from './review-store'
 import { loadClusters, loadReport, loadClaims } from './integration'
 import { thumbUrl } from './db'
 
 export function unclassifiedVideos(){
-  const scope=reviewScope(),meta=videoInfo(),queue=loadQueue(),archive=loadArchive(),dec=loadDecisions()
+  const scope=reviewScope(),meta=videoInfo(),queue=loadQueue(),archive=loadActiveArchive(),dec=loadDecisions()
   const handled=new Set([...queue,...archive].map(v=>v.vid))
   const handledPaths=new Set(queue.map(v=>scope.source(v.vid)).filter(Boolean))
   const visible=new Set<string>()

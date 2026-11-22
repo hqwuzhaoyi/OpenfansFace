@@ -4,7 +4,7 @@ import Database from 'better-sqlite3'
 import { NextRequest, NextResponse } from 'next/server'
 import { BASE, MEDIA2 } from '@/lib/env'
 import { loadReport } from '@/lib/integration'
-import { loadArchive, videoInfo } from '@/lib/review-store'
+import { loadActiveArchive, videoInfo } from '@/lib/review-store'
 import { readVideoSources, videoSource, isMediaFile } from '@/lib/video-sources'
 import { creatorFolder } from '@/lib/source-resolution'
 import { thumbUrl } from '@/lib/db'
@@ -17,7 +17,7 @@ export async function GET(req:NextRequest) {
   const names=new Set([name,...(identity?.aliases||[])].map((s:string)=>s.toLowerCase()))
   const sources=readVideoSources()
   const hidden=healthScope()
-  for(const item of loadArchive())sources.set(item.vid,item.win_dst)
+  for(const item of loadActiveArchive())sources.set(item.vid,item.win_dst)
   const byPath=new Map<string,{vid:string;path:string}>()
   for(const [vid,stored]of sources) {
     const candidateFolders=[stored&&creatorFolder(stored,MEDIA2),creatorFolder(vid,MEDIA2)]

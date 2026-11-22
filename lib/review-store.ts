@@ -7,6 +7,7 @@ import { loadClusters, loadReport } from './integration'
 
 export const ARCHIVE_F = path.join(BASE, 'archive-history.json')
 export const loadArchive = () => readCanonicalJson<ArchivedItem[]>(ARCHIVE_F, [])
+export const loadActiveArchive = () => loadArchive().filter(v => !v.undone)
 export const saveArchive = (items: ArchivedItem[]) => writeJson(ARCHIVE_F, items)
 
 /** Shared across workers and production/shadow instances. Never silently discard a live lock. */
@@ -31,7 +32,7 @@ export function queuedWithOrigin(): QueueItem[] {
   })
 }
 export function resolvedVids(): Set<string> {
-  return new Set([...loadQueue(), ...loadArchive()].map(v => v.vid))
+  return new Set([...loadQueue(), ...loadActiveArchive()].map(v => v.vid))
 }
 let videoInfoCache: { reportRef: any; clustersRef: any; map: Map<string, any> } | null = null
 export function videoInfo(): Map<string, any> {

@@ -660,7 +660,8 @@ pub fn analysis_state(config: &Config) -> Result<Value> {
     let mut reference = ReferenceGuards::default();
     for name in ["integration-queue.json", "archive-history.json"] {
         for row in input[name].as_array().into_iter().flatten() {
-            if row["file_state"] != "staged"
+            if (name != "archive-history.json" || row["undone"] != true)
+                && row["file_state"] != "staged"
                 && let Some(vid) = row["vid"].as_str()
             {
                 reference.assigned.insert(vid.to_owned());
@@ -815,7 +816,7 @@ fn recommendation_exists(config: &Config, name: &str, vid: &str) -> Result<bool>
             .as_array()
             .unwrap()
             .iter()
-            .any(|r| r["vid"] == vid)
+            .any(|r| r["vid"] == vid && (file != "archive-history.json" || r["undone"] != true))
         {
             return Ok(false);
         }

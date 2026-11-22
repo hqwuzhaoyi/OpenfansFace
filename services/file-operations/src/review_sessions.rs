@@ -249,7 +249,13 @@ fn tasks_filtered(
         .as_array()
         .unwrap()
         .iter()
-        .chain(history.as_array().unwrap())
+        .chain(
+            history
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|r| r["undone"] != true),
+        )
         .filter_map(|r| r["vid"].as_str().map(str::to_owned))
         .collect();
     let conn = db::open_readonly(&path)?;
@@ -309,7 +315,13 @@ fn waiting_count(config: &Config) -> Result<usize> {
         .as_array()
         .unwrap()
         .iter()
-        .chain(history.as_array().unwrap())
+        .chain(
+            history
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|r| r["undone"] != true),
+        )
         .filter_map(|r| r["vid"].as_str().map(str::to_owned))
         .collect();
     let conn = db::open_readonly(&path)?;

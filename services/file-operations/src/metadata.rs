@@ -150,9 +150,10 @@ fn updated(config: &Config, name: &str, value: &Value, plan: &Plan) -> Value {
     }
     if name == "archive-history.json" {
         for row in next.as_array_mut().unwrap() {
-            if row["vid"]
-                .as_str()
-                .is_some_and(|id| plan.files.iter().any(|f| f.vids.iter().any(|v| v == id)))
+            if row["undone"] != true
+                && row["vid"]
+                    .as_str()
+                    .is_some_and(|id| plan.files.iter().any(|f| f.vids.iter().any(|v| v == id)))
             {
                 row["last_file_operation"] = json!(plan.id)
             }
@@ -232,7 +233,7 @@ pub fn registered_ids(config: &Config, src: &str) -> Result<Vec<String>> {
             .unwrap()
             .iter()
             .rev()
-            .find(|r| r["vid"] == id)
+            .find(|r| r["vid"] == id && r["undone"] != true)
             .and_then(|r| r["win_dst"].as_str().or(r["dst"].as_str()));
         // Explicit current locations outrank historical canonical archive targets.
         let stored = overrides[id].as_str().or(archived).or(row["path"].as_str());
@@ -635,7 +636,11 @@ fn apply_delta_domain(
     if jobs
         && matches!(
             plan.action.as_str(),
-            "review-note" | "review-defer" | "review-restore"
+            "review-note"
+                | "review-defer"
+                | "review-restore"
+                | "auto-archive"
+                | "archive-unarchive"
         )
     {
         let has_events: bool = tx.query_row(
@@ -648,6 +653,8 @@ fn apply_delta_domain(
             let (kind, message) = match plan.action.as_str() {
                 "review-note" => ("note", "更新备注"),
                 "review-defer" => ("defer", "暂时跳过"),
+                "auto-archive" => ("auto_archived", "自动水印匹配已直接归档"),
+                "archive-unarchive" => ("auto_unarchived", "已撤回归档并恢复待人工确认"),
                 _ => ("restore", "恢复核对"),
             };
             for table in &delta.tables {

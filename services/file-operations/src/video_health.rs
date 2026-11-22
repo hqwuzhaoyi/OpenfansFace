@@ -158,6 +158,9 @@ fn inventory(config: &Config) -> Result<BTreeMap<String, Value>> {
         .as_array()
         .ok_or_else(|| Error::conflict("归档历史格式无效"))?
     {
+        if row["undone"] == true {
+            continue;
+        }
         if let Some(id) = row["vid"].as_str() {
             archive.insert(id.to_string(), row.clone());
             if !sources.contains_key(id)
@@ -1098,6 +1101,9 @@ pub fn library_observations(config: &Config, ids: &[String]) -> Result<Value> {
             .as_array()
             .ok_or_else(|| Error::conflict("归名记录格式无效"))?
         {
+            if document == "archive-history.json" && row["undone"] == true {
+                continue;
+            }
             if let Some(path) = row["vid"]
                 .as_str()
                 .and_then(|id| current.get(id))

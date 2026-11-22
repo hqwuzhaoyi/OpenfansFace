@@ -28,6 +28,8 @@ pub fn validate(request: &Request) -> Result<()> {
     match request.action.as_str() {
         "processing-result" => crate::processing_result::validate(request),
         "move-files" | "rename-file" => crate::person_move::validate(request),
+        "auto-archive" => crate::auto_archive::validate(request),
+        "archive-unarchive" => crate::unarchive::validate(request),
         action if action == "archive" || action == "metadata-write" || review_action(action) => {
             if !request.files.is_empty() {
                 return Err(Error::new(400, "invalid_request", "范围必须由原生计划确定"));
@@ -47,6 +49,8 @@ pub fn plan(config: &Config, request: Request) -> Result<Plan> {
         "move-files" | "rename-file" => crate::person_move::plan(config, request),
         "processing-result" => crate::processing_result::plan(config, request),
         "archive" => crate::archive::plan(config, request),
+        "auto-archive" => crate::auto_archive::plan(config, request),
+        "archive-unarchive" => crate::unarchive::plan(config, request),
         "metadata-write" => crate::shared_metadata::plan(config, request),
         action if review_action(action) => crate::review::plan(config, request),
         "delete-files" | "restore-files" => crate::staging::plan(config, request),
@@ -61,6 +65,8 @@ pub fn snapshot(config: &Config, plan: &Plan, successful: &[usize]) -> Result<Do
         "move-files" | "rename-file" => crate::person_move::snapshot(config, plan, successful),
         "processing-result" => Ok(crate::processing_result::snapshot()),
         "archive" => crate::archive::snapshot(config, plan, successful),
+        "auto-archive" => crate::auto_archive::snapshot(config, plan, successful),
+        "archive-unarchive" => crate::unarchive::snapshot(config, plan, successful),
         "metadata-write" => crate::shared_metadata::snapshot(config, plan, successful),
         action if review_action(action) => crate::review::snapshot(config, plan, successful),
         "delete-files" | "restore-files" => crate::staging::snapshot(config, plan, successful),
@@ -75,6 +81,8 @@ pub fn revalidate(config: &Config, plan: &Plan) -> Result<()> {
         "move-files" | "rename-file" => crate::person_move::revalidate(config, plan),
         "processing-result" => crate::processing_result::validate(&plan.request),
         "archive" => crate::archive::revalidate(config, plan),
+        "auto-archive" => crate::auto_archive::revalidate(config, plan),
+        "archive-unarchive" => crate::unarchive::revalidate(config, plan),
         "metadata-write" => crate::shared_metadata::revalidate(config, plan),
         action if review_action(action) => crate::review::revalidate(config, plan),
         "delete-files" | "restore-files" => crate::staging::revalidate(config, plan),
@@ -91,6 +99,10 @@ pub fn result(
 ) -> serde_json::Value {
     if plan.action == "archive" {
         crate::archive::result(plan, successful, failures)
+    } else if plan.action == "auto-archive" {
+        crate::auto_archive::result(plan, successful, failures)
+    } else if plan.action == "archive-unarchive" {
+        crate::unarchive::result(plan, successful, failures)
     } else {
         let mut result = plan
             .execution

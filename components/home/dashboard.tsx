@@ -20,7 +20,7 @@ const HOME_BREADCRUMB: WorkbenchBreadcrumbSegment[] = [{ key: 'home', label: '�
 import { StageMediaLoader } from '@/components/workbench/loading-skeletons'
 import { Skeleton } from '@/components/ui/skeleton'
 
-const jobColors={face:'#80a7ff',text:'#b69af6',watermark:'#b69af6',discovery:'#6cceba',archive:'#e8b27f',rebuild:'#80a7ff'}
+const jobColors={face:'#80a7ff',text:'#b69af6',watermark:'#b69af6',discovery:'#6cceba',archive:'#e8b27f','auto-archive':'#e8b27f',rebuild:'#80a7ff'}
 const date=(n:number|null)=>n?new Date(n*1000).toLocaleString('zh-CN',{month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit'}):'—'
 const elapsed=(n:number)=>n>=3600?`${Math.floor(n/3600)} 时 ${Math.floor(n%3600/60)} 分`:`${Math.floor(n/60)} 分 ${Math.floor(n%60)} 秒`
 function Definition({label,children}:{label:string;children:React.ReactNode}){return <details className="home-definition" name="home-definitions"><summary aria-label={`${label}统计口径`}><Info size={13}/></summary><div>{children}</div></details>}

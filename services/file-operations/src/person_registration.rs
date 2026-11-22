@@ -63,6 +63,7 @@ impl SourceIndex {
             .as_array()
             .unwrap()
             .iter()
+            .filter(|r| r["undone"] != true)
             .filter_map(|r| {
                 Some((
                     r["vid"].as_str()?,

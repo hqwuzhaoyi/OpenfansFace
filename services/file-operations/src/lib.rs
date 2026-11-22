@@ -7,6 +7,8 @@ pub mod archive_api;
 pub mod archive_cancel;
 pub mod archive_ledger;
 pub mod archive_resolution;
+pub mod auto_archive;
+pub mod auto_watermark;
 pub mod config;
 pub mod control;
 pub mod creator_delta;
@@ -41,6 +43,7 @@ pub mod shared_metadata;
 pub mod staging;
 pub mod staging_delete;
 pub mod store;
+pub mod unarchive;
 pub mod video_health;
 
 pub use config::Config;

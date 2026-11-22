@@ -7,7 +7,7 @@ let rebuild:{at:number;running:boolean;msg?:string}|undefined
 export async function GET(req:NextRequest){try{
   const data=await homeTasks(req.nextUrl.searchParams),url=process.env.CALIBRATOR_URL
   const archive=await nativeArchiveProgress(null)
-  data.jobs=data.jobs.filter(job=>job.kind!=='archive')
+  data.jobs=data.jobs.filter(job=>job.kind!=='archive'&&job.kind!=='auto-archive')
   if(archive.job&&(!archive.job.finished_at||Date.now()/1000-archive.job.finished_at<86400))data.jobs.push(normalizeJob(archive.job,Date.now()/1000,archive.job.heartbeat_at))
   if(url&&(!rebuild||Date.now()-rebuild.at>5000)){
     try{const res=await fetch(url+'/api/rebuild',{cache:'no-store',signal:AbortSignal.timeout(1200)});if(res.ok){const state=await res.json();rebuild={at:Date.now(),running:state.running===true,msg:state.msg}}}catch{}

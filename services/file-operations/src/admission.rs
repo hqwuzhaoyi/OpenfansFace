@@ -97,7 +97,9 @@ impl Worker {
                         .contains(&e.request.action.as_str())
                 }
                 Command::Batch(b) => b["mode"] == "preview",
-                Command::Archive { command, .. } => command == "archive-preview",
+                Command::Archive { command, .. } => {
+                    matches!(command.as_str(), "archive-preview" | "auto-watermark-preview")
+                }
                 Command::Metadata { .. } => false,
             };
             if !preview {

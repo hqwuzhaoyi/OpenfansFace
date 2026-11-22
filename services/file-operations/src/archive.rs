@@ -597,16 +597,23 @@ pub fn snapshot(config: &Config, plan: &Plan, successful: &[usize]) -> Result<Do
         if doc.name == "archive-history.json" {
             for &i in successful {
                 let mut row = data["rows"][i].clone();
+                row["original_path"] = json!(plan.files[i].src);
                 row["manifest"] = json!(format!("rust:{}", plan.id));
                 row["win_dst"] = json!(metadata::win(config, row["dst"].as_str().unwrap()));
                 if row["operation"] == "stage-duplicate" {
                     row["staged_path"] = json!(plan.files[i].dst);
                 }
+                if row["source"] == "auto-watermark" && row.get("auto_reason").is_none() {
+                    row["auto_reason"] = row
+                        .get("match_tier")
+                        .cloned()
+                        .unwrap_or_else(|| json!("fallback_queue"));
+                }
                 row["operation_id"] = json!(plan.id);
                 value
                     .as_array_mut()
                     .unwrap()
-                    .retain(|r| r["vid"] != row["vid"]);
+                    .retain(|r| r["vid"] != row["vid"] || r["undone"] == true);
                 value.as_array_mut().unwrap().push(row)
             }
         }

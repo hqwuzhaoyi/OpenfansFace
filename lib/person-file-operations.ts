@@ -4,7 +4,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import Database from 'better-sqlite3'
 import { BASE, CREATORS, MEDIA2, STAGE } from './env'
 import { ReviewError, validateCreator } from './review-logic'
-import { acquireReviewLock, loadArchive, videoInfo } from './review-store'
+import { acquireReviewLock, loadActiveArchive, videoInfo } from './review-store'
 import { writeJson } from './jsonio'
 import { readVideoSources, videoSource } from './video-sources'
 import { sourceCandidates } from './source-resolution'
@@ -76,7 +76,7 @@ export async function previewPersonFiles(body:PersonFileRequest):Promise<PersonF
   const catalog=await libraryPeople()
   if(!catalog.some(p=>p.name===person))throw new ReviewError('找不到当前人物，请刷新',404)
   const sources=readVideoSources(),idsByPath=new Map<string,string[]>()
-  for(const row of loadArchive())if(row.win_dst)sources.set(row.vid,row.win_dst)
+  for(const row of loadActiveArchive())if(row.win_dst)sources.set(row.vid,row.win_dst)
   for(const vid of new Set([...sources.keys(),...videoInfo().keys()]))for(const candidate of sourceCandidates(vid,sources.get(vid),MEDIA2))idsByPath.set(candidate,[...(idsByPath.get(candidate)||[]),vid])
   const idsForPath=(file:string)=>[...new Set(idsByPath.get(file)||[])].filter(vid=>videoSource(vid,sources)===file)
   const trackedIdsForPath=(file:string)=>{const ids=idsForPath(file);if(!ids.length&&personVideoExtension.test(file))ids.push(`file:${hash([file,String(fs.statSync(/*turbopackIgnore: true*/ file,{bigint:true}).ino)])}`);return ids}

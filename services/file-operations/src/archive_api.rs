@@ -32,26 +32,42 @@ pub fn execute(engine: &mut Engine, command: &str, mut body: Value) -> Result<Va
     if command == "archive-preview" {
         return archive::preview(&engine.config);
     }
+    if command == "auto-watermark-preview" {
+        return crate::auto_watermark::preview_auto_watermark_matches(&engine.config);
+    }
     if command == "archive-reconcile" {
         let id = body["id"]
             .as_str()
             .ok_or_else(|| Error::new(400, "invalid_request", "缺少操作编号"))?
             .to_owned();
         model::validate_id(&id)?;
-        let (request, version) = match engine.store.get(&id)? {
+        let (request, version, action_name) = match engine.store.get(&id)? {
             Some(record) => {
-                if record.plan.action != "archive" {
+                if !matches!(
+                    record.plan.action.as_str(),
+                    "archive" | "auto-archive" | "archive-unarchive"
+                ) {
                     return Err(Error::conflict("编号属于其他操作"));
                 }
-                (record.plan.request, Some(record.plan.version))
+                let action_name = record.plan.action.clone();
+                (record.plan.request, Some(record.plan.version), action_name)
             }
-            None => (request(id.clone(), "archive", json!({})), None),
+            None => (
+                request(id.clone(), "archive", json!({})),
+                None,
+                "archive".to_owned(),
+            ),
         };
         engine.reconcile_request(request, version)?;
+        if action_name == "archive-unarchive" {
+            return store::status(&engine.config.state_db(), &id);
+        }
         return progress(&engine.config, Some(&id));
     }
     let action = match command {
         "archive-apply" => "archive",
+        "auto-watermark-apply" => "auto-archive",
+        "archive-unarchive" => "archive-unarchive",
         "archive-resolve" => "archive-resolve",
         "queue-confirm" => "queue-confirm",
         "review-note" => "review-note",
@@ -73,12 +89,27 @@ pub fn execute(engine: &mut Engine, command: &str, mut body: Value) -> Result<Va
     obj.remove("operation_id");
     obj.remove("id");
     obj.remove("at");
+    if action == "auto-archive" {
+        obj.remove("async");
+    }
     if let Some(ids) = body.get_mut("vids") {
-        let mut values = crate::review::vids(ids)?;
-        if action == "archive" {
-            values.sort();
+        if action == "auto-archive" {
+            if let Some(arr) = ids.as_array() {
+                let mut values: Vec<String> = arr
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_owned))
+                    .collect();
+                values.sort();
+                values.dedup();
+                *ids = json!(values);
+            }
+        } else {
+            let mut values = crate::review::vids(ids)?;
+            if action == "archive" {
+                values.sort();
+            }
+            *ids = json!(values);
         }
-        *ids = json!(values);
     }
     let plan = if let Some(record) = engine.store.get(&id)? {
         let mut previous = record.plan.request.payload.clone().unwrap_or(Value::Null);
@@ -105,7 +136,7 @@ pub fn execute(engine: &mut Engine, command: &str, mut body: Value) -> Result<Va
                 Ok(result)
             }
         }
-        Err(error) if action == "archive" => {
+        Err(error) if matches!(action, "archive" | "auto-archive") => {
             if let Some(record) = engine.store.get(&id)?
                 && ["rolled_back", "recovery_needed", "failed"].contains(&record.status.as_str())
                 && record.status != "not_started"
@@ -115,13 +146,19 @@ pub fn execute(engine: &mut Engine, command: &str, mut body: Value) -> Result<Va
                     .as_ref()
                     .map(|e| e.error.as_str())
                     .unwrap_or(&error.error);
-                let result = failure_result(
-                    &record.plan,
-                    &record.status,
-                    cause,
-                    &engine.store.failures(&id)?,
-                    &retained_indexes(&engine.store.db, &id)?,
-                );
+                let failures = engine.store.failures(&id)?;
+                let retained = retained_indexes(&engine.store.db, &id)?;
+                let result = if action == "auto-archive" {
+                    crate::auto_archive::failure_result(
+                        &record.plan,
+                        &record.status,
+                        cause,
+                        &failures,
+                        &retained,
+                    )
+                } else {
+                    failure_result(&record.plan, &record.status, cause, &failures, &retained)
+                };
                 // Keep the terminal operation state; only its compatibility receipt is published.
                 // An uncertain/recovery-needed operation must never gain a final result that
                 // could short-circuit the common executor's reconciliation.
@@ -213,7 +250,7 @@ fn journal_failures(db: &rusqlite::Connection, id: &str) -> Result<Vec<Value>> {
 }
 pub fn progress(config: &Config, id: Option<&str>) -> Result<Value> {
     let db = db::open_readonly(&config.state_db())?;
-    let id=match id {Some(id)=>{model::validate_id(id)?;Some(id.to_owned())},None=>db.query_row("SELECT id FROM operations WHERE json_extract(plan,'$.action')='archive' ORDER BY created_at DESC,rowid DESC LIMIT 1",[],|r|r.get::<_,String>(0)).optional()?};
+    let id=match id {Some(id)=>{model::validate_id(id)?;Some(id.to_owned())},None=>db.query_row("SELECT id FROM operations WHERE json_extract(plan,'$.action') IN ('archive','auto-archive') ORDER BY created_at DESC,rowid DESC LIMIT 1",[],|r|r.get::<_,String>(0)).optional()?};
     let Some(id) = id else {
         return Ok(json!({"job":null}));
     };
@@ -233,9 +270,15 @@ pub fn progress(config: &Config, id: Option<&str>) -> Result<Value> {
     let plan = plan
         .map(|p| serde_json::from_str::<crate::model::Plan>(&p))
         .transpose()?;
-    if plan.as_ref().is_some_and(|p| p.action != "archive") {
+    if plan
+        .as_ref()
+        .is_some_and(|p| !matches!(p.action.as_str(), "archive" | "auto-archive"))
+    {
         return Err(Error::conflict("编号属于其他操作"));
     }
+    let is_auto = plan
+        .as_ref()
+        .is_some_and(|p| p.action == "auto-archive");
     let state = status["status"].as_str().unwrap_or("unknown");
     let phase = status["phase"].as_str().unwrap_or("unknown");
     let terminal = ["complete", "failed", "rolled_back", "cancelled"].contains(&state);
@@ -251,9 +294,9 @@ pub fn progress(config: &Config, id: Option<&str>) -> Result<Value> {
     let title = if phase.starts_with("duplicate_") {
         "校验重复文件"
     } else if partial {
-        "部分归档完成"
+        if is_auto { "部分自动归档完成" } else { "部分归档完成" }
     } else if state == "complete" {
-        "归档完成"
+        if is_auto { "自动归档完成" } else { "归档完成" }
     } else if state == "rolled_back" {
         "本轮已移动的文件已恢复"
     } else if state == "recovery_needed" {
@@ -266,25 +309,34 @@ pub fn progress(config: &Config, id: Option<&str>) -> Result<Value> {
         "移动文件"
     } else if state == "cancelled" {
         "未开始，已停止受理"
+    } else if is_auto {
+        "核对自动归档"
     } else {
         "核对归档"
     };
-    let mut out = json!({"job":{"id":id,"kind":"archive","title":"归档视频","status":if state=="complete"&&!partial{"complete"}else if terminal||state=="recovery_needed"{"error"}else{"running"},"stage":title,"current":current,"done":if moving{status["completed"].clone()}else{Value::Null},"total":if moving{status["total"].clone()}else{Value::Null},"unit":if moving{"个文件"}else{""},"failed":status["failed"],"started_at":created,"updated_at":updated,"heartbeat_at":updated,"href":"/integration","error":status["error"]}});
+    let kind = if is_auto { "auto-archive" } else { "archive" };
+    let job_title = if is_auto { "自动水印归档" } else { "归档视频" };
+    let mut out = json!({"job":{"id":id,"kind":kind,"title":job_title,"status":if state=="complete"&&!partial{"complete"}else if terminal||state=="recovery_needed"{"error"}else{"running"},"stage":title,"current":current,"done":if moving{status["completed"].clone()}else{Value::Null},"total":if moving{status["total"].clone()}else{Value::Null},"unit":if moving{"个文件"}else{""},"failed":status["failed"],"started_at":created,"updated_at":updated,"heartbeat_at":updated,"href":"/integration","error":status["error"]}});
     if let Some(result) = status.get("result") {
         out["result"] = result.clone()
     } else if let Some(plan) = &plan
         && ["rolled_back", "failed", "recovery_needed"].contains(&state)
     {
-        out["result"] = failure_result(
-            plan,
-            state,
-            status["error"].as_str().unwrap_or("归档未完成"),
-            &journal_failures(&db, &id)?,
-            &retained_indexes(&db, &id)?,
-        );
+        let err_msg = status["error"].as_str().unwrap_or("归档未完成");
+        let j_failures = journal_failures(&db, &id)?;
+        let retained = retained_indexes(&db, &id)?;
+        out["result"] = if is_auto {
+            crate::auto_archive::failure_result(plan, state, err_msg, &j_failures, &retained)
+        } else {
+            failure_result(plan, state, err_msg, &j_failures, &retained)
+        };
     }
     if state == "cancelled" {
-        out["result"] = json!({"ok":false,"moved":0,"remaining":crate::review::read(config,"integration-queue.json",json!([]))?.1.as_array().unwrap().len(),"errors":["请求未开始，已停止受理"]})
+        out["result"] = if is_auto {
+            json!({"ok":false,"id":id,"archived":0,"moved":0,"fallback_queued":0,"skipped":0,"results":[],"errors":["请求未开始，已停止受理"]})
+        } else {
+            json!({"ok":false,"moved":0,"remaining":crate::review::read(config,"integration-queue.json",json!([]))?.1.as_array().unwrap().len(),"errors":["请求未开始，已停止受理"]})
+        };
     }
     Ok(out)
 }

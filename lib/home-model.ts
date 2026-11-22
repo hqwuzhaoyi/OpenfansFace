@@ -1,5 +1,5 @@
 export type JobStatus = 'running'|'waiting'|'paused'|'complete'|'error'|'offline'
-export type JobKind = 'text'|'face'|'discovery'|'archive'|'watermark'|'rebuild'
+export type JobKind = 'text'|'face'|'discovery'|'archive'|'auto-archive'|'watermark'|'rebuild'
 export interface HomeJob {
   id:string; kind:JobKind; title:string; status:JobStatus; stage:string
   current?:string; vid?:string; done:number|null; total:number|null; unit:string; failed:number

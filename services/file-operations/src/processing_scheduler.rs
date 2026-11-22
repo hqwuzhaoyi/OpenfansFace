@@ -30,7 +30,8 @@ CREATE TABLE IF NOT EXISTS tasks (
  created_at REAL NOT NULL, updated_at REAL NOT NULL,
  error TEXT, manual INTEGER NOT NULL DEFAULT 0, deferred INTEGER NOT NULL DEFAULT 0,
  note TEXT NOT NULL DEFAULT '', data TEXT NOT NULL DEFAULT '{}', run_id TEXT NOT NULL DEFAULT '',
- lease_expires_at REAL NOT NULL DEFAULT 0, coordinator_generation TEXT NOT NULL DEFAULT ''
+ lease_expires_at REAL NOT NULL DEFAULT 0, coordinator_generation TEXT NOT NULL DEFAULT '',
+ auto_opt_out INTEGER NOT NULL DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS processing_stage ON tasks(stage, priority, is_new, created_at);
 CREATE TABLE IF NOT EXISTS events (
@@ -73,7 +74,7 @@ pub fn db_path(config: &Config) -> PathBuf {
     config.base.join("processing/processing.db")
 }
 
-fn ensure_columns(conn: &Connection) -> Result<()> {
+pub fn ensure_columns(conn: &Connection) -> Result<()> {
     let task_cols = db::columns(conn, "tasks")?;
     if !task_cols.is_empty() {
         if !task_cols.iter().any(|c| c == "run_id") {
@@ -91,6 +92,12 @@ fn ensure_columns(conn: &Connection) -> Result<()> {
         if !task_cols.iter().any(|c| c == "coordinator_generation") {
             conn.execute(
                 "ALTER TABLE tasks ADD COLUMN coordinator_generation TEXT NOT NULL DEFAULT ''",
+                [],
+            )?;
+        }
+        if !task_cols.iter().any(|c| c == "auto_opt_out") {
+            conn.execute(
+                "ALTER TABLE tasks ADD COLUMN auto_opt_out INTEGER NOT NULL DEFAULT 0",
                 [],
             )?;
         }
@@ -122,7 +129,9 @@ pub fn open_or_init(config: &Config) -> Result<Connection> {
     conn.busy_timeout(Duration::from_secs(30))?;
     conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA synchronous=FULL;")?;
     let schema_ready = conn
-        .prepare("SELECT run_id, lease_expires_at, coordinator_generation FROM tasks LIMIT 0")
+        .prepare(
+            "SELECT run_id, lease_expires_at, coordinator_generation, auto_opt_out FROM tasks LIMIT 0",
+        )
         .is_ok()
         && conn
             .prepare("SELECT execution FROM processing_runs LIMIT 0")
@@ -144,18 +153,22 @@ pub fn open_or_init(config: &Config) -> Result<Connection> {
     crate::agent_deployment::init_tables(&conn)?;
     let has_defaults: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM settings WHERE key IN ('paused', 'concurrency', 'batch_ledger_version')",
+            "SELECT COUNT(*) FROM settings WHERE key IN ('paused', 'concurrency', 'batch_ledger_version', 'auto_watermark_merge')",
             [],
             |r| r.get(0),
         )
         .unwrap_or(0);
-    if has_defaults < 3 {
+    if has_defaults < 4 {
         conn.execute(
             "INSERT OR IGNORE INTO settings VALUES ('paused','false')",
             [],
         )?;
         conn.execute(
             "INSERT OR IGNORE INTO settings VALUES ('concurrency','1')",
+            [],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO settings VALUES ('auto_watermark_merge','true')",
             [],
         )?;
         let version = setting(&conn, "batch_ledger_version")?
@@ -243,6 +256,56 @@ pub fn effective_concurrency(conn: &Connection, capacity: i64) -> Result<i64> {
         .unwrap_or(1)
         .max(1);
     Ok(capacity.max(1).min(configured))
+}
+
+fn is_active_history_row(row: &Value) -> bool {
+    row["undone"] != true
+}
+
+/// Returns true iff global processing is NOT paused AND `auto_watermark_merge` is enabled (defaults to true).
+pub fn is_auto_watermark_enabled(conn: &Connection) -> Result<bool> {
+    let paused = setting(conn, "paused")?
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if paused {
+        return Ok(false);
+    }
+    let enabled = match setting(conn, "auto_watermark_merge")? {
+        Some(Value::Bool(b)) => b,
+        Some(Value::Number(n)) => n.as_i64() != Some(0),
+        Some(Value::String(s)) => !matches!(s.trim().to_ascii_lowercase().as_str(), "false" | "0"),
+        _ => true,
+    };
+    Ok(enabled)
+}
+
+pub fn is_auto_watermark_enabled_for_config(config: &Config) -> Result<bool> {
+    let path = db_path(config);
+    if !path.exists() {
+        return Ok(true);
+    }
+    let conn = db::open_readonly(&path)?;
+    let has_settings: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='settings')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap_or(false);
+    if !has_settings {
+        return Ok(true);
+    }
+    is_auto_watermark_enabled(&conn)
+}
+
+#[allow(dead_code)]
+pub fn set_task_auto_opt_out(conn: &Connection, vid: &str, opt_out: bool) -> Result<()> {
+    ensure_columns(conn)?;
+    conn.execute(
+        "UPDATE tasks SET auto_opt_out=?1 WHERE vid=?2",
+        params![i64::from(opt_out), vid],
+    )?;
+    Ok(())
 }
 
 fn ensure_member(conn: &Connection, task: &Value, legacy: bool) -> Result<()> {
@@ -405,7 +468,7 @@ pub fn reconcile(
                 }
                 conn.execute(
                     "UPDATE tasks SET path=?,name=?,size=?,mtime_ns=?,duration=?,stage='queued',retry_stage='text',
-                    text_attempts=0,face_attempts=0,next_retry=0,error=NULL,data='{}',manual=0,deferred=0,run_id='',
+                    text_attempts=0,face_attempts=0,next_retry=0,error=NULL,data='{}',manual=0,deferred=0,auto_opt_out=0,run_id='',
                     lease_expires_at=0,batch_id=?,updated_at=? WHERE vid=?",
                     params![
                         item_path,
@@ -834,7 +897,9 @@ fn discover_inner(config: &Config, conn: &mut Connection, body: &Value) -> Resul
         }
     }
     for row in history.as_array().into_iter().flatten() {
-        if let Some(vid) = row["vid"].as_str() {
+        if is_active_history_row(row)
+            && let Some(vid) = row["vid"].as_str()
+        {
             resolved.insert(vid.to_owned());
         }
     }
@@ -1527,13 +1592,15 @@ fn eligible_vids(config: &Config, conn: &Connection) -> Result<BTreeSet<String>>
     let queue = review::read(config, "integration-queue.json", json!([]))?.1;
     let history = review::read(config, "archive-history.json", json!([]))?.1;
     let mut handled_ids = BTreeSet::new();
-    for row in queue
-        .as_array()
-        .into_iter()
-        .flatten()
-        .chain(history.as_array().into_iter().flatten())
-    {
+    for row in queue.as_array().into_iter().flatten() {
         if let Some(id) = row["vid"].as_str() {
+            handled_ids.insert(id.to_owned());
+        }
+    }
+    for row in history.as_array().into_iter().flatten() {
+        if is_active_history_row(row)
+            && let Some(id) = row["vid"].as_str()
+        {
             handled_ids.insert(id.to_owned());
         }
     }
@@ -2245,13 +2312,15 @@ pub fn dashboard(config: &Config, body: &Value) -> Result<Value> {
     let queue = review::read(config, "integration-queue.json", json!([]))?.1;
     let history_doc = review::read(config, "archive-history.json", json!([]))?.1;
     let mut handled = BTreeSet::new();
-    for row in queue
-        .as_array()
-        .into_iter()
-        .flatten()
-        .chain(history_doc.as_array().into_iter().flatten())
-    {
+    for row in queue.as_array().into_iter().flatten() {
         if let Some(vid) = row["vid"].as_str() {
+            handled.insert(vid.to_owned());
+        }
+    }
+    for row in history_doc.as_array().into_iter().flatten() {
+        if is_active_history_row(row)
+            && let Some(vid) = row["vid"].as_str()
+        {
             handled.insert(vid.to_owned());
         }
     }
@@ -2694,13 +2763,15 @@ pub fn home_tasks(config: &Config, body: &Value) -> Result<Value> {
         let queue = review::read(config, "integration-queue.json", json!([]))?.1;
         let history = review::read(config, "archive-history.json", json!([]))?.1;
         let mut handled = BTreeSet::new();
-        for row in queue
-            .as_array()
-            .into_iter()
-            .flatten()
-            .chain(history.as_array().into_iter().flatten())
-        {
+        for row in queue.as_array().into_iter().flatten() {
             if let Some(vid) = row["vid"].as_str() {
+                handled.insert(vid.to_owned());
+            }
+        }
+        for row in history.as_array().into_iter().flatten() {
+            if is_active_history_row(row)
+                && let Some(vid) = row["vid"].as_str()
+            {
                 handled.insert(vid.to_owned());
             }
         }
@@ -3305,7 +3376,9 @@ fn load_active_face_groups(config: &Config, face_version: &str) -> Result<Vec<Va
             && let Some(arr) = doc.as_array()
         {
             for r in arr {
-                if let Some(id) = r["vid"].as_str() {
+                if (name != "archive-history.json" || is_active_history_row(r))
+                    && let Some(id) = r["vid"].as_str()
+                {
                     handled.insert(id.to_owned());
                 }
             }
@@ -3671,12 +3744,13 @@ pub fn reference_state(engine: &Engine) -> Result<Value> {
     let queue = review::read(config, "integration-queue.json", json!([]))?.1;
     let history = review::read(config, "archive-history.json", json!([]))?.1;
     let mut assigned = serde_json::Map::new();
-    for row in queue
-        .as_array()
-        .into_iter()
-        .flatten()
-        .chain(history.as_array().into_iter().flatten())
-    {
+    for row in queue.as_array().into_iter().flatten().chain(
+        history
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|r| is_active_history_row(r)),
+    ) {
         if row["file_state"].as_str() == Some("staged") {
             continue;
         }
@@ -3985,7 +4059,8 @@ pub fn evict_artifacts(engine: &Engine, body: &Value) -> Result<Value> {
             && let Some(arr) = doc.as_array()
         {
             for r in arr {
-                if r["file_state"].as_str() != Some("staged")
+                if (doc_name != "archive-history.json" || is_active_history_row(r))
+                    && r["file_state"].as_str() != Some("staged")
                     && let Some(vid) = r["vid"].as_str()
                 {
                     assigned_vids.insert(vid.to_owned());
@@ -4263,7 +4338,9 @@ fn read_catalog_people(config: &Config) -> Vec<String> {
     for file in ["integration-queue.json", "archive-history.json"] {
         if let Some(rows) = read_json_fallback(&config.base.join(file), json!([])).as_array() {
             for item in rows {
-                if let Some(creator) = item["creator"].as_str().filter(|s| !s.is_empty()) {
+                if (file != "archive-history.json" || is_active_history_row(item))
+                    && let Some(creator) = item["creator"].as_str().filter(|s| !s.is_empty())
+                {
                     raw_names.insert(creator.to_owned());
                 }
             }
@@ -4284,7 +4361,9 @@ fn read_handled_vids(config: &Config) -> BTreeSet<String> {
     for file in ["integration-queue.json", "archive-history.json"] {
         if let Some(rows) = read_json_fallback(&config.base.join(file), json!([])).as_array() {
             for item in rows {
-                if let Some(vid) = item["vid"].as_str().filter(|s| !s.is_empty()) {
+                if (file != "archive-history.json" || is_active_history_row(item))
+                    && let Some(vid) = item["vid"].as_str().filter(|s| !s.is_empty())
+                {
                     ids.insert(vid.to_owned());
                 }
             }
@@ -5759,5 +5838,54 @@ mod tests {
             &vmtime,
             &files::identity(&meta),
         ));
+    }
+
+    #[test]
+    fn auto_watermark_settings_opt_out_and_undone_history() {
+        let env = TestEnv::new();
+        let conn = open_or_init(&env.config).unwrap();
+        assert!(is_auto_watermark_enabled(&conn).unwrap());
+        assert!(is_auto_watermark_enabled_for_config(&env.config).unwrap());
+
+        set_setting(&conn, "paused", &json!(true)).unwrap();
+        assert!(!is_auto_watermark_enabled(&conn).unwrap());
+        set_setting(&conn, "paused", &json!(false)).unwrap();
+        assert!(is_auto_watermark_enabled(&conn).unwrap());
+
+        set_setting(&conn, "auto_watermark_merge", &json!(false)).unwrap();
+        assert!(!is_auto_watermark_enabled(&conn).unwrap());
+        set_setting(&conn, "auto_watermark_merge", &json!(true)).unwrap();
+        assert!(is_auto_watermark_enabled(&conn).unwrap());
+
+        conn.execute(
+            "INSERT INTO tasks(vid,path,name,size,mtime_ns,stage,retry_stage,batch_id,created_at,updated_at)
+             VALUES('v-opt','/tmp/v-opt.mp4','v-opt.mp4',10,'100','review','face','b1',1.0,1.0),
+                   ('v-act','/tmp/v-act.mp4','v-act.mp4',10,'100','review','face','b1',1.0,1.0)",
+            [],
+        )
+        .unwrap();
+        set_task_auto_opt_out(&conn, "v-opt", true).unwrap();
+        let opt_val: i64 = conn
+            .query_row("SELECT auto_opt_out FROM tasks WHERE vid='v-opt'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(opt_val, 1);
+
+        fs::write(
+            env.config.base.join("archive-history.json"),
+            json!([
+                {"vid": "v-opt", "creator": "Alice", "undone": true},
+                {"vid": "v-act", "creator": "Alice"}
+            ])
+            .to_string(),
+        )
+        .unwrap();
+        let eligible = eligible_vids(&env.config, &conn).unwrap();
+        assert!(eligible.contains("v-opt"));
+        assert!(!eligible.contains("v-act"));
+        let handled = read_handled_vids(&env.config);
+        assert!(!handled.contains("v-opt"));
+        assert!(handled.contains("v-act"));
     }
 }

@@ -8,6 +8,8 @@ mod archive_api;
 mod archive_cancel;
 mod archive_ledger;
 mod archive_resolution;
+mod auto_archive;
+mod auto_watermark;
 mod config;
 mod control;
 mod creator_delta;
@@ -42,6 +44,7 @@ mod shared_metadata;
 mod staging;
 mod staging_delete;
 mod store;
+mod unarchive;
 mod video_health;
 
 use crate::{
@@ -77,6 +80,7 @@ struct Work {
 struct App {
     config: Config,
     worker: admission::Worker,
+    auto_archive_wake: Arc<auto_archive::AutoArchiveWake>,
     // Local journal reads must remain available while media/NFS reads are stalled.
     status_reads: Arc<Semaphore>,
     media_reads: Arc<Semaphore>,
@@ -305,6 +309,8 @@ fn media_listing_checkpoint(config: &Config, offset: usize) -> Result<()> {
 async fn serve() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
     let mut engine = Engine::new(config.clone())?;
+    let auto_archive_wake = auto_archive::AutoArchiveWake::new();
+    engine.set_auto_archive_wake(auto_archive_wake.clone());
     if config.parity_root.is_none() {
         match video_health::needs_recovery(&config) {
             Ok(true) => {
@@ -372,9 +378,21 @@ async fn serve() -> std::result::Result<(), Box<dyn std::error::Error>> {
     } else {
         None
     };
+    let auto_archive_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let auto_archive_worker = if config.parity_root.is_none() {
+        Some(auto_archive::spawn_auto_archive_publisher(
+            config.clone(),
+            worker.clone(),
+            auto_archive_wake.clone(),
+            auto_archive_stop.clone(),
+        ))
+    } else {
+        None
+    };
     let app = App {
         config: config.clone(),
         worker,
+        auto_archive_wake: auto_archive_wake.clone(),
         status_reads: Arc::new(Semaphore::new(4)),
         media_reads: Arc::new(Semaphore::new(4)),
         compute_reads: Arc::new(Semaphore::new(4)),
@@ -454,8 +472,15 @@ async fn serve() -> std::result::Result<(), Box<dyn std::error::Error>> {
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     health_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    auto_archive_stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    auto_archive_wake.notify_stop();
     if let Some(health) = health {
         health.join().map_err(|_| "health worker panicked")?;
+    }
+    if let Some(auto_archive_worker) = auto_archive_worker {
+        auto_archive_worker
+            .join()
+            .map_err(|_| "auto-archive worker panicked")?;
     }
     executor.join().map_err(|_| "execution worker panicked")?;
     Ok(())
@@ -504,6 +529,26 @@ async fn archive_post(
             ),
         ));
     }
+    if command == "auto-watermark-preview" && app.config.fixture.is_none() {
+        let permit = app
+            .compute_reads
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|_| Error::new(503, "unavailable", "读取服务不可用"))?;
+        let config = app.config;
+        return Ok((
+            StatusCode::OK,
+            Json(
+                tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    auto_watermark::preview_auto_watermark_matches(&config)
+                })
+                .await
+                .map_err(|_| Error::new(503, "unavailable", "自动水印预览读取失败"))??,
+            ),
+        ));
+    }
     if matches!(command.as_str(), "review-page" | "review-status")
         && app.config.fixture.is_none()
     {
@@ -528,7 +573,7 @@ async fn archive_post(
             ),
         ));
     }
-    let wait_ms = if command == "archive-apply" {
+    let wait_ms = if matches!(command.as_str(), "archive-apply" | "auto-watermark-apply") {
         payload["wait_ms"].as_u64()
     } else {
         None
@@ -1179,13 +1224,22 @@ async fn agent_commit_task_result(
         }
     };
     let config = app.config;
+    let wake = app.auto_archive_wake.clone();
+    let submitted_vid = payload.vid.clone();
     let resp = tokio::task::spawn_blocking(move || {
         agent_dispatcher::commit_task_result(&config, &auth, payload)
     })
     .await;
 
     match resp {
-        Ok(Ok(res)) => (axum::http::StatusCode::OK, Json(json!(res))).into_response(),
+        Ok(Ok(res)) => {
+            if res.completed == Some(true)
+                && let Some(vid) = submitted_vid.as_deref()
+            {
+                wake.notify_vid(vid);
+            }
+            (axum::http::StatusCode::OK, Json(json!(res))).into_response()
+        }
         Ok(Err(err)) => (
             axum::http::StatusCode::from_u16(err.status)
                 .unwrap_or(axum::http::StatusCode::INTERNAL_SERVER_ERROR),

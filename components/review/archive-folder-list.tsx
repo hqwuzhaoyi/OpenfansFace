@@ -7,6 +7,7 @@ import { fileName } from '@/lib/review-ui'
 import './archive-workbench.css'
 
 export interface ArchiveListItem {
+  rowKey?: string
   vid: string
   name: string
   src: string | null
@@ -16,6 +17,8 @@ export interface ArchiveListItem {
   status: string
   statusLabel: string
   size_gb?: number
+  source?: string
+  undone?: boolean
 }
 
 export function ArchiveCheckbox({ checked, mixed, disabled, label, onChange }: {
@@ -49,16 +52,19 @@ export function ArchiveFolderList({ items, selected, active, collapsed, disabled
         </button>
       </div>
       <div id={contentId} hidden={!open}>
-        {folder.items.map(item => <div key={item.vid} data-vid={item.vid} data-active={active === item.vid} data-selected={selected.has(item.vid)} className="archive-row">
+        {folder.items.map(item => {
+          const itemKey = item.rowKey || item.vid
+          return <div key={itemKey} data-vid={item.vid} data-active={active === itemKey} data-selected={selected.has(item.vid)} data-undone={item.undone || undefined} className="archive-row">
           {!history && <ArchiveCheckbox checked={selected.has(item.vid)} disabled={disabled} label={`选择 ${item.name}`} onChange={() => onToggle([item.vid])} />}
-          <button className="archive-rowOpen" aria-current={active === item.vid ? 'true' : undefined} onClick={() => onOpen(item.vid)} title={item.name}>
+          <button className="archive-rowOpen" aria-current={active === itemKey ? 'true' : undefined} onClick={() => onOpen(itemKey)} title={item.name}>
             <span className="archive-rowThumbnail">{item.thumb ? <img data-private-media draggable={false} src={item.thumb} alt="" loading="lazy" /> : <FileVideo size={18} />}</span>
-            <span className="archive-rowText"><strong>{item.name}</strong><small>{item.creator}{item.size_gb !== undefined && <> · {item.size_gb.toFixed(2)} GB</>}</small></span>
-            <span className={item.status === 'ok' || history ? 'archive-good' : 'archive-warning'} title={item.statusLabel}>
+            <span className="archive-rowText"><strong>{item.name}</strong><small className="archive-rowMeta"><span>{item.creator}{item.size_gb !== undefined && <> · {item.size_gb.toFixed(2)} GB</>}</span>{item.source === 'auto-watermark' && <span className="archive-autoBadge">自动水印</span>}</small></span>
+            {item.undone ? <span className="archive-undoneBadge">已撤回</span> : <span className={item.status === 'ok' || history ? 'archive-good' : 'archive-warning'} title={item.statusLabel}>
               {item.status === 'ok' || history ? <><span className="archive-dot" /><span className="sr-only">{item.statusLabel}</span></> : <span className="archive-rowStatus">{item.statusLabel}</span>}
-            </span>
+            </span>}
           </button>
-        </div>)}
+        </div>
+        })}
       </div>
     </section>
   })}</>

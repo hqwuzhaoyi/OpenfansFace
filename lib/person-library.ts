@@ -2,7 +2,7 @@ import path from 'node:path'
 import { BASE } from './env'
 import { peopleCatalog, publicThumb } from './people-catalog'
 import { loadReport, loadClaims } from './integration'
-import { loadArchive, loadQueue, videoInfo } from './review-store'
+import { loadActiveArchive, loadQueue, videoInfo } from './review-store'
 import { readJson } from './jsonio'
 import { validateCreator } from './review-logic'
 import { loadWatermarkMappings, loadWatermarkRecords, watermarkFile } from './watermarks'
@@ -34,7 +34,7 @@ export async function libraryPeople():Promise<LibraryPerson[]> {
 
 export async function personLibrary(input:string,includeRecommendations=true):Promise<PersonLibrary> {
   const inventory=await nativePersonInventory(validateCreator(input)),{name,root,folders,directory_exists}=inventory
-  const metadata=videoInfo(),history=loadArchive(),queue=loadQueue()
+  const metadata=videoInfo(),history=loadActiveArchive(),queue=loadQueue()
   const assigned=new Set([...queue,...history].map(v=>v.vid))
   const files:PersonVideo[]=inventory.files.map(file=>({...file,thumb:publicThumb(metadata.get(file.vid)?.thumb),duration:metadata.get(file.vid)?.duration})).sort((a,b)=>a.name.localeCompare(b.name,'zh-CN'))
   if(!includeRecommendations)return {name,root,files,recommendations:[],folders,queued:queue.filter(v=>v.creator===name).length,directory_exists}

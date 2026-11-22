@@ -9,16 +9,21 @@ use crate::{
 };
 use rusqlite::OptionalExtension;
 use serde_json::{Value, json};
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
 pub struct Engine {
     pub config: Config,
     pub store: Store,
+    pub auto_archive_wake: Option<Arc<crate::auto_archive::AutoArchiveWake>>,
 }
 impl Engine {
     pub fn new(config: Config) -> Result<Self> {
         let store = Store::start(&config)?;
-        let mut engine = Self { config, store };
+        let mut engine = Self {
+            config,
+            store,
+            auto_archive_wake: None,
+        };
         if engine.config.parity_root.is_none() {
             engine.recover_startup()?;
             crate::person_batch::recover(&mut engine)?;
@@ -27,7 +32,19 @@ impl Engine {
     }
     pub fn open_preview(config: Config) -> Result<Self> {
         let store = Store::open_preview(&config)?;
-        Ok(Self { config, store })
+        Ok(Self {
+            config,
+            store,
+            auto_archive_wake: None,
+        })
+    }
+    pub fn set_auto_archive_wake(&mut self, wake: Arc<crate::auto_archive::AutoArchiveWake>) {
+        self.auto_archive_wake = Some(wake);
+    }
+    pub fn notify_auto_archive(&self, vid: &str) {
+        if let Some(wake) = &self.auto_archive_wake {
+            wake.notify_vid(vid);
+        }
     }
     pub fn preview(&mut self, request: Request) -> Result<Value> {
         crate::person_batch::reject_child(&self.store, &request.id)?;
@@ -1321,6 +1338,7 @@ impl Engine {
         for &index in &successful {
             crate::archive::verify_duplicate(&self.config, plan, index, false)?;
         }
+        let strict_ledger = matches!(plan.action.as_str(), "auto-archive" | "archive-unarchive");
         if plan.execution.is_some() {
             let has_ledger_reserved = self.store.latest_step(id, "ledger_reserved")?.is_some();
             self.checkpoint(
@@ -1333,6 +1351,7 @@ impl Engine {
                     if state == "absent" {
                         match self.ledger_reserve(plan, &domain) {
                             Ok(()) => json!({"state":"prepared"}),
+                            Err(err) if strict_ledger => return Err(err),
                             Err(err) => json!({"state":"skipped","warning":err.error}),
                         }
                     } else {
@@ -1356,11 +1375,13 @@ impl Engine {
                         });
                     match fallback {
                         Ok(_) => json!({"state":"prepared"}),
+                        Err(_) if strict_ledger => return Err(error),
                         Err(err) => {
                             json!({"state":"skipped","warning":format!("{}; {}", error.error, err.error)})
                         }
                     }
                 }
+                Err(error) if strict_ledger => return Err(error),
                 Err(error) => json!({"state":"skipped","warning":error.error}),
             };
             self.checkpoint(id, "ledger_reserved", reserve_state)?;
@@ -1446,6 +1467,7 @@ impl Engine {
         };
         let evidence = match primary_ledger {
             Ok(applied) => applied,
+            Err(primary_err) if strict_ledger => return Err(primary_err),
             Err(primary_err) => match self.best_effort_sync_peach(plan, &successful) {
                 Ok(fallback_ev) => {
                     if let Some(ids) = fallback_ev["reconciled_scanner_assets"].as_array() {

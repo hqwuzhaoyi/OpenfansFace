@@ -475,7 +475,7 @@ pub fn snapshot(config: &Config, plan: &Plan, successful: &[usize]) -> Result<Do
         }
         if doc.name == "archive-history.json" {
             for row in value.as_array_mut().unwrap() {
-                if selected(plan, row) {
+                if row["undone"] != true && selected(plan, row) {
                     row["file_state"] = json!(if deleting { "staged" } else { "restored" });
                 }
             }

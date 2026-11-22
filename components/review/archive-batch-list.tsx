@@ -26,12 +26,13 @@ export function ArchiveBatchList({ batches, selected, active, disabled, onToggle
     const count = batch.rows.filter(row => selected.has(row.vid)).length
     const ready = batch.rows.filter(row => row.status === 'ok').length
     const issues = batch.rows.length - ready
+    const autoCount = batch.rows.filter(row => row.source === 'auto-watermark').length
     const title = batchCreator(batch)
     return <article key={batch.key} className="archive-batch" data-batch={batch.key} data-active={active === batch.key} data-selected={count > 0}>
       <div className="archive-batchMain"><ArchiveCheckbox label={`选择整波 ${title} ${archiveTime(batch.at)} 共 ${batch.rows.length} 个视频`} checked={count === batch.rows.length} mixed={count > 0 && count < batch.rows.length} disabled={disabled} onChange={() => onToggle(batch.rows.map(row => row.vid))} />
       <button data-archive-navigate className="archive-batchOpen" onClick={() => onOpen(batch.key)} aria-current={active === batch.key ? 'true' : undefined} title={`${title} · ${archiveTime(batch.at)}`}>
         <span className="archive-batchTitle"><strong>{title}</strong><time>{archiveTime(batch.at)}</time></span>
-        <span className="archive-batchMeta"><span><Layers size={12} />{batch.rows.length} 个视频</span>{issues ? <span className="archive-warning">{issues} 个需处理</span> : <span className="archive-good">可归档</span>}{count > 0 && <span className="archive-selectedCount">已选 {count}/{batch.rows.length}</span>}</span>
+        <span className="archive-batchMeta"><span><Layers size={12} />{batch.rows.length} 个视频</span>{autoCount > 0 && <span className="archive-autoBadge">自动水印{autoCount < batch.rows.length ? ` ${autoCount}` : ''}</span>}{issues ? <span className="archive-warning">{issues} 个需处理</span> : <span className="archive-good">可归档</span>}{count > 0 && <span className="archive-selectedCount">已选 {count}/{batch.rows.length}</span>}</span>
         <span className="archive-batchExcerpt">{batch.rows[0]?.name}{batch.rows.length > 1 ? ` 等 ${batch.rows.length} 个` : ''}{batch.inferred ? ' · 旧记录' : ''}</span>
       </button></div>
       <ArchiveRowActions rows={batch.rows} disabled={disabled} onResolve={onResolve} onCustomize={onCustomize} onUndo={onUndo} />

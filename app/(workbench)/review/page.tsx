@@ -2,7 +2,7 @@
 
 import Link from 'next/link'
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { Check, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, Film, Maximize2, Play, RefreshCw, SlidersHorizontal, X, ArrowLeft, ListChecks } from 'lucide-react'
+import { Check, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, Film, Maximize2, Play, RefreshCw, SlidersHorizontal, Sparkles, X, ArrowLeft, ListChecks } from 'lucide-react'
 import * as Popover from '@radix-ui/react-popover'
 import { workspaceToast as toast } from '@/components/workbench/feedback'
 import { api } from '@/lib/face-api'
@@ -31,6 +31,8 @@ import { useReviewActivity } from '@/components/workbench/review-activity'
 import { useBackgroundOperations } from '@/components/workbench/background-operations'
 import { AlertDialog,AlertDialogContent,AlertDialogHeader,AlertDialogTitle,AlertDialogDescription,AlertDialogFooter,AlertDialogCancel,AlertDialogAction } from '@/components/ui/alert-dialog'
 import { ReviewSummaryRow } from '@/components/review/review-summary-row'
+import { AutoMergeDialog } from '@/components/review/auto-merge-dialog'
+import { fetchAutoMergePreview, type AutoWatermarkPreview } from '@/lib/archive-actions'
 import { VideoPreviewDialog } from '@/components/workbench/video-preview-dialog'
 import { ReviewQueueSkeleton, StageMediaLoader } from '@/components/workbench/loading-skeletons'
 import { Skeleton } from '@/components/ui/skeleton'
@@ -90,6 +92,9 @@ export default function Review() {
   const returnFocus=useRef<HTMLElement|null>(null),session=useRef<string|undefined>(undefined),pendingSessionResetRef=useRef(false),noteBaseline=useRef<Record<string,string>>({}),notesRef=useRef(notes),polling=useRef(false),scrollAnchor=useRef<{vid:string;offset:number}[]|null>(null)
   notesRef.current=notes
   const [updates,setUpdates]=useState<{has_updates:boolean;refreshing:number;blocked:number;waiting?:number}|null>(null),[refreshConfirm,setRefreshConfirm]=useState(false),[sessionExpired,setSessionExpired]=useState(false)
+  const [autoMergePreview,setAutoMergePreview]=useState<AutoWatermarkPreview|null>(null),[autoMergeOpen,setAutoMergeOpen]=useState(false),[autoMergeLoading,setAutoMergeLoading]=useState(false)
+  const autoMergeTriggerRef=useRef<HTMLButtonElement>(null),autoMergeSeqRef=useRef(0)
+  const loadAutoMergePreview=useCallback(async()=>{const seq=++autoMergeSeqRef.current;setAutoMergeLoading(true);try{const next=await fetchAutoMergePreview();if(seq===autoMergeSeqRef.current)setAutoMergePreview(next)}catch{}finally{if(seq===autoMergeSeqRef.current)setAutoMergeLoading(false)}},[])
   const [groupsCollapsed,setGroupsCollapsed]=useState(false)
   const groupsManualRef=useRef(false)
   const [listWidth,setListWidth]=useState(356)
@@ -108,7 +113,7 @@ export default function Review() {
   hasManualSelectionsRef.current=hasManualSelections
   const hasDraftsRef=useRef(hasDrafts)
   hasDraftsRef.current=hasDrafts
-  const protectedWork=busy||pendingVids.size>0||loading||hasManualSelections||hasDrafts||previewOpen||lightbox.open||!!reference||(reviewDesktop&&stageOpen&&stageTab==='reference')||refreshConfirm||detailMode==='selection'
+  const protectedWork=busy||pendingVids.size>0||loading||hasManualSelections||hasDrafts||previewOpen||lightbox.open||autoMergeOpen||!!reference||(reviewDesktop&&stageOpen&&stageTab==='reference')||refreshConfirm||detailMode==='selection'
   const protectedWorkRef=useRef(protectedWork)
   protectedWorkRef.current=protectedWork
   const {version:activityVersion,canApply:canAutoApply,markAutoRefreshed}=useReviewActivity(protectedWork)
@@ -198,7 +203,7 @@ export default function Review() {
       const projectedNext=applyPendingReviewMutations(next,startedAtSeq,remainingPending,view)
       setUpdates(previous=>shouldCreateFresh?null:({has_updates:projectedNext.has_updates??previous?.has_updates??false,refreshing:previous?.refreshing||0,blocked:previous?.blocked||0,waiting:projectedNext.waiting}));setSelections(current=>Object.fromEntries(Object.entries(current).map(([key,tasks])=>[key,tasks.map(t=>projectedNext.rows.find(r=>r.vid===t.vid)||t)])));setInspected(current=>Object.fromEntries(Object.entries(current).map(([key,t])=>[key,projectedNext.rows.find(r=>r.vid===t.vid)||t])));setError('');setSessionExpired(false)
       for(const row of projectedNext.rows)if(notesRef.current[row.vid]===undefined)noteBaseline.current[row.vid]=row.note
-      if(options.refresh){initializedScopesRef.current.clear();autoSelectedScopesRef.current=new Set();setAutoSelectedScopes(new Set());setSelections({});setDrafts({});setNotes({});setPickerSearch({});noteBaseline.current={};setInspected({});setReference(null);setDetailMode('video');setPreviewOpen(false);setSubmitError('');setUpdates(null)}
+      if(options.refresh){initializedScopesRef.current.clear();autoSelectedScopesRef.current=new Set();setAutoSelectedScopes(new Set());setSelections({});setDrafts({});setNotes({});setPickerSearch({});noteBaseline.current={};setInspected({});setReference(null);setDetailMode('video');setPreviewOpen(false);setSubmitError('');setUpdates(null);void loadAutoMergePreview()}
       const visibleNextRows=projectedNext.rows.filter(r=>!pendingVidsRef.current.has(r.vid))
       const currentGroupKey=projectedNext.group?.key||group
       if(!options.silent&&currentGroupKey&&(!projectedNext.group||(!search&&!folder&&(projectedNext.remaining??visibleNextRows.length)===0))){
@@ -228,7 +233,7 @@ export default function Review() {
       return projectedNext
     }catch(e:any){if(token===sequence.current){if(isSessionExpiredError(e?.message)){clearReviewSessionCaches(true);if(shouldAutoRecoverExpiredReviewSession({hasManualSelections:hasManualSelectionsRef.current,hasDrafts:hasDraftsRef.current,inFlightCount:inFlightCountRef.current,alreadyRecovered:options.recovered}))return await latestLoadRef.current({refresh:true,recovered:true});setSessionExpired(true)}if(options.automatic)setUpdates(previous=>({...previous,has_updates:true,refreshing:previous?.refreshing||0,blocked:previous?.blocked||0}));else if(!options.silent)setError(e.message)}return null}
     finally{if(token===sequence.current&&!options.automatic&&!options.silent)setLoading(false)}
-  },[initialized,view,group,search,folder,page,linkFocus,personScope,clusterScope,updateFilters,activityVersion,canAutoApply,markAutoRefreshed,findNextAvailableGroup,applyGroupDefaultSelection,clearReviewSessionCaches])
+  },[initialized,view,group,search,folder,page,linkFocus,personScope,clusterScope,updateFilters,activityVersion,canAutoApply,markAutoRefreshed,findNextAvailableGroup,applyGroupDefaultSelection,clearReviewSessionCaches,loadAutoMergePreview])
   const latestLoadRef=useRef(load)
   latestLoadRef.current=load
   useEffect(()=>{if(data&&(!group||data.group?.key===group))applyGroupDefaultSelection(data)},[data,group,applyGroupDefaultSelection])
@@ -246,9 +251,11 @@ export default function Review() {
     return()=>{sequence.current++}
   },[initialized,queryFetchKey,load])
   useEffect(()=>{void loadPeople()},[loadPeople])
+  useEffect(()=>{if(initialized)void loadAutoMergePreview()},[initialized,loadAutoMergePreview])
   useEffect(()=>{
     return subscribe(event=>{
-      if(event.type==='archive-settled'){
+      if(event.type==='archive-settled'||event.type==='auto-merge-settled'){
+        void loadAutoMergePreview()
         if(!protectedWorkRef.current){
           clearReviewSessionCaches(true)
           void latestLoadRef.current({refresh:true})
@@ -260,6 +267,7 @@ export default function Review() {
       }else if(event.type==='person-batch-settled'||event.type==='person-file-settled'){
         deleteWorkbenchCache('review:people')
         void loadPeople()
+        void loadAutoMergePreview()
         if(!protectedWorkRef.current){
           clearReviewSessionCaches(true)
           void latestLoadRef.current({refresh:true})
@@ -270,7 +278,7 @@ export default function Review() {
         }
       }
     })
-  },[subscribe,loadPeople,clearReviewSessionCaches])
+  },[subscribe,loadPeople,clearReviewSessionCaches,loadAutoMergePreview])
 
   useEffect(()=>{setReference(null);setSubmitError('')},[scope])
   useEffect(()=>{if(reviewDesktop)setPreviewOpen(false)},[reviewDesktop])
@@ -375,7 +383,7 @@ export default function Review() {
   const stepFocusRef=useRef(stepFocus)
   stepFocusRef.current=stepFocus
   useEffect(()=>{
-    if(!reviewDesktop||lightbox.open||previewOpen||refreshConfirm)return
+    if(!reviewDesktop||lightbox.open||previewOpen||refreshConfirm||autoMergeOpen)return
     const onKey=(e:KeyboardEvent)=>{
       if(e.defaultPrevented||e.metaKey||e.ctrlKey||e.altKey)return
       const target=e.target as HTMLElement|null
@@ -385,7 +393,7 @@ export default function Review() {
     }
     window.addEventListener('keydown',onKey)
     return()=>window.removeEventListener('keydown',onKey)
-  },[reviewDesktop,lightbox.open,previewOpen,refreshConfirm])
+  },[reviewDesktop,lightbox.open,previewOpen,refreshConfirm,autoMergeOpen])
   const advanceAfterComplete=(vids:string[])=>{
     const completedSet=new Set(vids)
     const remainingRows=rows.filter(r=>!completedSet.has(r.vid))
@@ -710,7 +718,7 @@ export default function Review() {
   ]
   useSyncWorkbenchBreadcrumb(breadcrumbItems)
   return <main className="ws-page" aria-label="人工确认工作区" data-review-session={data?.session}>
-    <WorkbenchHeaderActions><NavigationButton variant="ghost" size="sm" asChild><Link href="/operations"><span className="ws-link-label">分析中</span><span className="ws-count">{updates?.waiting??data?.waiting??'—'}</span><ChevronRight size={14} aria-hidden="true"/></Link></NavigationButton><Button variant={updates?.has_updates||sessionExpired?"outline":"ghost"} aria-label="更新人工确认列表" title={updates?.refreshing?`后台正在更新 ${updates.refreshing} 条建议，当前列表保持不变`:'更新建议和分组'} disabled={loading} onClick={requestRefresh}><RefreshCw size={15} aria-hidden="true"/>{updates?.has_updates||sessionExpired?<span>有更新</span>:updates?.refreshing?<span className="ws-muted">后台更新中</span>:null}</Button></WorkbenchHeaderActions>
+    <WorkbenchHeaderActions>{(autoMergePreview?.eligible_count??0)>0&&<Button ref={autoMergeTriggerRef} variant="outline" size="sm" aria-label={`自动合入 ${autoMergePreview!.eligible_count} 个已匹配视频`} title={`可直接合入 ${autoMergePreview!.eligible_count} 个视频（${autoMergePreview!.group_count} 位人物）`} onClick={()=>setAutoMergeOpen(true)}><Sparkles size={14} aria-hidden="true"/><span>自动合入</span><span className="ws-count">{autoMergePreview!.eligible_count}</span></Button>}<NavigationButton variant="ghost" size="sm" asChild><Link href="/operations"><span className="ws-link-label">分析中</span><span className="ws-count">{updates?.waiting??data?.waiting??'—'}</span><ChevronRight size={14} aria-hidden="true"/></Link></NavigationButton><Button variant={updates?.has_updates||sessionExpired?"outline":"ghost"} aria-label="更新人工确认列表" title={updates?.refreshing?`后台正在更新 ${updates.refreshing} 条建议，当前列表保持不变`:'更新建议和分组'} disabled={loading} onClick={requestRefresh}><RefreshCw size={15} aria-hidden="true"/>{updates?.has_updates||sessionExpired?<span>有更新</span>:updates?.refreshing?<span className="ws-muted">后台更新中</span>:null}</Button></WorkbenchHeaderActions>
     {receipt&&<div className="ws-receipt"><QueueReceipt count={receipt.vids.length} creator={receipt.creator} onUndo={undo} busy={false}/></div>}
     {error&&<p role="alert" className="ws-error">{error}</p>}
     {sessionExpired&&!error&&<p role="status" className="ws-error">本次核对已过期，勾选和草稿仍保留。请更新列表后继续。</p>}
@@ -879,6 +887,7 @@ export default function Review() {
       returnFocus={lightboxTriggerRef}
       stripSlot={activeLightboxTab==='reference'&&refVideos.length>1?<div className="ws-stage-ref-strip"><div className="ws-stage-ref-row" role="group" aria-label="对照视频样本">{refVideos.map((v,idx)=><button key={v.vid} type="button" aria-pressed={idx===clampedRefIdx} className="ws-stage-ref-card" onClick={()=>setStageRefIndex(idx)} title={v.name}><span className="ws-stage-ref-thumb">{v.thumb?<img src={v.thumb} width={108} height={68} data-private-media draggable={false} alt="" loading="lazy"/>:<Play size={14} aria-hidden="true"/>}</span><span className="ws-stage-ref-name">{v.name}</span></button>)}</div></div>:undefined}
     />
+    <AutoMergeDialog open={autoMergeOpen} onOpenChange={setAutoMergeOpen} preview={autoMergePreview} loading={autoMergeLoading} onRefreshPreview={loadAutoMergePreview} returnFocus={autoMergeTriggerRef}/>
     <AlertDialog open={refreshConfirm} onOpenChange={setRefreshConfirm}><AlertDialogContent onCloseAutoFocus={e=>{e.preventDefault();refreshFocus.current?.focus({preventScroll:true})}}><AlertDialogHeader><AlertDialogTitle>更新当前核对列表？</AlertDialogTitle><AlertDialogDescription>后台的新建议可能调整分组。更新会清空勾选、未保存的备注和人物输入。取消可继续当前核对。</AlertDialogDescription></AlertDialogHeader><AlertDialogFooter><AlertDialogCancel>继续当前核对</AlertDialogCancel><AlertDialogAction onClick={()=>void load({refresh:true})}>更新列表</AlertDialogAction></AlertDialogFooter></AlertDialogContent></AlertDialog>
   </main>
 }

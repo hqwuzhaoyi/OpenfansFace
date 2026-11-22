@@ -11,6 +11,7 @@ import {
   Merge,
   Pencil,
   RefreshCw,
+  Sparkles,
   Trash2,
   X,
 } from "lucide-react";
@@ -63,6 +64,11 @@ function invalidateReviewCaches({
     deleteWorkbenchCache("review:people");
   }
 }
+import { workspaceToast as toast } from "@/components/workbench/feedback";
+import type {
+  AutoWatermarkApplyItemInput,
+  AutoWatermarkApplyResult,
+} from "@/lib/archive-actions";
 import type { ArchiveResult } from "@/lib/archive-run-model";
 import { api } from "@/lib/face-api";
 import type {
@@ -176,6 +182,25 @@ export type ArchiveTask = {
   error?: string;
 };
 
+export type AutoMergeTask = {
+  id: string;
+  kind: "auto-merge";
+  title: string;
+  subtitle: string;
+  vids: string[];
+  creators: string[];
+  version: string;
+  items: AutoWatermarkApplyItemInput[];
+  operationId: string;
+  status: BackgroundTaskStatus;
+  createdAt: number;
+  startedAt?: number;
+  finishedAt?: number;
+  progress?: ArchiveJobProgress | null;
+  result?: AutoWatermarkApplyResult | null;
+  error?: string;
+};
+
 export type ReviewMutationTask = {
   id: string;
   kind: "review-mutation";
@@ -195,6 +220,7 @@ export type BackgroundTask =
   | PersonBatchTask
   | PersonFileTask
   | ArchiveTask
+  | AutoMergeTask
   | ReviewMutationTask;
 
 export type BackgroundTaskEvent =
@@ -209,6 +235,10 @@ export type BackgroundTaskEvent =
   | {
       type: "archive-settled";
       task: ArchiveTask;
+    }
+  | {
+      type: "auto-merge-settled";
+      task: AutoMergeTask;
     };
 
 export type ScopeLockInfo = {
@@ -239,6 +269,11 @@ interface BackgroundOperationsContextValue {
     creators: string[];
     sizeGb?: string;
     personName?: string;
+  }) => string;
+  enqueueAutoMerge: (input: {
+    version: string;
+    items: AutoWatermarkApplyItemInput[];
+    creators: string[];
   }) => string;
   trackReviewMutation: <T>(input: {
     action: "confirm" | "defer" | "restore" | "undo";
@@ -550,6 +585,43 @@ export function BackgroundOperationsProvider({
         status: "queued",
         createdAt: Date.now(),
         needsFreshPreview: hasPriorActive,
+      };
+      setTasks((prev) => [...prev, task]);
+      return task.id;
+    },
+    [],
+  );
+
+  const enqueueAutoMerge = useCallback(
+    ({
+      version,
+      items,
+      creators,
+    }: {
+      version: string;
+      items: AutoWatermarkApplyItemInput[];
+      creators: string[];
+    }) => {
+      const operationId = makeUuid();
+      const uniqueCreators = [...new Set(creators.filter(Boolean))];
+      const creatorLabel =
+        uniqueCreators.length === 1
+          ? uniqueCreators[0]
+          : uniqueCreators.length > 1
+            ? `${uniqueCreators[0]} 等 ${uniqueCreators.length} 人`
+            : `${items.length} 个视频`;
+      const task: AutoMergeTask = {
+        id: operationId,
+        kind: "auto-merge",
+        title: `自动合入 · ${creatorLabel}`,
+        subtitle: `${items.length} 个视频 · ${uniqueCreators.length} 位人物`,
+        vids: items.map((item) => item.vid),
+        creators: uniqueCreators,
+        version,
+        items,
+        operationId,
+        status: "queued",
+        createdAt: Date.now(),
       };
       setTasks((prev) => [...prev, task]);
       return task.id;
@@ -1247,6 +1319,177 @@ export function BackgroundOperationsProvider({
     [emit, updateTask],
   );
 
+  // Execute an AutoMergeTask
+  const runAutoMergeTask = useCallback(
+    async (initialTask: AutoMergeTask) => {
+      const pollController = new AbortController();
+      let pollTimer: ReturnType<typeof setTimeout> | undefined;
+
+      try {
+        const poll = async () => {
+          try {
+            const prog = await api<{
+              job: ArchiveJobProgress | null;
+              result?: AutoWatermarkApplyResult | null;
+            }>(
+              `/api/plan/progress?id=${encodeURIComponent(initialTask.operationId)}`,
+              { signal: pollController.signal },
+            );
+            if (!pollController.signal.aborted && prog.job) {
+              updateTask(initialTask.id, (t) =>
+                t.kind === "auto-merge" ? { ...t, progress: prog.job } : t,
+              );
+            }
+          } catch {}
+          if (!pollController.signal.aborted) {
+            pollTimer = setTimeout(() => void poll(), 700);
+          }
+        };
+        void poll();
+
+        const response = await fetch("/api/review/auto-merge/apply", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            operation_id: initialTask.operationId,
+            version: initialTask.version,
+            items: initialTask.items,
+            async: true,
+          }),
+        });
+        const data = await response.json().catch(() => ({}));
+        pollController.abort();
+        clearTimeout(pollTimer);
+
+        let result: AutoWatermarkApplyResult;
+        if (response.status === 202 && data?.accepted === true) {
+          let transientErrors = 0;
+          let polledResult: AutoWatermarkApplyResult | null = null;
+          while (true) {
+            await new Promise((resolve) => setTimeout(resolve, 1000));
+            let prog: {
+              job: ArchiveJobProgress | null;
+              result?: AutoWatermarkApplyResult | null;
+            };
+            try {
+              prog = await api<{
+                job: ArchiveJobProgress | null;
+                result?: AutoWatermarkApplyResult | null;
+              }>(
+                `/api/plan/progress?id=${encodeURIComponent(initialTask.operationId)}`,
+              );
+              transientErrors = 0;
+            } catch (pollErr) {
+              transientErrors++;
+              if (transientErrors >= 5) {
+                throw pollErr;
+              }
+              continue;
+            }
+            if (prog.job) {
+              updateTask(initialTask.id, (t) =>
+                t.kind === "auto-merge" ? { ...t, progress: prog.job } : t,
+              );
+            }
+            if (prog.result) {
+              polledResult = prog.result;
+              break;
+            }
+            if (
+              prog.job &&
+              (prog.job.status === "complete" || prog.job.status === "error")
+            ) {
+              throw new Error(prog.job.error || "自动合入结果尚未返回");
+            }
+          }
+          result = polledResult;
+        } else {
+          result = response.ok
+            ? (data as AutoWatermarkApplyResult)
+            : {
+                ok: false,
+                archived: 0,
+                fallback_queued: 0,
+                skipped: 0,
+                results: [],
+                errors: [data?.error || "自动合入请求未被接受"],
+              };
+        }
+
+        for (const creator of initialTask.creators) {
+          deleteWorkbenchCache("persons:library:" + creator);
+        }
+        deleteWorkbenchCache("integration:plan");
+        invalidateReviewCaches({ resetSession: true });
+
+        const archivedCount = result.archived ?? result.moved ?? 0;
+        const fallbackCount = result.fallback_queued ?? 0;
+        const skippedCount = result.skipped ?? 0;
+        const nextStatus: BackgroundTaskStatus = result.recovery_needed
+          ? "recovery_needed"
+          : result.rolled_back
+            ? "rolled_back"
+            : result.ok || archivedCount > 0 || fallbackCount > 0
+              ? "complete"
+              : "failed";
+
+        if (nextStatus !== "complete") {
+          setOpen(true);
+          toast.error(result.errors?.[0] || "自动合入未完成，请核对后台任务");
+        } else if (fallbackCount > 0) {
+          toast.warning(
+            `已合入 ${archivedCount} 个，${fallbackCount} 个转入待归档${skippedCount ? `，${skippedCount} 个已跳过` : ""}`,
+          );
+        } else if (archivedCount > 0) {
+          toast.success(
+            `已直接合入 ${archivedCount} 个视频${skippedCount ? `（${skippedCount} 个已跳过）` : ""}`,
+          );
+        } else {
+          toast.warning(
+            skippedCount > 0
+              ? `本次未合入，${skippedCount} 个视频已变化并跳过`
+              : "本次无可合入视频",
+          );
+        }
+
+        const latest =
+          tasksRef.current.find(
+            (t): t is AutoMergeTask =>
+              t.kind === "auto-merge" && t.id === initialTask.id,
+          ) ?? initialTask;
+        const settledTask: AutoMergeTask = {
+          ...latest,
+          status: nextStatus,
+          result,
+          error: result.errors?.[0] || "",
+          finishedAt: Date.now(),
+        };
+        updateTask(initialTask.id, () => settledTask);
+        emit({ type: "auto-merge-settled", task: settledTask });
+      } catch (e) {
+        pollController.abort();
+        clearTimeout(pollTimer);
+        const message = (e as Error).message || "自动合入连接中断";
+        setOpen(true);
+        toast.error(message);
+        const latest =
+          tasksRef.current.find(
+            (t): t is AutoMergeTask =>
+              t.kind === "auto-merge" && t.id === initialTask.id,
+          ) ?? initialTask;
+        const settledTask: AutoMergeTask = {
+          ...latest,
+          status: "failed",
+          error: `${message}（可点击「核对恢复」查询本次合入结果）`,
+          finishedAt: Date.now(),
+        };
+        updateTask(initialTask.id, () => settledTask);
+        emit({ type: "auto-merge-settled", task: settledTask });
+      }
+    },
+    [emit, updateTask],
+  );
+
   // Serial Queue Runner Effect (only for heavy file operations; review-mutation runs independently)
   useEffect(() => {
     if (runningIdRef.current) return;
@@ -1281,13 +1524,15 @@ export function BackgroundOperationsProvider({
           await runPersonFileTask(nextTask);
         } else if (nextTask.kind === "archive") {
           await runArchiveTask(nextTask);
+        } else if (nextTask.kind === "auto-merge") {
+          await runAutoMergeTask(nextTask);
         }
       } finally {
         runningIdRef.current = null;
       }
     };
     void execute();
-  }, [tasks, runPersonBatchTask, runPersonFileTask, runArchiveTask, updateTask]);
+  }, [tasks, runPersonBatchTask, runPersonFileTask, runArchiveTask, runAutoMergeTask, updateTask]);
 
   const reconcileTask = useCallback(
     async (taskId: string) => {
@@ -1428,6 +1673,44 @@ export function BackgroundOperationsProvider({
             });
             if (settled) emit({ type: "archive-settled", task: settled });
           }
+        } else if (target.kind === "auto-merge") {
+          const prog = await api<{
+            job: ArchiveJobProgress | null;
+            result?: AutoWatermarkApplyResult | null;
+          }>("/api/plan/progress", {
+            method: "POST",
+            body: JSON.stringify({ id: target.operationId }),
+          });
+          if (prog.result) {
+            const res = prog.result;
+            const archivedCount = res.archived ?? res.moved ?? 0;
+            const nextStatus: BackgroundTaskStatus = res.recovery_needed
+              ? "recovery_needed"
+              : res.rolled_back
+                ? "rolled_back"
+                : res.ok || archivedCount > 0 || (res.fallback_queued ?? 0) > 0
+                  ? "complete"
+                  : "failed";
+            for (const creator of target.creators) {
+              deleteWorkbenchCache("persons:library:" + creator);
+            }
+            deleteWorkbenchCache("integration:plan");
+            invalidateReviewCaches({ resetSession: true });
+            const latest =
+              tasksRef.current.find(
+                (t): t is AutoMergeTask =>
+                  t.kind === "auto-merge" && t.id === taskId,
+              ) ?? target;
+            const settled: AutoMergeTask = {
+              ...latest,
+              status: nextStatus,
+              result: res,
+              error: res.errors?.[0] || "",
+              finishedAt: Date.now(),
+            };
+            updateTask(taskId, () => settled);
+            emit({ type: "auto-merge-settled", task: settled });
+          }
         }
       } catch (e) {
         updateTask(taskId, (t) => ({
@@ -1517,6 +1800,13 @@ export function BackgroundOperationsProvider({
             vidsMap.set(vid, { label, status: lockStatus, taskId: task.id });
           }
         }
+      } else if (task.kind === "auto-merge") {
+        const label = lockStatus === "running" ? "合入中" : "排队合入";
+        for (const vid of task.vids) {
+          if (!vidsMap.has(vid)) {
+            vidsMap.set(vid, { label, status: lockStatus, taskId: task.id });
+          }
+        }
       }
     }
 
@@ -1538,6 +1828,7 @@ export function BackgroundOperationsProvider({
       enqueuePersonBatch,
       enqueuePersonFile,
       enqueueArchive,
+      enqueueAutoMerge,
       trackReviewMutation,
       cancelQueuedTask,
       dismissTask,
@@ -1554,6 +1845,7 @@ export function BackgroundOperationsProvider({
       enqueuePersonBatch,
       enqueuePersonFile,
       enqueueArchive,
+      enqueueAutoMerge,
       trackReviewMutation,
       cancelQueuedTask,
       dismissTask,
@@ -1653,6 +1945,9 @@ function getActiveStageLabel(task: BackgroundTask): string {
     if (filesDone && !localIndexDone) return "更新本地记录与索引";
     return PERSON_FILE_STEP_LABEL[task.action];
   }
+  if (task.kind === "auto-merge") {
+    return task.progress?.stage || "自动合入至人物目录";
+  }
   return task.progress?.stage || "核对归档并移动文件";
 }
 
@@ -1665,6 +1960,18 @@ function getCompletedSummary(task: BackgroundTask): string {
   }
   if (task.kind === "archive") {
     return `已归档 ${task.result?.moved ?? task.vids.length} 个视频`;
+  }
+  if (task.kind === "auto-merge") {
+    const archived = task.result?.archived ?? task.result?.moved ?? 0;
+    const fallback = task.result?.fallback_queued ?? 0;
+    const skipped = task.result?.skipped ?? 0;
+    return [
+      `已合入 ${archived} 个`,
+      fallback > 0 ? `${fallback} 个转待归档` : "",
+      skipped > 0 ? `${skipped} 个跳过` : "",
+    ]
+      .filter(Boolean)
+      .join(" · ");
   }
   return PERSON_FILE_DONE_SUMMARY[task.action];
 }
@@ -1747,6 +2054,29 @@ function buildActivityItems(task: BackgroundTask): AgentActivityItem[] {
       },
     ];
   }
+  if (task.kind === "auto-merge") {
+    const doneCount =
+      task.status === "complete"
+        ? (task.result?.archived ?? task.result?.moved ?? 0) +
+          (task.result?.fallback_queued ?? 0) +
+          (task.result?.skipped ?? 0)
+        : (task.progress?.done ?? 0);
+    const totalCount = task.progress?.total ?? task.vids.length;
+    return [
+      {
+        id: `${task.id}-auto-merge`,
+        type: "step",
+        status:
+          task.status === "complete"
+            ? "complete"
+            : task.status === "running"
+              ? "active"
+              : "pending",
+        label: task.progress?.stage || "直接合入已有的人物目录并更新账本",
+        meta: `${doneCount} / ${totalCount}`,
+      },
+    ];
+  }
   const doneCount =
     task.status === "complete"
       ? task.result?.moved ?? task.vids.length
@@ -1771,6 +2101,7 @@ function buildActivityItems(task: BackgroundTask): AgentActivityItem[] {
 function TaskIcon({ task }: { task: BackgroundTask }) {
   if (task.kind === "review-mutation") return <Check className="size-3.5" />;
   if (task.kind === "archive") return <Archive className="size-3.5" />;
+  if (task.kind === "auto-merge") return <Sparkles className="size-3.5" />;
   if (task.kind === "person-batch") {
     return task.action === "merge" ? (
       <Merge className="size-3.5" />
@@ -1982,7 +2313,12 @@ export function BackgroundOperationsDock({
                   !!task.target) ||
                 (isComplete &&
                   task.kind === "person-file" &&
-                  !!(task.result?.person || task.person));
+                  !!(task.result?.person || task.person)) ||
+                (isComplete &&
+                  task.kind === "auto-merge" &&
+                  ((task.result?.fallback_queued ?? 0) > 0 ||
+                    ((task.result?.archived ?? task.result?.moved ?? 0) > 0 &&
+                      task.creators.length === 1)));
               const hasDismissAction = isComplete || isError;
 
               return (
@@ -2120,6 +2456,42 @@ export function BackgroundOperationsDock({
                               }}
                             >
                               查看目录
+                              <ArrowUpRight className="size-3" />
+                            </button>
+                          )}
+
+                        {isComplete &&
+                          task.kind === "auto-merge" &&
+                          (task.result?.fallback_queued ?? 0) > 0 && (
+                            <button
+                              type="button"
+                              className="bg-ops-group-btn"
+                              onClick={() => {
+                                router.push("/integration");
+                                setOpen(false);
+                              }}
+                            >
+                              查看待归档
+                              <ArrowUpRight className="size-3" />
+                            </button>
+                          )}
+
+                        {isComplete &&
+                          task.kind === "auto-merge" &&
+                          !(task.result?.fallback_queued ?? 0) &&
+                          (task.result?.archived ?? task.result?.moved ?? 0) > 0 &&
+                          task.creators.length === 1 && (
+                            <button
+                              type="button"
+                              className="bg-ops-group-btn"
+                              onClick={() => {
+                                router.push(
+                                  `/persons/${encodeURIComponent(task.creators[0])}`,
+                                );
+                                setOpen(false);
+                              }}
+                            >
+                              查看 {task.creators[0]}
                               <ArrowUpRight className="size-3" />
                             </button>
                           )}

@@ -2,7 +2,7 @@ import path from 'path'
 import { BASE } from './env'
 import { loadReport } from './integration'
 import { loadQueue,readJson,readCanonicalJson,writeJson } from './jsonio'
-import { loadArchive } from './review-store'
+import { loadActiveArchive } from './review-store'
 import { validateCreator } from './review-logic'
 import { savePerson,mergePeople,type SavedPerson } from './people-model'
 import { canonicalPersonName } from './person-names'
@@ -22,7 +22,7 @@ export function publicThumb(value?:string|null):string|null {
 }
 export function peopleCatalog() {
   const report=loadReport()
-  const assigned=[...loadQueue(),...loadArchive()].map(v=>({name:v.creator,rep_thumb:v.thumb||null,recent_at:v.at}))
+  const assigned=[...loadQueue(),...loadActiveArchive()].map(v=>({name:v.creator,rep_thumb:v.thumb||null,recent_at:v.at}))
   const deleted=readJson<Record<string,unknown>>(path.join(BASE,'people-deleted.json'),{})
   return mergePeople(report.identities||[],loadSavedPeople(),assigned).filter(p=>!Object.hasOwn(deleted,p.name)).map(p=>({...p,rep_thumb:publicThumb(p.rep_thumb)}))
 }

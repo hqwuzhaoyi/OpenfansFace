@@ -3,14 +3,14 @@ import { reviewScope } from '@/lib/review-scope'
 import { creatorFolder } from '@/lib/source-resolution'
 import { MEDIA2 } from '@/lib/env'
 import { loadReport } from '@/lib/integration'
-import { loadQueue,loadArchive,videoInfo } from '@/lib/review-store'
+import { loadQueue,loadActiveArchive,videoInfo } from '@/lib/review-store'
 import { peopleCatalog,publicThumb } from '@/lib/people-catalog'
 import { fileName } from '@/lib/review-ui'
 
 export async function GET() {
   const report=loadReport(),scope=reviewScope(),metadata=videoInfo()
   const models=new Map((report.identities||[]).map((i:any)=>[i.name,i]))
-  const queue=loadQueue(),history=loadArchive(),queued=new Map(queue.map(v=>[v.vid,v])),archived=new Map(history.map(v=>[v.vid,v]))
+  const queue=loadQueue(),history=loadActiveArchive(),queued=new Map(queue.map(v=>[v.vid,v])),archived=new Map(history.map(v=>[v.vid,v]))
   const identities=peopleCatalog().map(person=>{
     const model:any=models.get(person.name)||{name:person.name,aliases:[],tpl_faces:0,vids:[]}
     const videos=new Map<string,any>((model.vids||[]).map((v:any)=>[v.vid,v]))

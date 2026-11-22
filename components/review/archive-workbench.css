@@ -217,3 +217,11 @@
 @media(max-width:700px) { .archive-run { align-items:stretch; flex-direction:column; gap:8px; } .archive-run .archive-actionButtons { flex-wrap:wrap; } }
 
 body:has(.archive-confirmDialog[data-instant=true]) [data-slot=alert-dialog-overlay] { animation:none!important; }
+
+.archive-detailBadges { display:flex; align-items:center; gap:6px; flex-wrap:wrap; flex-shrink:0; }
+.archive-autoBadge { display:inline-flex; align-items:center; gap:3px; padding:1px 6px; border-radius:5px; border:1px solid var(--wb-success-border); background:var(--wb-success-bg); color:var(--wb-success); font-size:10px; font-weight:500; line-height:1.5; white-space:nowrap; flex-shrink:0; }
+.archive-undoneBadge { display:inline-flex; align-items:center; padding:1px 6px; border-radius:5px; border:1px solid var(--border); background:var(--muted); color:var(--muted-foreground); font-size:10px; font-weight:500; line-height:1.5; white-space:nowrap; flex-shrink:0; }
+.archive-mutedBadge { color:var(--muted-foreground); background:var(--muted); border-color:var(--border); }
+.archive-rowMeta { display:flex!important; align-items:center; gap:6px; flex-wrap:wrap; }
+.archive-row[data-undone=true] .archive-rowOpen { opacity:.62; }
+.archive-inlineConfirm { display:inline-flex; align-items:center; flex-wrap:wrap; gap:8px; padding:6px 10px; border:1px solid var(--border-strong); border-radius:8px; background:var(--card); font-size:12px; color:var(--muted-foreground); }

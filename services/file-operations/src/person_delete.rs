@@ -313,9 +313,10 @@ pub fn updated(config: &Config, name: &str, value: &Value, plan: &Plan) -> Value
         }
         "archive-history.json" => {
             for row in next.as_array_mut().unwrap() {
-                if row["vid"]
-                    .as_str()
-                    .is_some_and(|id| plan.files.iter().any(|f| f.vids.iter().any(|v| v == id)))
+                if row["undone"] != true
+                    && row["vid"]
+                        .as_str()
+                        .is_some_and(|id| plan.files.iter().any(|f| f.vids.iter().any(|v| v == id)))
                 {
                     row["last_file_operation"] = json!(plan.id);
                 }

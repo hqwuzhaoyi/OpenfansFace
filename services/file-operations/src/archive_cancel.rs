@@ -84,14 +84,21 @@ fn ensure_lease_table(conn: &Connection) -> Result<()> {
 }
 
 pub fn supports_scanner_reconciliation(plan: &Plan) -> bool {
-    matches!(plan.action.as_str(), "archive" | "merge-person")
+    matches!(
+        plan.action.as_str(),
+        "archive" | "auto-archive" | "archive-unarchive" | "merge-person"
+    )
 }
 
 fn write_coordination_files(config: &Config, payload: &Value) {
     let local = config
         .state_db()
         .with_file_name("scanner-coordination.json");
-    if payload["action"] == "archive" || local.exists() {
+    if matches!(
+        payload["action"].as_str(),
+        Some("archive" | "auto-archive" | "archive-unarchive")
+    ) || local.exists()
+    {
         if let Some(parent) = local.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
@@ -147,8 +154,11 @@ fn write_coordination_files(config: &Config, payload: &Value) {
 }
 
 pub fn acquire_scanner_lease(config: &Config, plan: &Plan) -> Result<Value> {
-    if plan.action != "archive"
-        && !(supports_scanner_reconciliation(plan) && peach_state_dir(config).is_some())
+    if plan.files.is_empty()
+        || (!matches!(
+            plan.action.as_str(),
+            "archive" | "auto-archive" | "archive-unarchive"
+        ) && !(supports_scanner_reconciliation(plan) && peach_state_dir(config).is_some()))
     {
         return Ok(Value::Null);
     }
@@ -544,7 +554,11 @@ fn observe_scanner_rows(
         .iter()
         .find(|t| t.table == db::Table::Asset)
         .ok_or_else(conflict)?;
-    let targets: Vec<(String, Value)> = if plan.action == "archive" {
+    let is_asset_path_op = matches!(
+        plan.action.as_str(),
+        "archive" | "auto-archive" | "archive-unarchive"
+    );
+    let targets: Vec<(String, Value)> = if is_asset_path_op {
         delta
             .changes
             .guards
@@ -583,7 +597,7 @@ fn observe_scanner_rows(
     let mut pairs = vec![];
     for (path, after_row) in &targets {
         let Some(file) = plan.files.iter().find(|f| {
-            Path::new(&f.dst).starts_with(config.creators())
+            (plan.action == "archive-unarchive" || Path::new(&f.dst).starts_with(config.creators()))
                 && metadata::win(config, &f.dst) == *path
         }) else {
             continue;
@@ -753,7 +767,7 @@ fn observe_scanner_rows(
             }
         }
     }
-    if plan.action != "archive" {
+    if !is_asset_path_op {
         for file in &plan.files {
             if !Path::new(&file.dst).starts_with(config.creators()) {
                 continue;

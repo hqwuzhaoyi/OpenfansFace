@@ -4,16 +4,31 @@ import path from 'node:path'
 import { BASE } from './env'
 import { validateFileOperationId } from './file-operation-routing'
 import type { ArchiveRun } from './archive-run-model'
+import type { AutoWatermarkApplyResult, AutoWatermarkPreview, UnarchiveResult } from './archive-actions'
 import { invalidateIntegrationCache } from './integration'
 /** Thin transport only. Rust owns queue, metadata, media and Peach mutations. */
 export function nativeArchiveEnabled():true { return true }
 export async function nativeArchive(command:string,body:unknown={}):Promise<unknown>{
   const result=await request({command,body})
-  if(!['archive-preview','review-page','review-status'].includes(command))invalidateIntegrationCache()
+  if(!['archive-preview','review-page','review-status','auto-watermark-preview'].includes(command))invalidateIntegrationCache()
   return result
 }
 export async function nativeArchiveApplyAsync(body:unknown={},waitMs=2000):Promise<Record<string,unknown>>{
   return nativeJsonRequest('v1/archive',{command:'archive-apply',body,wait_ms:waitMs},{label:'归档',completion:'allow_accepted',error:(message,status)=>Object.assign(new Error(message),{status})})
+}
+export async function nativeAutoWatermarkPreview():Promise<AutoWatermarkPreview>{
+  return await nativeArchive('auto-watermark-preview',{}) as AutoWatermarkPreview
+}
+export async function nativeAutoWatermarkApply(body:unknown={}):Promise<AutoWatermarkApplyResult>{
+  return await nativeArchive('auto-watermark-apply',body) as AutoWatermarkApplyResult
+}
+export async function nativeAutoWatermarkApplyAsync(body:unknown={},waitMs=3000):Promise<Record<string,unknown>>{
+  const result=await nativeJsonRequest<Record<string,unknown>>('v1/archive',{command:'auto-watermark-apply',body,wait_ms:waitMs},{label:'自动合入',completion:'allow_accepted',error:(message,status)=>Object.assign(new Error(message),{status})})
+  invalidateIntegrationCache()
+  return result
+}
+export async function nativeArchiveUnarchive(body:unknown={}):Promise<UnarchiveResult>{
+  return await nativeArchive('archive-unarchive',body) as UnarchiveResult
 }
 function legacyProgress(id:string|null):Pick<ArchiveRun,'job'|'result'>|null {
   if(!id){

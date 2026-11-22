@@ -269,7 +269,7 @@ fn provenance(source: &str, id: &str) -> Result<Value> {
         return Err(Error::new(400, "invalid_request", "相似组编号无效"));
     }
     let href = match source {
-        "review" => "/review".into(),
+        "review" | "auto-watermark" => "/review".into(),
         "watermark" => "/watermarks".into(),
         "all" => "/unclassified".into(),
         "approval" => {
@@ -376,10 +376,13 @@ pub fn prepare(
     } else {
         body["vids"].clone()
     })?;
-    if ids
-        .iter()
-        .any(|id| history.as_array().unwrap().iter().any(|r| r["vid"] == *id))
-    {
+    if ids.iter().any(|id| {
+        history
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["vid"] == *id && r["undone"] != true)
+    }) {
         return Err(Error::conflict("部分视频已归档，请刷新后检查完成记录"));
     }
     let tasks = if action == "queue-confirm" && body["source"] == "review" {
@@ -497,6 +500,7 @@ pub fn prepare(
                         "all",
                         "watermark",
                         "review",
+                        "auto-watermark",
                     ]
                     .contains(s)
                 })
@@ -964,6 +968,7 @@ fn prepare_restore(config: &Config, body: &Value) -> Result<Prepared> {
         return Ok(out);
     }
     let db = db::open(&path)?;
+    crate::processing_scheduler::ensure_columns(&db)?;
     for task in db::rows(&db, "SELECT * FROM tasks ORDER BY vid", [])? {
         if !ids.contains(&task["vid"])
             || task["updated_at"]
@@ -993,6 +998,9 @@ fn prepare_restore(config: &Config, body: &Value) -> Result<Prepared> {
             "queued"
         });
         next["deferred"] = integer(0);
+        if next.get("auto_opt_out").is_some() {
+            next["auto_opt_out"] = integer(1);
+        }
         next["updated_at"] = json!(timestamp(at)?);
         out.jobs.push(task);
         out.job_updates.push(next);

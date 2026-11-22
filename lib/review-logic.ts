@@ -1,13 +1,21 @@
-export type ReviewSource = 'cluster' | 'person' | 'approval' | 'all' | 'watermark' | 'review' | 'legacy'
+export type ReviewSource = 'cluster' | 'person' | 'approval' | 'all' | 'watermark' | 'review' | 'legacy' | 'auto-watermark'
 export type ArchiveResolution = { kind: 'rename'; name: string } | { kind: 'stage-duplicate' }
 export interface QueueItem {
   vid: string; creator: string; at: string
   source?: ReviewSource; source_id?: string; return_href?: string; batch_id?: string
   resolution?: ArchiveResolution
   note?: string
+  auto_fallback_reason?: string
+  match_tier?: string; watermark_key?: string; watermark_text?: string
 }
 export interface Decisions { approved: string[]; rejected: string[] }
-export interface ArchivedItem extends QueueItem { dst: string; win_dst: string; manifest: string; staged_path?: string }
+export interface ArchivedItem extends QueueItem {
+  dst: string; win_dst: string; manifest: string; staged_path?: string
+  operation?: string; size?: number
+  operation_id?: string; original_path?: string; auto_reason?: string
+  watermark_platform?: string; renamed_keep_both?: boolean
+  undone?: boolean; undone_at?: string; restored_path?: string; op_id?: string
+}
 export class ReviewError extends Error {
   status: number
   constructor(message: string, status = 400) { super(message); this.status = status }
@@ -24,7 +32,7 @@ export function validateVids(value: unknown): string[] {
 }
 export function origin(source: ReviewSource, sourceId: string): Pick<QueueItem, 'source' | 'source_id' | 'return_href'> {
   if (source === 'cluster' && !/^p\d+$/.test(sourceId)) throw new ReviewError('相似组编号无效')
-  return { source, source_id: sourceId, return_href: source === 'review' ? '/review' : source === 'watermark' ? '/watermarks' : source === 'all' ? '/unclassified' : source === 'approval' ? `/approvals${sourceId ? `?vid=${encodeURIComponent(sourceId)}` : ''}`
+  return { source, source_id: sourceId, return_href: source === 'review' || source === 'auto-watermark' ? '/review' : source === 'watermark' ? '/watermarks' : source === 'all' ? '/unclassified' : source === 'approval' ? `/approvals${sourceId ? `?vid=${encodeURIComponent(sourceId)}` : ''}`
     : source === 'person' ? `/persons/${encodeURIComponent(sourceId)}`
     : source === 'cluster' ? `/clusters?cid=${encodeURIComponent(sourceId)}` : '/clusters' }
 }

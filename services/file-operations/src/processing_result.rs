@@ -110,6 +110,9 @@ pub fn load_catalog(config: &Config, aliases: &Value) -> Result<Vec<String>> {
             .into_iter()
             .flatten()
         {
+            if doc == "archive-history.json" && row["undone"] == true {
+                continue;
+            }
             if let Some(name) = row["creator"].as_str().filter(|s| !s.is_empty()) {
                 names.insert(canonical_person(name, aliases));
             }
@@ -826,7 +829,7 @@ fn current_external(config: &Config, s: &Submission) -> Result<()> {
             .as_array()
             .unwrap()
             .iter()
-            .any(|r| r["vid"] == s.task.vid)
+            .any(|r| r["vid"] == s.task.vid && (name != "archive-history.json" || r["undone"] != true))
         {
             return Err(stale("视频已由人工处理"));
         }
@@ -888,6 +891,9 @@ pub fn assigned_reference_inputs(config: &Config) -> Result<Value> {
     let mut assigned = BTreeSet::new();
     for name in ["integration-queue.json", "archive-history.json"] {
         for row in review::read(config, name, json!([]))?.1.as_array().unwrap() {
+            if name == "archive-history.json" && row["undone"] == true {
+                continue;
+            }
             if let Some(vid) = row["vid"].as_str() {
                 assigned.insert(vid.to_owned());
             }
@@ -1189,6 +1195,9 @@ fn prepare_data(
         let mut handled = BTreeSet::new();
         for name in ["integration-queue.json", "archive-history.json"] {
             for r in review::read(config, name, json!([]))?.1.as_array().unwrap() {
+                if name == "archive-history.json" && r["undone"] == true {
+                    continue;
+                }
                 if let Some(id) = r["vid"].as_str() {
                     handled.insert(id.to_owned());
                 }
@@ -1346,6 +1355,9 @@ fn resolve(
     match result {
         Ok(value) => {
             gate.release()?;
+            if value["next_stage"] == "review" || value["data"]["ready"] == true {
+                engine.notify_auto_archive(&e.vid);
+            }
             Ok(value)
         }
         Err(e)

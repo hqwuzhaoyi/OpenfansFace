@@ -24,3 +24,10 @@ test('Chinese names decode once; invalid directory names are rejected', () => {
   assert.equal(decodedName('%bad'),'％bad'.replace('％','%'))
   for (const n of ['..','../x','a/b','a\\b','']) assert.throws(()=>validateCreator(n))
 })
+test('auto-watermark origin links back to /review', () => {
+  assert.deepEqual(origin('auto-watermark', 'dreamymoo'), {
+    source: 'auto-watermark',
+    source_id: 'dreamymoo',
+    return_href: '/review',
+  })
+})

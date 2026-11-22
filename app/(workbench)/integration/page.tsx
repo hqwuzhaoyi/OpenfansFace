@@ -18,7 +18,7 @@ import { filterArchiveBatches, retainArchiveSelection, summarizeArchiveSelection
 import { ArchiveBatchList, archiveTime, batchCreator } from '@/components/review/archive-batch-list'
 import { ArchiveVideoPlayer } from '@/components/review/archive-video-player'
 import { ArchiveRowActions } from '@/components/review/archive-row-actions'
-import { archiveShortcut, canResolveArchiveRow } from '@/lib/archive-actions'
+import { archiveShortcut, autoArchiveReasonLabel, canResolveArchiveRow, canUnarchiveHistoryItem, requestUnarchive } from '@/lib/archive-actions'
 import { sourceLabel, type ReviewVideo, fileName } from '@/lib/review-ui'
 import { ArchiveResolutionDialog } from '@/components/review/archive-resolution'
 import { ArchiveCheckbox, ArchiveFolderList, type ArchiveListItem } from '@/components/review/archive-folder-list'
@@ -26,7 +26,7 @@ import { PathText } from '@/components/review/video'
 import { Button } from '@/components/ui/button'
 import { WorkspaceButton } from '@/components/workbench/inner'
 import { ArchiveDetailSkeleton, ArchiveListSkeleton } from '@/components/workbench/loading-skeletons'
-import { readWorkbenchCache, writeWorkbenchCache } from '@/components/workbench/state'
+import { deleteWorkbenchCache, readWorkbenchCache, writeWorkbenchCache } from '@/components/workbench/state'
 import { WorkbenchBreadcrumb, WorkbenchHeaderActions, useSyncWorkbenchBreadcrumb, type WorkbenchBreadcrumbSegment } from '@/components/workbench/breadcrumb'
 import { useBackgroundOperations } from '@/components/workbench/background-operations'
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from '@/components/ui/alert-dialog'
@@ -60,6 +60,10 @@ function Integration() {
   const [result, setResult] = useState<ApplyResult | null>(null), [undoResult, setUndoResult] = useState<UndoItem[]>([])
   const [resolving, setResolving] = useState<Row[] | null>(null), [waveKey, setWaveKey] = useState<string | null>(null)
   const [undoRequest, setUndoRequest] = useState<{ vids: string[]; goBack: boolean } | null>(null)
+  const [confirmUnarchiveKey, setConfirmUnarchiveKey] = useState<string | null>(null)
+  const [unarchiving, setUnarchiving] = useState(false)
+  const cancelUnarchiveRef = useRef<HTMLButtonElement>(null)
+  const unarchiveBtnRef = useRef<HTMLButtonElement>(null)
   const requestSequence = useRef(0), writing = useRef(false), searchInput = useRef<HTMLInputElement>(null)
   const scrollList = useRef<HTMLDivElement>(null), scrollDetail = useRef<HTMLDivElement>(null)
   const confirmButton = useRef<HTMLButtonElement>(null)
@@ -127,6 +131,8 @@ function Integration() {
           setResult(event.task.result)
         }
         void load()
+      }else if(event.type==='auto-merge-settled'){
+        void load()
       }
     })
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -147,16 +153,47 @@ function Integration() {
   const stagedCount = validChosen.filter(r => r.operation === 'stage-duplicate').length
   const selectGB = validChosen.reduce((sum, row) => sum + (row.size_gb || 0), 0).toFixed(2)
   const disabled = busy || archiving || !!result?.recovery_needed || loading || !!error
+  const historyEntries = useMemo(
+    () => (plan?.history || []).map((record, index) => ({
+      key: `${record.vid}::${record.operation_id || record.op_id || record.manifest || record.at || index}`,
+      record,
+    })),
+    [plan],
+  )
+  const itemKey = (item: ArchiveListItem) => item.rowKey || item.vid
   const items: ArchiveListItem[] = history
-    ? (plan?.history || []).map(r => ({ vid: r.vid, name: r.name || fileName(r.dst || r.win_dst || r.vid), src: r.dst || r.win_dst, thumb: r.thumb || null, creator: r.creator, size_gb: r.size_gb, status: 'archived', statusLabel: '已归档' }))
-    : waveRows.map(r => ({ ...r, statusLabel: rowStatus(r) }))
+    ? historyEntries.map(({ key, record: r }) => ({
+        rowKey: key,
+        vid: r.vid,
+        name: r.name || fileName(r.dst || r.win_dst || r.vid),
+        src: r.undone ? (r.restored_path || r.original_path || r.dst || r.win_dst) : (r.dst || r.win_dst),
+        thumb: r.thumb || null,
+        creator: r.creator,
+        size_gb: r.size_gb !== undefined ? r.size_gb : typeof r.size === 'number' && r.size > 0 ? +(r.size / 2 ** 30).toFixed(2) : undefined,
+        status: r.undone ? 'undone' : 'archived',
+        statusLabel: r.undone ? '已撤回' : '已归档',
+        source: r.source,
+        undone: Boolean(r.undone),
+      }))
+    : waveRows.map(r => ({ ...r, statusLabel: rowStatus(r), source: r.source }))
   const filtered = history ? items.filter(r => !query || [r.name, r.vid, r.src || '', r.creator].some(value => value.toLowerCase().includes(query.toLowerCase()))) : items
-  const current = filtered.find(r => r.vid === active) || filtered[0]
+  const current = filtered.find(r => itemKey(r) === active) || filtered[0]
+  const currentKey = current ? itemKey(current) : null
   const pending = !history && current ? waveRows.find(r => r.vid === current.vid) : undefined
-  const archived = history && current ? plan?.history.find(r => r.vid === current.vid) : undefined
+  const archived = history && current ? historyEntries.find(e => e.key === currentKey)?.record : undefined
   const detailVideo: ReviewVideo | null = current ? { ...current, path: current.src || current.vid } : null
   const folders = groupSourceFolders(filtered)
-  const activeIndex = filtered.findIndex(r => r.vid === current?.vid)
+  const activeIndex = filtered.findIndex(r => itemKey(r) === currentKey)
+
+  useEffect(() => {
+    setConfirmUnarchiveKey(null)
+  }, [currentKey, history])
+
+  useEffect(() => {
+    if (confirmUnarchiveKey && confirmUnarchiveKey === currentKey) {
+      requestAnimationFrame(() => cancelUnarchiveRef.current?.focus({ preventScroll: true }))
+    }
+  }, [confirmUnarchiveKey, currentKey])
 
   const chooseWave = (key: string, mobile = true) => {
     setWaveKey(key); setActive(null)
@@ -164,7 +201,7 @@ function Integration() {
     scrollDetail.current?.scrollTo(0, 0)
   }
   const setView = (value: boolean) => {
-    setHistory(value); setActive(null); setCollapsed(new Set()); setFilter('all'); setQuery(''); setMobileDetail(false)
+    setHistory(value); setActive(null); setConfirmUnarchiveKey(null); setCollapsed(new Set()); setFilter('all'); setQuery(''); setMobileDetail(false)
     const url = new URL(window.location.href)
     if (value) url.searchParams.set('view', 'history'); else url.searchParams.delete('view')
     window.history.replaceState(window.history.state, '', url)
@@ -173,18 +210,18 @@ function Integration() {
   }
   const showSelected = () => { setHistory(false); setFilter('selected'); setQuery(''); setListHidden(false); setMobileDetail(false) }
   const toggle = (ids: string[]) => { if (!disabled && !history) setSelected(previous => toggleArchiveSelection(previous, ids)) }
-  const openItem = (vid: string, mobile = true) => {
-    setActive(vid)
+  const openItem = (key: string, mobile = true) => {
+    setActive(key)
     if (mobile) setMobileDetail(true)
     if (history) {
-      const directory = folders.find(folder => folder.items.some(item => item.vid === vid))?.path
+      const directory = folders.find(folder => folder.items.some(item => itemKey(item) === key))?.path
       if (directory) setCollapsed(previous => { const next = new Set(previous); next.delete(directory); return next })
       scrollDetail.current?.scrollTo(0, 0)
     }
   }
   const move = (offset: number) => {
     if (!filtered.length) return
-    openItem(filtered[(activeIndex + offset + filtered.length) % filtered.length].vid, false)
+    openItem(itemKey(filtered[(activeIndex + offset + filtered.length) % filtered.length]), false)
   }
   const moveBatch = (offset: number) => {
     if (!visibleWaves.length) return
@@ -241,6 +278,30 @@ function Integration() {
     finally { writing.current = false; setBusy(false) }
   }
   const undoRows = (targets: Row[]) => setUndoRequest({ vids: targets.map(row => row.vid), goBack: false })
+  const unarchiveRecord = async (record: ArchiveRecord) => {
+    if (writing.current || disabled || unarchiving || !canUnarchiveHistoryItem(record)) return
+    writing.current = true; setBusy(true); setUnarchiving(true)
+    try {
+      const opId = record.operation_id || record.op_id || record.manifest || undefined
+      const res = await requestUnarchive({ vid: record.vid, ...(opId ? { op_id: opId } : {}) })
+      deleteWorkbenchCache('integration:plan')
+      deleteWorkbenchCache('persons:library:' + record.creator)
+      deleteWorkbenchCache('review:session')
+      deleteWorkbenchCache('review:page:')
+      deleteWorkbenchCache('review:lastData')
+      setConfirmUnarchiveKey(null)
+      await load()
+      toast.success(
+        res.renamed_keep_both ? '已撤回至原目录（保留两份），并退出自动合入' : '已撤回至原位置，并退出自动合入',
+        toastOptions,
+      )
+    } catch (cause) {
+      toast.error((cause as Error).message, toastOptions)
+      await load()
+    } finally {
+      writing.current = false; setBusy(false); setUnarchiving(false)
+    }
+  }
   const apply = () => {
     if (!plan || writing.current || disabled || (!validChosen.length || validChosen.length > 5000)) return
     const targetVids = validChosen.map(r => r.vid)
@@ -344,7 +405,7 @@ function Integration() {
         ] as const).map(([id, label, count]) => <button key={id} disabled={busy} aria-pressed={filter === id} onClick={() => id === 'selected' ? showSelected() : setFilter(id)}>{label}<span>{count}</span></button>)}</div>}
         {!history && <div className="archive-selection"><ArchiveCheckbox label="选择当前列表的全部波次" disabled={disabled || !visibleIds.size} checked={!!visibleIds.size && [...visibleIds].every(id => selected.has(id))} mixed={[...visibleIds].some(id => selected.has(id)) && ![...visibleIds].every(id => selected.has(id))} onChange={() => toggle([...visibleIds])} /><span>{visibleWaves.length} 波</span><button disabled={disabled || !visibleWaves.some(w => w.rows.some(r => r.status === 'ok'))} onClick={() => setSelected(previous => new Set([...previous, ...visibleWaves.flatMap(w => w.rows.filter(r => r.status === 'ok').map(r => r.vid))]))}>选中可归档</button><button disabled={disabled || !chosen.length} onClick={() => setSelected(new Set())}>清空</button></div>}
         <div ref={scrollList} className="archive-listScroll">
-          {loading && !plan ? <ArchiveListSkeleton history={history} /> : (history ? !filtered.length : !visibleWaves.length) ? <div className="archive-empty"><Archive size={28} aria-hidden="true" /><p>{query || filter !== 'all' ? '没有匹配的记录' : history ? '还没有归档记录' : '当前没有待归档视频'}</p>{query || filter !== 'all' ? <Button variant="ghost" size="sm" onClick={() => { setQuery(''); setFilter('all') }}>查看全部</Button> : !history && <Link className="underline underline-offset-4" href="/clusters">核对相似视频组</Link>}</div> : history ? <ArchiveFolderList items={filtered} active={current?.vid} selected={selected} collapsed={collapsed} disabled={disabled} history onToggle={toggle} onOpen={openItem} onCollapse={path => setCollapsed(previous => { const next = new Set(previous); next.has(path) ? next.delete(path) : next.add(path); return next })} /> : <ArchiveBatchList batches={visibleWaves} selected={selected} active={wave?.key} disabled={disabled} onToggle={toggle} onOpen={chooseWave} onResolve={resolveInline} onCustomize={setResolving} onUndo={undoRows} />}
+          {loading && !plan ? <ArchiveListSkeleton history={history} /> : (history ? !filtered.length : !visibleWaves.length) ? <div className="archive-empty"><Archive size={28} aria-hidden="true" /><p>{query || filter !== 'all' ? '没有匹配的记录' : history ? '还没有归档记录' : '当前没有待归档视频'}</p>{query || filter !== 'all' ? <Button variant="ghost" size="sm" onClick={() => { setQuery(''); setFilter('all') }}>查看全部</Button> : !history && <Link className="underline underline-offset-4" href="/clusters">核对相似视频组</Link>}</div> : history ? <ArchiveFolderList items={filtered} active={currentKey ?? undefined} selected={selected} collapsed={collapsed} disabled={disabled} history onToggle={toggle} onOpen={openItem} onCollapse={path => setCollapsed(previous => { const next = new Set(previous); next.has(path) ? next.delete(path) : next.add(path); return next })} /> : <ArchiveBatchList batches={visibleWaves} selected={selected} active={wave?.key} disabled={disabled} onToggle={toggle} onOpen={chooseWave} onResolve={resolveInline} onCustomize={setResolving} onUndo={undoRows} />}
         </div>
         <footer className="archive-listBottom"><span>{history ? `存放目录 · ${folders.length} 个` : '点击查看详情 · 勾选整波'}</span><span title="A 全选/取消当前列表；Enter 打开归档确认；J/K 切换波次；X 勾选当前波"><kbd>A</kbd>全选 <kbd>↵</kbd>归档 <kbd>J</kbd><kbd>K</kbd>浏览</span></footer>
       </section>
@@ -355,23 +416,35 @@ function Integration() {
             <div className="archive-waveHeading"><div><h2>{batchCreator(wave)}</h2><p>{waveTime(wave.at)} · {waveRows.length} 个视频 · 已选 {waveRows.filter(r => selected.has(r.vid)).length} 个</p></div><ArchiveCheckbox label="选择详情中的整波视频" checked={waveRows.every(r => selected.has(r.vid))} mixed={waveRows.some(r => selected.has(r.vid)) && !waveRows.every(r => selected.has(r.vid))} disabled={disabled} onChange={() => toggle(waveRows.map(r => r.vid))} /></div>
             <div className="archive-waveVideos">{waveRows.map(row => <div className="archive-waveVideo" key={row.vid} data-vid={row.vid} data-active={current?.vid === row.vid}>
               <div className="archive-waveVideoMain"><ArchiveCheckbox label={`选择视频 ${row.name}`} checked={selected.has(row.vid)} disabled={disabled} onChange={() => toggle([row.vid])} />
-              <button data-archive-navigate aria-label={`查看视频 ${row.name}`} aria-current={current?.vid === row.vid ? 'true' : undefined} onClick={() => openItem(row.vid, false)}><span>{row.name}</span><small>{row.size_gb.toFixed(2)} GB</small><span className={row.status === 'ok' ? 'archive-good' : 'archive-warning'}>{archiving&&job?.vid===row.vid?'正在处理':rowStatus(row)}</span></button></div>
+              <button data-archive-navigate aria-label={`查看视频 ${row.name}`} aria-current={current?.vid === row.vid ? 'true' : undefined} onClick={() => openItem(row.vid, false)}><span>{row.name}</span>{row.source === 'auto-watermark' && <span className="archive-autoBadge">自动水印</span>}<small>{row.size_gb.toFixed(2)} GB</small><span className={row.status === 'ok' ? 'archive-good' : 'archive-warning'}>{archiving&&job?.vid===row.vid?'正在处理':rowStatus(row)}</span></button></div>
               {result?.failures?.find(f=>f.vid===row.vid)&&<p className="archive-warning px-3 pb-2 text-xs">{result.failures.find(f=>f.vid===row.vid)?.message}</p>}
               <ArchiveRowActions rows={[row]} disabled={disabled} onResolve={resolveInline} onCustomize={setResolving} onUndo={undoRows} />
             </div>)}</div>
           </section>}
 
           {current && detailVideo ? <>
-            <div className="archive-detailTitle"><div><h2>{current.name}</h2><p>{current.size_gb !== undefined ? `${current.size_gb.toFixed(2)} GB · ` : ''}{sourceLabel[(pending || archived)?.source || 'legacy'] || '归名确认'}</p></div><span className={`archive-badge ${pending && pending.status !== 'ok' ? 'archive-warning' : 'archive-good'}`}>{pending && pending.status !== 'ok' ? <CircleAlert size={13} /> : <CircleCheck size={13} />}{current.statusLabel}</span></div>
+            <div className="archive-detailTitle"><div><h2>{current.name}</h2><p>{current.size_gb !== undefined ? `${current.size_gb.toFixed(2)} GB · ` : ''}{sourceLabel[(pending || archived)?.source || 'legacy'] || '归名确认'}{(pending || archived)?.watermark_text ? ` · 水印 ${(pending || archived)!.watermark_text}` : ''}</p></div><div className="archive-detailBadges">{(pending || archived)?.source === 'auto-watermark' && <span className="archive-autoBadge">自动水印</span>}<span className={`archive-badge ${archived?.undone ? 'archive-mutedBadge' : pending && pending.status !== 'ok' ? 'archive-warning' : 'archive-good'}`}>{archived?.undone ? <Undo2 size={13} aria-hidden="true" /> : pending && pending.status !== 'ok' ? <CircleAlert size={13} aria-hidden="true" /> : <CircleCheck size={13} aria-hidden="true" />}{current.statusLabel}</span></div></div>
             <ArchiveVideoPlayer key={detailVideo.path || detailVideo.vid} video={detailVideo} detailVisibleOnMobile={mobileDetail} />
             <div className="archive-paths">
-              <div className="archive-pathLine"><Folder size={16} /><PathText value={current.src || current.vid} label={history ? '现在位置' : pending?.src ? '当前位置' : '原记录路径（源文件未找到）'} /></div>
+              <div className="archive-pathLine"><Folder size={16} /><PathText value={current.src || current.vid} label={archived?.undone ? '已撤回至原位置' : history ? '现在位置' : pending?.src ? '当前位置' : '原记录路径（源文件未找到）'} /></div>
+              {history && archived?.undone && (archived.dst || archived.win_dst) && <><div className="archive-pathConnector"><ArrowDown size={14} /><span>原归档位置</span></div><div className="archive-pathLine"><Archive size={16} /><PathText value={archived.dst || archived.win_dst} label="归档时目标路径" /></div></>}
+              {history && !archived?.undone && archived?.original_path && <><div className="archive-pathConnector"><ArrowDown size={14} /><span>撤回将恢复至原路径</span></div><div className="archive-pathLine"><Folder size={16} /><PathText value={archived.original_path} label="归档前原路径" /></div></>}
               {pending?.dst && <><div className="archive-pathConnector"><ArrowDown size={14} /><span>{pending.operation === 'stage-duplicate' ? '保留已有目标，完整校验后将重复源文件移入回收站' : '归档后移动到'}</span></div><div className="archive-pathLine"><Archive size={16} /><PathText value={pending.dst} label={pending.operation === 'stage-duplicate' ? '保留的目标文件' : '目标人物目录'} /></div></>}
               {archived?.staged_path && <><div className="archive-pathConnector"><ArrowDown size={14} /><span>源文件保留，未删除</span></div><div className="archive-pathLine"><Archive size={16} /><PathText value={archived.staged_path} label="重复源文件回收站位置" /></div></>}
             </div>
-            <div className="archive-person"><span className="archive-avatar">{current.creator.slice(0, 1)}</span><div><small>已确认人物</small><strong>{current.creator}<ShieldCheck size={14} className="archive-good" /></strong></div><span>{history ? '归档已完成' : '可跨波次勾选归档'}</span></div>
-            <div className={`archive-reason ${pending && pending.status !== 'ok' ? 'archive-warning' : 'archive-good'}`}>{pending && pending.status !== 'ok' ? <CircleAlert size={16} /> : <CheckCheck size={16} />}<span>{pending?.reason || '已完成文件移动与 Peach 账本更新。'}</span></div>
-            {pending && <div className="archive-detailsActions">{conflicts.some(r => r.vid === pending.vid) && <Button variant="outline" size="sm" disabled={disabled} onClick={() => setResolving([pending])}>{pending.resolution ? '更改处理方式' : '选择同名文件处理方式'}</Button>}<Button variant="ghost" size="sm" disabled={disabled} onClick={() => setUndoRequest({ vids: [pending.vid], goBack: true })}><Undo2 size={14} />退回待确认，重新选人</Button></div>}
+            <div className="archive-person"><span className="archive-avatar">{current.creator.slice(0, 1)}</span><div><small>已确认人物</small><strong>{current.creator}<ShieldCheck size={14} className="archive-good" /></strong></div><span>{archived?.undone ? '已撤回至待确认' : history ? '归档已完成' : '可跨波次勾选归档'}</span></div>
+            <div className={`archive-reason ${archived?.undone ? 'text-muted-foreground' : pending && pending.status !== 'ok' ? 'archive-warning' : 'archive-good'}`}>{archived?.undone ? <Undo2 size={16} aria-hidden="true" /> : pending && pending.status !== 'ok' ? <CircleAlert size={16} aria-hidden="true" /> : <CheckCheck size={16} aria-hidden="true" />}<span>{archived?.undone ? `已于 ${archived.undone_at ? waveTime(archived.undone_at) : '此前'} 撤回至原位置，该视频已退出自动合入。` : pending ? `${pending.reason}${pending.auto_fallback_reason && pending.auto_fallback_reason !== pending.reason ? `（${pending.auto_fallback_reason}）` : ''}` : autoArchiveReasonLabel(archived?.auto_reason) || '已完成文件移动与 Peach 账本更新。'}</span></div>
+            {pending && <div className="archive-detailsActions">{conflicts.some(r => r.vid === pending.vid) && <Button variant="outline" size="sm" disabled={disabled} onClick={() => setResolving([pending])}>{pending.resolution ? '更改处理方式' : '选择同名文件处理方式'}</Button>}<Button variant="ghost" size="sm" disabled={disabled} onClick={() => setUndoRequest({ vids: [pending.vid], goBack: true })}><Undo2 size={14} aria-hidden="true" />退回待确认，重新选人</Button></div>}
+            {history && archived && (archived.undone || canUnarchiveHistoryItem(archived)) && <div className="archive-detailsActions">
+              {archived.undone ? <>
+                <Button variant="outline" size="sm" disabled><Undo2 size={14} aria-hidden="true" />已撤回</Button>
+                <Link href={'/review?vid=' + encodeURIComponent(archived.vid)} className="text-xs underline underline-offset-4">查看待确认</Link>
+              </> : confirmUnarchiveKey === currentKey ? <div className="archive-inlineConfirm" role="group" aria-label="确认撤回归档" onKeyDown={e => { if (e.key === 'Escape' && !unarchiving) { setConfirmUnarchiveKey(null); requestAnimationFrame(() => unarchiveBtnRef.current?.focus({ preventScroll: true })) } }}>
+                <span>移回原目录并退出自动合入</span>
+                <Button variant="destructive" size="sm" disabled={unarchiving} onClick={() => void unarchiveRecord(archived)}>{unarchiving ? '撤回中…' : '确认撤回'}</Button>
+                <Button ref={cancelUnarchiveRef} variant="ghost" size="sm" disabled={unarchiving} onClick={() => { setConfirmUnarchiveKey(null); requestAnimationFrame(() => unarchiveBtnRef.current?.focus({ preventScroll: true })) }}>取消</Button>
+              </div> : <Button ref={unarchiveBtnRef} variant="outline" size="sm" disabled={disabled || unarchiving} onClick={() => setConfirmUnarchiveKey(currentKey)}><Undo2 size={14} aria-hidden="true" />撤回</Button>}
+            </div>}
             {(pending || archived)?.note && <p className="archive-reason">备注：{(pending || archived)?.note}</p>}<div className="archive-metadata"><span>{waveTime((pending || archived)?.at || '')} {history ? '归档记录' : '加入队列'}</span>{pending?.return_href && <Link href={'/review?vid='+encodeURIComponent(pending.vid)} className="underline underline-offset-4">查看归名来源</Link>}</div>
           </> : loading ? <ArchiveDetailSkeleton /> : <div className="archive-empty"><CircleCheck size={28} aria-hidden="true" /><p>从左侧选择视频查看详情</p></div>}
         </div>
