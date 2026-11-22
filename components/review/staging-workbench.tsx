@@ -19,6 +19,7 @@ import { Dialog, DialogDescription, DialogTitle } from '@/components/ui/dialog'
 import { ResponsiveDialogContent } from './responsive-dialog'
 import { VideoHealthPanel } from './video-health-panel'
 import { VideoPlayer } from './video'
+import { WorkbenchHeaderActions, useSyncWorkbenchBreadcrumb, type WorkbenchBreadcrumbSegment } from '@/components/workbench/breadcrumb'
 import './staging.css'
 
 type Plan = RestorePlan | DeletePlan
@@ -45,7 +46,7 @@ function savedPlan(value: unknown): value is Plan {
 }
 
 export function StagingWorkbench() {
-  const [health, setHealth] = useState(false), [list, setList] = useState<StagingList | null>(() => readWorkbenchCache<StagingList>('staging:list:0:') ?? null), [query, setQuery] = useState('')
+  const [health, setHealth] = useState(false), [healthRefreshSignal, setHealthRefreshSignal] = useState(0), [healthBusy, setHealthBusy] = useState(false), [list, setList] = useState<StagingList | null>(() => readWorkbenchCache<StagingList>('staging:list:0:') ?? null), [query, setQuery] = useState('')
   const [loading, setLoading] = useState(() => !readWorkbenchCache<StagingList>('staging:list:0:')), [selecting, setSelecting] = useState(false), [error, setError] = useState('')
   const [selected, setSelected] = useState<Map<string, StagedFile>>(new Map()), [focused, setFocused] = useState<StagedFile | null>(null)
   const [playing, setPlaying] = useState<ReviewVideo | null>(null), [instant, setInstant] = useState(false)
@@ -159,6 +160,16 @@ export function StagingWorkbench() {
   const closeDialog = () => { previewSequence.current++; setPreparing(false); setOpen(false) }
   const showReceipt = () => { captureTrigger(); setOpen(true) }
   const changeView = (value: string) => { setHealth(value === 'health'); history.replaceState(null, '', value === 'health' ? '/staging#video-health' : '/staging') }
+  const breadcrumbItems: WorkbenchBreadcrumbSegment[] = [
+    { key: 'home', label: '首页', href: '/', icon: 'home' },
+    {
+      key: 'staging',
+      label: '回收站',
+      ...(health ? { href: '/staging', onClick: () => { changeView('files'); void load(offsetRef.current) } } : {}),
+    },
+    ...(health ? [{ key: 'staging-health', label: '视频体检' }] : []),
+  ]
+  useSyncWorkbenchBreadcrumb(breadcrumbItems)
   const detail = focused && <>
     <div className="ws-detail-heading"><h2>文件详情</h2><Button variant="ghost" size="icon" aria-label="关闭文件详情" title="关闭详情" onClick={() => { setFocused(null); rowTrigger.current?.focus({ preventScroll: true }) }}><X size={15} /></Button></div>
     <div className="ws-detail-content"><div className="ws-task-info"><div className="staging-detail-file"><FileVideo size={24} /><h3>{focused.name}</h3></div><dl><dt>文件大小</dt><dd>{bytes(focused.size)}</dd><dt>来源</dt><dd>{origin(focused)}</dd></dl>
@@ -167,10 +178,33 @@ export function StagingWorkbench() {
       {videoFile.test(focused.name) && focused.size > 0 && <Button ref={playTrigger} variant="outline" onClick={event => { setInstant(event.detail === 0 || matchMedia('(prefers-reduced-motion: reduce)').matches); setPlaying({ vid: focused.vid, path: focused.path, name: focused.name, thumb: null }) }}><Play size={14} />播放核对</Button>}
     </div></div><div className="ws-detail-actions"><Button variant="outline" disabled={busy || !!error} onClick={() => begin('restore-files', focused)}><RotateCcw size={14} />恢复</Button><Button className="staging-danger" variant="outline" disabled={busy || !!error} onClick={() => begin('delete-staged', focused)}><Trash2 size={14} />永久删除</Button></div>
   </>
-  if (health) return <VideoHealthPanel onBack={() => { changeView('files'); void load(offsetRef.current) }} />
-  return <main className="ws-page staging-page" aria-label="回收站文件工作区">
-    <header className="ws-header"><h1>回收站</h1><div className="ws-actions"><Button variant="ghost" size="icon" aria-label="刷新回收站" title="刷新回收站" disabled={loading || busy} onClick={() => load(offsetRef.current)}><RefreshCw size={15} /></Button><Button className="staging-danger" variant="outline" disabled={!list?.files || !!error || busy} onClick={() => begin('clear-staging')}><Trash2 size={14} />清空回收站</Button></div></header>
-    <div className="ws-view-tabs"><WorkspaceTabs value="files" onChange={changeView} label="回收站视图" items={[{ value: 'files', label: '回收站文件', count: list?.files }, { value: 'health', label: '视频体检' }]} /></div>
+  return <main className="ws-page staging-page" aria-label={health ? '回收站工作区' : '回收站文件工作区'}>
+    <WorkbenchHeaderActions>
+      {health ? (
+        <Button variant="ghost" size="icon" aria-label="刷新视频体检" title="刷新视频体检" disabled={healthBusy} onClick={() => setHealthRefreshSignal(n => n + 1)}>
+          <RefreshCw size={15} />
+        </Button>
+      ) : (
+        <>
+          <Button variant="ghost" size="icon" aria-label="刷新回收站" title="刷新回收站" disabled={loading || busy} onClick={() => load(offsetRef.current)}>
+            <RefreshCw size={15} />
+          </Button>
+          <Button className="staging-danger" variant="outline" disabled={!list?.files || !!error || busy} onClick={() => begin('clear-staging')}>
+            <Trash2 size={14} />清空回收站
+          </Button>
+        </>
+      )}
+    </WorkbenchHeaderActions>
+    <div className="ws-view-tabs"><WorkspaceTabs value={health ? 'health' : 'files'} onChange={changeView} label="回收站视图" items={[{ value: 'files', label: '回收站文件', count: list?.files }, { value: 'health', label: '视频体检' }]} /></div>
+    {health ? (
+      <VideoHealthPanel
+        embedded
+        refreshSignal={healthRefreshSignal}
+        onLoadingChange={setHealthBusy}
+        onBack={() => { changeView('files'); void load(offsetRef.current) }}
+      />
+    ) : (
+      <>
     {error && <div className="staging-notice"><WorkspaceMessage error>{error}{list ? ' 当前列表为上次读取的结果。' : ''}</WorkspaceMessage><Button variant="outline" onClick={() => load(offsetRef.current)}>重试</Button></div>}
     {plan && sent && <div className="staging-receipt" role="status"><span>{labels[plan.request.action]} · {uncertain && !status ? '结果待确认' : statusLabel(status?.status)}{status?.total != null ? ` ${status.committed ?? status.completed ?? 0} / ${status.total}` : ''}</span><Button variant="ghost" onClick={showReceipt}>查看回执</Button></div>}
     {operationError && sent && !open && <div className="staging-notice"><WorkspaceMessage error>{operationError}</WorkspaceMessage></div>}
@@ -194,5 +228,7 @@ export function StagingWorkbench() {
         </>}
       </div><div className="ws-detail-actions"><Button variant="outline" onClick={closeDialog}>{submitting ? '后台继续' : '关闭'}</Button>{!sent && !plan && action === 'restore-files' && <Button disabled={preparing || !restoreFile || (destinationMode === 'custom' && !person.trim())} onClick={() => prepare(action, [restoreFile!])}>预览恢复</Button>}{!sent && plan && <Button variant={action === 'restore-files' ? 'primary' : 'outline'} className={action !== 'restore-files' ? 'staging-danger' : ''} disabled={submitting || (action !== 'restore-files' && confirmation !== labels[action])} onClick={() => execute()}>确认{labels[action]}</Button>}{status?.status === 'complete' && status.result && 'person' in status.result && status.result.person && <NavigationButton variant="outline" size="sm" asChild><Link href={`/persons/${encodeURIComponent(status.result.person)}`}>查看人物目录</Link></NavigationButton>}{sent && plan && <><Button variant="outline" disabled={submitting} onClick={() => execute(true)}>核对恢复状态</Button><Button variant="ghost" disabled={submitting} onClick={() => checkStatus(plan)}>刷新回执</Button></>}</div>
     </ResponsiveDialogContent></Dialog><VideoPlayer video={playing} onClose={() => setPlaying(null)} returnFocus={playTrigger} instantEntry={instant} />
+      </>
+    )}
   </main>
 }

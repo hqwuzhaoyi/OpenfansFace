@@ -7,7 +7,7 @@
   width: 100%;
   max-width: 1700px;
   margin: 0 auto;
-  padding: 24px;
+  padding: 20px 24px;
 }
 
 .ws-deploy-pinned-banner {
@@ -99,12 +99,6 @@
 
 .ws-deploy-toolbar-left .ws-search {
   max-width: 280px;
-}
-
-.ws-deploy-toolbar-right {
-  display: flex;
-  align-items: center;
-  gap: 8px;
 }
 
 /* Deploy Matrix Table / List */
@@ -501,12 +495,12 @@
 /* Mobile responsiveness */
 @media (max-width: 768px) {
   .ws-deploy-root {
-    padding: 14px 10px;
+    padding: 14px 12px;
     gap: 14px;
   }
   .ws-deploy-toolbar {
     display: grid;
-    grid-template-columns: minmax(0, 1fr) auto;
+    grid-template-columns: minmax(0, 1fr);
     align-items: center;
     gap: 10px 8px;
   }
@@ -523,13 +517,6 @@
     max-width: none;
     width: 100%;
     min-width: 0;
-  }
-  .ws-deploy-toolbar-right {
-    width: auto;
-  }
-  .ws-deploy-toolbar-right button {
-    min-height: 40px;
-    padding-inline: 12px;
   }
   .ws-deploy-card-header {
     flex-direction: column;

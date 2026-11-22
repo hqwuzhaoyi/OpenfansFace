@@ -35,6 +35,7 @@ import { VideoPreviewDialog } from '@/components/workbench/video-preview-dialog'
 import { ReviewQueueSkeleton, StageMediaLoader } from '@/components/workbench/loading-skeletons'
 import { Skeleton } from '@/components/ui/skeleton'
 import { WorkspaceSearch, WorkspaceTabs, useReviewDesktop } from '@/components/workbench/controls'
+import { WorkbenchHeaderActions, useSyncWorkbenchBreadcrumb, type WorkbenchBreadcrumbSegment } from '@/components/workbench/breadcrumb'
 
 type Group={key:string;label:string;kind:string;count:number}
 type Data={has_updates?:boolean;session?:string;session_at?:number;expires_at?:number;remaining?:number;next_page?:number|null;previous_page?:number|null;blocked?:{vid:string;message:string}[];counts:Record<string,number>;groups:Group[];group:Group|null;total:number;rows:ProcessingTask[];page:number;limit:number;waiting:number;online:boolean;folders:string[];focus_missing:boolean}
@@ -687,8 +688,29 @@ export default function Review() {
     </div>
     <div className="ws-detail-actions">{reference?<><Button variant="outline" onClick={backReference}>返回{reference.returnTo==='selection'?'人物选择':'证据'}</Button><Button className="ws-action-primary" onClick={()=>{setCreator(reference.name);backReference()}}><span className="ws-btn-truncate">选择 {reference.name}</span></Button></>:detailMode==='selection'?<><Button variant="outline" disabled={!actionTargets.length||sessionExpired} onClick={()=>void action(view==='deferred'?'restore':'defer',actionTargets.map(t=>t.vid))}>{view==='deferred'?'恢复':'暂缓'}</Button><Button className="ws-action-primary" disabled={!actionTargets.length||!creator.trim()||sessionExpired||actionTargets.some(t=>blockedIds.has(t.vid)||pendingVids.has(t.vid))} onClick={()=>void confirm()}><span className="ws-btn-truncate">归给 {creator.trim()||'所选人物'}</span><span className="ws-btn-badge">· <DigitSwap value={actionTargets.length}/></span></Button></>:<><Button variant="outline" disabled={!focused||!!focused?.review_blocked&&!selected.has(focused.vid)} onClick={()=>focused&&toggle([focused])}>{focused&&selected.has(focused.vid)?'取消选择':'选择此项'}</Button><Button variant="outline" disabled={!actionTargets.length||sessionExpired} onClick={()=>void action(view==='deferred'?'restore':'defer',actionTargets.map(t=>t.vid))}>{view==='deferred'?'恢复':'暂缓'}</Button>{creator.trim()?<Button className="ws-action-primary" disabled={!actionTargets.length||sessionExpired||actionTargets.some(t=>blockedIds.has(t.vid)||pendingVids.has(t.vid))} onClick={()=>void confirm()}><span className="ws-btn-truncate">归给 {creator.trim()}</span><span className="ws-btn-badge">· <DigitSwap value={actionTargets.length}/></span></Button>:<Button className="ws-action-primary" disabled={!actionTargets.length} onClick={openSelection}><span>核对所选</span><span className="ws-btn-badge">· <DigitSwap value={actionTargets.length}/></span></Button>}</>}</div>
   </>
+  const midScopeSegment:WorkbenchBreadcrumbSegment|null=personScope?{key:`person:${personScope}`,label:personScope}:clusterScope?{key:`cluster:${clusterScope}`,label:`相似组 ${clusterScope}`}:view!=='all'?{key:`view:${view}`,label:views.find(v=>v.value===view)?.label||view}:null
+  const leafGroupSegment:WorkbenchBreadcrumbSegment|null=data?.group?.label?{key:`group:${data.group.key}`,label:data.group.label}:null
+  const hasDeeperBreadcrumb=Boolean(midScopeSegment||leafGroupSegment)
+  const midScopeHref=personScope?`/review?person=${encodeURIComponent(personScope)}`:clusterScope?`/review?cluster=${encodeURIComponent(clusterScope)}`:`/review?view=${encodeURIComponent(view)}`
+  const breadcrumbItems:WorkbenchBreadcrumbSegment[]=[
+    {key:'home',label:'首页',href:'/',icon:'home'},
+    {
+      key:'review',
+      label:'人工确认',
+      ...(hasDeeperBreadcrumb?{
+        href:'/review',
+        onClick:()=>{advanceSequenceRef.current++;updateFilters({view:'all',group:'',person:'',cluster:'',page:'0',vid:''})},
+      }:{}),
+    },
+    ...(midScopeSegment?[{
+      ...midScopeSegment,
+      ...(leafGroupSegment?{href:midScopeHref,onClick:()=>{advanceSequenceRef.current++;updateFilters({group:'',page:'0',vid:''})}}:{}),
+    }]:[]),
+    ...(leafGroupSegment?[leafGroupSegment]:[]),
+  ]
+  useSyncWorkbenchBreadcrumb(breadcrumbItems)
   return <main className="ws-page" aria-label="人工确认工作区" data-review-session={data?.session}>
-    <header className="ws-header"><h1>人工确认</h1><div className="ws-actions"><NavigationButton variant="ghost" size="sm" asChild><Link href="/operations"><span className="ws-link-label">分析中</span><span className="ws-count">{updates?.waiting??data?.waiting??'—'}</span><ChevronRight size={14} aria-hidden="true"/></Link></NavigationButton><Button variant={updates?.has_updates||sessionExpired?"outline":"ghost"} aria-label="更新人工确认列表" title={updates?.refreshing?`后台正在更新 ${updates.refreshing} 条建议，当前列表保持不变`:'更新建议和分组'} disabled={loading} onClick={requestRefresh}><RefreshCw size={15} aria-hidden="true"/>{updates?.has_updates||sessionExpired?<span>有更新</span>:updates?.refreshing?<span className="ws-muted">后台更新中</span>:null}</Button></div></header>
+    <WorkbenchHeaderActions><NavigationButton variant="ghost" size="sm" asChild><Link href="/operations"><span className="ws-link-label">分析中</span><span className="ws-count">{updates?.waiting??data?.waiting??'—'}</span><ChevronRight size={14} aria-hidden="true"/></Link></NavigationButton><Button variant={updates?.has_updates||sessionExpired?"outline":"ghost"} aria-label="更新人工确认列表" title={updates?.refreshing?`后台正在更新 ${updates.refreshing} 条建议，当前列表保持不变`:'更新建议和分组'} disabled={loading} onClick={requestRefresh}><RefreshCw size={15} aria-hidden="true"/>{updates?.has_updates||sessionExpired?<span>有更新</span>:updates?.refreshing?<span className="ws-muted">后台更新中</span>:null}</Button></WorkbenchHeaderActions>
     {receipt&&<div className="ws-receipt"><QueueReceipt count={receipt.vids.length} creator={receipt.creator} onUndo={undo} busy={false}/></div>}
     {error&&<p role="alert" className="ws-error">{error}</p>}
     {sessionExpired&&!error&&<p role="status" className="ws-error">本次核对已过期，勾选和草稿仍保留。请更新列表后继续。</p>}

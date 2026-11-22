@@ -12,6 +12,7 @@ import { WorkspaceButton as Button, WorkspaceCard, WorkspaceMessage, WorkspacePa
 import { InlineBeuiLoader, WorkbenchListSkeleton } from '@/components/workbench/loading-skeletons'
 import { Skeleton } from '@/components/ui/skeleton'
 import { VideoPlayer } from './video'
+import { WorkbenchBreadcrumb, type WorkbenchBreadcrumbSegment } from '@/components/workbench/breadcrumb'
 import './staging.css'
 
 type Report = Omit<VideoHealthReport, 'records'> & { rows: VideoHealthRecord[] }
@@ -22,7 +23,17 @@ const date = (value?: string) => value && Number.isFinite(Date.parse(value))
   : '尚无记录'
 const size = (bytes?: number | null) => bytes == null ? '未知' : bytes < 1024 ** 2 ? `${number.format(bytes)} B` : bytes < 1024 ** 3 ? `${(bytes / 1024 ** 2).toFixed(1)} MB` : `${(bytes / 1024 ** 3).toFixed(2)} GB`
 
-export function VideoHealthPanel({ onBack }: { onBack?: () => void } = {}) {
+export function VideoHealthPanel({
+  onBack,
+  embedded = false,
+  refreshSignal = 0,
+  onLoadingChange,
+}: {
+  onBack?: () => void
+  embedded?: boolean
+  refreshSignal?: number
+  onLoadingChange?: (loading: boolean) => void
+} = {}) {
   const [data, setData] = useState<Report | null>(null)
   const [storage, setStorage] = useState<StagingStats | null>(null)
   const [error, setError] = useState(''), [storageError, setStorageError] = useState('')
@@ -67,6 +78,15 @@ export function VideoHealthPanel({ onBack }: { onBack?: () => void } = {}) {
     return () => { healthSequence.current++; storageSequence.current++ }
   }, [loadHealth, loadStorage])
   useEffect(() => {
+    if (refreshSignal > 0) {
+      void loadHealth()
+      void loadStorage()
+    }
+  }, [refreshSignal, loadHealth, loadStorage])
+  useEffect(() => {
+    onLoadingChange?.(loading || storageLoading)
+  }, [loading, storageLoading, onLoadingChange])
+  useEffect(() => {
     if (data?.status !== 'running') return
     const timer = setInterval(() => { void loadHealth() }, 15000)
     return () => clearInterval(timer)
@@ -110,8 +130,7 @@ export function VideoHealthPanel({ onBack }: { onBack?: () => void } = {}) {
     }}><Play size={14} />播放核对</Button></div>}
   </>
 
-  return <main className="ws-page staging-page" aria-label="回收站工作区">
-    <header className="ws-header"><h1>视频体检</h1><div className="ws-actions">{onBack && <Button variant="outline" onClick={onBack}>回收站文件</Button>}<Button variant="outline" disabled={loading || storageLoading} onClick={() => { void loadHealth(); void loadStorage() }}><RefreshCw size={14} />刷新</Button></div></header>
+  const workarea = (
     <div className="staging-workarea">
       <aside className="staging-storage" aria-label="回收站概况">{storageSummary}</aside>
       <section id="video-health" className="ws-queue staging-health" aria-labelledby="staging-health-title">
@@ -141,6 +160,25 @@ export function VideoHealthPanel({ onBack }: { onBack?: () => void } = {}) {
       </section>
       {wide && <aside className="ws-inspector staging-inspector" aria-label="检查详情">{detail || <div className="staging-detail-empty"><FileVideo size={28} /><p>选择记录查看检查依据</p></div>}</aside>}
     </div>
-    <VideoPlayer video={playing} onClose={() => setPlaying(null)} returnFocus={playTrigger} instantEntry={instantPlayer} />
+  )
+  const player = <VideoPlayer video={playing} onClose={() => setPlaying(null)} returnFocus={playTrigger} instantEntry={instantPlayer} />
+
+  if (embedded) {
+    return <>
+      {workarea}
+      {player}
+    </>
+  }
+
+  const standaloneBreadcrumb: WorkbenchBreadcrumbSegment[] = [
+    { key: 'home', label: '首页', href: '/', icon: 'home' },
+    { key: 'staging', label: '回收站', href: '/staging', onClick: onBack },
+    { key: 'staging-health', label: '视频体检' },
+  ]
+
+  return <main className="ws-page staging-page" aria-label="回收站工作区">
+    <header className="ws-header"><WorkbenchBreadcrumb items={standaloneBreadcrumb} className="wb-header-breadcrumb" /><div className="ws-actions">{onBack && <Button variant="outline" onClick={onBack}>回收站文件</Button>}<Button variant="outline" disabled={loading || storageLoading} onClick={() => { void loadHealth(); void loadStorage() }}><RefreshCw size={14} />刷新</Button></div></header>
+    {workarea}
+    {player}
   </main>
 }

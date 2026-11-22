@@ -7,13 +7,14 @@ import { workspaceToast as toast } from '@/components/workbench/feedback'
 import { WorkspaceCard, WorkspaceButton as Button } from '@/components/workbench/inner'
 import { InlineBeuiLoader, WorkbenchListSkeleton } from '@/components/workbench/loading-skeletons'
 import { WorkspaceTabs, WorkspaceSearch } from '@/components/workbench/controls'
+import { WorkbenchHeaderActions, useSyncWorkbenchBreadcrumb, type WorkbenchBreadcrumbSegment } from '@/components/workbench/breadcrumb'
 import { api } from '@/lib/face-api'
 import type { AgentNode, DeviceGroupPool, NodeListApiResponse } from '@/lib/processing-node-model'
 import { HardwareDial } from './hardware-dial'
 import { NodeStatusBadge } from './node-status-badge'
 import './node-view.css'
 
-export default function NodeView() {
+export default function NodeView({ onNavigateOverview }: { onNavigateOverview?: () => void } = {}) {
   const queryClient = useQueryClient()
   const [filter, setFilter] = useState<string>('all')
   const [query, setQuery] = useState<string>('')
@@ -131,40 +132,49 @@ export default function NodeView() {
   }, [devicePools, query, filter])
 
   const cluster = data?.cluster
+  const breadcrumbItems = useMemo<WorkbenchBreadcrumbSegment[]>(
+    () => [
+      { key: 'home', label: '首页', href: '/', icon: 'home' },
+      {
+        key: 'operations',
+        label: '处理操作台',
+        href: '/operations?tab=tasks&view=dashboard',
+        onClick: onNavigateOverview,
+      },
+      { key: 'ops-nodes', label: '节点资源与设备池' },
+    ],
+    [onNavigateOverview],
+  )
+  useSyncWorkbenchBreadcrumb(breadcrumbItems)
 
   return (
     <div className="ws-node-view">
-      {/* Header bar */}
-      <div className="ws-node-view-header">
-        <div>
-          <h2>节点资源与设备池</h2>
-          {cluster ? (
-            <span>
-              {`${cluster.device_groups_count} 个物理设备 · ${cluster.total_nodes} 个 Agent (${cluster.accepting_nodes} 个可接单)`}
-            </span>
-          ) : (
-            <div className="mt-1.5">
-              <InlineBeuiLoader
-                size={13}
-                label="正在连接节点服务"
-                showLabel
-                className="!mt-0 !inline-flex [&>span]:!mt-0 [&>span]:!inline"
-              />
-            </div>
-          )}
-        </div>
-        <div className="ws-node-header-actions">
-          <Button
-            variant="ghost"
-            size="sm"
-            disabled={isFetching}
-            onClick={() => void refetch()}
-            aria-label="刷新节点列表"
-          >
-            <RefreshCw size={14} className={isFetching ? 'animate-spin' : ''} />
-            刷新
-          </Button>
-        </div>
+      <WorkbenchHeaderActions>
+        <Button
+          variant="ghost"
+          size="sm"
+          disabled={isFetching}
+          onClick={() => void refetch()}
+          aria-label="刷新节点列表"
+        >
+          <RefreshCw size={14} className={isFetching ? 'animate-spin' : ''} />
+          刷新
+        </Button>
+      </WorkbenchHeaderActions>
+
+      <div className="ws-node-cluster-summary">
+        {cluster ? (
+          <span>
+            {`${cluster.device_groups_count} 个物理设备 · ${cluster.total_nodes} 个 Agent (${cluster.accepting_nodes} 个可接单)`}
+          </span>
+        ) : (
+          <InlineBeuiLoader
+            size={13}
+            label="正在连接节点服务"
+            showLabel
+            className="!mt-0 !inline-flex [&>span]:!mt-0 [&>span]:!inline"
+          />
+        )}
       </div>
 
       {error && (

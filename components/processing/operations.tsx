@@ -1,5 +1,6 @@
 'use client'
 
+import { useCallback } from 'react'
 import { Layers3, LayoutGrid, ListTodo, Server, ShieldCheck } from 'lucide-react'
 import { useWorkspaceQuery } from '@/components/workbench/state'
 import { WorkspaceTabs } from '@/components/workbench/controls'
@@ -34,6 +35,19 @@ export default function Operations({ defaultView = 'dashboard' }: { defaultView?
         ? 'queue'
         : defaultView
 
+  const navigateOverview = useCallback(
+    () =>
+      update({
+        tab: 'tasks',
+        view: 'dashboard',
+        stage: '',
+        batch: '',
+        node_id: '',
+        waiting_reason: '',
+      }),
+    [update]
+  )
+
   return (
     <div className="ws-operations-root">
       <div className="ws-view-tabs ws-operations-tabs" role="navigation" aria-label="操作台三视图">
@@ -67,10 +81,14 @@ export default function Operations({ defaultView = 'dashboard' }: { defaultView?
 
       <div className="ws-operations-view-container">
         {activeTab === 'tasks' && (
-          activeView === 'queue' ? <ProcessingTaskQueue /> : <ProcessingDashboard />
+          activeView === 'queue' ? (
+            <ProcessingTaskQueue onNavigateOverview={navigateOverview} />
+          ) : (
+            <ProcessingDashboard onNavigateOverview={navigateOverview} />
+          )
         )}
-        {activeTab === 'nodes' && <NodeView />}
-        {activeTab === 'deploy' && <DeploymentView />}
+        {activeTab === 'nodes' && <NodeView onNavigateOverview={navigateOverview} />}
+        {activeTab === 'deploy' && <DeploymentView onNavigateOverview={navigateOverview} />}
       </div>
     </div>
   )

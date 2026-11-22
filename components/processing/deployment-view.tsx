@@ -24,6 +24,7 @@ import { api } from '@/lib/face-api'
 import { workspaceToast as toast } from '@/components/workbench/feedback'
 import { WorkspaceCard, WorkspaceButton as Button } from '@/components/workbench/inner'
 import { WorkspaceTabs, WorkspaceSearch } from '@/components/workbench/controls'
+import { WorkbenchHeaderActions, useSyncWorkbenchBreadcrumb, type WorkbenchBreadcrumbSegment } from '@/components/workbench/breadcrumb'
 import { Drawer } from '@/components/beui/motion/drawer'
 import { AnimatedBadge } from '@/components/beui/motion/animated-badge'
 import { useFocusTrap } from '@/lib/beui/hooks/use-focus-trap'
@@ -40,7 +41,7 @@ import {
 } from '@/lib/processing-deployment-model'
 import './deployment-view.css'
 
-export default function DeploymentView() {
+export default function DeploymentView({ onNavigateOverview }: { onNavigateOverview?: () => void } = {}) {
   const queryClient = useQueryClient()
   const [filter, setFilter] = useState<string>('all')
   const [query, setQuery] = useState<string>('')
@@ -152,8 +153,35 @@ export default function DeploymentView() {
     })
   }, [data, filter, query])
 
+  const breadcrumbItems = useMemo<WorkbenchBreadcrumbSegment[]>(
+    () => [
+      { key: 'home', label: '首页', href: '/', icon: 'home' },
+      {
+        key: 'operations',
+        label: '处理操作台',
+        href: '/operations?tab=tasks&view=dashboard',
+        onClick: onNavigateOverview,
+      },
+      { key: 'ops-deploy', label: '部署视图' },
+    ],
+    [onNavigateOverview],
+  )
+  useSyncWorkbenchBreadcrumb(breadcrumbItems)
+
   return (
     <div className="ws-deploy-root">
+      <WorkbenchHeaderActions>
+        <Button
+          variant="ghost"
+          size="sm"
+          onClick={() => refetch()}
+          disabled={isFetching}
+          aria-label="刷新部署状态"
+        >
+          <RefreshCw size={14} className={isFetching ? 'animate-spin' : ''} />
+          <span>刷新</span>
+        </Button>
+      </WorkbenchHeaderActions>
       {/* Pinned Release Banner */}
       <div className="ws-deploy-pinned-banner">
         <div className="ws-deploy-banner-top">
@@ -218,18 +246,6 @@ export default function DeploymentView() {
             placeholder="搜索节点或版本..."
             label="搜索节点"
           />
-        </div>
-        <div className="ws-deploy-toolbar-right">
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => refetch()}
-            disabled={isFetching}
-            aria-label="刷新部署状态"
-          >
-            <RefreshCw size={14} className={isFetching ? 'animate-spin' : ''} />
-            <span>刷新</span>
-          </Button>
         </div>
       </div>
 

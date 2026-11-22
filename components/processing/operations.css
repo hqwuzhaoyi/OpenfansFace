@@ -142,18 +142,4 @@
     min-height: 36px;
     font-size: 12px;
   }
-
-  .ws-operations-view-container > .ws-page > .ws-header {
-    min-height: auto;
-    padding: 8px 12px;
-  }
-
-  .ws-operations-view-container > .ws-page > .ws-header > div:first-child {
-    display: none;
-  }
-
-  .ws-operations-view-container > .ws-page > .ws-header > .ws-actions {
-    width: 100%;
-    justify-content: flex-end;
-  }
 }

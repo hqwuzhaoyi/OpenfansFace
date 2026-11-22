@@ -24,8 +24,10 @@ import { ArchiveResolutionDialog } from '@/components/review/archive-resolution'
 import { ArchiveCheckbox, ArchiveFolderList, type ArchiveListItem } from '@/components/review/archive-folder-list'
 import { PathText } from '@/components/review/video'
 import { Button } from '@/components/ui/button'
+import { WorkspaceButton } from '@/components/workbench/inner'
 import { ArchiveDetailSkeleton, ArchiveListSkeleton } from '@/components/workbench/loading-skeletons'
 import { readWorkbenchCache, writeWorkbenchCache } from '@/components/workbench/state'
+import { WorkbenchBreadcrumb, WorkbenchHeaderActions, useSyncWorkbenchBreadcrumb, type WorkbenchBreadcrumbSegment } from '@/components/workbench/breadcrumb'
 import { useBackgroundOperations } from '@/components/workbench/background-operations'
 import { AlertDialog, AlertDialogAction, AlertDialogCancel, AlertDialogContent, AlertDialogDescription, AlertDialogFooter, AlertDialogHeader, AlertDialogTitle } from '@/components/ui/alert-dialog'
 import '@/components/review/archive-workbench.css'
@@ -259,14 +261,82 @@ function Integration() {
   const progressPercent=job?jobPercent(job):null
   const resultTitle=result?.recovery_needed?'需要核对恢复，已暂停写操作':result?.rolled_back?'归档失败，本轮已移动的文件已恢复':result?.moved?`已归档 ${result.moved} 个${result.errors.length?' · 部分项目未完成':''}`:'本轮未归档，任务已保留'
 
+  const detailBreadcrumbItems: WorkbenchBreadcrumbSegment[] = history
+    ? [
+        {
+          key: 'detail-history',
+          label: '已归档',
+          href: '/integration?view=history',
+          onClick: () => {
+            if (listHidden) setListHidden(false)
+            scrollDetail.current?.scrollTo({ top: 0 })
+          },
+        },
+        { key: `creator:${current?.creator || 'none'}`, label: current?.creator || '视频详情' },
+      ]
+    : [
+        {
+          key: 'detail-wave',
+          label: '波次详情',
+          href: '/integration',
+          onClick: () => {
+            if (listHidden) setListHidden(false)
+            scrollDetail.current?.scrollTo({ top: 0 })
+          },
+        },
+        { key: `creator:${current?.creator || 'none'}`, label: current?.creator || '视频详情' },
+      ]
+  const topBreadcrumbItems: WorkbenchBreadcrumbSegment[] = [
+    { key: 'home', label: '首页', href: '/', icon: 'home' },
+    {
+      key: 'integration',
+      label: '待归档',
+      ...(history || mobileDetail
+        ? {
+            href: '/integration',
+            onClick: () => {
+              if (history) setView(false)
+              setMobileDetail(false)
+            },
+          }
+        : {}),
+    },
+    ...(history
+      ? [
+          {
+            key: 'integration-history',
+            label: '已归档',
+            ...(mobileDetail
+              ? {
+                  href: '/integration?view=history',
+                  onClick: () => setMobileDetail(false),
+                }
+              : {}),
+          },
+        ]
+      : []),
+    ...(mobileDetail && current?.creator
+      ? [{ key: `creator:${current.creator}`, label: current.creator }]
+      : []),
+  ]
+  useSyncWorkbenchBreadcrumb(topBreadcrumbItems)
 
   return <main className="archive-workbench">
+    <WorkbenchHeaderActions>
+      <WorkspaceButton variant="outline" size="sm" aria-label={history ? '返回待归档' : '查看已归档记录'} title={history ? '返回待归档' : '已归档记录'} disabled={busy} onClick={() => setView(!history)}>
+        {history ? <Archive size={14} /> : <History size={14} />}
+        <span>{history ? '返回待归档' : '已归档记录'}</span>
+      </WorkspaceButton>
+      <WorkspaceButton variant="ghost" size="icon" aria-label="刷新归档预览" title="刷新" disabled={busy || loading} onClick={() => load()}>
+        <RefreshCw size={15} className={loading ? 'animate-spin motion-reduce:animate-none' : ''} />
+      </WorkspaceButton>
+    </WorkbenchHeaderActions>
     {error && <div role="alert" className={`archive-notice archive-warning`}>{error}<Button size="sm" variant="ghost" disabled={loading || busy} onClick={() => load()}>重新加载</Button></div>}
     {result?.errors.length ? <details className="archive-notice archive-warning"><summary>{resultTitle} · 查看原因</summary><ul>{result.errors.map((message,i)=><li key={i}>{message}</li>)}</ul></details>:null}
     {!!undoResult.length && !history && <div className="archive-notice" role="status"><div className="flex justify-between gap-3"><p>已将 {undoResult.length} 个视频退回待确认，文件没有移动或删除。</p><button aria-label="关闭退回结果" className="archive-iconButton" onClick={() => setUndoResult([])}><X size={15} /></button></div><div className="archive-noticeLinks">{Array.from(new Map(undoResult.map(r => [r.return_href, r])).values()).map((r, i) => <Link key={r.return_href || i} href={'/review?vid='+encodeURIComponent(r.vid)}>回到{sourceLabel[r.source || 'legacy'] || '原确认入口'}</Link>)}</div></div>}
     <div className="archive-split" data-hidden={listHidden} data-mobile-detail={mobileDetail}>
       <section className="archive-list" aria-label={history ? '归档记录列表' : '待归档波次列表'} aria-busy={loading}>
-        <header className="archive-listHeading"><h1>{history ? '已归档' : '待归档'}<span className="archive-count">{history ? items.length : `${waves.length} 波 · ${rows.length} 个`}</span></h1><div className="archive-iconActions"><button className="archive-iconButton" aria-label={history ? '返回待归档' : '查看已归档记录'} title={history ? '返回待归档' : '已归档记录'} disabled={busy} onClick={() => setView(!history)}>{history ? <Archive size={17} /> : <History size={17} />}</button><button className="archive-iconButton" aria-label="刷新归档预览" title="刷新" disabled={busy || loading} onClick={() => load()}><RefreshCw size={16} className={loading ? 'animate-spin motion-reduce:animate-none' : ''} /></button></div></header>
+        <header className="archive-listHeading"><div className="archive-listHeadingMain"><h2>{history ? '已归档记录' : '待归档波次'}</h2><span className="archive-count">{history ? `${items.length} 条` : `${waves.length} 波 · ${rows.length} 个`}</span></div></header>
         <label className="archive-search"><Search size={15} /><input ref={searchInput} aria-label="搜索人物、文件或路径" placeholder="搜索人物、文件或路径…" disabled={busy} value={query} onChange={event => setQuery(event.target.value)} /><kbd>/</kbd></label>
         {!history && <div className="archive-filters">{([
           ['all', '全部', waves.length], ['ok', '可归档', waves.filter(w => w.rows.some(r => r.status === 'ok')).length],
@@ -279,7 +349,7 @@ function Integration() {
         <footer className="archive-listBottom"><span>{history ? `存放目录 · ${folders.length} 个` : '点击查看详情 · 勾选整波'}</span><span title="A 全选/取消当前列表；Enter 打开归档确认；J/K 切换波次；X 勾选当前波"><kbd>A</kbd>全选 <kbd>↵</kbd>归档 <kbd>J</kbd><kbd>K</kbd>浏览</span></footer>
       </section>
       <section className="archive-detail" aria-label="波次与视频详情" aria-busy={loading && !current}>
-        <header className="archive-detailTop"><button className="archive-mobileBack" onClick={() => setMobileDetail(false)}><ArrowLeft size={15} />返回列表</button><div className="archive-breadcrumb"><button className="archive-iconButton" aria-label={listHidden ? '展开视频列表' : '收起视频列表'} aria-expanded={!listHidden} onClick={() => setListHidden(!listHidden)}><PanelLeft size={17} /></button><i /><span>{history ? '已归档' : '波次详情'}</span><ChevronRight size={13} /><b>{current?.creator || '视频详情'}</b></div><div className="archive-paging"><span>{current ? activeIndex + 1 : 0} / {filtered.length}</span><button className="archive-iconButton" aria-label="上一个视频" disabled={!filtered.length} onClick={() => move(-1)}><ChevronLeft size={17} /></button><button className="archive-iconButton" aria-label="下一个视频" disabled={!filtered.length} onClick={() => move(1)}><ChevronRight size={17} /></button></div></header>
+        <header className="archive-detailTop"><button className="archive-mobileBack" onClick={() => setMobileDetail(false)}><ArrowLeft size={15} />返回列表</button><div className="archive-breadcrumb"><button className="archive-iconButton" aria-label={listHidden ? '展开视频列表' : '收起视频列表'} aria-expanded={!listHidden} onClick={() => setListHidden(!listHidden)}><PanelLeft size={17} /></button><i /><WorkbenchBreadcrumb items={detailBreadcrumbItems} compact asHeading={false} ariaLabel="详情路径" /></div><div className="archive-paging"><span>{current ? activeIndex + 1 : 0} / {filtered.length}</span><button className="archive-iconButton" aria-label="上一个视频" disabled={!filtered.length} onClick={() => move(-1)}><ChevronLeft size={17} /></button><button className="archive-iconButton" aria-label="下一个视频" disabled={!filtered.length} onClick={() => move(1)}><ChevronRight size={17} /></button></div></header>
         <div ref={scrollDetail} className="archive-detailScroll">
           {!history && wave && <section className="archive-waveDetail" aria-label="本波视频">
             <div className="archive-waveHeading"><div><h2>{batchCreator(wave)}</h2><p>{waveTime(wave.at)} · {waveRows.length} 个视频 · 已选 {waveRows.filter(r => selected.has(r.vid)).length} 个</p></div><ArchiveCheckbox label="选择详情中的整波视频" checked={waveRows.every(r => selected.has(r.vid))} mixed={waveRows.some(r => selected.has(r.vid)) && !waveRows.every(r => selected.has(r.vid))} disabled={disabled} onChange={() => toggle(waveRows.map(r => r.vid))} /></div>

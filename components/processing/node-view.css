@@ -2,7 +2,7 @@
   display: grid;
   grid-template-columns: minmax(0, 1fr);
   gap: 20px;
-  padding: 24px;
+  padding: 20px 24px;
   width: 100%;
   max-width: 1700px;
   min-width: 0;
@@ -10,31 +10,9 @@
   box-sizing: border-box;
 }
 
-.ws-node-view-header {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 16px;
-}
-
-.ws-node-view-header h2 {
-  font-size: 21px;
-  font-weight: 600;
-  letter-spacing: -0.02em;
-  margin: 0;
-}
-
-.ws-node-view-header span {
-  display: block;
-  margin-top: 5px;
+.ws-node-cluster-summary {
   font-size: 12px;
   color: var(--muted-foreground);
-}
-
-.ws-node-header-actions {
-  display: flex;
-  align-items: center;
-  gap: 8px;
 }
 
 .ws-node-toolbar {
@@ -302,17 +280,8 @@
 /* 390px Mobile Viewport & Touch Target Optimization */
 @media (max-width: 767px) {
   .ws-node-view {
-    padding: 14px 10px;
+    padding: 14px 12px;
     gap: 14px;
-  }
-
-  .ws-node-view-header {
-    flex-wrap: wrap;
-    gap: 10px;
-  }
-
-  .ws-node-header-actions button {
-    min-height: 44px;
   }
 
   .ws-node-toolbar {

@@ -31,6 +31,8 @@ import { useBackgroundOperations } from '@/components/workbench/background-opera
 import { InlineBeuiLoader, PersonLibrarySkeleton, WorkbenchListSkeleton } from '@/components/workbench/loading-skeletons'
 import { Skeleton } from '@/components/ui/skeleton'
 import { AnimatedBadge } from '@/components/beui/motion/animated-badge'
+import { WorkspaceButton } from '@/components/workbench/inner'
+import { WorkbenchHeaderActions, useSyncWorkbenchBreadcrumb, type WorkbenchBreadcrumbSegment } from '@/components/workbench/breadcrumb'
 import './tokens.css'
 import './workbench.css'
 
@@ -227,8 +229,35 @@ function PersonWorkbenchContent({initialName=''}:{initialName?:string}) {
   const activeTabInitialLoading=tab==='owned'?ownedInitialLoading:queuedInitialLoading
   const activeTabBusy=initialPeoplePending||(tab==='owned'?loading||ownedInitialLoading:planLoading)
   const recInitialLoading=ownedInitialLoading
+  const personSubSegment:WorkbenchBreadcrumbSegment|null=name?(tab==='queued'?{key:'tab:queued',label:'待归档'}:folder!=='*'?{key:`folder:${folder}`,label:folder==='.'?'根目录':folder}:null):null
+  const breadcrumbItems:WorkbenchBreadcrumbSegment[]=[
+    {key:'home',label:'首页',href:'/',icon:'home'},
+    {
+      key:'persons',
+      label:'人物库',
+      ...(name?{
+        href:'/persons',
+        onClick:()=>{if(window.innerWidth<=900)setMobile('people');else document.querySelector<HTMLInputElement>('.pw-people input')?.focus()},
+      }:{}),
+    },
+    ...(name?[{
+      key:`person:${name}`,
+      label:name,
+      ...(personSubSegment?{
+        href:`/persons/${encodeURIComponent(name)}`,
+        onClick:()=>{if(tab!=='owned')switchTab('owned');else if(folder!=='*'){setFolder('*');setLimit(60);setSelected([])}},
+      }:{}),
+    }]:[]),
+    ...(personSubSegment?[personSubSegment]:[]),
+  ]
+  useSyncWorkbenchBreadcrumb(breadcrumbItems)
   return <div className="pw pw-directory pw-live" data-theme={theme}>
-    <div className="pw-surface"><header className="pw-top"><div className="pw-brand"><strong>人物库</strong>{name&&<><span>/</span><span className="pw-current-person">{name}</span>{currentPersonLocked&&<AnimatedBadge status={lockedPeople.get(name)?.status==='running'?'loading':'neutral'}>{lockedPeople.get(name)?.label}</AnimatedBadge>}</>}</div>{pendingFilePlan&&<Button onClick={()=>setFileAction({action:pendingFilePlan.action,files:[],resumePlan:pendingFilePlan})}>查看文件操作</Button>}<Button className="pw-icon pw-refresh" aria-label="刷新人物和视频" disabled={loading||peopleLoading} onClick={()=>{void loadPeople();void loadStats(true);if(name){void refresh(name).catch(()=>{});if(tab==='queued')void loadPlan(name).catch(()=>{})}}}><RefreshCw size={15}/></Button></header>
+    <WorkbenchHeaderActions>
+      {name&&currentPersonLocked&&<AnimatedBadge status={lockedPeople.get(name)?.status==='running'?'loading':'neutral'}>{lockedPeople.get(name)?.label}</AnimatedBadge>}
+      {pendingFilePlan&&<WorkspaceButton variant="outline" size="sm" onClick={()=>setFileAction({action:pendingFilePlan.action,files:[],resumePlan:pendingFilePlan})}>查看文件操作</WorkspaceButton>}
+      <WorkspaceButton variant="ghost" size="icon" aria-label="刷新人物和视频" title="刷新" disabled={loading||peopleLoading} onClick={()=>{void loadPeople();void loadStats(true);if(name){void refresh(name).catch(()=>{});if(tab==='queued')void loadPlan(name).catch(()=>{})}}}><RefreshCw size={15}/></WorkspaceButton>
+    </WorkbenchHeaderActions>
+    <div className="pw-surface">
       <nav className="pw-mobile-nav" aria-label="人物工作区">{(['people','library','suggestions'] as const).map((section,i)=><Button key={section} data-active={mobile===section} onClick={()=>setMobile(section)}>{['人物','视频目录','推荐加入'][i]}</Button>)}</nav>
       <div className="pw-layout" data-mobile={mobile}>
         <aside className="pw-people"><div className="pw-panel-title"><h2>人物目录</h2><span><Count value={people.length}/></span></div><PersonSearch value={peopleQuery} onChange={setPeopleQuery} sort={peopleSort} onSortChange={setPeopleSort} theme={theme}/><div className="pw-people-select-all"><Checkbox label="全选" aria-label="选择当前搜索结果" checked={selectableVisiblePeople.length>0&&selectableVisiblePeople.every(p=>selectedPeople.includes(p.name))} indeterminate={selectableVisiblePeople.some(p=>selectedPeople.includes(p.name))&&!selectableVisiblePeople.every(p=>selectedPeople.includes(p.name))} disabled={!selectableVisiblePeople.length} onCheckedChange={checked=>setSelectedPeople(current=>checked?[...new Set([...current,...selectableVisiblePeople.map(p=>p.name)])]:current.filter(name=>!selectableVisiblePeople.some(p=>p.name===name)))}/></div><div className="pw-person-list" aria-busy={peopleLoading&&!people.length}>
@@ -243,7 +272,7 @@ function PersonWorkbenchContent({initialName=''}:{initialName?:string}) {
           {selectedPeople.length>0?<WorkbenchStep phase="selected" className="pw-people-bulk"><div className="pw-people-selection"><span className="pw-selection-count" aria-live="polite" aria-atomic="true">已选 <Count value={selectedPeople.length}/> 人</span><Button className="pw-clear-people" aria-label="清空人物选择" title="清空选择" onClick={()=>{setSelectedPeople([]);document.querySelector<HTMLButtonElement>('.pw-people [aria-label="选择当前搜索结果"]')?.focus()}}><X size={14}/></Button></div><div className="pw-people-bulk-actions" role="group" aria-label="人物批量操作"><Button aria-label="删除所选人物" disabled={selectedPeople.length>50} onClick={()=>setPeopleAction('delete')}><Trash2 size={14}/>删除</Button><Button aria-label="合并所选人物" disabled={selectedPeople.length<2||selectedPeople.length>50} title="勾选至少两个人物后合并" onClick={()=>setPeopleAction('merge')}><Merge size={14}/>合并</Button></div>{selectedPeople.length>50&&<small>单次最多操作 50 个人物</small>}</WorkbenchStep>:<div className="pw-foot-note">{visiblePeople.length} / {people.length} 人</div>}
           {(statsLoading||statsError)&&<div className="pw-foot-note">{statsLoading?<InlineBeuiLoader label="正在统计视频数量和体积" size={12}/>:<p role="alert">统计未更新<Button onClick={()=>void loadStats(true)}>重试</Button></p>}</div>}
         </div></aside>
-        <main className="pw-library"><div className="pw-library-head"><div><h1>{name||'选择人物'}<span>的影像库</span><Button className="pw-person-rename" aria-label="重命名人物" title="重命名人物" disabled={busy||currentPersonLocked||loading||!name} onClick={()=>manageFiles('rename-person',[])}><Pencil size={14}/></Button></h1>{name&&<p><FolderOpen size={13} aria-hidden="true"/><span className="pw-library-location" title={data?.root}>creators / {name}</span><span>·</span>{data?`${data.files.length} 个视频`:loading?<InlineBeuiLoader label="正在读取人物目录" size={12}/>:'—'}</p>}</div><PeachPersonLink name={name} refreshKey={data}/></div>
+        <main className="pw-library"><div className="pw-library-head"><div><h2 className="pw-library-title">{name||'选择人物'}<span>的影像库</span><Button className="pw-person-rename" aria-label="重命名人物" title="重命名人物" disabled={busy||currentPersonLocked||loading||!name} onClick={()=>manageFiles('rename-person',[])}><Pencil size={14}/></Button></h2>{name&&<p><FolderOpen size={13} aria-hidden="true"/><span className="pw-library-location" title={data?.root}>creators / {name}</span><span>·</span>{data?`${data.files.length} 个视频`:loading?<InlineBeuiLoader label="正在读取人物目录" size={12}/>:'—'}</p>}</div><PeachPersonLink name={name} refreshKey={data}/></div>
           {name&&<ExternalProfiles name={name} compact refreshKey={accountsRevision} onManage={()=>setAccountPerson(name)}/>}
           <div className="pw-tabs" role="group" aria-label="文件状态"><Button data-active={tab==='owned'} onClick={()=>switchTab('owned')}><Grid2X2 size={14}/>已有视频<Badge>{data?.files.length??'—'}</Badge></Button><Button data-active={tab==='queued'} onClick={()=>switchTab('queued')}><Archive size={14}/>待归档<Badge>{plan?queueRows.length:data?.queued??person?.queued??'—'}</Badge></Button></div>
           <div className="pw-toolbar"><label className="pw-search"><Search size={14}/><Input aria-label="搜索视频" placeholder="搜索文件名或路径…" value={query} onChange={e=>{setQuery(e.target.value);setLimit(60);setSelected([])}}/></label><Button className="pw-icon" aria-label={descending?'按名称正序':'按名称倒序'} onClick={()=>setDescending(v=>!v)}><ArrowDownAZ size={16}/></Button>{<Button className="pw-text-button" disabled={!selectableVisibleVideos.length} onClick={()=>setSelected(selectableVisibleVideos.every(v=>selected.includes(v.vid))?selected.filter(id=>!selectableVisibleVideos.some(v=>v.vid===id)):[...new Set([...selected,...selectableVisibleVideos.map(v=>v.vid)])])}>选择本页</Button>}</div>

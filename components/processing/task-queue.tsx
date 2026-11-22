@@ -30,6 +30,7 @@ import { useWorkspaceQuery, useWorkspaceScroll, readWorkbenchCache, writeWorkben
 import * as Popover from '@radix-ui/react-popover'
 import { InputGroupButton } from '@/components/ui/input-group'
 import { WorkspaceSearch, WorkspaceTabs, useWideWorkspace } from '@/components/workbench/controls'
+import { WorkbenchHeaderActions, useSyncWorkbenchBreadcrumb, type WorkbenchBreadcrumbSegment } from '@/components/workbench/breadcrumb'
 import { Dialog, DialogTitle, DialogDescription } from '@/components/ui/dialog'
 import { ResponsiveDialogContent } from '@/components/review/responsive-dialog'
 import { Drawer } from '@/components/beui/motion/drawer'
@@ -46,7 +47,7 @@ const date = (n?: number) =>
       })
     : '尚未完成'
 
-export default function ProcessingTaskQueue() {
+export default function ProcessingTaskQueue({ onNavigateOverview }: { onNavigateOverview?: () => void } = {}) {
   const { values: filters, ready: initialized, update: updateFilters } = useWorkspaceQuery(
     { stage: '', batch: '', node_id: '', waiting_reason: '', q: '', page: '0' },
     { stage: ['', 'queued', 'ocr', 'detect', 'feature', 'text', 'face', 'face_queued', 'running', 'review', 'done', 'error', 'excluded', 'retry'] }
@@ -460,31 +461,66 @@ export default function ProcessingTaskQueue() {
   )
 
   const tasksList = data?.tasks || []
+  const stageLabel = stage ? cards.find((c) => c.key === stage)?.title || TASK_STAGE_LABELS[stage] || stage : ''
+  const breadcrumbItems: WorkbenchBreadcrumbSegment[] = [
+    { key: 'home', label: '首页', href: '/', icon: 'home' },
+    {
+      key: 'operations',
+      label: '处理操作台',
+      href: '/operations?tab=tasks&view=dashboard',
+      onClick: onNavigateOverview,
+    },
+    {
+      key: 'ops-queue',
+      label: '任务列表',
+      ...(stage || batch
+        ? {
+            href: '/operations?tab=tasks&view=queue',
+            onClick: () =>
+              updateFilters({
+                stage: '',
+                batch: '',
+                node_id: '',
+                waiting_reason: '',
+                page: '0',
+              }),
+          }
+        : {}),
+    },
+    ...(stage
+      ? [
+          {
+            key: `stage:${stage}`,
+            label: stageLabel,
+            ...(batch
+              ? {
+                  href: `/operations?tab=tasks&view=queue&stage=${encodeURIComponent(stage)}`,
+                  onClick: () => updateFilters({ batch: '', page: '0' }),
+                }
+              : {}),
+          },
+        ]
+      : []),
+    ...(batch ? [{ key: `batch:${batch}`, label: `批次 ${batch}` }] : []),
+  ]
+  useSyncWorkbenchBreadcrumb(breadcrumbItems)
 
   return (
     <main className="ws-page" aria-label="处理任务列表工作区">
-      <header className="ws-header">
-        <div className="flex items-center gap-3">
-          <NavigationButton size="sm" variant="ghost" asChild>
-            <Link href="/operations?tab=tasks&view=dashboard">返回看板</Link>
-          </NavigationButton>
-          <h1>任务列表</h1>
-        </div>
-        <div className="ws-actions">
-          <Button
-            variant="outline"
-            size="sm"
-            disabled={busy || !data}
-            onClick={() => act(data?.paused ? 'resume' : 'pause')}
-          >
-            {data?.paused ? <CirclePlay size={14} /> : <CirclePause size={14} />}
-            <span>{data?.paused ? '恢复分析' : '暂停分析'}</span>
-          </Button>
-          <Button variant="ghost" className="ws-icon" aria-label="刷新处理状态" title="刷新" onClick={load}>
-            <RefreshCw size={15} />
-          </Button>
-        </div>
-      </header>
+      <WorkbenchHeaderActions>
+        <Button
+          variant="outline"
+          size="sm"
+          disabled={busy || !data}
+          onClick={() => act(data?.paused ? 'resume' : 'pause')}
+        >
+          {data?.paused ? <CirclePlay size={14} /> : <CirclePause size={14} />}
+          <span>{data?.paused ? '恢复分析' : '暂停分析'}</span>
+        </Button>
+        <Button variant="ghost" className="ws-icon" aria-label="刷新处理状态" title="刷新" onClick={load}>
+          <RefreshCw size={15} />
+        </Button>
+      </WorkbenchHeaderActions>
       {(error || progressError) && <p role="alert" className="ws-error">{error || progressError}</p>}
       {data?.last_discovery?.error && (
         <p role="alert" className="ws-error">发现失败：{data.last_discovery.error}</p>

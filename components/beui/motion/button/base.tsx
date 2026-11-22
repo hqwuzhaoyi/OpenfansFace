@@ -11,6 +11,7 @@ import {
   type PointerEvent,
   type ReactNode,
   useCallback,
+  useEffect,
   useRef,
   useState,
 } from "react";
@@ -60,6 +61,15 @@ const SIZE_CLASS: Record<ButtonSize, string> = {
   icon: "h-8 w-8 rounded-lg",
 };
 
+function useHydrationSafeReducedMotion() {
+  const prefersReduced = useReducedMotion() ?? false;
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => {
+    setMounted(true);
+  }, []);
+  return mounted && prefersReduced;
+}
+
 export const Button = forwardRef<HTMLButtonElement, ButtonProps>(
   function Button(
     {
@@ -74,7 +84,7 @@ export const Button = forwardRef<HTMLButtonElement, ButtonProps>(
     },
     ref,
   ) {
-    const reduce = useReducedMotion();
+    const reduce = useHydrationSafeReducedMotion();
     const canHover = useHoverCapable();
     const [ripples, setRipples] = useState<Ripple[]>([]);
     const nextId = useRef(0);
@@ -164,7 +174,7 @@ export const ButtonLink = forwardRef<HTMLAnchorElement, ButtonLinkProps>(
     },
     ref,
   ) {
-    const reduce = useReducedMotion();
+    const reduce = useHydrationSafeReducedMotion();
     const canHover = useHoverCapable();
 
     return (

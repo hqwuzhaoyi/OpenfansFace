@@ -1,5 +1,6 @@
 "use client";
-// beui.dev/components/motion/animated-sidebar
+// beui.dev/components/motion/animated-sidebar (MIT License, see components/beui/LICENSE)
+// Source: https://beui.dev/r/animated-sidebar.json
 
 import { ChevronRight } from "lucide-react";
 import Link from "next/link";
@@ -33,6 +34,7 @@ import {
   SPRING_LAYOUT,
   SPRING_PRESS,
 } from "@/lib/beui/ease";
+import { useMessages } from "@/lib/beui/i18n";
 import { cn } from "@/lib/beui/utils";
 
 type SidebarState = "expanded" | "collapsed";
@@ -42,6 +44,7 @@ type SidebarCollapsible = "offcanvas" | "icon" | "none";
 
 const MOBILE_QUERY = "(max-width: 767px)";
 const SIDEBAR_KEYBOARD_SHORTCUT = "b";
+const MotionLink = motion.create(Link);
 
 const PANEL_TRANSITION = {
   duration: 0.36,
@@ -147,6 +150,15 @@ function useIsMobile() {
   );
 }
 
+/** English defaults. Override per instance with `labels`, or app-wide with `LocaleProvider`. */
+export const animatedSidebarMessages = {
+  label: "Sidebar",
+  toggle: "Toggle sidebar",
+  close: "Close sidebar",
+};
+
+export type AnimatedSidebarMessages = typeof animatedSidebarMessages;
+
 interface AnimatedSidebarContextValue {
   isMobile: boolean;
   layoutId: string;
@@ -158,6 +170,7 @@ interface AnimatedSidebarContextValue {
   state: SidebarState;
   toggleSidebar: () => void;
   triggerRef: React.RefObject<HTMLButtonElement | null>;
+  t: ReturnType<typeof useMessages<AnimatedSidebarMessages>>;
 }
 
 const AnimatedSidebarContext =
@@ -207,6 +220,8 @@ export interface AnimatedSidebarProviderProps
   defaultOpenMobile?: boolean;
   onOpenMobileChange?: (open: boolean) => void;
   style?: SidebarProviderStyle;
+  /** Override any built-in string. */
+  labels?: Partial<AnimatedSidebarMessages>;
 }
 
 export function AnimatedSidebarProvider({
@@ -219,13 +234,20 @@ export function AnimatedSidebarProvider({
   onOpenMobileChange,
   className,
   style,
+  labels,
   ...props
 }: AnimatedSidebarProviderProps) {
+  const t = useMessages("animatedSidebar", animatedSidebarMessages, labels);
   const [internalOpen, setInternalOpen] = useState(defaultOpen);
   const [internalOpenMobile, setInternalOpenMobile] =
     useState(defaultOpenMobile);
   const isMobile = useIsMobile();
-  const reduce = useReducedMotion() ?? false;
+  const prefersReducedMotion = useReducedMotion() ?? false;
+  const [mounted, setMounted] = useState(false);
+  useEffect(() => {
+    setMounted(true);
+  }, []);
+  const reduce = mounted && prefersReducedMotion;
   const generatedId = useId();
   const triggerRef = useRef<HTMLButtonElement>(null);
   const desktopOpen = open ?? internalOpen;
@@ -280,6 +302,7 @@ export function AnimatedSidebarProvider({
         state: desktopOpen ? "expanded" : "collapsed",
         toggleSidebar,
         triggerRef,
+        t,
       }}
     >
       <div
@@ -388,7 +411,7 @@ function MobileSidebar({
     >
       <motion.button
         type="button"
-        aria-label="Close sidebar"
+        aria-label={context.t("close")}
         tabIndex={context.openMobile ? 0 : -1}
         initial={false}
         animate={{ opacity: context.openMobile ? 1 : 0 }}
@@ -503,7 +526,7 @@ export const AnimatedSidebar = forwardRef<HTMLElement, AnimatedSidebarProps>(
       side = "left",
       variant = "sidebar",
       collapsible = "icon",
-      ariaLabel = "Sidebar",
+      ariaLabel: ariaLabelProp,
       children,
       className,
       panelClassName,
@@ -513,6 +536,7 @@ export const AnimatedSidebar = forwardRef<HTMLElement, AnimatedSidebarProps>(
     forwardedRef,
   ) {
     const context = useAnimatedSidebar();
+    const ariaLabel = ariaLabelProp ?? context.t("label");
     const collapsed = collapsible !== "none" && !context.open;
     const offcanvas = collapsed && collapsible === "offcanvas";
     const width = offcanvas
@@ -546,7 +570,7 @@ export const AnimatedSidebar = forwardRef<HTMLElement, AnimatedSidebarProps>(
         data-side={side}
         animate={{ width }}
         transition={
-          { duration: 0 }
+          context.reduce ? { duration: 0 } : SIDEBAR_MORPH_TRANSITION
         }
         style={style}
         className={cn(
@@ -566,8 +590,7 @@ export const AnimatedSidebar = forwardRef<HTMLElement, AnimatedSidebarProps>(
             context.reduce ? REDUCED_TRANSITION : PANEL_TRANSITION
           }
           className={cn(
-            "sticky top-0 flex h-svh w-full flex-col bg-background",
-            offcanvas ? "overflow-hidden" : "overflow-visible",
+            "sticky top-0 flex h-svh w-full flex-col overflow-hidden bg-background",
             collapsible === "offcanvas" && "w-[var(--sidebar-width)]",
             variant === "sidebar" &&
               (side === "left" ? "border-border border-r" : "border-border border-l"),
@@ -610,7 +633,7 @@ export const AnimatedSidebarTrigger = forwardRef<
         else if (forwardedRef) forwardedRef.current = node;
       }}
       type={type}
-      aria-label={props["aria-label"] ?? "Toggle sidebar"}
+      aria-label={props["aria-label"] ?? context.t("toggle")}
       aria-expanded={expanded}
       data-slot="sidebar-trigger"
       data-state={expanded ? "expanded" : "collapsed"}
@@ -644,7 +667,7 @@ export const AnimatedSidebarClose = forwardRef<
       {...props}
       ref={forwardedRef}
       type={type}
-      aria-label={props["aria-label"] ?? "Close sidebar"}
+      aria-label={props["aria-label"] ?? context.t("close")}
       onClick={(event) => {
         onClick?.(event);
         if (event.defaultPrevented) return;
@@ -679,8 +702,8 @@ export const AnimatedSidebarRail = forwardRef<
       ref={forwardedRef}
       type={type}
       data-side={panel.side}
-      aria-label={props["aria-label"] ?? "Toggle sidebar"}
-      title="Toggle sidebar"
+      aria-label={props["aria-label"] ?? context.t("toggle")}
+      title={context.t("toggle")}
       tabIndex={-1}
       onClick={(event) => {
         onClick?.(event);
@@ -835,10 +858,10 @@ export const AnimatedSidebarMenu = forwardRef<
       ref={forwardedRef as React.Ref<HTMLElement>}
       as="ul"
       inset={0}
-      pillClassName="rounded-[8px] bg-accent/60"
-      pillContainerClassName="inset-y-auto top-0 h-10"
+      pillClassName="rounded-xl bg-muted/70"
+      pillContainerClassName="inset-y-auto top-0 h-9"
       data-slot="sidebar-menu"
-      className={cn("flex w-full min-w-0 list-none flex-col gap-1", className)}
+      className={cn("flex w-full min-w-0 list-none flex-col gap-0.5", className)}
     >
       {children}
     </SharedLayoutBg>
@@ -929,6 +952,7 @@ export interface AnimatedSidebarMenuSubButtonProps {
   closeOnSelect?: boolean;
   target?: "_blank" | "_self" | "_parent" | "_top";
   rel?: string;
+  onClick?: React.MouseEventHandler<HTMLAnchorElement | HTMLButtonElement>;
   onSelect?: () => void;
   className?: string;
 }
@@ -942,6 +966,7 @@ export function AnimatedSidebarMenuSubButton({
   closeOnSelect = true,
   target,
   rel,
+  onClick,
   onSelect,
   className,
 }: AnimatedSidebarMenuSubButtonProps) {
@@ -954,6 +979,7 @@ export function AnimatedSidebarMenuSubButton({
       event.preventDefault();
       return;
     }
+    onClick?.(event);
     onSelect?.();
     if (context.isMobile && closeOnSelect) context.setOpenMobile(false);
   };
@@ -978,6 +1004,23 @@ export function AnimatedSidebarMenuSubButton({
     disabled && "cursor-not-allowed opacity-40",
     className,
   );
+
+  if (href && href.startsWith("/") && !target) {
+    return (
+      <MotionLink
+        href={href}
+        aria-current={isActive ? "page" : undefined}
+        aria-disabled={disabled || undefined}
+        tabIndex={disabled ? -1 : undefined}
+        onClick={select}
+        whileTap={context.reduce || disabled ? undefined : { scale: 0.98 }}
+        transition={SPRING_PRESS}
+        className={interactiveClassName}
+      >
+        {content}
+      </MotionLink>
+    );
+  }
 
   return href ? (
     <motion.a
@@ -1073,7 +1116,7 @@ export function AnimatedSidebarMenuButton({
         <motion.span
           layoutId={context.layoutId}
           transition={context.reduce ? { duration: 0 } : SPRING_LAYOUT}
-          className="absolute inset-0 rounded-[8px] bg-accent"
+          className="absolute inset-0 rounded-xl bg-muted"
         />
       ) : null}
       {icon ? (
@@ -1084,31 +1127,40 @@ export function AnimatedSidebarMenuButton({
           {icon}
         </span>
       ) : null}
-      {panel.collapsed ? (
-        <span className="sr-only">{children}</span>
-      ) : (
-        <motion.span
-          initial={false}
-          animate={{ opacity: 1, x: 0 }}
-          transition={context.reduce ? REDUCED_TRANSITION : LABEL_ENTER_TRANSITION}
-          className="relative z-10 min-w-0 flex-1 truncate"
-        >
-          {children}
-        </motion.span>
-      )}
+      <motion.span
+        initial={false}
+        animate={{
+          opacity: panel.collapsed ? 0 : 1,
+          x: panel.collapsed ? -4 : 0,
+        }}
+        transition={
+          context.reduce
+            ? REDUCED_TRANSITION
+            : panel.collapsed
+              ? LABEL_EXIT_TRANSITION
+              : LABEL_ENTER_TRANSITION
+        }
+        aria-hidden={panel.collapsed}
+        className={cn(
+          "relative z-10 min-w-0 flex-1 truncate",
+          panel.collapsed && "pointer-events-none",
+        )}
+      >
+        {children}
+      </motion.span>
       {badge && !panel.collapsed ? (
         <span className="relative z-10 shrink-0 text-xs text-muted-foreground">
           {badge}
         </span>
       ) : null}
-      {ariaExpanded !== undefined && !panel.collapsed ? (
+      {ariaExpanded !== undefined ? (
         <motion.span
           aria-hidden="true"
           initial={false}
           animate={{
-            opacity: 1,
+            opacity: panel.collapsed ? 0 : 1,
             rotate: ariaExpanded ? 90 : 0,
-            x: 0,
+            x: panel.collapsed ? 4 : 0,
           }}
           transition={context.reduce ? { duration: 0 } : SPRING_LAYOUT}
           className="relative z-10 grid size-4 shrink-0 place-items-center text-muted-foreground"
@@ -1120,10 +1172,7 @@ export function AnimatedSidebarMenuButton({
   );
 
   const interactiveClassName = cn(
-    "relative flex min-w-0 items-center overflow-hidden rounded-[8px] text-left text-xs font-medium outline-none",
-    panel.collapsed
-      ? "mx-auto size-10 justify-center px-0"
-      : "min-h-11 w-full gap-2.5 px-3",
+    "relative flex min-h-9 w-full min-w-0 items-center gap-2.5 overflow-hidden rounded-xl px-3 text-left text-sm font-medium outline-none",
     "text-muted-foreground transition-colors hover:text-foreground",
     "focus-visible:bg-muted/70 focus-visible:ring-2 focus-visible:ring-ring",
     isActive && "text-foreground",
@@ -1133,7 +1182,7 @@ export function AnimatedSidebarMenuButton({
 
   if (href && href.startsWith("/") && !target) {
     return (
-      <Link
+      <MotionLink
         href={href}
         aria-current={isActive ? "page" : undefined}
         aria-expanded={ariaExpanded}
@@ -1142,10 +1191,12 @@ export function AnimatedSidebarMenuButton({
         title={panel.collapsed ? textLabel : undefined}
         tabIndex={disabled ? -1 : undefined}
         onClick={select}
+        whileTap={context.reduce || disabled ? undefined : { scale: 0.98 }}
+        transition={SPRING_PRESS}
         className={interactiveClassName}
       >
         {content}
-      </Link>
+      </MotionLink>
     );
   }
 
