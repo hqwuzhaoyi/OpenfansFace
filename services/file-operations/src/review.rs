@@ -119,7 +119,7 @@ pub fn sources(config: &Config) -> Result<BTreeMap<String, String>> {
     let mut out = indexed_sources(config)?;
     let path = config.base.join("processing/processing.db");
     if path.exists() {
-        let conn = db::open(&path)?;
+        let conn = db::open_readonly(&path)?;
         let mut stmt = conn.prepare("SELECT vid,path FROM tasks ORDER BY vid")?;
         let mut rows = stmt.query([])?;
         while let Some(row) = rows.next()? {
@@ -133,7 +133,7 @@ pub fn sources(config: &Config) -> Result<BTreeMap<String, String>> {
 /// Index/explicit overrides outrank analysis discovery; whole-report inputs exclude task-only paths.
 pub fn indexed_sources(config: &Config) -> Result<BTreeMap<String, String>> {
     let mut out = BTreeMap::new();
-    let conn = db::open(&config.base.join("faces.db"))?;
+    let conn = db::open_readonly(&config.base.join("faces.db"))?;
     let mut stmt = conn.prepare("SELECT vid,path FROM videos ORDER BY vid")?;
     let mut rows = stmt.query([])?;
     while let Some(row) = rows.next()? {
@@ -154,23 +154,27 @@ pub fn indexed_sources(config: &Config) -> Result<BTreeMap<String, String>> {
 }
 /// Targeted equivalent of `sources(config)` when only a small set of `vids` will be queried.
 pub fn sources_for_vids(config: &Config, vids: &BTreeSet<String>) -> Result<BTreeMap<String, String>> {
+    const CHUNK: usize = 250;
     if vids.is_empty() {
         return Ok(BTreeMap::new());
     }
-    if vids.len() > 64 {
+    if vids.len() > 1000 {
         return sources(config);
     }
     let mut out = BTreeMap::new();
-    let placeholders = std::iter::repeat_n("?", vids.len())
-        .collect::<Vec<_>>()
-        .join(",");
-    let faces_conn = db::open(&config.base.join("faces.db"))?;
-    let sql = format!("SELECT vid,path FROM videos WHERE vid IN ({placeholders})");
-    let mut stmt = faces_conn.prepare(&sql)?;
-    let mut rows = stmt.query(rusqlite::params_from_iter(vids.iter()))?;
-    while let Some(row) = rows.next()? {
-        if let (Some(id), Some(path)) = (row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?) {
-            out.insert(id, path);
+    let vid_list: Vec<&str> = vids.iter().map(String::as_str).collect();
+    let faces_conn = db::open_readonly(&config.base.join("faces.db"))?;
+    for chunk in vid_list.chunks(CHUNK) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!("SELECT vid,path FROM videos WHERE vid IN ({placeholders})");
+        let mut stmt = faces_conn.prepare(&sql)?;
+        let mut rows = stmt.query(rusqlite::params_from_iter(chunk.iter().copied()))?;
+        while let Some(row) = rows.next()? {
+            if let (Some(id), Some(path)) = (row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?) {
+                out.insert(id, path);
+            }
         }
     }
     for (id, path) in read(config, "video-path-overrides.json", json!({}))?
@@ -184,15 +188,24 @@ pub fn sources_for_vids(config: &Config, vids: &BTreeSet<String>) -> Result<BTre
             out.insert(id.clone(), path.into());
         }
     }
+    let missing: Vec<&str> = vid_list
+        .into_iter()
+        .filter(|v| !out.contains_key(*v))
+        .collect();
     let path = config.base.join("processing/processing.db");
-    if path.exists() {
-        let conn = db::open(&path)?;
-        let sql = format!("SELECT vid,path FROM tasks WHERE vid IN ({placeholders})");
-        let mut stmt = conn.prepare(&sql)?;
-        let mut rows = stmt.query(rusqlite::params_from_iter(vids.iter()))?;
-        while let Some(row) = rows.next()? {
-            if let (Some(id), Some(path)) = (row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?) {
-                out.entry(id).or_insert(path);
+    if !missing.is_empty() && path.exists() {
+        let conn = db::open_readonly(&path)?;
+        for chunk in missing.chunks(CHUNK) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!("SELECT vid,path FROM tasks WHERE vid IN ({placeholders})");
+            let mut stmt = conn.prepare(&sql)?;
+            let mut rows = stmt.query(rusqlite::params_from_iter(chunk.iter().copied()))?;
+            while let Some(row) = rows.next()? {
+                if let (Some(id), Some(path)) = (row.get::<_, Option<String>>(0)?, row.get::<_, Option<String>>(1)?) {
+                    out.entry(id).or_insert(path);
+                }
             }
         }
     }

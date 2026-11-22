@@ -7,9 +7,12 @@ use crate::{
     review, shared_metadata,
 };
 use rusqlite::{OptionalExtension, params};
+use serde::{Deserialize, Deserializer, de};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, OnceLock},
 };
@@ -84,6 +87,11 @@ fn sidecar_write(config: &Config) -> Result<rusqlite::Connection> {
         [],
         |r| r.get(0),
     )?;
+    let has_items: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_items')",
+        [],
+        |r| r.get(0),
+    )?;
     let has_deliveries: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='review_deliveries')",
         [],
@@ -93,9 +101,10 @@ fn sidecar_write(config: &Config) -> Result<rusqlite::Connection> {
         conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL; PRAGMA journal_mode = WAL;")?;
     }
     conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA synchronous = NORMAL;")?;
-    if !has_snapshots || !has_deliveries {
+    if !has_snapshots || !has_items || !has_deliveries {
         conn.execute_batch(
             "CREATE TABLE IF NOT EXISTS session_snapshots(id TEXT PRIMARY KEY, expires INTEGER NOT NULL, snapshot TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS session_items(session TEXT NOT NULL, vid TEXT NOT NULL, evidence TEXT NOT NULL, PRIMARY KEY(session, vid), FOREIGN KEY(session) REFERENCES session_snapshots(id) ON DELETE CASCADE);
              CREATE TABLE IF NOT EXISTS review_deliveries(token TEXT PRIMARY KEY, session TEXT NOT NULL, vid TEXT NOT NULL, evidence TEXT NOT NULL, FOREIGN KEY(session) REFERENCES session_snapshots(id) ON DELETE CASCADE);
              CREATE INDEX IF NOT EXISTS review_delivery_session ON review_deliveries(session, vid);",
         )?;
@@ -104,6 +113,14 @@ fn sidecar_write(config: &Config) -> Result<rusqlite::Connection> {
 }
 fn sidecar_readonly(config: &Config) -> Result<rusqlite::Connection> {
     db::open_readonly(&config.review_sessions_db())
+}
+fn sidecar_has_items_table(conn: &rusqlite::Connection) -> bool {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_items')",
+        [],
+        |r| r.get(0),
+    )
+    .unwrap_or(false)
 }
 fn sidecar_has_deliveries_table(conn: &rusqlite::Connection) -> bool {
     conn.query_row(
@@ -171,6 +188,142 @@ fn compact_clusters(value: Value) -> Value {
             .collect(),
     )
 }
+const FILE_CACHE_CAP: usize = 8;
+
+#[derive(Clone, PartialEq, Eq)]
+struct FileStamp {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    mtime_ns: String,
+    ctime: i64,
+    ctime_nsec: i64,
+}
+
+fn file_stamp(path: &Path) -> Result<Option<FileStamp>> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    if meta.file_type().is_symlink() {
+        return Err(Error::conflict("元数据不能是符号链接").at(path.display().to_string()));
+    }
+    Ok(Some(FileStamp {
+        dev: meta.dev(),
+        ino: meta.ino(),
+        len: meta.len(),
+        mtime_ns: crate::files::mtime_ns(&meta),
+        ctime: meta.ctime(),
+        ctime_nsec: meta.ctime_nsec(),
+    }))
+}
+
+fn cached_stamped_file<T>(
+    cache: &Mutex<VecDeque<(PathBuf, FileStamp, Arc<T>)>>,
+    path: &Path,
+    empty: impl FnOnce() -> T,
+    loader: impl FnOnce() -> Result<T>,
+) -> Result<Arc<T>> {
+    let evict = || {
+        if let Ok(mut guard) = cache.lock() {
+            guard.retain(|(p, _, _)| p != path);
+        }
+    };
+    let stamp = match file_stamp(path) {
+        Ok(Some(stamp)) => stamp,
+        Ok(None) => {
+            evict();
+            return Ok(Arc::new(empty()));
+        }
+        Err(e) => {
+            evict();
+            return Err(e);
+        }
+    };
+    if let Ok(mut guard) = cache.lock()
+        && let Some(pos) = guard.iter().position(|(p, s, _)| p == path && s == &stamp)
+    {
+        let hit = guard.remove(pos).unwrap();
+        let val = hit.2.clone();
+        guard.push_back(hit);
+        return Ok(val);
+    }
+    let loaded = match loader() {
+        Ok(val) => Arc::new(val),
+        Err(e) => {
+            evict();
+            return Err(e);
+        }
+    };
+    if let Ok(mut guard) = cache.lock() {
+        guard.retain(|(p, _, _)| p != path);
+        while guard.len() >= FILE_CACHE_CAP {
+            guard.pop_front();
+        }
+        guard.push_back((path.to_path_buf(), stamp, loaded.clone()));
+    }
+    Ok(loaded)
+}
+
+fn archived_vids_cache() -> &'static Mutex<VecDeque<(PathBuf, FileStamp, Arc<BTreeSet<String>>)>> {
+    static CACHE: OnceLock<Mutex<VecDeque<(PathBuf, FileStamp, Arc<BTreeSet<String>>)>>> =
+        OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+fn archived_vids(config: &Config) -> Result<Arc<BTreeSet<String>>> {
+    #[derive(Deserialize)]
+    struct ArchiveRow {
+        #[serde(default)]
+        vid: Option<String>,
+        #[serde(default)]
+        undone: Value,
+    }
+    let path = config.base.join("archive-history.json");
+    cached_stamped_file(
+        archived_vids_cache(),
+        &path,
+        BTreeSet::new,
+        || {
+            let Some(raw) = crate::files::read_optional(&path)? else {
+                return Ok(BTreeSet::new());
+            };
+            match serde_json::from_str::<Vec<ArchiveRow>>(&raw) {
+                Ok(rows) => Ok(rows
+                    .into_iter()
+                    .filter(|r| r.undone != Value::Bool(true))
+                    .filter_map(|r| r.vid)
+                    .collect()),
+                Err(_) => {
+                    let value = review::read(config, "archive-history.json", json!([]))?.1;
+                    Ok(value
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter(|r| r["undone"] != true)
+                        .filter_map(|r| r["vid"].as_str().map(str::to_owned))
+                        .collect())
+                }
+            }
+        },
+    )
+}
+
+fn clusters_cache() -> &'static Mutex<VecDeque<(PathBuf, FileStamp, Arc<Value>)>> {
+    static CACHE: OnceLock<Mutex<VecDeque<(PathBuf, FileStamp, Arc<Value>)>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+fn cached_clusters(config: &Config) -> Result<Arc<Value>> {
+    let path = config.base.join("clusters.json");
+    cached_stamped_file(
+        clusters_cache(),
+        &path,
+        || json!([]),
+        || Ok(compact_clusters(review::read(config, "clusters.json", json!([]))?.1)),
+    )
+}
 fn material_matches(live: Value, e: &Value) -> bool {
     if let Some(expected) = e.get("material_hash").and_then(Value::as_str) {
         let (actual_hash, actual_manual) = split_material(live);
@@ -236,6 +389,293 @@ fn candidate_names(data: &Value) -> BTreeSet<String> {
     }
     names
 }
+#[derive(Default)]
+struct LightFace {
+    unknown_group: Option<String>,
+}
+
+enum FaceField {
+    UnknownGroup,
+    Ignore,
+}
+
+impl<'de> Deserialize<'de> for FaceField {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct FieldVisitor;
+        impl<'de> de::Visitor<'de> for FieldVisitor {
+            type Value = FaceField;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("face object key")
+            }
+            fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<FaceField, E> {
+                Ok(if v == "unknown_group" {
+                    FaceField::UnknownGroup
+                } else {
+                    FaceField::Ignore
+                })
+            }
+        }
+        deserializer.deserialize_identifier(FieldVisitor)
+    }
+}
+
+impl<'de> Deserialize<'de> for LightFace {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+        struct FaceVisitor;
+        impl<'de> de::Visitor<'de> for FaceVisitor {
+            type Value = LightFace;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("face metadata or null")
+            }
+            fn visit_unit<E: de::Error>(self) -> std::result::Result<LightFace, E> {
+                Ok(LightFace::default())
+            }
+            fn visit_none<E: de::Error>(self) -> std::result::Result<LightFace, E> {
+                Ok(LightFace::default())
+            }
+            fn visit_bool<E: de::Error>(self, _: bool) -> std::result::Result<LightFace, E> {
+                Ok(LightFace::default())
+            }
+            fn visit_i64<E: de::Error>(self, _: i64) -> std::result::Result<LightFace, E> {
+                Ok(LightFace::default())
+            }
+            fn visit_u64<E: de::Error>(self, _: u64) -> std::result::Result<LightFace, E> {
+                Ok(LightFace::default())
+            }
+            fn visit_f64<E: de::Error>(self, _: f64) -> std::result::Result<LightFace, E> {
+                Ok(LightFace::default())
+            }
+            fn visit_str<E: de::Error>(self, _: &str) -> std::result::Result<LightFace, E> {
+                Ok(LightFace::default())
+            }
+            fn visit_seq<A: de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> std::result::Result<LightFace, A::Error> {
+                while seq.next_element::<de::IgnoredAny>()?.is_some() {}
+                Ok(LightFace::default())
+            }
+            fn visit_map<A: de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> std::result::Result<LightFace, A::Error> {
+                let mut unknown_group = None;
+                while let Some(key) = map.next_key::<FaceField>()? {
+                    match key {
+                        FaceField::UnknownGroup => {
+                            if let Value::String(s) = map.next_value::<Value>()? {
+                                unknown_group = Some(s);
+                            }
+                        }
+                        FaceField::Ignore => {
+                            let _: de::IgnoredAny = map.next_value()?;
+                        }
+                    }
+                }
+                Ok(LightFace { unknown_group })
+            }
+        }
+        deserializer.deserialize_any(FaceVisitor)
+    }
+}
+
+#[derive(Deserialize)]
+struct LightTaskData {
+    #[serde(default)]
+    ready: Value,
+    #[serde(default)]
+    kind: Value,
+    #[serde(default)]
+    suggested: Value,
+    #[serde(default)]
+    candidates: Value,
+    #[serde(default)]
+    face: LightFace,
+}
+
+struct LightweightScan {
+    items: Vec<Value>,
+    live_ids: BTreeSet<String>,
+    waiting: usize,
+    refreshing: usize,
+}
+
+fn sql_ref_to_public_value(value: rusqlite::types::ValueRef<'_>) -> rusqlite::Result<Value> {
+    use rusqlite::types::{Type, ValueRef};
+    match value {
+        ValueRef::Null => Ok(Value::Null),
+        ValueRef::Integer(n) => Ok(json!(n)),
+        ValueRef::Real(n) if n.is_finite() => Ok(json!(n)),
+        ValueRef::Real(_) => Err(rusqlite::Error::FromSqlConversionFailure(
+            0,
+            Type::Real,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "non-finite SQLite REAL cannot be recorded losslessly",
+            )),
+        )),
+        ValueRef::Text(s) => Ok(json!(std::str::from_utf8(s).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(0, Type::Text, Box::new(error))
+        })?)),
+        ValueRef::Blob(b) => Ok(json!({"$blob": b})),
+    }
+}
+
+fn excluded_vids_and_paths(config: &Config) -> Result<(BTreeSet<String>, BTreeSet<String>)> {
+    let queue = review::read(config, "integration-queue.json", json!([]))?.1;
+    let archived = archived_vids(config)?;
+    let queue_vids: BTreeSet<String> = queue
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["vid"].as_str().map(str::to_owned))
+        .collect();
+    let sources = review::sources_for_vids(config, &queue_vids)?;
+    let paths: BTreeSet<_> = queue_vids
+        .iter()
+        .filter_map(|v| review::source(config, v, &sources))
+        .collect();
+    let mut excluded_vids = queue_vids;
+    excluded_vids.extend(archived.iter().cloned());
+    Ok((excluded_vids, paths))
+}
+
+fn load_lightweight_tasks(
+    config: &Config,
+    aliases: &Value,
+    health: &HealthReader,
+) -> Result<LightweightScan> {
+    let path = config.base.join("processing/processing.db");
+    if !path.exists() {
+        return Ok(LightweightScan {
+            items: vec![],
+            live_ids: BTreeSet::new(),
+            waiting: 0,
+            refreshing: 0,
+        });
+    }
+    let (excluded_vids, paths) = excluded_vids_and_paths(config)?;
+    let conn = db::open_readonly(&path)?;
+    let cols = db::columns(&conn, "tasks")?;
+    let opt_col = |c: &'static str| -> &'static str {
+        if cols.iter().any(|x| x == c) { c } else { "NULL" }
+    };
+    let sql = format!(
+        "SELECT vid, path, stage, manual, deferred, note, data, {}, {}, {}, {} \
+         FROM tasks WHERE stage!='excluded' \
+         ORDER BY priority DESC, is_new DESC, created_at DESC, vid",
+        opt_col("name"),
+        opt_col("size"),
+        opt_col("mtime_ns"),
+        opt_col("retry_stage"),
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let mut rows = stmt.query([])?;
+    let mut live_ids = BTreeSet::new();
+    let mut staged: Vec<(bool, Value)> = vec![];
+    let mut waiting = 0usize;
+    let mut refreshing = 0usize;
+    while let Some(row) = rows.next()? {
+        let vid = row.get::<_, Option<String>>(0)?.unwrap_or_default();
+        let row_path = row.get::<_, Option<String>>(1)?.unwrap_or_default();
+        if excluded_vids.contains(&vid) || paths.contains(&row_path) {
+            continue;
+        }
+        live_ids.insert(vid.clone());
+        let stage = row.get::<_, Option<String>>(2)?.unwrap_or_default();
+        let manual_val = sql_ref_to_public_value(row.get_ref(3)?)?;
+        let manual = review::number(&manual_val).unwrap_or(0);
+        if stage != "review" && manual == 0 {
+            waiting += 1;
+        }
+        let deferred_val = sql_ref_to_public_value(row.get_ref(4)?)?;
+        let deferred = review::number(&deferred_val).unwrap_or(0);
+        let note = sql_ref_to_public_value(row.get_ref(5)?)?;
+        let raw_data = match row.get_ref(6)? {
+            rusqlite::types::ValueRef::Text(bytes) => bytes,
+            _ => return Err(Error::conflict("任务数据无效")),
+        };
+        let name = sql_ref_to_public_value(row.get_ref(7)?)?;
+        let size = sql_ref_to_public_value(row.get_ref(8)?)?;
+        let mtime_ns = sql_ref_to_public_value(row.get_ref(9)?)?;
+        let retry_stage = match row.get_ref(10)? {
+            rusqlite::types::ValueRef::Text(s) => std::str::from_utf8(s).ok().map(str::to_owned),
+            _ => None,
+        };
+        let light: LightTaskData = serde_json::from_slice(raw_data)?;
+        let is_available = manual != 0
+            || stage == "review"
+            || (light.ready == Value::Bool(true)
+                && (stage == "face"
+                    || stage == "face_queued"
+                    || ((stage == "retry" || stage == "error")
+                        && retry_stage.as_deref() == Some("face"))));
+        if !is_available {
+            continue;
+        }
+        if stage != "review" && manual == 0 {
+            refreshing += 1;
+        }
+        if health.is_hidden(config, &vid, &row_path)? {
+            continue;
+        }
+        let mut light_data = json!({
+            "kind": light.kind,
+            "suggested": light.suggested,
+            "candidates": light.candidates,
+        });
+        canonical_fields(&mut light_data, "", aliases)?;
+        crate::processing_result::re_resolve_task_data(&mut light_data);
+        let mut hasher = Sha256::new();
+        hasher.update(raw_data);
+        hasher.update([0u8]);
+        if let Ok(resolved_bytes) = serde_json::to_vec(&light_data) {
+            hasher.update(&resolved_bytes);
+        }
+        let full_hex = format!("{:x}", hasher.finalize());
+        let data_digest = &full_hex[..32];
+        let grp = group_from(manual, &light_data, light.face.unknown_group.as_deref());
+        let has_wm = has_watermark_candidate(&light_data);
+        staged.push((
+            has_wm,
+            json!({
+                "vid": vid,
+                "path": row_path,
+                "name": name,
+                "size": size,
+                "mtime_ns": mtime_ns,
+                "manual": manual,
+                "deferred": deferred,
+                "note": note,
+                "kind": light_data["kind"],
+                "suggested": light_data["suggested"],
+                "candidates": light_data["candidates"],
+                "group": grp,
+                "data_digest": data_digest,
+                "pending_seen": deferred == 0,
+                "deferred_seen": deferred != 0,
+            }),
+        ));
+    }
+    staged.sort_by_key(|(has_wm, _)| !*has_wm);
+    let mut items = Vec::with_capacity(staged.len());
+    for (index, (_, mut item)) in staged.into_iter().enumerate() {
+        let key = if item["pending_seen"] == true {
+            "pending_order"
+        } else {
+            "deferred_order"
+        };
+        item[key] = json!(index);
+        items.push(item);
+    }
+    Ok(LightweightScan {
+        items,
+        live_ids,
+        waiting,
+        refreshing,
+    })
+}
+
 #[cfg(test)]
 fn tasks(config: &Config, aliases: &Value) -> Result<Vec<Value>> {
     tasks_filtered(config, aliases, None, false)
@@ -253,32 +693,7 @@ fn tasks_filtered(
     if !path.exists() {
         return Ok(vec![]);
     }
-    let queue = review::read(config, "integration-queue.json", json!([]))?.1;
-    let history = review::read(config, "archive-history.json", json!([]))?.1;
-    let queue_vids: BTreeSet<String> = queue
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(|r| r["vid"].as_str().map(str::to_owned))
-        .collect();
-    let sources = review::sources_for_vids(config, &queue_vids)?;
-    let paths: BTreeSet<_> = queue_vids
-        .iter()
-        .filter_map(|v| review::source(config, v, &sources))
-        .collect();
-    let excluded_vids: BTreeSet<String> = queue
-        .as_array()
-        .unwrap()
-        .iter()
-        .chain(
-            history
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|r| r["undone"] != true),
-        )
-        .filter_map(|r| r["vid"].as_str().map(str::to_owned))
-        .collect();
+    let (excluded_vids, paths) = excluded_vids_and_paths(config)?;
     let conn = db::open_readonly(&path)?;
     let raw_rows = if let Some(filter) = only_vids {
         if filter.is_empty() {
@@ -319,32 +734,7 @@ fn waiting_count(config: &Config) -> Result<usize> {
     if !path.exists() {
         return Ok(0);
     }
-    let queue = review::read(config, "integration-queue.json", json!([]))?.1;
-    let history = review::read(config, "archive-history.json", json!([]))?.1;
-    let queue_vids: BTreeSet<String> = queue
-        .as_array()
-        .unwrap()
-        .iter()
-        .filter_map(|r| r["vid"].as_str().map(str::to_owned))
-        .collect();
-    let sources = review::sources_for_vids(config, &queue_vids)?;
-    let paths: BTreeSet<_> = queue_vids
-        .iter()
-        .filter_map(|v| review::source(config, v, &sources))
-        .collect();
-    let excluded_vids: BTreeSet<String> = queue
-        .as_array()
-        .unwrap()
-        .iter()
-        .chain(
-            history
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|r| r["undone"] != true),
-        )
-        .filter_map(|r| r["vid"].as_str().map(str::to_owned))
-        .collect();
+    let (excluded_vids, paths) = excluded_vids_and_paths(config)?;
     let conn = db::open_readonly(&path)?;
     let mut stmt = conn.prepare(
         "SELECT vid,path FROM tasks WHERE stage!='excluded' AND stage!='review' AND manual=0",
@@ -383,17 +773,14 @@ fn canonical_fields(value: &mut Value, key: &str, aliases: &Value) -> Result<()>
     }
     Ok(())
 }
-fn bucket(t: &Value) -> &str {
-    if review::number(&t["manual"]).unwrap_or(0) != 0 {
+fn group_from(manual: i64, data: &Value, unknown_group: Option<&str>) -> Value {
+    let kind = if manual != 0 {
         "manual"
     } else {
-        t["data"]["kind"].as_str().unwrap_or("none")
-    }
-}
-fn group(t: &Value) -> Value {
-    let kind = bucket(t);
-    let suggested = t["data"]["suggested"].as_str().unwrap_or("");
-    let face = t["data"]["face"]["unknown_group"].as_str().unwrap_or("");
+        data["kind"].as_str().unwrap_or("none")
+    };
+    let suggested = data["suggested"].as_str().unwrap_or("");
+    let face = unknown_group.unwrap_or("");
     let (key, label) = if kind == "suggested" && !suggested.is_empty() {
         (format!("person:{suggested}"), suggested.into())
     } else if kind == "none" && !face.is_empty() {
@@ -423,6 +810,13 @@ fn group(t: &Value) -> Value {
     };
     json!({"key":key,"label":label,"kind":kind})
 }
+fn group(t: &Value) -> Value {
+    group_from(
+        review::number(&t["manual"]).unwrap_or(0),
+        &t["data"],
+        t["data"]["face"]["unknown_group"].as_str(),
+    )
+}
 fn text_evidence(t: &Value) -> Value {
     let w = &t["data"]["watermark"];
     json!({"folder":t["data"]["folder"],"watermark":if w.is_null(){Value::Null}else{json!({"pipeline":w["pipeline"],"status":w["status"],"candidates":w["candidates"]})}})
@@ -436,23 +830,68 @@ impl HealthReader {
             candidates: crate::video_health::hidden_candidates(config)?,
         })
     }
-    fn state(&self, config: &Config, t: &Value) -> Result<Value> {
-        let id = t["vid"].as_str().unwrap_or("");
-        let path = t["path"].as_str().unwrap_or("");
-        let hidden = if self.candidates.contains(id) {
+    fn is_hidden(&self, config: &Config, id: &str, path: &str) -> Result<bool> {
+        if self.candidates.contains(id) {
             std::fs::metadata(path)
                 .ok()
                 .map(|s| review::health_hidden(config, id, path, &s))
-                .transpose()?
-                .unwrap_or(false)
+                .transpose()
+                .map(|opt| opt.unwrap_or(false))
         } else {
-            false
-        };
+            Ok(false)
+        }
+    }
+    fn state(&self, config: &Config, t: &Value) -> Result<Value> {
+        let id = t["vid"].as_str().unwrap_or("");
+        let path = t["path"].as_str().unwrap_or("");
+        let hidden = self.is_hidden(config, id, path)?;
         Ok(json!({"hidden":hidden}))
     }
 }
-fn dispositions(config: &Config) -> Result<BTreeMap<String, Value>> {
+#[derive(Clone, PartialEq, Eq)]
+struct DispositionsStamp {
+    dev: u64,
+    ino: u64,
+    count: i64,
+    max_rowid: i64,
+    sum_rowid: i64,
+}
+fn dispositions_cache()
+-> &'static Mutex<VecDeque<(PathBuf, DispositionsStamp, Arc<BTreeMap<String, Value>>)>> {
+    static CACHE: OnceLock<
+        Mutex<VecDeque<(PathBuf, DispositionsStamp, Arc<BTreeMap<String, Value>>)>>,
+    > = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+fn dispositions(config: &Config) -> Result<Arc<BTreeMap<String, Value>>> {
+    let db_path = config.state_db();
     let conn = schema_readonly(config)?;
+    let meta = std::fs::metadata(&db_path)?;
+    let (count, max_rowid, sum_rowid): (i64, i64, i64) = conn.query_row(
+        "SELECT COUNT(*), COALESCE(MAX(rowid), 0), COALESCE(SUM(rowid), 0) \
+         FROM operations INDEXED BY idx_operations_complete_action \
+         WHERE status='complete' \
+           AND json_extract(plan,'$.action') IN ('queue-confirm','queue-undo','review-note','review-defer','review-restore','review-delete','claim-decide')",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    let stamp = DispositionsStamp {
+        dev: meta.dev(),
+        ino: meta.ino(),
+        count,
+        max_rowid,
+        sum_rowid,
+    };
+    if let Ok(mut guard) = dispositions_cache().lock()
+        && let Some(pos) = guard
+            .iter()
+            .position(|(p, s, _)| p == &db_path && s == &stamp)
+    {
+        let hit = guard.remove(pos).unwrap();
+        let val = hit.2.clone();
+        guard.push_back(hit);
+        return Ok(val);
+    }
     let mut stmt = conn.prepare(
         "SELECT id, \
                 CASE WHEN json_type(plan,'$.request.payload.vids')='array' THEN json_extract(plan,'$.request.payload.vids') END, \
@@ -481,7 +920,15 @@ fn dispositions(config: &Config) -> Result<BTreeMap<String, Value>> {
             result.insert(vid.to_owned(), Value::String(id.clone()));
         }
     }
-    Ok(result)
+    let arc = Arc::new(result);
+    if let Ok(mut guard) = dispositions_cache().lock() {
+        guard.retain(|(p, _, _)| p != &db_path);
+        while guard.len() >= FILE_CACHE_CAP {
+            guard.pop_front();
+        }
+        guard.push_back((db_path, stamp, arc.clone()));
+    }
+    Ok(arc)
 }
 pub fn validate_undo(config: &Config, body: &Value) -> Result<()> {
     let Some(session) = body["review_session"].as_str() else {
@@ -601,7 +1048,7 @@ fn read_session(config: &Config, id: &str) -> Result<(Arc<Value>, bool)> {
                 )
                 .optional()?;
             let value: Value = serde_json::from_str(&raw.ok_or_else(expired)?)?;
-            if value["schema_version"] != 1 && value["schema_version"] != 2 {
+            if !matches!(value["schema_version"].as_i64(), Some(1 | 2 | 3)) {
                 return Err(expired());
             }
             let arc = Arc::new(value);
@@ -656,15 +1103,92 @@ struct AmendedSnapshot {
     overrides: BTreeMap<usize, Value>,
 }
 impl AmendedSnapshot {
-    fn base_evidence(&self) -> &[Value] {
-        self.base["evidence"].as_array().map_or(&[], Vec::as_slice)
+    fn is_v3(&self) -> bool {
+        self.base["schema_version"] == 3
     }
+    fn base_items(&self) -> &[Value] {
+        let key = if self.is_v3() { "items" } else { "evidence" };
+        self.base[key].as_array().map_or(&[], Vec::as_slice)
+    }
+    fn base_item(&self, index: usize) -> &Value {
+        &self.base_items()[index]
+    }
+    fn is_amended(&self, index: usize) -> bool {
+        self.overrides.contains_key(&index)
+    }
+    #[cfg(test)]
     fn iter(&self) -> impl Iterator<Item = &Value> {
-        let base = self.base_evidence();
+        let base = self.base_items();
         (0..base.len()).map(|i| self.overrides.get(&i).unwrap_or(&base[i]))
+    }
+    fn iter_indexed(&self) -> impl Iterator<Item = (usize, &Value)> {
+        let base = self.base_items();
+        (0..base.len()).map(|i| (i, self.overrides.get(&i).unwrap_or(&base[i])))
     }
     fn clusters(&self) -> &Value {
         &self.base["clusters"]
+    }
+}
+
+fn item_vid_opt(e: &Value, is_v3: bool) -> Option<&str> {
+    if is_v3 {
+        e["vid"].as_str()
+    } else {
+        e["task"]["vid"].as_str()
+    }
+}
+fn item_vid(e: &Value, is_v3: bool) -> &str {
+    item_vid_opt(e, is_v3).unwrap_or("")
+}
+fn item_path(e: &Value, is_v3: bool) -> &str {
+    if is_v3 {
+        e["path"].as_str().unwrap_or("")
+    } else {
+        e["task"]["path"].as_str().unwrap_or("")
+    }
+}
+fn item_name(e: &Value, is_v3: bool) -> &str {
+    if is_v3 {
+        e["name"].as_str().unwrap_or("")
+    } else {
+        e["task"]["name"].as_str().unwrap_or("")
+    }
+}
+fn item_manual(e: &Value, is_v3: bool) -> &Value {
+    if is_v3 {
+        &e["manual"]
+    } else {
+        &e["task"]["manual"]
+    }
+}
+fn item_deferred(e: &Value, is_v3: bool) -> &Value {
+    if is_v3 {
+        &e["deferred"]
+    } else {
+        &e["task"]["deferred"]
+    }
+}
+fn item_bucket(e: &Value, is_v3: bool) -> &str {
+    if review::number(item_manual(e, is_v3)).unwrap_or(0) != 0 {
+        "manual"
+    } else if is_v3 {
+        e["kind"].as_str().unwrap_or("none")
+    } else {
+        e["task"]["data"]["kind"].as_str().unwrap_or("none")
+    }
+}
+fn item_suggested(e: &Value, is_v3: bool) -> &Value {
+    if is_v3 {
+        &e["suggested"]
+    } else {
+        &e["task"]["data"]["suggested"]
+    }
+}
+fn item_candidates(e: &Value, is_v3: bool) -> &Value {
+    if is_v3 {
+        &e["candidates"]
+    } else {
+        &e["task"]["data"]["candidates"]
     }
 }
 
@@ -682,14 +1206,17 @@ fn amended(config: &Config, id: &str, snapshot: Arc<Value>) -> Result<AmendedSna
             overrides: BTreeMap::new(),
         });
     }
-    let base_evidence = snapshot["evidence"].as_array().unwrap();
-    let positions: BTreeMap<&str, usize> = base_evidence
+    let is_v3 = snapshot["schema_version"] == 3;
+    let base_items = snapshot[if is_v3 { "items" } else { "evidence" }]
+        .as_array()
+        .ok_or_else(expired)?;
+    let positions: BTreeMap<&str, usize> = base_items
         .iter()
         .enumerate()
-        .filter_map(|(i, e)| e["task"]["vid"].as_str().map(|vid| (vid, i)))
+        .filter_map(|(i, e)| item_vid_opt(e, is_v3).map(|vid| (vid, i)))
         .collect();
     let mut overrides: BTreeMap<usize, Value> = BTreeMap::new();
-    let mut next_pending = base_evidence.len() as u64;
+    let mut next_pending = base_items.len() as u64;
     let mut next_deferred = next_pending;
     for row in ops {
         let plan: Value = serde_json::from_str(row["plan"].as_str().unwrap())?;
@@ -704,7 +1231,7 @@ fn amended(config: &Config, id: &str, snapshot: Arc<Value>) -> Result<AmendedSna
         for index in selected {
             let e = overrides
                 .entry(index)
-                .or_insert_with(|| base_evidence[index].clone());
+                .or_insert_with(|| base_items[index].clone());
             e["disposition"] = plan["id"].clone();
             match action {
                 "queue-confirm" | "review-delete" => e["completed"] = json!(true),
@@ -713,11 +1240,12 @@ fn amended(config: &Config, id: &str, snapshot: Arc<Value>) -> Result<AmendedSna
                     let restored:Option<String>=conn.query_row("SELECT plan FROM operations WHERE status='complete' AND json_extract(plan,'$.action')='queue-restore' AND json_extract(plan,'$.request.payload.parent_id')=?",[plan["id"].as_str().unwrap_or("")],|r|r.get(0)).optional()?;
                     if let Some(raw) = restored {
                         let child: Value = serde_json::from_str(&raw)?;
+                        let target_vid = item_vid(e, is_v3);
                         if child["execution"]["data"]["job_updates"]
                             .as_array()
                             .is_some_and(|rows| {
                                 rows.iter().any(|r| {
-                                    r["vid"] == e["task"]["vid"]
+                                    r["vid"].as_str() == Some(target_vid)
                                         && review::number(&r["deferred"]) == Some(0)
                                 })
                             })
@@ -727,18 +1255,32 @@ fn amended(config: &Config, id: &str, snapshot: Arc<Value>) -> Result<AmendedSna
                                 next_pending += 1;
                             }
                             e["pending_seen"] = json!(true);
-                            set_manual(e, "deferred", json!(0));
+                            if is_v3 {
+                                e["deferred"] = json!(0);
+                            } else {
+                                set_manual(e, "deferred", json!(0));
+                            }
                         }
                     }
                 }
-                "review-note" => set_manual(e, "note", body["note"].clone()),
+                "review-note" => {
+                    if is_v3 {
+                        e["note"] = body["note"].clone();
+                    } else {
+                        set_manual(e, "note", body["note"].clone());
+                    }
+                }
                 "review-defer" => {
                     if e["deferred_order"].is_null() {
                         e["deferred_order"] = json!(next_deferred);
                         next_deferred += 1;
                     }
                     e["deferred_seen"] = json!(true);
-                    set_manual(e, "deferred", json!(1));
+                    if is_v3 {
+                        e["deferred"] = json!(1);
+                    } else {
+                        set_manual(e, "deferred", json!(1));
+                    }
                 }
                 "review-restore" => {
                     if e["pending_order"].is_null() {
@@ -746,7 +1288,11 @@ fn amended(config: &Config, id: &str, snapshot: Arc<Value>) -> Result<AmendedSna
                         next_pending += 1;
                     }
                     e["pending_seen"] = json!(true);
-                    set_manual(e, "deferred", json!(0));
+                    if is_v3 {
+                        e["deferred"] = json!(0);
+                    } else {
+                        set_manual(e, "deferred", json!(0));
+                    }
                 }
                 _ => {}
             }
@@ -756,6 +1302,140 @@ fn amended(config: &Config, id: &str, snapshot: Arc<Value>) -> Result<AmendedSna
         base: snapshot,
         overrides,
     })
+}
+fn apply_v3_amendment(ev: &mut Value, skel: &Value) {
+    if !skel["disposition"].is_null() {
+        ev["disposition"] = skel["disposition"].clone();
+    }
+    if let Some(completed) = skel.get("completed").filter(|v| !v.is_null()) {
+        ev["completed"] = completed.clone();
+    }
+    if !skel["pending_seen"].is_null() {
+        ev["pending_seen"] = skel["pending_seen"].clone();
+    }
+    if !skel["deferred_seen"].is_null() {
+        ev["deferred_seen"] = skel["deferred_seen"].clone();
+    }
+    if !skel["pending_order"].is_null() {
+        ev["pending_order"] = skel["pending_order"].clone();
+    }
+    if !skel["deferred_order"].is_null() {
+        ev["deferred_order"] = skel["deferred_order"].clone();
+    }
+    if ev["task"]["note"] != skel["note"] {
+        set_manual(ev, "note", skel["note"].clone());
+    }
+    let deferred = review::number(&skel["deferred"]).unwrap_or(0);
+    if review::number(&ev["task"]["deferred"]).unwrap_or(0) != deferred {
+        set_manual(ev, "deferred", json!(deferred));
+    }
+}
+fn copy_v3_order_flags(ev: &mut Value, base_skel: &Value) {
+    ev["pending_seen"] = base_skel["pending_seen"].clone();
+    ev["deferred_seen"] = base_skel["deferred_seen"].clone();
+    if !base_skel["pending_order"].is_null() {
+        ev["pending_order"] = base_skel["pending_order"].clone();
+    }
+    if !base_skel["deferred_order"].is_null() {
+        ev["deferred_order"] = base_skel["deferred_order"].clone();
+    }
+}
+fn materialize_v3_items(
+    config: &Config,
+    miss_items: &[(&str, &Value)],
+    health: &HealthReader,
+) -> Result<BTreeMap<String, Value>> {
+    if miss_items.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let miss_vids: BTreeSet<String> = miss_items.iter().map(|(v, _)| (*v).to_owned()).collect();
+    let material = shared_metadata::MaterialReader::new_for_vids(config, Some(&miss_vids))?;
+    let disps = dispositions(config)?;
+    let path = config.base.join("processing/processing.db");
+    let mut raw_by_vid: BTreeMap<String, Value> = BTreeMap::new();
+    if path.exists() {
+        let conn = db::open_readonly(&path)?;
+        let vid_list: Vec<&str> = miss_vids.iter().map(String::as_str).collect();
+        for chunk in vid_list.chunks(250) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!("SELECT * FROM tasks WHERE vid IN ({placeholders})");
+            for row in db::rows(
+                &conn,
+                &sql,
+                rusqlite::params_from_iter(chunk.iter().copied()),
+            )? {
+                if let Some(vid) = row["vid"].as_str().map(str::to_owned) {
+                    raw_by_vid.insert(vid, row);
+                }
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    for (vid, base_skel) in miss_items {
+        let mut ev = if let Some(row) = raw_by_vid.remove(*vid) {
+            let mut t = public(row)?;
+            t["__review_raw_people"] = json!(candidate_names(&t["data"]));
+            canonical_fields(&mut t["data"], "", material.aliases())?;
+            crate::processing_result::re_resolve_task_data(&mut t["data"]);
+            evidence(config, &t, &material, health, &disps)?
+        } else {
+            json!({
+                "task": {
+                    "vid": base_skel["vid"],
+                    "name": base_skel["name"],
+                    "path": base_skel["path"],
+                    "size": base_skel["size"],
+                    "mtime_ns": base_skel["mtime_ns"],
+                    "manual": base_skel["manual"],
+                    "deferred": base_skel["deferred"],
+                    "note": base_skel["note"],
+                    "data": {
+                        "kind": base_skel["kind"],
+                        "suggested": base_skel["suggested"],
+                        "candidates": base_skel["candidates"],
+                    }
+                },
+                "group": base_skel["group"],
+                "scope": {"vids": [vid], "people": [], "watermark_keys": []},
+                "material_hash": "",
+                "manual_tasks": [],
+                "health": {"hidden": false},
+                "disposition": null,
+            })
+        };
+        copy_v3_order_flags(&mut ev, base_skel);
+        out.insert((*vid).to_owned(), ev);
+    }
+    Ok(out)
+}
+fn load_v3_session_items(
+    conn: &rusqlite::Connection,
+    session: &str,
+    vids: &[&str],
+) -> Result<BTreeMap<String, Value>> {
+    let mut out = BTreeMap::new();
+    if vids.is_empty() || !sidecar_has_items_table(conn) {
+        return Ok(out);
+    }
+    for chunk in vids.chunks(250) {
+        let placeholders = std::iter::repeat_n("?", chunk.len())
+            .collect::<Vec<_>>()
+            .join(",");
+        let sql = format!(
+            "SELECT vid, evidence FROM session_items WHERE session=? AND vid IN ({placeholders})"
+        );
+        let mut stmt = conn.prepare(&sql)?;
+        let params_iter = std::iter::once(session).chain(chunk.iter().copied());
+        let mut rows = stmt.query(rusqlite::params_from_iter(params_iter))?;
+        while let Some(row) = rows.next()? {
+            let vid: String = row.get(0)?;
+            let raw: String = row.get(1)?;
+            out.insert(vid, serde_json::from_str(&raw)?);
+        }
+    }
+    Ok(out)
 }
 fn set_manual_rows(rows: &mut [Value], key: &str, value: &Value) {
     for r in rows {
@@ -792,7 +1472,7 @@ pub fn validate(config: &Config, body: &Value) -> Result<Vec<Value>> {
         None
     };
     let mut rows = vec![];
-    let material = shared_metadata::MaterialReader::new(config)?;
+    let material = shared_metadata::MaterialReader::new_for_vids(config, Some(&id_set))?;
     let current = tasks_filtered(config, material.aliases(), Some(&id_set), false)?;
     let health = HealthReader::new(config)?;
     let dispositions = dispositions(config)?;
@@ -866,114 +1546,97 @@ pub fn execute(engine: &mut Engine, command: &str, body: Value) -> Result<Value>
         .as_str()
         .filter(|v| !v.is_empty())
         .map(str::to_owned);
-    let created = id.is_none();
-    let need_live_diff = created || command == "review-status";
-    let (id, snapshot, in_sidecar, changed_count, waiting, refreshing) = if !need_live_diff {
-        let id = id.unwrap();
-        let (base, in_sidecar) = read_session(config, &id)?;
+    if command == "review-status" {
+        let id = id.ok_or_else(expired)?;
+        let (base, _in_sidecar) = read_session(config, &id)?;
         let snapshot = amended(config, &id, base)?;
-        let waiting = waiting_count(config)?;
-        (id, snapshot, in_sidecar, 0usize, waiting, 0usize)
-    } else {
-        let material = shared_metadata::MaterialReader::new(config)?;
-        let live = tasks_for_review(config, material.aliases())?;
-        let health = HealthReader::new(config)?;
-        let (id, snapshot, in_sidecar) = match id {
-            Some(id) => {
-                let (base, in_sidecar) = read_session(config, &id)?;
-                let snap = amended(config, &id, base)?;
-                (id, snap, in_sidecar)
-            }
-            None => {
-                if command == "review-status" {
-                    return Err(expired());
-                }
-                let dispositions = dispositions(config)?;
-                let id = uuid::Uuid::new_v4().to_string();
-                let mut evidence = live
-                    .iter()
-                    .filter(|t| available(t))
-                    .map(|t| evidence(config, t, &material, &health, &dispositions))
-                    .collect::<Result<Vec<_>>>()?;
-                evidence.retain(|e| e["health"]["hidden"] != true);
-                evidence.sort_by_key(|e| !has_watermark_candidate(&e["task"]["data"]));
-                for (index, e) in evidence.iter_mut().enumerate() {
-                    let key = if e["pending_seen"] == true {
-                        "pending_order"
-                    } else {
-                        "deferred_order"
-                    };
-                    e[key] = json!(index);
-                }
-                let snapshot = json!({"schema_version":2,"evidence":evidence,"clusters":compact_clusters(review::read(config,"clusters.json",json!([]))?.1)});
-                let raw = serde_json::to_string(&snapshot)?;
-                if raw.len() > 64 * 1024 * 1024 {
-                    return Err(Error::new(
-                        503,
-                        "review_scope_limit",
-                        "核对记录过多，请缩小处理范围",
-                    ));
-                }
-                let replace_session = body["replace_session"]
-                    .as_str()
-                    .map(str::trim)
-                    .filter(|v| !v.is_empty())
-                    .map(str::to_owned);
-                let expires = {
-                    let _guard = session_write_lock()
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    let mut sidecar = sidecar_write(config)?;
-                    let expires = now(&sidecar)? + TTL;
-                    let deleted = {
-                        let stx = sidecar
-                            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-                        let mut deleted = stx.execute(
-                            "DELETE FROM session_snapshots WHERE expires<=unixepoch()",
-                            [],
-                        )?;
-                        if let Some(old_id) = &replace_session
-                            && old_id != &id
-                        {
-                            deleted += stx.execute(
-                                "DELETE FROM session_snapshots WHERE id=?",
-                                [old_id],
-                            )?;
+        let mut changed_count = 0usize;
+        let (waiting, refreshing) = if snapshot.is_v3() {
+            let active_vids: BTreeSet<&str> = snapshot
+                .iter_indexed()
+                .filter(|(_, e)| e["completed"] != true)
+                .filter_map(|(_, e)| item_vid_opt(e, true))
+                .collect();
+            let mut mat_rows: BTreeMap<String, String> = BTreeMap::new();
+            if !active_vids.is_empty() && config.review_sessions_db().exists() {
+                let sro = sidecar_readonly(config)?;
+                if sidecar_has_items_table(&sro) {
+                    let mut stmt =
+                        sro.prepare("SELECT vid, evidence FROM session_items WHERE session=?")?;
+                    let mut rows = stmt.query([&id])?;
+                    while let Some(row) = rows.next()? {
+                        let vid: String = row.get(0)?;
+                        if active_vids.contains(vid.as_str()) {
+                            let raw: String = row.get(1)?;
+                            mat_rows.insert(vid, raw);
                         }
-                        deleted += stx.execute(
-                            "DELETE FROM session_snapshots WHERE id NOT IN (SELECT id FROM session_snapshots ORDER BY expires DESC, rowid DESC LIMIT ?1)",
-                            [MAX_ACTIVE_SESSIONS - 1],
-                        )?;
-                        stx.execute(
-                            "INSERT OR REPLACE INTO session_snapshots VALUES(?,?,?)",
-                            params![&id, expires, &raw],
-                        )?;
-                        stx.commit()?;
-                        deleted
-                    };
-                    if deleted > 0 {
-                        maybe_incremental_vacuum(&sidecar, 16_384, 256);
                     }
-                    expires
-                };
-                let arc = Arc::new(snapshot);
-                session_cache_put(&config.review_sessions_db(), &id, expires, arc.clone());
-                (
-                    id,
-                    AmendedSnapshot {
-                        base: arc,
-                        overrides: BTreeMap::new(),
-                    },
-                    true,
-                )
+                }
             }
-        };
-        let mut changed_count = 0;
-        if !created {
+            let mat_vids: BTreeSet<String> = mat_rows.keys().cloned().collect();
+            let mat_reader = if !mat_vids.is_empty() {
+                Some(shared_metadata::MaterialReader::new_for_vids(
+                    config,
+                    Some(&mat_vids),
+                )?)
+            } else {
+                None
+            };
+            let owned_aliases;
+            let live_aliases = if let Some(ref mr) = mat_reader {
+                mr.aliases()
+            } else {
+                owned_aliases = review::read(config, "person-renames.json", json!({}))?.1;
+                &owned_aliases
+            };
+            let health = HealthReader::new(config)?;
+            let scan = load_lightweight_tasks(config, live_aliases, &health)?;
             let visible_by_id: BTreeMap<&str, &Value> = snapshot
-                .iter()
-                .filter(|e| e["completed"] != true)
-                .filter_map(|e| e["task"]["vid"].as_str().map(|vid| (vid, &e["task"])))
+                .iter_indexed()
+                .filter(|(_, e)| e["completed"] != true)
+                .filter_map(|(_, e)| item_vid_opt(e, true).map(|vid| (vid, e)))
+                .collect();
+            for t in &scan.items {
+                if !visible_by_id
+                    .get(t["vid"].as_str().unwrap_or(""))
+                    .is_some_and(|v| {
+                        v["data_digest"] == t["data_digest"]
+                            && v["path"] == t["path"]
+                            && v["size"] == t["size"]
+                            && v["mtime_ns"] == t["mtime_ns"]
+                            && v["deferred"] == t["deferred"]
+                            && v["note"] == t["note"]
+                    })
+                {
+                    changed_count += 1;
+                }
+            }
+            for (idx, skel) in snapshot.iter_indexed().filter(|(_, e)| e["completed"] != true) {
+                let vid = item_vid(skel, true);
+                let path = item_path(skel, true);
+                if !scan.live_ids.contains(vid) || health.is_hidden(config, vid, path)? {
+                    changed_count += 1;
+                    continue;
+                }
+                if let (Some(raw_ev), Some(mr)) = (mat_rows.get(vid), &mat_reader) {
+                    let mut ev: Value = serde_json::from_str(raw_ev)?;
+                    if snapshot.is_amended(idx) {
+                        apply_v3_amendment(&mut ev, skel);
+                    }
+                    if !material_matches(mr.material_only(config, &ev["scope"])?, &ev) {
+                        changed_count += 1;
+                    }
+                }
+            }
+            (scan.waiting, scan.refreshing)
+        } else {
+            let material = shared_metadata::MaterialReader::new(config)?;
+            let live = tasks_for_review(config, material.aliases())?;
+            let health = HealthReader::new(config)?;
+            let visible_by_id: BTreeMap<&str, &Value> = snapshot
+                .iter_indexed()
+                .filter(|(_, e)| e["completed"] != true)
+                .filter_map(|(_, e)| e["task"]["vid"].as_str().map(|vid| (vid, &e["task"])))
                 .collect();
             let live_ids: BTreeSet<_> = live
                 .iter()
@@ -996,7 +1659,7 @@ pub fn execute(engine: &mut Engine, command: &str, body: Value) -> Result<Value>
                     changed_count += 1
                 }
             }
-            for e in snapshot.iter().filter(|e| e["completed"] != true) {
+            for (_, e) in snapshot.iter_indexed().filter(|(_, e)| e["completed"] != true) {
                 if !live_ids.contains(e["task"]["vid"].as_str().unwrap_or(""))
                     || !material_matches(material.material_only(config, &e["scope"])?, e)
                     || health.state(config, &e["task"])? != e["health"]
@@ -1004,29 +1667,62 @@ pub fn execute(engine: &mut Engine, command: &str, body: Value) -> Result<Value>
                     changed_count += 1
                 }
             }
-        }
-        let waiting = live
-            .iter()
-            .filter(|t| t["stage"] != "review" && review::number(&t["manual"]).unwrap_or(0) == 0)
-            .count();
-        let refreshing = live
-            .iter()
-            .filter(|t| {
-                available(t)
-                    && t["stage"] != "review"
-                    && review::number(&t["manual"]).unwrap_or(0) == 0
-            })
-            .count();
-        (id, snapshot, in_sidecar, changed_count, waiting, refreshing)
-    };
-    if need_live_diff {
+            let waiting = live
+                .iter()
+                .filter(|t| t["stage"] != "review" && review::number(&t["manual"]).unwrap_or(0) == 0)
+                .count();
+            let refreshing = live
+                .iter()
+                .filter(|t| {
+                    available(t)
+                        && t["stage"] != "review"
+                        && review::number(&t["manual"]).unwrap_or(0) == 0
+                })
+                .count();
+            (waiting, refreshing)
+        };
         crate::model::trim_allocator();
-    }
-    if command == "review-status" {
         return Ok(
             json!({"session":id,"has_updates":changed_count>0,"changed":changed_count,"waiting":waiting,"refreshing":refreshing}),
         );
     }
+
+    let mut created_ctx: Option<(String, HealthReader)> = None;
+    let (id, snapshot, in_sidecar, waiting) = match id {
+        Some(id) => {
+            let (base, in_sidecar) = read_session(config, &id)?;
+            let snap = amended(config, &id, base)?;
+            let waiting = waiting_count(config)?;
+            (id, snap, in_sidecar, waiting)
+        }
+        None => {
+            let aliases = review::read(config, "person-renames.json", json!({}))?.1;
+            let health = HealthReader::new(config)?;
+            let scan = load_lightweight_tasks(config, &aliases, &health)?;
+            let snapshot_val = json!({"schema_version":3,"items":scan.items});
+            let raw = serde_json::to_string(&snapshot_val)?;
+            if raw.len() > 64 * 1024 * 1024 {
+                return Err(Error::new(
+                    503,
+                    "review_scope_limit",
+                    "核对记录过多，请缩小处理范围",
+                ));
+            }
+            let id = uuid::Uuid::new_v4().to_string();
+            let arc = Arc::new(snapshot_val);
+            created_ctx = Some((raw, health));
+            (
+                id,
+                AmendedSnapshot {
+                    base: arc,
+                    overrides: BTreeMap::new(),
+                },
+                true,
+                scan.waiting,
+            )
+        }
+    };
+    let is_v3 = snapshot.is_v3();
     let s = |key: &str| body[key].as_str().unwrap_or("");
     let view = if s("view").is_empty() {
         "all"
@@ -1036,49 +1732,64 @@ pub fn execute(engine: &mut Engine, command: &str, body: Value) -> Result<Value>
     let deferred = view == "deferred";
     let person = s("person");
     let cluster = s("cluster");
+    let cluster_vids: Option<BTreeSet<String>> = if cluster.is_empty() {
+        None
+    } else {
+        let clusters_val;
+        let clusters_ref: &Value = if is_v3 {
+            clusters_val = cached_clusters(config)?;
+            &clusters_val
+        } else {
+            snapshot.clusters()
+        };
+        Some(
+            clusters_ref
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|c| c["cid"] == cluster)
+                .and_then(|c| c["vids"].as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|v| v.as_str().or_else(|| v["vid"].as_str()).map(str::to_owned))
+                .collect(),
+        )
+    };
     let mut counts = json!({"all":0,"suggested":0,"conflict":0,"none":0,"manual":0,"deferred":0});
-    for e in snapshot.iter().filter(|e| e["completed"] != true) {
-        let t = &e["task"];
-        if review::number(&t["deferred"]).unwrap_or(0) != 0 {
+    for (_, e) in snapshot
+        .iter_indexed()
+        .filter(|(_, e)| e["completed"] != true)
+    {
+        if review::number(item_deferred(e, is_v3)).unwrap_or(0) != 0 {
             counts["deferred"] = json!(counts["deferred"].as_u64().unwrap() + 1)
         } else {
-            for k in ["all", bucket(t)] {
+            for k in ["all", item_bucket(e, is_v3)] {
                 counts[k] = json!(counts[k].as_u64().unwrap_or(0) + 1)
             }
         }
     }
-    let mut scope: Vec<_> = snapshot
-        .iter()
-        .filter(|e| {
-            let t = &e["task"];
-            let lane = review::number(&t["deferred"]).unwrap_or(0) != 0;
+    let mut scope: Vec<(usize, &Value)> = snapshot
+        .iter_indexed()
+        .filter(|(_, e)| {
+            let lane = review::number(item_deferred(e, is_v3)).unwrap_or(0) != 0;
             let ever = e[if deferred {
                 "deferred_seen"
             } else {
                 "pending_seen"
             }] == true;
             (lane == deferred || ever)
-                && (deferred || view == "all" || bucket(t) == view)
+                && (deferred || view == "all" || item_bucket(e, is_v3) == view)
                 && (person.is_empty()
-                    || t["data"]["candidates"]
+                    || item_candidates(e, is_v3)
                         .as_array()
                         .is_some_and(|cs| cs.iter().any(|c| c["name"] == person))
-                    || t["data"]["suggested"] == person)
-                && (cluster.is_empty()
-                    || snapshot.clusters().as_array().is_some_and(|cs| {
-                        cs.iter().any(|c| {
-                            c["cid"] == cluster
-                                && c["vids"]
-                                    .as_array()
-                                    .is_some_and(|vs| {
-                                        vs.iter()
-                                            .any(|v| v == &t["vid"] || v["vid"] == t["vid"])
-                                    })
-                        })
-                    }))
+                    || item_suggested(e, is_v3) == person)
+                && cluster_vids
+                    .as_ref()
+                    .is_none_or(|vids| vids.contains(item_vid(e, is_v3)))
         })
         .collect();
-    scope.sort_by_key(|e| {
+    scope.sort_by_key(|(_, e)| {
         e[if deferred {
             "deferred_order"
         } else {
@@ -1087,18 +1798,18 @@ pub fn execute(engine: &mut Engine, command: &str, body: Value) -> Result<Value>
         .as_u64()
         .unwrap_or(u64::MAX)
     });
-    let is_remaining = |e: &&Value| {
+    let is_remaining = |e: &Value| {
         e["completed"] != true
-            && (review::number(&e["task"]["deferred"]).unwrap_or(0) != 0) == deferred
+            && (review::number(item_deferred(e, is_v3)).unwrap_or(0) != 0) == deferred
     };
     let mut grouped: BTreeMap<String, Value> = BTreeMap::new();
     let mut totals: BTreeMap<String, usize> = BTreeMap::new();
-    for e in snapshot.iter() {
+    for (_, e) in snapshot.iter_indexed() {
         *totals
             .entry(e["group"]["key"].as_str().unwrap_or("").into())
             .or_default() += 1;
     }
-    for e in &scope {
+    for &(_, e) in &scope {
         let key = e["group"]["key"].as_str().unwrap_or("").to_owned();
         let group = grouped.entry(key).or_insert_with(|| {
             let mut g = e["group"].clone();
@@ -1121,7 +1832,10 @@ pub fn execute(engine: &mut Engine, command: &str, body: Value) -> Result<Value>
             })
             .then_with(|| a["label"].as_str().cmp(&b["label"].as_str()))
     });
-    let focus = scope.iter().find(|e| e["task"]["vid"] == s("vid"));
+    let focus = scope
+        .iter()
+        .find(|(_, e)| item_vid(e, is_v3) == s("vid"))
+        .map(|(_, e)| *e);
     let focus_missing = !s("vid").is_empty() && focus.is_none();
     let requested = focus
         .map(|e| e["group"]["key"].as_str().unwrap_or(""))
@@ -1133,22 +1847,22 @@ pub fn execute(engine: &mut Engine, command: &str, body: Value) -> Result<Value>
     };
     let query = s("q").to_lowercase();
     let folder = s("folder");
-    let rows: Vec<_> = scope
+    let rows: Vec<(usize, &Value)> = scope
         .into_iter()
-        .filter(|e| {
+        .filter(|(_, e)| {
             selected
                 .as_ref()
                 .is_some_and(|g| e["group"]["key"] == g["key"])
                 && (folder.is_empty()
-                    || Path::new(e["task"]["path"].as_str().unwrap_or(""))
+                    || Path::new(item_path(e, is_v3))
                         .parent()
                         .is_some_and(|p| p == Path::new(folder)))
                 && (query.is_empty()
                     || format!(
                         "{} {} {}",
-                        e["task"]["name"].as_str().unwrap_or(""),
-                        e["task"]["path"].as_str().unwrap_or(""),
-                        e["task"]["data"]["candidates"]
+                        item_name(e, is_v3),
+                        item_path(e, is_v3),
+                        item_candidates(e, is_v3)
                     )
                     .to_lowercase()
                     .contains(&query))
@@ -1157,51 +1871,126 @@ pub fn execute(engine: &mut Engine, command: &str, body: Value) -> Result<Value>
     let limit = 24usize;
     let page = rows
         .iter()
-        .position(|e| e["task"]["vid"] == s("vid"))
+        .position(|(_, e)| item_vid(e, is_v3) == s("vid"))
         .map(|n| n / limit)
         .unwrap_or_else(|| s("page").parse::<usize>().unwrap_or(0))
         .min(rows.len().saturating_sub(1) / limit);
-    let (delivered, current_epoch) = if in_sidecar {
-        let mut delivered = vec![];
-        let mut missing: Vec<(String, Option<String>, String)> = vec![];
-        if created {
-            for e in rows
+    let (delivered, current_epoch) = if is_v3 {
+        let page_items: Vec<(usize, &Value)> = rows
+            .iter()
+            .skip(page * limit)
+            .take(limit)
+            .copied()
+            .filter(|(_, e)| is_remaining(e))
+            .collect();
+        if let Some((snapshot_raw, health)) = created_ctx {
+            let miss_items: Vec<(&str, &Value)> = page_items
                 .iter()
-                .skip(page * limit)
-                .take(limit)
-                .filter(|e| is_remaining(e))
-            {
-                let raw = serde_json::to_string(e)?;
-                let vid = e["task"]["vid"].as_str().map(str::to_owned);
+                .map(|(idx, _)| {
+                    let base = snapshot.base_item(*idx);
+                    (item_vid(base, true), base)
+                })
+                .collect();
+            let mut materialized = materialize_v3_items(config, &miss_items, &health)?;
+            let mut delivered = vec![];
+            let mut new_items: Vec<(String, String)> = vec![];
+            let mut missing_deliveries: Vec<(String, String, String)> = vec![];
+            for (_, skel) in &page_items {
+                let vid = item_vid(skel, true);
+                let ev = materialized
+                    .remove(vid)
+                    .ok_or_else(|| Error::conflict("核对证据生成失败"))?;
+                let raw = serde_json::to_string(&ev)?;
+                new_items.push((vid.to_owned(), raw.clone()));
                 let token = uuid::Uuid::new_v4().to_string();
-                missing.push((token.clone(), vid, raw));
-                let mut task = e["task"].clone();
+                missing_deliveries.push((token.clone(), vid.to_owned(), raw));
+                let mut task = ev["task"].clone();
                 task["review_token"] = json!(token);
                 delivered.push(task);
             }
-            let current_epoch = if !missing.is_empty() {
+            let replace_session = body["replace_session"]
+                .as_str()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_owned);
+            let (expires, current_epoch) = {
                 let _guard = session_write_lock()
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
-                let mut rw = sidecar_write(config)?;
-                let epoch = now(&rw)?;
-                let tx = rw.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-                {
-                    let mut insert =
-                        tx.prepare("INSERT OR IGNORE INTO review_deliveries VALUES(?,?,?,?)")?;
-                    for (token, vid, raw) in &missing {
-                        insert.execute(params![token, &id, vid.as_deref(), raw])?;
+                let mut sidecar = sidecar_write(config)?;
+                let epoch = now(&sidecar)?;
+                let expires = epoch + TTL;
+                let deleted = {
+                    let stx = sidecar
+                        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                    let mut deleted = stx.execute(
+                        "DELETE FROM session_snapshots WHERE expires<=unixepoch()",
+                        [],
+                    )?;
+                    if let Some(old_id) = &replace_session
+                        && old_id != &id
+                    {
+                        deleted += stx.execute(
+                            "DELETE FROM session_snapshots WHERE id=?",
+                            [old_id],
+                        )?;
                     }
+                    deleted += stx.execute(
+                        "DELETE FROM session_snapshots WHERE id NOT IN (SELECT id FROM session_snapshots ORDER BY expires DESC, rowid DESC LIMIT ?1)",
+                        [MAX_ACTIVE_SESSIONS - 1],
+                    )?;
+                    stx.execute(
+                        "INSERT OR REPLACE INTO session_snapshots VALUES(?,?,?)",
+                        params![&id, expires, &snapshot_raw],
+                    )?;
+                    if !new_items.is_empty() {
+                        let mut item_insert =
+                            stx.prepare("INSERT OR IGNORE INTO session_items VALUES(?,?,?)")?;
+                        for (vid, raw) in &new_items {
+                            item_insert.execute(params![&id, vid, raw])?;
+                        }
+                    }
+                    if !missing_deliveries.is_empty() {
+                        let mut deliv_insert =
+                            stx.prepare("INSERT OR IGNORE INTO review_deliveries VALUES(?,?,?,?)")?;
+                        for (token, vid, raw) in &missing_deliveries {
+                            deliv_insert.execute(params![token, &id, vid, raw])?;
+                        }
+                    }
+                    stx.commit()?;
+                    deleted
+                };
+                if deleted > 0 {
+                    maybe_incremental_vacuum(&sidecar, 16_384, 256);
                 }
-                tx.commit()?;
-                epoch
-            } else {
-                let ro = sidecar_readonly(config)?;
-                now(&ro)?
+                (expires, epoch)
             };
+            session_cache_put(
+                &config.review_sessions_db(),
+                &id,
+                expires,
+                snapshot.base.clone(),
+            );
+            crate::model::trim_allocator();
             (delivered, current_epoch)
         } else {
             let ro = sidecar_readonly(config)?;
+            let current_epoch = now(&ro)?;
+            let page_vids: Vec<&str> = page_items.iter().map(|(_, e)| item_vid(e, true)).collect();
+            let mut stored_items = load_v3_session_items(&ro, &id, &page_vids)?;
+            let miss_items: Vec<(&str, &Value)> = page_items
+                .iter()
+                .filter_map(|(idx, skel)| {
+                    let vid = item_vid(skel, true);
+                    (!stored_items.contains_key(vid)).then(|| (vid, snapshot.base_item(*idx)))
+                })
+                .collect();
+            let mut materialized = if miss_items.is_empty() {
+                BTreeMap::new()
+            } else {
+                let health = HealthReader::new(config)?;
+                materialize_v3_items(config, &miss_items, &health)?
+            };
             let has_deliveries = sidecar_has_deliveries_table(&ro);
             let mut stmt = if has_deliveries {
                 Some(ro.prepare(
@@ -1210,14 +1999,24 @@ pub fn execute(engine: &mut Engine, command: &str, body: Value) -> Result<Value>
             } else {
                 None
             };
-            for e in rows
-                .iter()
-                .skip(page * limit)
-                .take(limit)
-                .filter(|e| is_remaining(e))
-            {
-                let raw = serde_json::to_string(e)?;
-                let vid = e["task"]["vid"].as_str();
+            let mut delivered = vec![];
+            let mut new_items: Vec<(String, String)> = vec![];
+            let mut missing_deliveries: Vec<(String, String, String)> = vec![];
+            for (idx, skel) in &page_items {
+                let vid = item_vid(skel, true);
+                let mut ev = if let Some(existing) = stored_items.remove(vid) {
+                    existing
+                } else {
+                    let fresh = materialized
+                        .remove(vid)
+                        .ok_or_else(|| Error::conflict("核对证据生成失败"))?;
+                    new_items.push((vid.to_owned(), serde_json::to_string(&fresh)?));
+                    fresh
+                };
+                if snapshot.is_amended(*idx) {
+                    apply_v3_amendment(&mut ev, skel);
+                }
+                let raw = serde_json::to_string(&ev)?;
                 let token = if let Some(ref mut s) = stmt {
                     s.query_row(params![&id, vid, &raw], |r| r.get::<_, String>(0))
                         .optional()?
@@ -1228,34 +2027,97 @@ pub fn execute(engine: &mut Engine, command: &str, body: Value) -> Result<Value>
                     Some(existing) => existing,
                     None => {
                         let token = uuid::Uuid::new_v4().to_string();
-                        missing.push((token.clone(), vid.map(str::to_owned), raw));
+                        missing_deliveries.push((token.clone(), vid.to_owned(), raw));
                         token
                     }
                 };
-                let mut task = e["task"].clone();
+                let mut task = ev["task"].clone();
                 task["review_token"] = json!(token);
                 delivered.push(task);
             }
-            let current_epoch = now(&ro)?;
             drop(stmt);
             drop(ro);
-            if !missing.is_empty() {
+            if !new_items.is_empty() || !missing_deliveries.is_empty() {
                 let _guard = session_write_lock()
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
                 let mut rw = sidecar_write(config)?;
                 let tx = rw.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-                {
-                    let mut insert =
+                if !new_items.is_empty() {
+                    let mut item_insert =
+                        tx.prepare("INSERT OR IGNORE INTO session_items VALUES(?,?,?)")?;
+                    for (vid, raw) in &new_items {
+                        item_insert.execute(params![&id, vid, raw])?;
+                    }
+                }
+                if !missing_deliveries.is_empty() {
+                    let mut deliv_insert =
                         tx.prepare("INSERT OR IGNORE INTO review_deliveries VALUES(?,?,?,?)")?;
-                    for (token, vid, raw) in &missing {
-                        insert.execute(params![token, &id, vid.as_deref(), raw])?;
+                    for (token, vid, raw) in &missing_deliveries {
+                        deliv_insert.execute(params![token, &id, vid, raw])?;
                     }
                 }
                 tx.commit()?;
             }
             (delivered, current_epoch)
         }
+    } else if in_sidecar {
+        let ro = sidecar_readonly(config)?;
+        let has_deliveries = sidecar_has_deliveries_table(&ro);
+        let mut stmt = if has_deliveries {
+            Some(ro.prepare(
+                "SELECT token FROM review_deliveries WHERE session=? AND vid=? AND evidence=? LIMIT 1",
+            )?)
+        } else {
+            None
+        };
+        let mut delivered = vec![];
+        let mut missing: Vec<(String, Option<String>, String)> = vec![];
+        for (_, e) in rows
+            .iter()
+            .skip(page * limit)
+            .take(limit)
+            .filter(|(_, e)| is_remaining(e))
+        {
+            let raw = serde_json::to_string(e)?;
+            let vid = e["task"]["vid"].as_str();
+            let token = if let Some(ref mut s) = stmt {
+                s.query_row(params![&id, vid, &raw], |r| r.get::<_, String>(0))
+                    .optional()?
+            } else {
+                None
+            };
+            let token = match token {
+                Some(existing) => existing,
+                None => {
+                    let token = uuid::Uuid::new_v4().to_string();
+                    missing.push((token.clone(), vid.map(str::to_owned), raw));
+                    token
+                }
+            };
+            let mut task = e["task"].clone();
+            task["review_token"] = json!(token);
+            delivered.push(task);
+        }
+        let current_epoch = now(&ro)?;
+        drop(stmt);
+        drop(ro);
+        if !missing.is_empty() {
+            let _guard = session_write_lock()
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut rw = sidecar_write(config)?;
+            let tx = rw.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            {
+                let mut insert =
+                    tx.prepare("INSERT OR IGNORE INTO review_deliveries VALUES(?,?,?,?)")?;
+                for (token, vid, raw) in &missing {
+                    insert.execute(params![token, &id, vid.as_deref(), raw])?;
+                }
+            }
+            tx.commit()?;
+        }
+        (delivered, current_epoch)
     } else {
         let ro = schema_readonly(config)?;
         let mut stmt = ro.prepare(
@@ -1263,11 +2125,11 @@ pub fn execute(engine: &mut Engine, command: &str, body: Value) -> Result<Value>
         )?;
         let mut delivered = vec![];
         let mut missing: Vec<(String, Option<String>, String)> = vec![];
-        for e in rows
+        for (_, e) in rows
             .iter()
             .skip(page * limit)
             .take(limit)
-            .filter(|e| is_remaining(e))
+            .filter(|(_, e)| is_remaining(e))
         {
             let raw = serde_json::to_string(e)?;
             let vid = e["task"]["vid"].as_str();
@@ -1304,21 +2166,27 @@ pub fn execute(engine: &mut Engine, command: &str, body: Value) -> Result<Value>
         (delivered, current_epoch)
     };
     let pages = rows.len().div_ceil(limit);
-    let has = |p: usize| rows.iter().skip(p * limit).take(limit).any(&is_remaining);
+    let has = |p: usize| {
+        rows.iter()
+            .skip(p * limit)
+            .take(limit)
+            .any(|(_, e)| is_remaining(e))
+    };
     let next = (page + 1..pages).find(|p| has(*p));
     let previous = (0..page).rev().find(|p| has(*p));
     let folders: BTreeSet<_> = snapshot
-        .iter()
-        .filter_map(|e| {
-            Path::new(e["task"]["path"].as_str()?)
-                .parent()
-                .map(|p| p.display().to_string())
+        .iter_indexed()
+        .filter_map(|(_, e)| {
+            let path = item_path(e, is_v3);
+            (!path.is_empty())
+                .then(|| Path::new(path).parent().map(|p| p.display().to_string()))
+                .flatten()
         })
         .collect();
     let heartbeat = review::read(config, "processing/heartbeat.json", json!({}))?.1;
     let age = current_epoch as f64 - heartbeat["at"].as_f64().unwrap_or(0.0);
     Ok(
-        json!({"session":id,"counts":counts,"groups":groups,"group":selected,"rows":delivered,"total":rows.len(),"remaining":rows.iter().filter(|e|is_remaining(e)).count(),"page":page,"limit":limit,"next_page":next,"previous_page":previous,"waiting":waiting,"online":(-30.0..90.0).contains(&age),"folders":folders,"focus_missing":focus_missing,"has_updates":changed_count>0}),
+        json!({"session":id,"counts":counts,"groups":groups,"group":selected,"rows":delivered,"total":rows.len(),"remaining":rows.iter().filter(|(_, e)| is_remaining(e)).count(),"page":page,"limit":limit,"next_page":next,"previous_page":previous,"waiting":waiting,"online":(-30.0..90.0).contains(&age),"folders":folders,"focus_missing":focus_missing,"has_updates":false}),
     )
 }
 
@@ -1607,24 +2475,185 @@ mod alias_snapshot_tests {
                 |r| r.get(0),
             )
             .unwrap();
-        let sc_raw: String = sc_conn
+        let (sc_sid, sc_raw): (String, String) = sc_conn
             .query_row(
-                "SELECT snapshot FROM session_snapshots ORDER BY rowid DESC LIMIT 1",
+                "SELECT id, snapshot FROM session_snapshots ORDER BY rowid DESC LIMIT 1",
                 [],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
         assert_eq!(sc_count, MAX_ACTIVE_SESSIONS);
         assert!(sc_del_sessions <= MAX_ACTIVE_SESSIONS);
         let sc_val: Value = serde_json::from_str(&sc_raw).unwrap();
-        assert_eq!(sc_val["schema_version"], 2);
-        assert_eq!(sc_val["clusters"][0]["vids"][0], "v1");
-        assert!(sc_val["evidence"][0].get("material").is_none());
-        assert!(sc_val["evidence"][0].get("text").is_none());
-        assert!(sc_val["evidence"][0]["material_hash"].is_string());
+        assert_eq!(sc_val["schema_version"], 3);
+        assert!(sc_val.get("clusters").is_none());
+        assert!(sc_val.get("evidence").is_none());
+        assert!(sc_val["items"][0]["data_digest"].is_string());
+        assert!(sc_val["items"][0].get("face").is_none());
+        assert!(sc_val["items"][0].get("watermark").is_none());
+
+        let item_raw: String = sc_conn
+            .query_row(
+                "SELECT evidence FROM session_items WHERE session=? AND vid='v1'",
+                [&sc_sid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let item_val: Value = serde_json::from_str(&item_raw).unwrap();
+        assert!(item_val.get("material").is_none());
+        assert!(item_val.get("text").is_none());
+        assert!(item_val["material_hash"].is_string());
+
+        let hit_cluster = execute(
+            &mut engine,
+            "review-page",
+            json!({"session": sc_sid, "cluster": "c1"}),
+        )
+        .unwrap();
+        assert_eq!(hit_cluster["rows"].as_array().unwrap().len(), 1);
+        let miss_cluster = execute(
+            &mut engine,
+            "review-page",
+            json!({"session": sc_sid, "cluster": "missing"}),
+        )
+        .unwrap();
+        assert_eq!(miss_cluster["rows"].as_array().unwrap().len(), 0);
 
         drop(sc_conn);
         drop(op_conn);
+        drop(engine);
+        drop(jobs);
+        drop(faces);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn schema_v3_lazy_materialization_and_aba_freeze() {
+        let root = fs::canonicalize("/tmp")
+            .unwrap()
+            .join(format!("face-review-v3-lazy-{}", uuid::Uuid::new_v4()));
+        let base = root.join("base");
+        let media = root.join("media");
+        fs::create_dir_all(base.join("file-operations-rust")).unwrap();
+        fs::create_dir_all(base.join("processing")).unwrap();
+        fs::create_dir_all(&media).unwrap();
+        let config = Config {
+            base: base.clone(),
+            media,
+            ledger: root.join("ledger.db"),
+            bind: "127.0.0.1:0".into(),
+            token: None,
+            fixture: None,
+            parity_root: None,
+        };
+        drop(crate::store::Store::start(&config).unwrap());
+        let faces = rusqlite::Connection::open(base.join("faces.db")).unwrap();
+        faces
+            .execute_batch("CREATE TABLE videos(vid TEXT PRIMARY KEY,path TEXT);")
+            .unwrap();
+        let jobs = rusqlite::Connection::open(base.join("processing/processing.db")).unwrap();
+        jobs.execute_batch("CREATE TABLE tasks(vid TEXT PRIMARY KEY,path TEXT,stage TEXT,priority INTEGER,is_new INTEGER,created_at REAL,data TEXT,manual INTEGER,deferred INTEGER,note TEXT);").unwrap();
+        let orig_data = json!({
+            "ready": true,
+            "candidates": [],
+            "face": {"unknown_group": "", "bulky": "FACE_BLOB_MARKER"},
+            "watermark": {"status": "done", "pipeline": "ocr-v1", "candidates": [], "bulky": "WM_BLOB_MARKER"}
+        });
+        for i in 0..30 {
+            let vid = format!("v{i:02}");
+            let file = format!("/fixture/{vid}.mp4");
+            jobs.execute(
+                "INSERT INTO tasks VALUES(?,?,'review',0,?,?,?,0,0,'')",
+                params![&vid, &file, 100 - i as i64, 0, orig_data.to_string()],
+            )
+            .unwrap();
+        }
+
+        let op_obs = db::open_readonly(&config.state_db()).unwrap();
+        let op_ver0: i64 = op_obs
+            .pragma_query_value(None, "data_version", |r| r.get(0))
+            .unwrap();
+
+        let mut engine = Engine::open_preview(config.clone()).unwrap();
+        let page0 = execute(&mut engine, "review-page", json!({})).unwrap();
+        let sid = page0["session"].as_str().unwrap().to_owned();
+        assert_eq!(page0["total"], 30);
+        assert_eq!(page0["rows"].as_array().unwrap().len(), 24);
+        let first_vid = page0["rows"][0]["vid"].as_str().unwrap().to_owned();
+        let first_token = page0["rows"][0]["review_token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let sc_obs = sidecar_readonly(&config).unwrap();
+        let snap_raw: String = sc_obs
+            .query_row(
+                "SELECT snapshot FROM session_snapshots WHERE id=?",
+                [&sid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(!snap_raw.contains("FACE_BLOB_MARKER"));
+        assert!(!snap_raw.contains("WM_BLOB_MARKER"));
+        let item_count_0: i64 = sc_obs
+            .query_row(
+                "SELECT COUNT(*) FROM session_items WHERE session=?",
+                [&sid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(item_count_0, 24);
+
+        let sc_ver0: i64 = sc_obs
+            .pragma_query_value(None, "data_version", |r| r.get(0))
+            .unwrap();
+        let page0_revisit = execute(&mut engine, "review-page", json!({"session": sid})).unwrap();
+        assert_eq!(page0_revisit["rows"][0]["review_token"], first_token);
+        let op_ver1: i64 = op_obs
+            .pragma_query_value(None, "data_version", |r| r.get(0))
+            .unwrap();
+        let sc_ver1: i64 = sc_obs
+            .pragma_query_value(None, "data_version", |r| r.get(0))
+            .unwrap();
+        assert_eq!(op_ver0, op_ver1);
+        assert_eq!(sc_ver0, sc_ver1);
+
+        let mut mutated = orig_data.clone();
+        mutated["kind"] = json!("suggested");
+        mutated["suggested"] = json!("Mutated");
+        jobs.execute(
+            "UPDATE tasks SET data=? WHERE vid=?",
+            params![mutated.to_string(), &first_vid],
+        )
+        .unwrap();
+
+        let status = execute(&mut engine, "review-status", json!({"session": sid})).unwrap();
+        assert_eq!(status["has_updates"], true);
+        assert!(status["changed"].as_u64().unwrap() >= 1);
+
+        let page0_after_edit =
+            execute(&mut engine, "review-page", json!({"session": sid})).unwrap();
+        assert_eq!(page0_after_edit["rows"][0]["data"], orig_data);
+        assert_eq!(page0_after_edit["rows"][0]["review_token"], first_token);
+
+        let page1 = execute(
+            &mut engine,
+            "review-page",
+            json!({"session": sid, "page": "1"}),
+        )
+        .unwrap();
+        assert_eq!(page1["rows"].as_array().unwrap().len(), 6);
+        let item_count_1: i64 = sc_obs
+            .query_row(
+                "SELECT COUNT(*) FROM session_items WHERE session=?",
+                [&sid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(item_count_1, 30);
+
+        drop(sc_obs);
+        drop(op_obs);
         drop(engine);
         drop(jobs);
         drop(faces);
@@ -1723,6 +2752,29 @@ mod alias_snapshot_tests {
         assert!(!map.contains_key("v5"));
         assert_eq!(map.len(), 4);
 
+        let map_hit = dispositions(&config).unwrap();
+        assert!(Arc::ptr_eq(&map, &map_hit));
+
+        let rw = db::open(&config.state_db()).unwrap();
+        rw.execute(
+            "INSERT INTO operations(id,request_hash,plan,status,phase) VALUES('op-11','h',?,'complete','complete')",
+            [json!({"action": "review-note", "request": {"payload": {"vids": ["v6"]}}}).to_string()],
+        )
+        .unwrap();
+        let map_new = dispositions(&config).unwrap();
+        assert!(!Arc::ptr_eq(&map, &map_new));
+        assert_eq!(map_new.get("v6"), Some(&json!("op-11")));
+
+        rw.execute(
+            "UPDATE operations SET status='complete', phase='complete' WHERE id='op-pending'",
+            [],
+        )
+        .unwrap();
+        let map_ooo = dispositions(&config).unwrap();
+        assert!(!Arc::ptr_eq(&map_new, &map_ooo));
+        assert_eq!(map_ooo.get("v2"), Some(&json!("op-pending")));
+
+        drop(rw);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1838,6 +2890,26 @@ mod alias_snapshot_tests {
         .unwrap();
         assert_eq!(validated.len(), 1);
         assert_eq!(validated[0]["vid"], "v-leg");
+
+        // Case 3: Schema v2 snapshot stored directly in review-sessions.sqlite3.
+        let v2_sid = "sess-v2-sidecar";
+        let v2_snap = json!({
+            "schema_version": 2,
+            "clusters": [],
+            "evidence": [ev]
+        });
+        let sw = sidecar_write(&config).unwrap();
+        sw.execute(
+            "INSERT INTO session_snapshots VALUES(?, unixepoch() + 3600, ?)",
+            params![v2_sid, v2_snap.to_string()],
+        )
+        .unwrap();
+        drop(sw);
+        let v2_page = execute(&mut engine, "review-page", json!({"session": v2_sid})).unwrap();
+        assert_eq!(v2_page["rows"].as_array().unwrap().len(), 1);
+        assert_eq!(v2_page["rows"][0]["vid"], "v-leg");
+        let v2_status = execute(&mut engine, "review-status", json!({"session": v2_sid})).unwrap();
+        assert_eq!(v2_status["has_updates"], false);
 
         drop(engine);
         drop(store);

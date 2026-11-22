@@ -361,29 +361,34 @@ impl MaterialReader {
         let manual = if path.exists() {
             match only_vids {
                 Some(filter) if filter.is_empty() => Some(BTreeMap::new()),
-                Some(filter) if filter.len() <= 64 => {
+                Some(filter) if filter.len() <= 500 => {
                     let conn = db::open_readonly(&path)?;
                     let columns = db::columns(&conn, "tasks")?;
                     let selected: Vec<_> = ["vid", "manual", "deferred", "note"]
                         .into_iter()
                         .filter(|key| columns.iter().any(|c| c == key))
                         .collect();
-                    let placeholders = std::iter::repeat_n("?", filter.len())
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    let sql = format!(
-                        "SELECT {} FROM tasks WHERE vid IN ({placeholders}) ORDER BY vid",
-                        selected.join(",")
-                    );
-                    Some(
-                        db::rows(&conn, &sql, rusqlite::params_from_iter(filter.iter()))?
-                            .into_iter()
-                            .filter_map(|row| {
-                                let vid = row["vid"].as_str().map(str::to_owned)?;
-                                Some((vid, row))
-                            })
-                            .collect(),
-                    )
+                    let vid_list: Vec<&str> = filter.iter().map(String::as_str).collect();
+                    let mut map = BTreeMap::new();
+                    for chunk in vid_list.chunks(250) {
+                        let placeholders = std::iter::repeat_n("?", chunk.len())
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        let sql = format!(
+                            "SELECT {} FROM tasks WHERE vid IN ({placeholders}) ORDER BY vid",
+                            selected.join(",")
+                        );
+                        for row in db::rows(
+                            &conn,
+                            &sql,
+                            rusqlite::params_from_iter(chunk.iter().copied()),
+                        )? {
+                            if let Some(vid) = row["vid"].as_str().map(str::to_owned) {
+                                map.insert(vid, row);
+                            }
+                        }
+                    }
+                    Some(map)
                 }
                 _ => {
                     let conn = db::open_readonly(&path)?;
@@ -411,7 +416,7 @@ impl MaterialReader {
             None
         };
         let sources = match only_vids {
-            Some(filter) if filter.len() <= 64 => review::sources_for_vids(config, filter)?,
+            Some(filter) if filter.len() <= 500 => review::sources_for_vids(config, filter)?,
             _ => review::sources(config)?,
         };
         Ok(Self {
