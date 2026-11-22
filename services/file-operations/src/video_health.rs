@@ -10,14 +10,14 @@ use serde_json::{Value, json};
 #[cfg(not(test))]
 use std::io::Write;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs,
     io::Read,
-    os::unix::process::CommandExt,
-    path::Path,
+    os::unix::{fs::MetadataExt, process::CommandExt},
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     sync::{
-        Arc,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -26,7 +26,91 @@ use std::{
 const HEALTH: &str = "video-health.json";
 const REPORTS: &str = "video-health-reports.json";
 const DAY: i64 = 86400;
+const HEALTH_CACHE_CAP: usize = 16;
 static UNREAPED: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Clone, PartialEq, Eq)]
+struct HealthFileStamp {
+    dev: u64,
+    ino: u64,
+    len: u64,
+    mtime_ns: String,
+    ctime: i64,
+    ctime_nsec: i64,
+}
+
+type HiddenCacheEntry = (PathBuf, HealthFileStamp, Arc<BTreeSet<String>>);
+
+fn hidden_candidates_cache() -> &'static Mutex<VecDeque<HiddenCacheEntry>> {
+    static CACHE: OnceLock<Mutex<VecDeque<HiddenCacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+fn evict_hidden_candidates(path: &Path) {
+    if let Ok(mut guard) = hidden_candidates_cache().lock() {
+        guard.retain(|(p, _, _)| p != path);
+    }
+}
+
+pub fn hidden_candidates(config: &Config) -> Result<Arc<BTreeSet<String>>> {
+    let path = config.base.join(HEALTH);
+    let meta = match fs::symlink_metadata(&path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            evict_hidden_candidates(&path);
+            return Ok(Arc::new(BTreeSet::new()));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    if meta.file_type().is_symlink() {
+        evict_hidden_candidates(&path);
+        return Err(Error::conflict("元数据不能是符号链接").at(path.display().to_string()));
+    }
+    let stamp = HealthFileStamp {
+        dev: meta.dev(),
+        ino: meta.ino(),
+        len: meta.len(),
+        mtime_ns: files::mtime_ns(&meta),
+        ctime: meta.ctime(),
+        ctime_nsec: meta.ctime_nsec(),
+    };
+    if let Ok(guard) = hidden_candidates_cache().lock()
+        && let Some((_, cached_stamp, cached)) = guard.iter().find(|(p, _, _)| p == &path)
+        && cached_stamp == &stamp
+    {
+        return Ok(cached.clone());
+    }
+    let report = match review::read(config, HEALTH, json!({})) {
+        Ok((_, value)) => value,
+        Err(e) => {
+            evict_hidden_candidates(&path);
+            return Err(e);
+        }
+    };
+    if report.get("records").is_some_and(|rows| !rows.is_object()) {
+        evict_hidden_candidates(&path);
+        return Err(Error::new(503, "health_contract", "体检记录损坏，无法读取"));
+    }
+    let set: Arc<BTreeSet<String>> = Arc::new(
+        report["records"]
+            .as_object()
+            .map(|rows| {
+                rows.iter()
+                    .filter(|(_, row)| row["hidden"] == true)
+                    .map(|(vid, _)| vid.clone())
+                    .collect::<BTreeSet<String>>()
+            })
+            .unwrap_or_default(),
+    );
+    if let Ok(mut guard) = hidden_candidates_cache().lock() {
+        guard.retain(|(p, _, _)| p != &path);
+        while guard.len() >= HEALTH_CACHE_CAP {
+            guard.pop_front();
+        }
+        guard.push_back((path, stamp, set.clone()));
+    }
+    Ok(set)
+}
 pub fn now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1451,6 +1535,87 @@ mod tests {
         );
         assert_eq!(result.unwrap_err().code, "probe_unavailable");
         assert_eq!(fs::read_dir(c.state_dir()).unwrap().count(), 0);
+        fs::remove_dir_all(c.fixture.unwrap()).unwrap();
+    }
+
+    #[test]
+    fn hidden_candidates_caches_by_file_stamp_and_invalidates_safely() {
+        let c = fixture();
+        let health_path = c.base.join(HEALTH);
+
+        // Missing file returns empty set without error.
+        let empty = hidden_candidates(&c).unwrap();
+        assert!(empty.is_empty());
+
+        // Present file is parsed and cached across untouched reads.
+        write(
+            &c,
+            HEALTH,
+            json!({
+                "records": {
+                    "v1": {"hidden": true, "status": "corrupt"},
+                    "v2": {"hidden": false, "status": "healthy"}
+                }
+            }),
+        );
+        let first = hidden_candidates(&c).unwrap();
+        assert_eq!(first.iter().cloned().collect::<Vec<_>>(), vec!["v1"]);
+        let second = hidden_candidates(&c).unwrap();
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "unchanged video-health.json should hit process-local Arc cache"
+        );
+
+        // Modifying content changes file stamp and refreshes cache.
+        write(
+            &c,
+            HEALTH,
+            json!({
+                "records": {
+                    "v1": {"hidden": false, "status": "healthy"},
+                    "v2": {"hidden": true, "status": "missing"},
+                    "v3": {"hidden": true, "status": "corrupt"}
+                }
+            }),
+        );
+        let updated = hidden_candidates(&c).unwrap();
+        assert!(!Arc::ptr_eq(&first, &updated));
+        assert_eq!(
+            updated.iter().cloned().collect::<Vec<_>>(),
+            vec!["v2", "v3"]
+        );
+
+        // Corrupted JSON must error and evict cache rather than returning stale data.
+        fs::write(&health_path, "{broken-json").unwrap();
+        assert!(hidden_candidates(&c).is_err());
+
+        // Non-object `records` must error with 503 health_contract.
+        write(&c, HEALTH, json!({"records": []}));
+        let err = hidden_candidates(&c).unwrap_err();
+        assert_eq!(err.status, 503);
+        assert_eq!(err.code, "health_contract");
+
+        // Restoring valid content works after eviction.
+        write(
+            &c,
+            HEALTH,
+            json!({"records": {"v4": {"hidden": true}}}),
+        );
+        let recovered = hidden_candidates(&c).unwrap();
+        assert_eq!(recovered.iter().cloned().collect::<Vec<_>>(), vec!["v4"]);
+
+        // Symlink rejection.
+        let outside = c.base.join("outside-health.json");
+        fs::write(&outside, json!({"records": {"v9": {"hidden": true}}}).to_string()).unwrap();
+        fs::remove_file(&health_path).unwrap();
+        std::os::unix::fs::symlink(&outside, &health_path).unwrap();
+        let sym_err = hidden_candidates(&c).unwrap_err();
+        assert_eq!(sym_err.status, 409);
+
+        // Deleting file evicts and returns empty again.
+        fs::remove_file(&health_path).unwrap();
+        assert!(hidden_candidates(&c).unwrap().is_empty());
+
         fs::remove_dir_all(c.fixture.unwrap()).unwrap();
     }
 }

@@ -15,7 +15,6 @@ use std::{
 };
 const TTL: i64 = 8 * 60 * 60;
 pub const MAX_ACTIVE_SESSIONS: i64 = 16;
-const SIDECAR_MARKER: &str = "{\"schema_version\":2,\"sidecar\":true}";
 
 struct CachedSession {
     db_path: PathBuf,
@@ -80,49 +79,71 @@ fn sidecar_write(config: &Config) -> Result<rusqlite::Connection> {
             | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
     conn.busy_timeout(std::time::Duration::from_secs(30))?;
-    let ready: bool = conn.query_row(
+    let has_snapshots: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_snapshots')",
         [],
         |r| r.get(0),
     )?;
-    if !ready {
+    let has_deliveries: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='review_deliveries')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_snapshots {
+        conn.execute_batch("PRAGMA auto_vacuum = INCREMENTAL; PRAGMA journal_mode = WAL;")?;
+    }
+    conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA synchronous = NORMAL;")?;
+    if !has_snapshots || !has_deliveries {
         conn.execute_batch(
-            "PRAGMA auto_vacuum = INCREMENTAL; PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; CREATE TABLE IF NOT EXISTS session_snapshots(id TEXT PRIMARY KEY, expires INTEGER NOT NULL, snapshot TEXT NOT NULL);",
+            "CREATE TABLE IF NOT EXISTS session_snapshots(id TEXT PRIMARY KEY, expires INTEGER NOT NULL, snapshot TEXT NOT NULL);
+             CREATE TABLE IF NOT EXISTS review_deliveries(token TEXT PRIMARY KEY, session TEXT NOT NULL, vid TEXT NOT NULL, evidence TEXT NOT NULL, FOREIGN KEY(session) REFERENCES session_snapshots(id) ON DELETE CASCADE);
+             CREATE INDEX IF NOT EXISTS review_delivery_session ON review_deliveries(session, vid);",
         )?;
-    } else {
-        conn.execute_batch("PRAGMA synchronous = NORMAL;")?;
     }
     Ok(conn)
 }
 fn sidecar_readonly(config: &Config) -> Result<rusqlite::Connection> {
     db::open_readonly(&config.review_sessions_db())
 }
-fn prune_sidecar_with_conn(conn: &mut rusqlite::Connection, active_ids: &[String]) -> Result<()> {
-    let deleted = {
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let deleted = if active_ids.is_empty() {
-            tx.execute("DELETE FROM session_snapshots", [])?
-        } else {
-            let placeholders = std::iter::repeat_n("?", active_ids.len())
-                .collect::<Vec<_>>()
-                .join(",");
-            let sql = format!("DELETE FROM session_snapshots WHERE id NOT IN ({placeholders})");
-            tx.execute(&sql, rusqlite::params_from_iter(active_ids.iter()))?
-        };
-        tx.commit()?;
-        deleted
-    };
-    if deleted > 0 {
-        let _ = conn.execute_batch("PRAGMA incremental_vacuum(2000);");
-    }
-    Ok(())
+fn sidecar_has_deliveries_table(conn: &rusqlite::Connection) -> bool {
+    conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='review_deliveries')",
+        [],
+        |r| r.get(0),
+    )
+    .unwrap_or(false)
 }
-pub fn prune_sidecar(config: &Config, active_ids: &[String]) -> Result<()> {
+fn maybe_incremental_vacuum(
+    conn: &rusqlite::Connection,
+    freelist_threshold: i64,
+    max_pages: i64,
+) {
+    let freelist: i64 = conn
+        .pragma_query_value(None, "freelist_count", |r| r.get(0))
+        .unwrap_or(0);
+    if freelist > freelist_threshold {
+        let _ = conn.execute_batch(&format!("PRAGMA incremental_vacuum({max_pages});"));
+    }
+}
+pub fn cleanup_sidecar(config: &Config) -> Result<()> {
     if !config.review_sessions_db().exists() {
         return Ok(());
     }
+    let _guard = session_write_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
     let mut conn = sidecar_write(config)?;
-    prune_sidecar_with_conn(&mut conn, active_ids)
+    {
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute("DELETE FROM session_snapshots WHERE expires<=unixepoch()", [])?;
+        tx.execute(
+            "DELETE FROM session_snapshots WHERE id NOT IN (SELECT id FROM session_snapshots ORDER BY expires DESC, rowid DESC LIMIT ?1)",
+            [MAX_ACTIVE_SESSIONS],
+        )?;
+        tx.commit()?;
+    }
+    maybe_incremental_vacuum(&conn, 0, 4000);
+    Ok(())
 }
 fn split_material(mut value: Value) -> (String, Value) {
     let manual = value
@@ -407,24 +428,12 @@ fn text_evidence(t: &Value) -> Value {
     json!({"folder":t["data"]["folder"],"watermark":if w.is_null(){Value::Null}else{json!({"pipeline":w["pipeline"],"status":w["status"],"candidates":w["candidates"]})}})
 }
 struct HealthReader {
-    candidates: BTreeSet<String>,
+    candidates: Arc<BTreeSet<String>>,
 }
 impl HealthReader {
     fn new(config: &Config) -> Result<Self> {
-        let report = review::read(config, "video-health.json", json!({}))?.1;
-        if report.get("records").is_some_and(|rows| !rows.is_object()) {
-            return Err(Error::new(503, "health_contract", "体检记录损坏，无法读取"));
-        }
         Ok(Self {
-            candidates: report["records"]
-                .as_object()
-                .map(|rows| {
-                    rows.iter()
-                        .filter(|(_, row)| row["hidden"] == true)
-                        .map(|(vid, _)| vid.clone())
-                        .collect()
-                })
-                .unwrap_or_default(),
+            candidates: crate::video_health::hidden_candidates(config)?,
         })
     }
     fn state(&self, config: &Config, t: &Value) -> Result<Value> {
@@ -444,23 +453,32 @@ impl HealthReader {
 }
 fn dispositions(config: &Config) -> Result<BTreeMap<String, Value>> {
     let conn = schema_readonly(config)?;
+    let mut stmt = conn.prepare(
+        "SELECT id, \
+                CASE WHEN json_type(plan,'$.request.payload.vids')='array' THEN json_extract(plan,'$.request.payload.vids') END, \
+                CASE WHEN json_type(plan,'$.request.payload.vid')='text' THEN json_extract(plan,'$.request.payload.vid') END \
+         FROM operations INDEXED BY idx_operations_complete_action \
+         WHERE status='complete' \
+           AND json_extract(plan,'$.action') IN ('queue-confirm','queue-undo','review-note','review-defer','review-restore','claim-decide') \
+         ORDER BY rowid",
+    )?;
+    let mut rows = stmt.query([])?;
     let mut result = BTreeMap::new();
-    for row in db::rows(
-        &conn,
-        "SELECT id,plan FROM operations WHERE status='complete' AND json_extract(plan,'$.action') IN ('queue-confirm','queue-undo','review-note','review-defer','review-restore','claim-decide') ORDER BY rowid",
-        [],
-    )? {
-        let plan: Value = serde_json::from_str(row["plan"].as_str().unwrap())?;
-        let body = &plan["request"]["payload"];
-        for vid in body["vids"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .chain(std::iter::once(&body["vid"]))
+    while let Some(row) = rows.next()? {
+        let id: String = row.get(0)?;
+        if let rusqlite::types::ValueRef::Text(raw_vids) = row.get_ref(1)?
+            && let Ok(Value::Array(arr)) = serde_json::from_slice::<Value>(raw_vids)
         {
-            if let Some(vid) = vid.as_str() {
-                result.insert(vid.into(), row["id"].clone());
+            for vid in arr {
+                if let Some(vid) = vid.as_str() {
+                    result.insert(vid.to_owned(), Value::String(id.clone()));
+                }
             }
+        }
+        if let rusqlite::types::ValueRef::Text(single) = row.get_ref(2)?
+            && let Ok(vid) = std::str::from_utf8(single)
+        {
+            result.insert(vid.to_owned(), Value::String(id.clone()));
         }
     }
     Ok(result)
@@ -553,7 +571,45 @@ fn evidence(
         "deferred_seen": review::number(&t["deferred"]).unwrap_or(0) != 0,
     }))
 }
-fn read(config: &Config, id: &str) -> Result<Arc<Value>> {
+fn read_session(config: &Config, id: &str) -> Result<(Arc<Value>, bool)> {
+    let sidecar_path = config.review_sessions_db();
+    if sidecar_path.exists() {
+        let sconn = sidecar_readonly(config)?;
+        let expires: Option<i64> = sconn
+            .query_row(
+                "SELECT expires FROM session_snapshots WHERE id=? AND expires>unixepoch()",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(expires) = expires {
+            if let Ok(mut guard) = session_cache().lock()
+                && let Some(pos) = guard.iter().position(|entry| {
+                    entry.db_path == sidecar_path && entry.id == id && entry.expires == expires
+                })
+            {
+                let hit = guard.remove(pos).unwrap();
+                let snapshot = hit.snapshot.clone();
+                guard.push_back(hit);
+                return Ok((snapshot, true));
+            }
+            let raw: Option<String> = sconn
+                .query_row(
+                    "SELECT snapshot FROM session_snapshots WHERE id=? AND expires>unixepoch()",
+                    [id],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let value: Value = serde_json::from_str(&raw.ok_or_else(expired)?)?;
+            if value["schema_version"] != 1 && value["schema_version"] != 2 {
+                return Err(expired());
+            }
+            let arc = Arc::new(value);
+            session_cache_put(&sidecar_path, id, expires, arc.clone());
+            return Ok((arc, true));
+        }
+    }
+
     let db_path = config.state_db();
     let conn = schema_readonly(config)?;
     let expires: Option<i64> = conn
@@ -572,7 +628,7 @@ fn read(config: &Config, id: &str) -> Result<Arc<Value>> {
         let hit = guard.remove(pos).unwrap();
         let snapshot = hit.snapshot.clone();
         guard.push_back(hit);
-        return Ok(snapshot);
+        return Ok((snapshot, false));
     }
     let raw: Option<String> = conn
         .query_row(
@@ -581,26 +637,19 @@ fn read(config: &Config, id: &str) -> Result<Arc<Value>> {
             |r| r.get(0),
         )
         .optional()?;
-    let mut value: Value = serde_json::from_str(&raw.ok_or_else(expired)?)?;
+    let value: Value = serde_json::from_str(&raw.ok_or_else(expired)?)?;
     if value["sidecar"] == true {
-        if !config.review_sessions_db().exists() {
-            return Err(expired());
-        }
-        let sidecar_raw: Option<String> = sidecar_readonly(config)?
-            .query_row(
-                "SELECT snapshot FROM session_snapshots WHERE id=?",
-                [id],
-                |r| r.get(0),
-            )
-            .optional()?;
-        value = serde_json::from_str(&sidecar_raw.ok_or_else(expired)?)?;
+        return Err(expired());
     }
     if value["schema_version"] != 1 && value["schema_version"] != 2 {
         return Err(expired());
     }
     let arc = Arc::new(value);
     session_cache_put(&db_path, id, expires, arc.clone());
-    Ok(arc)
+    Ok((arc, false))
+}
+fn read(config: &Config, id: &str) -> Result<Arc<Value>> {
+    Ok(read_session(config, id)?.0)
 }
 struct AmendedSnapshot {
     base: Arc<Value>,
@@ -736,6 +785,12 @@ pub fn validate(config: &Config, body: &Value) -> Result<Vec<Value>> {
     let ids = review::vids(&body["vids"])?;
     let id_set: BTreeSet<String> = ids.iter().cloned().collect();
     let conn = schema_readonly(config)?;
+    let sidecar_ro = if config.review_sessions_db().exists() {
+        let ro = sidecar_readonly(config)?;
+        sidecar_has_deliveries_table(&ro).then_some(ro)
+    } else {
+        None
+    };
     let mut rows = vec![];
     let material = shared_metadata::MaterialReader::new(config)?;
     let current = tasks_filtered(config, material.aliases(), Some(&id_set), false)?;
@@ -749,13 +804,25 @@ pub fn validate(config: &Config, body: &Value) -> Result<Vec<Value>> {
                 "所选视频缺少本次已展示证据，请重新打开该页",
             )
         })?;
-        let raw: Option<String> = conn
-            .query_row(
+        let mut raw: Option<String> = if let Some(ref sro) = sidecar_ro {
+            sro.query_row(
                 "SELECT evidence FROM review_deliveries WHERE token=? AND session=? AND vid=?",
                 params![token, session, vid],
                 |r| r.get(0),
             )
-            .optional()?;
+            .optional()?
+        } else {
+            None
+        };
+        if raw.is_none() {
+            raw = conn
+                .query_row(
+                    "SELECT evidence FROM review_deliveries WHERE token=? AND session=? AND vid=?",
+                    params![token, session, vid],
+                    |r| r.get(0),
+                )
+                .optional()?;
+        }
         let e: Value = serde_json::from_str(
             &raw.ok_or_else(|| Error::new(409, "review_not_viewed", "视频未在本次会话展示"))?,
         )?;
@@ -801,17 +868,22 @@ pub fn execute(engine: &mut Engine, command: &str, body: Value) -> Result<Value>
         .map(str::to_owned);
     let created = id.is_none();
     let need_live_diff = created || command == "review-status";
-    let (id, snapshot, changed_count, waiting, refreshing) = if !need_live_diff {
+    let (id, snapshot, in_sidecar, changed_count, waiting, refreshing) = if !need_live_diff {
         let id = id.unwrap();
-        let snapshot = amended(config, &id, read(config, &id)?)?;
+        let (base, in_sidecar) = read_session(config, &id)?;
+        let snapshot = amended(config, &id, base)?;
         let waiting = waiting_count(config)?;
-        (id, snapshot, 0usize, waiting, 0usize)
+        (id, snapshot, in_sidecar, 0usize, waiting, 0usize)
     } else {
         let material = shared_metadata::MaterialReader::new(config)?;
         let live = tasks_for_review(config, material.aliases())?;
         let health = HealthReader::new(config)?;
-        let id = match id {
-            Some(id) => id,
+        let (id, snapshot, in_sidecar) = match id {
+            Some(id) => {
+                let (base, in_sidecar) = read_session(config, &id)?;
+                let snap = amended(config, &id, base)?;
+                (id, snap, in_sidecar)
+            }
             None => {
                 if command == "review-status" {
                     return Err(expired());
@@ -853,58 +925,49 @@ pub fn execute(engine: &mut Engine, command: &str, body: Value) -> Result<Value>
                         .unwrap_or_else(|e| e.into_inner());
                     let mut sidecar = sidecar_write(config)?;
                     let expires = now(&sidecar)? + TTL;
-                    {
+                    let deleted = {
                         let stx = sidecar
                             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                        let mut deleted = stx.execute(
+                            "DELETE FROM session_snapshots WHERE expires<=unixepoch()",
+                            [],
+                        )?;
+                        if let Some(old_id) = &replace_session
+                            && old_id != &id
+                        {
+                            deleted += stx.execute(
+                                "DELETE FROM session_snapshots WHERE id=?",
+                                [old_id],
+                            )?;
+                        }
+                        deleted += stx.execute(
+                            "DELETE FROM session_snapshots WHERE id NOT IN (SELECT id FROM session_snapshots ORDER BY expires DESC, rowid DESC LIMIT ?1)",
+                            [MAX_ACTIVE_SESSIONS - 1],
+                        )?;
                         stx.execute(
                             "INSERT OR REPLACE INTO session_snapshots VALUES(?,?,?)",
                             params![&id, expires, &raw],
                         )?;
                         stx.commit()?;
-                    }
-                    let active_ids: Vec<String> = {
-                        let mut conn = schema(config)?;
-                        let tx = conn
-                            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-                        let has_expired: bool = tx.query_row(
-                            "SELECT EXISTS(SELECT 1 FROM review_sessions WHERE expires<=unixepoch())",
-                            [],
-                            |r| r.get(0),
-                        )?;
-                        if has_expired {
-                            tx.execute("DELETE FROM review_sessions WHERE expires<=unixepoch()", [])?;
-                        }
-                        if let Some(old_id) = &replace_session
-                            && old_id != &id
-                        {
-                            tx.execute("DELETE FROM review_sessions WHERE id=?", [old_id])?;
-                        }
-                        tx.execute(
-                            "DELETE FROM review_sessions WHERE id NOT IN (SELECT id FROM review_sessions ORDER BY expires DESC, rowid DESC LIMIT ?1)",
-                            [MAX_ACTIVE_SESSIONS - 1],
-                        )?;
-                        tx.execute(
-                            "INSERT INTO review_sessions VALUES(?,?,?)",
-                            params![&id, expires, SIDECAR_MARKER],
-                        )?;
-                        let active = {
-                            let mut stmt = tx.prepare("SELECT id FROM review_sessions")?;
-                            let rows = stmt
-                                .query_map([], |r| r.get::<_, String>(0))?
-                                .collect::<std::result::Result<Vec<_>, _>>()?;
-                            rows
-                        };
-                        tx.commit()?;
-                        active
+                        deleted
                     };
-                    let _ = prune_sidecar_with_conn(&mut sidecar, &active_ids);
+                    if deleted > 0 {
+                        maybe_incremental_vacuum(&sidecar, 16_384, 256);
+                    }
                     expires
                 };
-                session_cache_put(&config.state_db(), &id, expires, Arc::new(snapshot));
-                id
+                let arc = Arc::new(snapshot);
+                session_cache_put(&config.review_sessions_db(), &id, expires, arc.clone());
+                (
+                    id,
+                    AmendedSnapshot {
+                        base: arc,
+                        overrides: BTreeMap::new(),
+                    },
+                    true,
+                )
             }
         };
-        let snapshot = amended(config, &id, read(config, &id)?)?;
         let mut changed_count = 0;
         if !created {
             let visible_by_id: BTreeMap<&str, &Value> = snapshot
@@ -954,7 +1017,7 @@ pub fn execute(engine: &mut Engine, command: &str, body: Value) -> Result<Value>
                     && review::number(&t["manual"]).unwrap_or(0) == 0
             })
             .count();
-        (id, snapshot, changed_count, waiting, refreshing)
+        (id, snapshot, in_sidecar, changed_count, waiting, refreshing)
     };
     if need_live_diff {
         crate::model::trim_allocator();
@@ -1098,7 +1161,102 @@ pub fn execute(engine: &mut Engine, command: &str, body: Value) -> Result<Value>
         .map(|n| n / limit)
         .unwrap_or_else(|| s("page").parse::<usize>().unwrap_or(0))
         .min(rows.len().saturating_sub(1) / limit);
-    let (delivered, current_epoch) = {
+    let (delivered, current_epoch) = if in_sidecar {
+        let mut delivered = vec![];
+        let mut missing: Vec<(String, Option<String>, String)> = vec![];
+        if created {
+            for e in rows
+                .iter()
+                .skip(page * limit)
+                .take(limit)
+                .filter(|e| is_remaining(e))
+            {
+                let raw = serde_json::to_string(e)?;
+                let vid = e["task"]["vid"].as_str().map(str::to_owned);
+                let token = uuid::Uuid::new_v4().to_string();
+                missing.push((token.clone(), vid, raw));
+                let mut task = e["task"].clone();
+                task["review_token"] = json!(token);
+                delivered.push(task);
+            }
+            let current_epoch = if !missing.is_empty() {
+                let _guard = session_write_lock()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let mut rw = sidecar_write(config)?;
+                let epoch = now(&rw)?;
+                let tx = rw.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                {
+                    let mut insert =
+                        tx.prepare("INSERT OR IGNORE INTO review_deliveries VALUES(?,?,?,?)")?;
+                    for (token, vid, raw) in &missing {
+                        insert.execute(params![token, &id, vid.as_deref(), raw])?;
+                    }
+                }
+                tx.commit()?;
+                epoch
+            } else {
+                let ro = sidecar_readonly(config)?;
+                now(&ro)?
+            };
+            (delivered, current_epoch)
+        } else {
+            let ro = sidecar_readonly(config)?;
+            let has_deliveries = sidecar_has_deliveries_table(&ro);
+            let mut stmt = if has_deliveries {
+                Some(ro.prepare(
+                    "SELECT token FROM review_deliveries WHERE session=? AND vid=? AND evidence=? LIMIT 1",
+                )?)
+            } else {
+                None
+            };
+            for e in rows
+                .iter()
+                .skip(page * limit)
+                .take(limit)
+                .filter(|e| is_remaining(e))
+            {
+                let raw = serde_json::to_string(e)?;
+                let vid = e["task"]["vid"].as_str();
+                let token = if let Some(ref mut s) = stmt {
+                    s.query_row(params![&id, vid, &raw], |r| r.get::<_, String>(0))
+                        .optional()?
+                } else {
+                    None
+                };
+                let token = match token {
+                    Some(existing) => existing,
+                    None => {
+                        let token = uuid::Uuid::new_v4().to_string();
+                        missing.push((token.clone(), vid.map(str::to_owned), raw));
+                        token
+                    }
+                };
+                let mut task = e["task"].clone();
+                task["review_token"] = json!(token);
+                delivered.push(task);
+            }
+            let current_epoch = now(&ro)?;
+            drop(stmt);
+            drop(ro);
+            if !missing.is_empty() {
+                let _guard = session_write_lock()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let mut rw = sidecar_write(config)?;
+                let tx = rw.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                {
+                    let mut insert =
+                        tx.prepare("INSERT OR IGNORE INTO review_deliveries VALUES(?,?,?,?)")?;
+                    for (token, vid, raw) in &missing {
+                        insert.execute(params![token, &id, vid.as_deref(), raw])?;
+                    }
+                }
+                tx.commit()?;
+            }
+            (delivered, current_epoch)
+        }
+    } else {
         let ro = schema_readonly(config)?;
         let mut stmt = ro.prepare(
             "SELECT token FROM review_deliveries WHERE session=? AND vid=? AND evidence=? LIMIT 1",
@@ -1293,6 +1451,7 @@ mod alias_snapshot_tests {
         let base = root.join("base");
         let media = root.join("media");
         fs::create_dir_all(base.join("file-operations-rust")).unwrap();
+        fs::create_dir_all(base.join("processing")).unwrap();
         fs::create_dir_all(&media).unwrap();
         let config = Config {
             base: base.clone(),
@@ -1303,54 +1462,29 @@ mod alias_snapshot_tests {
             fixture: None,
             parity_root: None,
         };
-        let store = crate::store::Store::start(&config).unwrap();
-        let session_id = "sess-nodup";
-        let snapshot = json!({
-            "schema_version": 1,
-            "clusters": [],
-            "evidence": [
-                {
-                    "task": {"vid": "v1", "name": "a.mp4", "path": "/tmp/a.mp4", "deferred": 0, "manual": 0, "data": {"kind": "none"}},
-                    "group": {"key": "none", "label": "无候选人物", "kind": "none"},
-                    "scope": {"vids": ["v1"], "people": [], "watermark_keys": []},
-                    "material": {},
-                    "text": {},
-                    "health": {"hidden": false},
-                    "disposition": null,
-                    "pending_seen": true,
-                    "deferred_seen": false,
-                    "pending_order": 0
-                },
-                {
-                    "task": {"vid": "v2", "name": "b.mp4", "path": "/tmp/b.mp4", "deferred": 0, "manual": 0, "data": {"kind": "none"}},
-                    "group": {"key": "none", "label": "无候选人物", "kind": "none"},
-                    "scope": {"vids": ["v2"], "people": [], "watermark_keys": []},
-                    "material": {},
-                    "text": {},
-                    "health": {"hidden": false},
-                    "disposition": null,
-                    "pending_seen": true,
-                    "deferred_seen": false,
-                    "pending_order": 1
-                }
-            ]
-        });
-        store
-            .db
-            .execute(
-                "INSERT INTO review_sessions VALUES(?, unixepoch() + 3600, ?)",
-                params![session_id, snapshot.to_string()],
+        drop(crate::store::Store::start(&config).unwrap());
+        let faces = rusqlite::Connection::open(base.join("faces.db")).unwrap();
+        faces
+            .execute_batch("CREATE TABLE videos(vid TEXT PRIMARY KEY,path TEXT);")
+            .unwrap();
+        let jobs = rusqlite::Connection::open(base.join("processing/processing.db")).unwrap();
+        jobs.execute_batch("CREATE TABLE tasks(vid TEXT PRIMARY KEY,path TEXT,stage TEXT,priority INTEGER,is_new INTEGER,created_at REAL,data TEXT,manual INTEGER,deferred INTEGER,note TEXT);").unwrap();
+        for (vid, file) in [("v1", "/fixture/a.mp4"), ("v2", "/fixture/b.mp4")] {
+            jobs.execute(
+                "INSERT INTO tasks VALUES(?,?,'review',0,0,0,?,0,0,'')",
+                [vid, file, &json!({"ready":true,"candidates":[]}).to_string()],
             )
             .unwrap();
-        drop(store);
+        }
 
-        let observer = db::open_readonly(&config.state_db()).unwrap();
-        let ver_before: i64 = observer
+        let op_observer = db::open_readonly(&config.state_db()).unwrap();
+        let op_ver_before: i64 = op_observer
             .pragma_query_value(None, "data_version", |r| r.get(0))
             .unwrap();
 
         let mut engine = Engine::open_preview(config.clone()).unwrap();
-        let first = execute(&mut engine, "review-page", json!({"session": session_id})).unwrap();
+        let first = execute(&mut engine, "review-page", json!({})).unwrap();
+        let session_id = first["session"].as_str().unwrap().to_owned();
         let first_tokens: Vec<_> = first["rows"]
             .as_array()
             .unwrap()
@@ -1359,13 +1493,18 @@ mod alias_snapshot_tests {
             .collect();
         assert_eq!(first_tokens.len(), 2);
 
-        let ver_after_first: i64 = observer
+        let op_ver_after_first: i64 = op_observer
             .pragma_query_value(None, "data_version", |r| r.get(0))
             .unwrap();
-        assert_ne!(
-            ver_before, ver_after_first,
-            "first page load should persist missing review_deliveries"
+        assert_eq!(
+            op_ver_before, op_ver_after_first,
+            "creating a review session and delivering tokens must not write operations.sqlite3"
         );
+
+        let sc_observer = sidecar_readonly(&config).unwrap();
+        let sc_ver_after_first: i64 = sc_observer
+            .pragma_query_value(None, "data_version", |r| r.get(0))
+            .unwrap();
 
         let second = execute(&mut engine, "review-page", json!({"session": session_id})).unwrap();
         let second_tokens: Vec<_> = second["rows"]
@@ -1376,15 +1515,25 @@ mod alias_snapshot_tests {
             .collect();
         assert_eq!(first_tokens, second_tokens);
 
-        let ver_after_second: i64 = observer
+        let op_ver_after_second: i64 = op_observer
+            .pragma_query_value(None, "data_version", |r| r.get(0))
+            .unwrap();
+        let sc_ver_after_second: i64 = sc_observer
             .pragma_query_value(None, "data_version", |r| r.get(0))
             .unwrap();
         assert_eq!(
-            ver_after_first, ver_after_second,
-            "revisiting a rendered review page must not write to SQLite"
+            op_ver_before, op_ver_after_second,
+            "revisiting a rendered review page must not write operations.sqlite3"
         );
-        drop(observer);
+        assert_eq!(
+            sc_ver_after_first, sc_ver_after_second,
+            "revisiting a rendered review page must not write review-sessions.sqlite3"
+        );
+        drop(sc_observer);
+        drop(op_observer);
         drop(engine);
+        drop(jobs);
+        drop(faces);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -1441,27 +1590,22 @@ mod alias_snapshot_tests {
         let op_count: i64 = op_conn
             .query_row("SELECT COUNT(*) FROM review_sessions", [], |r| r.get(0))
             .unwrap();
-        let max_marker_len: i64 = op_conn
-            .query_row(
-                "SELECT MAX(length(snapshot)) FROM review_sessions",
-                [],
-                |r| r.get(0),
-            )
+        let op_deliv_count: i64 = op_conn
+            .query_row("SELECT COUNT(*) FROM review_deliveries", [], |r| r.get(0))
             .unwrap();
-        let del_sessions: i64 = op_conn
+        assert_eq!(op_count, 0);
+        assert_eq!(op_deliv_count, 0);
+
+        let sc_conn = sidecar_readonly(&config).unwrap();
+        let sc_count: i64 = sc_conn
+            .query_row("SELECT COUNT(*) FROM session_snapshots", [], |r| r.get(0))
+            .unwrap();
+        let sc_del_sessions: i64 = sc_conn
             .query_row(
                 "SELECT COUNT(DISTINCT session) FROM review_deliveries",
                 [],
                 |r| r.get(0),
             )
-            .unwrap();
-        assert_eq!(op_count, MAX_ACTIVE_SESSIONS);
-        assert!(max_marker_len < 64);
-        assert!(del_sessions <= MAX_ACTIVE_SESSIONS);
-
-        let sc_conn = sidecar_readonly(&config).unwrap();
-        let sc_count: i64 = sc_conn
-            .query_row("SELECT COUNT(*) FROM session_snapshots", [], |r| r.get(0))
             .unwrap();
         let sc_raw: String = sc_conn
             .query_row(
@@ -1471,6 +1615,7 @@ mod alias_snapshot_tests {
             )
             .unwrap();
         assert_eq!(sc_count, MAX_ACTIVE_SESSIONS);
+        assert!(sc_del_sessions <= MAX_ACTIVE_SESSIONS);
         let sc_val: Value = serde_json::from_str(&sc_raw).unwrap();
         assert_eq!(sc_val["schema_version"], 2);
         assert_eq!(sc_val["clusters"][0]["vids"][0], "v1");
@@ -1481,6 +1626,221 @@ mod alias_snapshot_tests {
         drop(sc_conn);
         drop(op_conn);
         drop(engine);
+        drop(jobs);
+        drop(faces);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn dispositions_uses_partial_index_under_skew_and_handles_vids_and_scalar_vid() {
+        let root = fs::canonicalize("/tmp")
+            .unwrap()
+            .join(format!("face-review-disp-{}", uuid::Uuid::new_v4()));
+        let base = root.join("base");
+        let media = root.join("media");
+        fs::create_dir_all(base.join("file-operations-rust")).unwrap();
+        fs::create_dir_all(&media).unwrap();
+        let config = Config {
+            base,
+            media,
+            ledger: root.join("ledger.db"),
+            bind: "127.0.0.1:0".into(),
+            token: None,
+            fixture: None,
+            parity_root: None,
+        };
+        let store = crate::store::Store::start(&config).unwrap();
+        for i in 0..500 {
+            store
+                .db
+                .execute(
+                    "INSERT INTO operations(id,request_hash,plan,status,phase) VALUES(?1,'h','{\"action\":\"processing-result\"}','complete','complete')",
+                    [format!("op-pr-{i}")],
+                )
+                .unwrap();
+        }
+        let samples = [
+            ("op-1", "queue-confirm", json!({"vids": ["v1", 99, "v2"]})),
+            ("op-2", "review-note", json!({"vid": "v3", "vids": "not-array"})),
+            ("op-3", "review-defer", json!({"vids": ["v1"]})),
+            ("op-4", "review-restore", json!({"vids": ["v4"]})),
+            ("op-5", "claim-decide", json!({"vid": 123})),
+            ("op-6", "archive", json!({"vids": ["v1"]})),
+            ("op-7", "auto-archive", json!({"vids": ["v2"]})),
+            ("op-8", "merge-person", json!({"vids": ["v3"]})),
+            ("op-9", "person-batch", json!({"vids": ["v4"]})),
+            ("op-10", "metadata-write", json!({"vids": ["v5"]})),
+        ];
+        for (id, action, payload) in samples {
+            store
+                .db
+                .execute(
+                    "INSERT INTO operations(id,request_hash,plan,status,phase) VALUES(?1,'h',?2,'complete','complete')",
+                    params![
+                        id,
+                        json!({"action": action, "request": {"payload": payload}}).to_string()
+                    ],
+                )
+                .unwrap();
+        }
+        store
+            .db
+            .execute(
+                "INSERT INTO operations(id,request_hash,plan,status,phase) VALUES('op-pending','h',?,'running','file_moving')",
+                [json!({"action": "queue-confirm", "request": {"payload": {"vids": ["v2"]}}}).to_string()],
+            )
+            .unwrap();
+        store.db.execute_batch("ANALYZE;").unwrap();
+
+        let eqp: Vec<String> = store
+            .db
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT id, \
+                 CASE WHEN json_type(plan,'$.request.payload.vids')='array' THEN json_extract(plan,'$.request.payload.vids') END, \
+                 CASE WHEN json_type(plan,'$.request.payload.vid')='text' THEN json_extract(plan,'$.request.payload.vid') END \
+                 FROM operations INDEXED BY idx_operations_complete_action \
+                 WHERE status='complete' \
+                   AND json_extract(plan,'$.action') IN ('queue-confirm','queue-undo','review-note','review-defer','review-restore','claim-decide') \
+                 ORDER BY rowid",
+            )
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(
+            eqp.iter()
+                .any(|line| line.contains("idx_operations_complete_action")),
+            "expected idx_operations_complete_action in {eqp:?}"
+        );
+        drop(store);
+
+        let map = dispositions(&config).unwrap();
+        assert_eq!(map.get("v1"), Some(&json!("op-3")));
+        assert_eq!(map.get("v2"), Some(&json!("op-1")));
+        assert_eq!(map.get("v3"), Some(&json!("op-2")));
+        assert_eq!(map.get("v4"), Some(&json!("op-4")));
+        assert!(!map.contains_key("v5"));
+        assert_eq!(map.len(), 4);
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn legacy_inline_session_and_legacy_deliveries_remain_validatable() {
+        let root = fs::canonicalize("/tmp")
+            .unwrap()
+            .join(format!("face-review-legacy-{}", uuid::Uuid::new_v4()));
+        let base = root.join("base");
+        let media = root.join("media");
+        let video_path = media.join("pikpak/legacy.mp4");
+        fs::create_dir_all(base.join("file-operations-rust")).unwrap();
+        fs::create_dir_all(base.join("processing")).unwrap();
+        fs::create_dir_all(video_path.parent().unwrap()).unwrap();
+        fs::write(&video_path, b"legacy-video").unwrap();
+        let stat = fs::metadata(&video_path).unwrap();
+        let size = stat.len();
+        let mtime_ns = crate::files::mtime_ns(&stat);
+        let config = Config {
+            base: base.clone(),
+            media,
+            ledger: root.join("ledger.db"),
+            bind: "127.0.0.1:0".into(),
+            token: None,
+            fixture: None,
+            parity_root: None,
+        };
+        let store = crate::store::Store::start(&config).unwrap();
+        let faces = rusqlite::Connection::open(base.join("faces.db")).unwrap();
+        faces
+            .execute_batch("CREATE TABLE videos(vid TEXT PRIMARY KEY,path TEXT);")
+            .unwrap();
+        faces
+            .execute(
+                "INSERT INTO videos VALUES('v-leg', ?)",
+                [video_path.to_str().unwrap()],
+            )
+            .unwrap();
+        let jobs = rusqlite::Connection::open(base.join("processing/processing.db")).unwrap();
+        jobs.execute_batch("CREATE TABLE tasks(vid TEXT PRIMARY KEY,path TEXT,stage TEXT,priority INTEGER,is_new INTEGER,created_at REAL,data TEXT,manual INTEGER,deferred INTEGER,note TEXT);").unwrap();
+        jobs.execute(
+            "INSERT INTO tasks VALUES('v-leg', ?, 'review', 0, 0, 0, ?, 0, 0, '')",
+            [
+                video_path.to_str().unwrap(),
+                &json!({"ready":true,"candidates":[]}).to_string(),
+            ],
+        )
+        .unwrap();
+
+        // Case 1: Inline session stored directly in operations.sqlite3.
+        let inline_id = "sess-inline";
+        let inline_snap = json!({
+            "schema_version": 1,
+            "clusters": [],
+            "evidence": [{
+                "task": {"vid": "v-leg", "name": "legacy.mp4", "path": video_path.to_str().unwrap(), "size": size, "mtime_ns": mtime_ns, "deferred": 0, "manual": 0, "note": "", "data": {"kind": "none", "ready": true, "candidates": []}},
+                "group": {"key": "none", "label": "无候选人物", "kind": "none"},
+                "scope": {"vids": ["v-leg"], "people": [], "watermark_keys": []},
+                "material": {},
+                "text": {},
+                "health": {"hidden": false},
+                "disposition": null,
+                "pending_seen": true,
+                "deferred_seen": false,
+                "pending_order": 0
+            }]
+        });
+        store
+            .db
+            .execute(
+                "INSERT INTO review_sessions VALUES(?, unixepoch() + 3600, ?)",
+                params![inline_id, inline_snap.to_string()],
+            )
+            .unwrap();
+
+        let mut engine = Engine::open_preview(config.clone()).unwrap();
+        let inline_page =
+            execute(&mut engine, "review-page", json!({"session": inline_id})).unwrap();
+        assert_eq!(inline_page["rows"].as_array().unwrap().len(), 1);
+
+        // Case 2: Sidecar session whose delivery token resides in operations.sqlite3.review_deliveries.
+        let sidecar_page = execute(&mut engine, "review-page", json!({})).unwrap();
+        let sc_sid = sidecar_page["session"].as_str().unwrap().to_owned();
+        let legacy_token = "tok-in-operations-db";
+        let material = shared_metadata::MaterialReader::new(&config).unwrap();
+        let health = HealthReader::new(&config).unwrap();
+        let disp = dispositions(&config).unwrap();
+        let live = tasks_for_review(&config, material.aliases()).unwrap();
+        let ev = evidence(&config, &live[0], &material, &health, &disp).unwrap();
+        store
+            .db
+            .execute(
+                "INSERT INTO review_sessions VALUES(?, unixepoch() + 3600, '{\"schema_version\":2,\"sidecar\":true}')",
+                [&sc_sid],
+            )
+            .unwrap();
+        store
+            .db
+            .execute(
+                "INSERT INTO review_deliveries VALUES(?, ?, 'v-leg', ?)",
+                params![legacy_token, &sc_sid, ev.to_string()],
+            )
+            .unwrap();
+
+        let validated = validate(
+            &config,
+            &json!({
+                "review_session": sc_sid,
+                "vids": ["v-leg"],
+                "review_tokens": {"v-leg": legacy_token}
+            }),
+        )
+        .unwrap();
+        assert_eq!(validated.len(), 1);
+        assert_eq!(validated[0]["vid"], "v-leg");
+
+        drop(engine);
+        drop(store);
         drop(jobs);
         drop(faces);
         fs::remove_dir_all(root).unwrap();

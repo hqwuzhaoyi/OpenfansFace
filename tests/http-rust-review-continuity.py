@@ -59,7 +59,7 @@ def main():
   new=f.call('review-page');assert new['session']!=a['session'];t=new['rows'][0]
   target=Path(t['path']);target.write_bytes(target.read_bytes()+b'changed')
   f.call('queue-confirm',confirm(f,new,[t]),status=409)
-  with sqlite3.connect(f.base/'file-operations-rust/operations.sqlite3') as c:c.execute('UPDATE review_sessions SET expires=0 WHERE id=?',[a['session']])
+  with sqlite3.connect(f.base/'file-operations-rust/review-sessions.sqlite3') as c:c.execute('UPDATE session_snapshots SET expires=0 WHERE id=?',[a['session']])
   assert f.call('review-page',{'session':a['session']},status=409)['code']=='review_session_expired'
   f.call('review-status',{'session':str(uuid.uuid4())},status=409)
   print('PASS #18 native sessions: delivered/scoped evidence, facial recompute, immutable paging, exact receipts, restart, multi-tab, ABA, note/defer/restore, file/rule guards and expiry',f.root)

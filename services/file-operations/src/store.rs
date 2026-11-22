@@ -55,6 +55,7 @@ impl Store {
           CREATE INDEX IF NOT EXISTS idx_operations_status ON operations(status,created_at,id);
           CREATE INDEX IF NOT EXISTS idx_operations_complete_action ON operations(json_extract(plan,'$.action')) WHERE status='complete';
           CREATE INDEX IF NOT EXISTS idx_operations_complete_review_session ON operations(json_extract(plan,'$.request.payload.review_session')) WHERE status='complete';
+          CREATE INDEX IF NOT EXISTS idx_operations_archive_action ON operations(created_at DESC) WHERE json_extract(plan,'$.action') IN ('archive','auto-archive');
           PRAGMA user_version=9;")?;
         let has_stat1: bool = conn
             .query_row(
@@ -71,9 +72,17 @@ impl Store {
                     |r| r.get(0),
                 )
                 .unwrap_or(false);
-        if !has_action_stat {
+        let has_archive_stat = has_stat1
+            && conn
+                .query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sqlite_stat1 WHERE idx='idx_operations_archive_action')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(false);
+        if !has_action_stat || !has_archive_stat {
             let _ = conn.execute_batch(
-                "ANALYZE idx_operations_status; ANALYZE idx_operations_complete_action; ANALYZE idx_operations_complete_review_session;",
+                "ANALYZE idx_operations_status; ANALYZE idx_operations_complete_action; ANALYZE idx_operations_complete_review_session; ANALYZE idx_operations_archive_action;",
             );
         }
         let _ = conn.execute(
@@ -84,12 +93,7 @@ impl Store {
             "DELETE FROM review_sessions WHERE id NOT IN (SELECT id FROM review_sessions ORDER BY expires DESC, rowid DESC LIMIT ?1)",
             [crate::review_sessions::MAX_ACTIVE_SESSIONS],
         );
-        if let Ok(mut stmt) = conn.prepare("SELECT id FROM review_sessions")
-            && let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0))
-        {
-            let active: Vec<String> = rows.flatten().collect();
-            let _ = crate::review_sessions::prune_sidecar(config, &active);
-        }
+        let _ = crate::review_sessions::cleanup_sidecar(config);
         let _ = conn.execute(
             "DELETE FROM operations WHERE status='not_started' AND created_at < datetime('now','-2 hours') AND NOT EXISTS(SELECT 1 FROM steps WHERE operation_id=operations.id) AND NOT EXISTS(SELECT 1 FROM gates WHERE id=operations.id)",
             [],
@@ -300,6 +304,39 @@ fn compact_terminal_blobs(tx: &rusqlite::Transaction, id: &str) -> Result<()> {
             tx.execute(
                 "UPDATE operations SET evidence=? WHERE id=?",
                 params![serde_json::to_string(&value)?, id],
+            )?;
+        }
+    }
+    let plan_raw: Option<String> = tx
+        .query_row("SELECT plan FROM operations WHERE id=?", [id], |r| r.get(0))
+        .optional()?;
+    if let Some(raw) = plan_raw
+        && let Ok(mut plan) = serde_json::from_str::<Value>(&raw)
+        && let Some(docs) = plan
+            .get_mut("execution")
+            .and_then(|e| e.get_mut("data"))
+            .and_then(|d| d.get_mut("documents"))
+            .and_then(Value::as_array_mut)
+    {
+        let mut changed = false;
+        for doc in docs.iter_mut() {
+            if doc
+                .as_object()
+                .is_some_and(|o| o.contains_key("before") || o.contains_key("after"))
+            {
+                *doc = json!({
+                    "name": doc.get("name").cloned().unwrap_or(Value::Null),
+                    "before_hash": doc.get("before").filter(|v| !v.is_null()).map(hash),
+                    "after_hash": doc.get("after").filter(|v| !v.is_null()).map(hash),
+                    "compacted": true,
+                });
+                changed = true;
+            }
+        }
+        if changed {
+            tx.execute(
+                "UPDATE operations SET plan=? WHERE id=?",
+                params![serde_json::to_string(&plan)?, id],
             )?;
         }
     }
@@ -765,6 +802,179 @@ mod perf_index_tests {
         assert_eq!(jri["name"], "report.json");
         assert!(jri["before_hash"].is_string());
         assert!(jri["after_hash"].is_string());
+
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn archive_progress_uses_partial_index_under_skewed_distribution() {
+        let root = fs::canonicalize("/tmp")
+            .unwrap()
+            .join(format!("face-store-archive-idx-{}", uuid::Uuid::new_v4()));
+        let base = root.join("base");
+        let media = root.join("media");
+        fs::create_dir_all(&base).unwrap();
+        fs::create_dir_all(&media).unwrap();
+        let config = Config {
+            base,
+            media,
+            ledger: root.join("ledger.db"),
+            bind: "127.0.0.1:0".into(),
+            token: None,
+            fixture: None,
+            parity_root: None,
+        };
+        let store = Store::start(&config).unwrap();
+        for i in 0..250 {
+            store
+                .db
+                .execute(
+                    "INSERT INTO operations(id,request_hash,plan,status,phase,created_at) VALUES(?1,'h','{\"action\":\"processing-result\"}','complete','complete','2026-11-22 00:00:00')",
+                    [format!("pr-{i}")],
+                )
+                .unwrap();
+        }
+        store
+            .db
+            .execute(
+                "INSERT INTO operations(id,request_hash,plan,status,phase,created_at) VALUES('arch-old','h','{\"action\":\"archive\"}','complete','complete','2026-11-22 01:00:00')",
+                [],
+            )
+            .unwrap();
+        store
+            .db
+            .execute(
+                "INSERT INTO operations(id,request_hash,plan,status,phase,created_at) VALUES('arch-new','h','{\"action\":\"auto-archive\"}','running','file_moving','2026-11-22 02:00:00')",
+                [],
+            )
+            .unwrap();
+        store.db.execute_batch("ANALYZE;").unwrap();
+        let query = "SELECT id FROM operations INDEXED BY idx_operations_archive_action WHERE json_extract(plan,'$.action') IN ('archive','auto-archive') ORDER BY created_at DESC,rowid DESC LIMIT 1";
+        let eqp: Vec<String> = store
+            .db
+            .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(3))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert!(
+            eqp.iter()
+                .any(|line| line.contains("idx_operations_archive_action")),
+            "expected idx_operations_archive_action in {eqp:?}"
+        );
+        let latest: String = store.db.query_row(query, [], |r| r.get(0)).unwrap();
+        assert_eq!(latest, "arch-new");
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn complete_and_rollback_compact_plan_documents_while_preserving_receipt_fields() {
+        let root = fs::canonicalize("/tmp")
+            .unwrap()
+            .join(format!("face-store-plan-compact-{}", uuid::Uuid::new_v4()));
+        let base = root.join("base");
+        let media = root.join("media");
+        fs::create_dir_all(&base).unwrap();
+        fs::create_dir_all(&media).unwrap();
+        let config = Config {
+            base,
+            media,
+            ledger: root.join("ledger.db"),
+            bind: "127.0.0.1:0".into(),
+            token: None,
+            fixture: None,
+            parity_root: None,
+        };
+        let mut store = Store::start(&config).unwrap();
+        let make_plan = |id: &str, action: &str| Plan {
+            id: id.into(),
+            request: crate::model::Request {
+                id: id.into(),
+                action: action.into(),
+                person: "Alice".into(),
+                files: vec![],
+                filename: String::new(),
+                target_person: None,
+                target_folder: None,
+                payload: Some(json!({"vids": ["v1"]})),
+            },
+            version: format!("ver-{id}"),
+            action: action.into(),
+            person: "Alice".into(),
+            target_person: String::new(),
+            files: vec![crate::model::FileMove {
+                src: "/tmp/a.mp4".into(),
+                dst: "/tmp/b.mp4".into(),
+                size: 42,
+                vids: vec!["v1".into()],
+                version: "fv1".into(),
+            }],
+            total_bytes: 42,
+            directories: vec![],
+            ledger_version: String::new(),
+            metadata_version: String::new(),
+            execution: Some(crate::model::ExecutionIntent {
+                scopes: vec![],
+                failure_policy: crate::model::FailurePolicy::Rollback,
+                stores: crate::model::AffectedStores {
+                    faces: false,
+                    jobs: true,
+                    ledger: false,
+                },
+                data: json!({
+                    "documents": [
+                        {"name": "watermarks/results.json", "before": "{\"huge\":1}", "after": "{\"huge\":2}"},
+                        {"name": "new-doc.json", "before": null, "after": "{\"created\":true}"}
+                    ],
+                    "rows": [{"vid": "v1", "name": "a.mp4"}],
+                    "optional_rule": {"parent_id": id, "key": "k1"},
+                    "optional_restore": {"parent_id": id, "vids": ["v1"]},
+                    "job_updates": [{"vid": "v1", "deferred": 0}]
+                }),
+                result: json!({"ok": true}),
+            }),
+        };
+
+        let p_complete = make_plan("op-plan-complete", "queue-confirm");
+        store.preview(&p_complete).unwrap();
+        store.complete(&p_complete, &json!({"ok": true})).unwrap();
+        // Idempotent second complete() call must keep compacted hashes intact.
+        store.complete(&p_complete, &json!({"ok": true})).unwrap();
+
+        let rec = store.get(&p_complete.id).unwrap().unwrap();
+        assert_eq!(rec.plan.version, "ver-op-plan-complete");
+        assert_eq!(rec.plan.files.len(), 1);
+        let exec_data = &rec.plan.execution.as_ref().unwrap().data;
+        assert_eq!(exec_data["rows"][0]["vid"], "v1");
+        assert_eq!(exec_data["optional_rule"]["key"], "k1");
+        assert_eq!(exec_data["optional_restore"]["vids"][0], "v1");
+        assert_eq!(exec_data["job_updates"][0]["vid"], "v1");
+        let docs = exec_data["documents"].as_array().unwrap();
+        assert_eq!(docs.len(), 2);
+        assert!(docs[0].get("before").is_none() && docs[0].get("after").is_none());
+        assert_eq!(docs[0]["name"], "watermarks/results.json");
+        assert_eq!(docs[0]["before_hash"], json!(hash(&json!("{\"huge\":1}"))));
+        assert_eq!(docs[0]["after_hash"], json!(hash(&json!("{\"huge\":2}"))));
+        assert_eq!(docs[0]["compacted"], true);
+        assert!(docs[1]["before_hash"].is_null());
+        assert_eq!(docs[1]["after_hash"], json!(hash(&json!("{\"created\":true}"))));
+
+        let p_rb = make_plan("op-plan-rb", "archive");
+        store.preview(&p_rb).unwrap();
+        store
+            .rolled_back(&p_rb.id, &Error::conflict("rolled back test"))
+            .unwrap();
+        let rb_rec = store.get(&p_rb.id).unwrap().unwrap();
+        let rb_docs = rb_rec.plan.execution.unwrap().data["documents"]
+            .as_array()
+            .unwrap()
+            .clone();
+        assert!(rb_docs[0].get("before").is_none());
+        assert!(rb_docs[0].get("after").is_none());
+        assert_eq!(rb_docs[0]["compacted"], true);
 
         drop(store);
         fs::remove_dir_all(root).unwrap();

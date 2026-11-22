@@ -250,7 +250,7 @@ fn journal_failures(db: &rusqlite::Connection, id: &str) -> Result<Vec<Value>> {
 }
 pub fn progress(config: &Config, id: Option<&str>) -> Result<Value> {
     let db = db::open_readonly(&config.state_db())?;
-    let id=match id {Some(id)=>{model::validate_id(id)?;Some(id.to_owned())},None=>db.query_row("SELECT id FROM operations WHERE json_extract(plan,'$.action') IN ('archive','auto-archive') ORDER BY created_at DESC,rowid DESC LIMIT 1",[],|r|r.get::<_,String>(0)).optional()?};
+    let id=match id {Some(id)=>{model::validate_id(id)?;Some(id.to_owned())},None=>db.query_row("SELECT id FROM operations INDEXED BY idx_operations_archive_action WHERE json_extract(plan,'$.action') IN ('archive','auto-archive') ORDER BY created_at DESC,rowid DESC LIMIT 1",[],|r|r.get::<_,String>(0)).optional()?};
     let Some(id) = id else {
         return Ok(json!({"job":null}));
     };
