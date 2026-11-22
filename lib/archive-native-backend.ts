@@ -12,6 +12,9 @@ export async function nativeArchive(command:string,body:unknown={}):Promise<unkn
   if(!['archive-preview','review-page','review-status'].includes(command))invalidateIntegrationCache()
   return result
 }
+export async function nativeArchiveApplyAsync(body:unknown={},waitMs=2000):Promise<Record<string,unknown>>{
+  return nativeJsonRequest('v1/archive',{command:'archive-apply',body,wait_ms:waitMs},{label:'归档',completion:'allow_accepted',error:(message,status)=>Object.assign(new Error(message),{status})})
+}
 function legacyProgress(id:string|null):Pick<ArchiveRun,'job'|'result'>|null {
   if(!id){
     try { id=JSON.parse(fs.readFileSync(path.join(BASE,'jobs/archive.json'),'utf8')).id }

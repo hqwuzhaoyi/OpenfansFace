@@ -73,3 +73,7 @@ export function WorkspaceTabs({
 const wideQuery='(min-width: 1200px)'
 function subscribeWide(callback:()=>void){const media=window.matchMedia(wideQuery);media.addEventListener('change',callback);return()=>media.removeEventListener('change',callback)}
 export function useWideWorkspace(){return useSyncExternalStore(subscribeWide,()=>window.matchMedia(wideQuery).matches,()=>false)}
+
+const reviewDesktopQuery='(min-width: 1100px)'
+function subscribeReviewDesktop(callback:()=>void){const media=window.matchMedia(reviewDesktopQuery);media.addEventListener('change',callback);return()=>media.removeEventListener('change',callback)}
+export function useReviewDesktop(){return useSyncExternalStore(subscribeReviewDesktop,()=>window.matchMedia(reviewDesktopQuery).matches,()=>false)}

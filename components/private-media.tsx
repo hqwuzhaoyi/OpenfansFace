@@ -8,7 +8,7 @@ import { usePrivacy } from '@/components/privacy-provider'
 
 // Thin application policy around the existing BEUI button and native media.
 // source + route + revision ensure permission cannot transfer to another item.
-function useMediaPrivacy(source: string | undefined) {
+export function useMediaPrivacy(source: string | undefined) {
   const { enabled, ready, revision } = usePrivacy()
   const pathname = usePathname()
   const token = JSON.stringify([source, pathname, revision])
@@ -34,8 +34,19 @@ function useMediaPrivacy(source: string | undefined) {
     return () => observer.disconnect()
   }, [])
 
-  return { container, enabled, ready, revealed, blocked, toggle: () => setGrant(revealed ? null : token) }
+  return {
+    container,
+    enabled,
+    ready,
+    revealed,
+    blocked,
+    reveal: () => setGrant(token),
+    conceal: () => setGrant(null),
+    toggle: () => setGrant(revealed ? null : token),
+  }
 }
+
+export type MediaPrivacyController = ReturnType<typeof useMediaPrivacy>
 
 function RevealButton({ revealed, toggle, kind }: { revealed: boolean; toggle: () => void; kind: '视频' | '图片' }) {
   const label = revealed ? `遮挡${kind}` : `显示${kind}`
@@ -52,8 +63,27 @@ export function PrivateImage({ src, alt, compact = false, ...props }: ComponentP
   </span>
 }
 
-export function PrivateVideo({ ref, src, autoPlay, controls, muted, controlsList, disablePictureInPicture, disableRemotePlayback, onPlay, onContextMenu, ...props }: Omit<ComponentProps<'video'>, 'src'> & { src?: string }) {
-  const privacy = useMediaPrivacy(src)
+export function PrivateVideo({
+  ref,
+  src,
+  autoPlay,
+  controls,
+  muted,
+  controlsList,
+  disablePictureInPicture,
+  disableRemotePlayback,
+  onPlay,
+  onContextMenu,
+  hideRevealButton = false,
+  privacy: externalPrivacy,
+  ...props
+}: Omit<ComponentProps<'video'>, 'src'> & {
+  src?: string
+  hideRevealButton?: boolean
+  privacy?: MediaPrivacyController
+}) {
+  const internalPrivacy = useMediaPrivacy(src)
+  const privacy = externalPrivacy ?? internalPrivacy
   const player = useRef<HTMLVideoElement | null>(null)
   useLayoutEffect(() => { if (privacy.blocked) player.current?.pause() }, [privacy.blocked])
   useLayoutEffect(() => {
@@ -81,6 +111,6 @@ export function PrivateVideo({ ref, src, autoPlay, controls, muted, controlsList
         else onPlay?.(event)
       }}
     />
-    {privacy.ready && privacy.enabled && <RevealButton revealed={privacy.revealed} toggle={privacy.toggle} kind="视频" />}
+    {!hideRevealButton && privacy.ready && privacy.enabled && <RevealButton revealed={privacy.revealed} toggle={privacy.toggle} kind="视频" />}
   </span>
 }

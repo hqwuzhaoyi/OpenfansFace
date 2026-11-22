@@ -141,6 +141,8 @@ pub struct Envelope {
     pub confirmation: Option<String>,
     pub request: Request,
     pub version: Option<String>,
+    #[serde(default)]
+    pub wait_ms: Option<u64>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileMove {

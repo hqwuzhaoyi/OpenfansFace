@@ -52,8 +52,45 @@ export function WorkspacePath({value,label='完整路径',compact=false}:{value:
 }
 
 const mediaPositions=new Map<string,number>()
-export function WorkspaceMedia({path,name,autoPlay=false}:{path:string;name:string;autoPlay?:boolean}){
+export function getMediaPosition(path:string):number{return mediaPositions.get(path)||0}
+export function rememberMediaPosition(path:string,time:number){
+  mediaPositions.set(path,time)
+  if(mediaPositions.size>200)mediaPositions.delete(mediaPositions.keys().next().value!)
+}
+export function WorkspaceMedia({
+  path,
+  name,
+  poster,
+  autoPlay=false,
+  fill=false,
+  compact=false,
+  showVolumeSlider=false,
+  enableGlobalHotkeys=false,
+  initialTime,
+  onTimeRemember,
+  onExpand,
+  onPrev,
+  onNext,
+  hasPrev,
+  hasNext,
+}:{
+  path:string
+  name:string
+  poster?:string
+  autoPlay?:boolean
+  fill?:boolean
+  compact?:boolean
+  showVolumeSlider?:boolean
+  enableGlobalHotkeys?:boolean
+  initialTime?:number
+  onTimeRemember?:(time:number)=>void
+  onExpand?:(time:number,triggerEl:HTMLElement|null)=>void
+  onPrev?:()=>void
+  onNext?:()=>void
+  hasPrev?:boolean
+  hasNext?:boolean
+}){
   const [failed,setFailed]=useState(false),[attempt,setAttempt]=useState(0),src=`/api/video?p=${encodeURIComponent(path)}`
   useEffect(()=>{setFailed(false);setAttempt(0)},[path])
-  return <div className="ws-media"><WorkbenchVideoPlayer key={`${path}:${attempt}`} src={src} name={name} autoPlay={autoPlay} initialTime={mediaPositions.get(path)||0} onTimeRemember={t=>{mediaPositions.set(path,t);if(mediaPositions.size>200)mediaPositions.delete(mediaPositions.keys().next().value!)}} onError={()=>setFailed(true)}/>{failed&&<WorkspaceCard><WorkspaceMessage error>暂时无法播放，请核对文件路径、网络或编码支持，或直接用外部播放器打开。</WorkspaceMessage><ExternalPlayerBar src={src} name={name}/><WorkspaceButton variant="outline" onClick={()=>{setFailed(false);setAttempt(n=>n+1)}}>重新加载视频</WorkspaceButton></WorkspaceCard>}</div>
+  return <div className={`ws-media ${fill?'ws-media-fill':''}`.trim()}><WorkbenchVideoPlayer key={`${path}:${attempt}`} src={src} name={name} poster={poster} autoPlay={autoPlay} fill={fill} compact={compact} showVolumeSlider={showVolumeSlider} enableGlobalHotkeys={enableGlobalHotkeys} initialTime={initialTime??getMediaPosition(path)} onTimeRemember={t=>{rememberMediaPosition(path,t);onTimeRemember?.(t)}} onExpand={onExpand} onPrev={onPrev} onNext={onNext} hasPrev={hasPrev} hasNext={hasNext} onError={()=>setFailed(true)}/>{failed&&<WorkspaceCard><WorkspaceMessage error>暂时无法播放，请核对文件路径、网络或编码支持，或直接用外部播放器打开。</WorkspaceMessage><ExternalPlayerBar src={src} name={name}/><WorkspaceButton variant="outline" onClick={()=>{setFailed(false);setAttempt(n=>n+1)}}>重新加载视频</WorkspaceButton></WorkspaceCard>}</div>
 }

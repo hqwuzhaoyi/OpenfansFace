@@ -14,6 +14,8 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
 };
 const TTL: i64 = 8 * 60 * 60;
+pub const MAX_ACTIVE_SESSIONS: i64 = 16;
+const SIDECAR_MARKER: &str = "{\"schema_version\":2,\"sidecar\":true}";
 
 struct CachedSession {
     db_path: PathBuf,
@@ -65,6 +67,103 @@ fn schema(config: &Config) -> Result<rusqlite::Connection> {
 }
 fn schema_readonly(config: &Config) -> Result<rusqlite::Connection> {
     db::open_readonly(&config.state_db())
+}
+fn sidecar_write(config: &Config) -> Result<rusqlite::Connection> {
+    let path = config.review_sessions_db();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let conn = rusqlite::Connection::open_with_flags(
+        &path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+            | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    conn.busy_timeout(std::time::Duration::from_secs(30))?;
+    let ready: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='session_snapshots')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !ready {
+        conn.execute_batch(
+            "PRAGMA auto_vacuum = INCREMENTAL; PRAGMA journal_mode = WAL; PRAGMA synchronous = NORMAL; CREATE TABLE IF NOT EXISTS session_snapshots(id TEXT PRIMARY KEY, expires INTEGER NOT NULL, snapshot TEXT NOT NULL);",
+        )?;
+    } else {
+        conn.execute_batch("PRAGMA synchronous = NORMAL;")?;
+    }
+    Ok(conn)
+}
+fn sidecar_readonly(config: &Config) -> Result<rusqlite::Connection> {
+    db::open_readonly(&config.review_sessions_db())
+}
+fn prune_sidecar_with_conn(conn: &mut rusqlite::Connection, active_ids: &[String]) -> Result<()> {
+    let deleted = {
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let deleted = if active_ids.is_empty() {
+            tx.execute("DELETE FROM session_snapshots", [])?
+        } else {
+            let placeholders = std::iter::repeat_n("?", active_ids.len())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!("DELETE FROM session_snapshots WHERE id NOT IN ({placeholders})");
+            tx.execute(&sql, rusqlite::params_from_iter(active_ids.iter()))?
+        };
+        tx.commit()?;
+        deleted
+    };
+    if deleted > 0 {
+        let _ = conn.execute_batch("PRAGMA incremental_vacuum(2000);");
+    }
+    Ok(())
+}
+pub fn prune_sidecar(config: &Config, active_ids: &[String]) -> Result<()> {
+    if !config.review_sessions_db().exists() {
+        return Ok(());
+    }
+    let mut conn = sidecar_write(config)?;
+    prune_sidecar_with_conn(&mut conn, active_ids)
+}
+fn split_material(mut value: Value) -> (String, Value) {
+    let manual = value
+        .as_object_mut()
+        .and_then(|o| o.remove("manual_tasks"))
+        .unwrap_or(Value::Null);
+    (crate::model::hash(&value), manual)
+}
+fn compact_clusters(value: Value) -> Value {
+    let Some(items) = value.as_array() else {
+        return json!([]);
+    };
+    Value::Array(
+        items
+            .iter()
+            .map(|c| {
+                let vids: Vec<&str> = c["vids"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|v| v.as_str().or_else(|| v["vid"].as_str()))
+                    .collect();
+                json!({"cid": c["cid"], "vids": vids})
+            })
+            .collect(),
+    )
+}
+fn material_matches(live: Value, e: &Value) -> bool {
+    if let Some(expected) = e.get("material_hash").and_then(Value::as_str) {
+        let (actual_hash, actual_manual) = split_material(live);
+        actual_hash == expected && actual_manual == e["manual_tasks"]
+    } else {
+        live == e["material"]
+    }
+}
+fn text_matches(live_task: &Value, e: &Value) -> bool {
+    if e.get("text").is_some_and(|v| !v.is_null()) {
+        text_evidence(live_task) == e["text"]
+    } else {
+        text_evidence(live_task) == text_evidence(&e["task"])
+    }
 }
 fn session_write_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -429,9 +528,18 @@ fn evidence(
         .as_object_mut()
         .unwrap()
         .remove("__review_raw_people");
-    Ok(
-        json!({"task":displayed,"group":group(t),"scope":scope,"material":material.material_only(config,&scope)?,"text":text_evidence(t),"health":health.state(config,t)?,"disposition":dispositions.get(t["vid"].as_str().unwrap_or("")),"pending_seen":review::number(&t["deferred"]).unwrap_or(0)==0,"deferred_seen":review::number(&t["deferred"]).unwrap_or(0)!=0}),
-    )
+    let (material_hash, manual_tasks) = split_material(material.material_only(config, &scope)?);
+    Ok(json!({
+        "task": displayed,
+        "group": group(t),
+        "scope": scope,
+        "material_hash": material_hash,
+        "manual_tasks": manual_tasks,
+        "health": health.state(config, t)?,
+        "disposition": dispositions.get(t["vid"].as_str().unwrap_or("")),
+        "pending_seen": review::number(&t["deferred"]).unwrap_or(0) == 0,
+        "deferred_seen": review::number(&t["deferred"]).unwrap_or(0) != 0,
+    }))
 }
 fn read(config: &Config, id: &str) -> Result<Arc<Value>> {
     let db_path = config.state_db();
@@ -461,8 +569,21 @@ fn read(config: &Config, id: &str) -> Result<Arc<Value>> {
             |r| r.get(0),
         )
         .optional()?;
-    let value: Value = serde_json::from_str(&raw.ok_or_else(expired)?)?;
-    if value["schema_version"] != 1 {
+    let mut value: Value = serde_json::from_str(&raw.ok_or_else(expired)?)?;
+    if value["sidecar"] == true {
+        if !config.review_sessions_db().exists() {
+            return Err(expired());
+        }
+        let sidecar_raw: Option<String> = sidecar_readonly(config)?
+            .query_row(
+                "SELECT snapshot FROM session_snapshots WHERE id=?",
+                [id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        value = serde_json::from_str(&sidecar_raw.ok_or_else(expired)?)?;
+    }
+    if value["schema_version"] != 1 && value["schema_version"] != 2 {
         return Err(expired());
     }
     let arc = Arc::new(value);
@@ -575,16 +696,26 @@ fn amended(config: &Config, id: &str, snapshot: Arc<Value>) -> Result<AmendedSna
         overrides,
     })
 }
+fn set_manual_rows(rows: &mut [Value], key: &str, value: &Value) {
+    for r in rows {
+        r[key] = if key == "note" {
+            value.clone()
+        } else {
+            review::integer(value.as_i64().unwrap_or(0))
+        };
+    }
+}
 fn set_manual(e: &mut Value, key: &str, value: Value) {
     e["task"][key] = value.clone();
-    if let Some(rows) = e["material"]["manual_tasks"].as_array_mut() {
-        for r in rows {
-            r[key] = if key == "note" {
-                value.clone()
-            } else {
-                review::integer(value.as_i64().unwrap_or(0))
-            };
-        }
+    if let Some(rows) = e.get_mut("manual_tasks").and_then(Value::as_array_mut) {
+        set_manual_rows(rows, key, &value);
+    }
+    if let Some(rows) = e
+        .get_mut("material")
+        .and_then(|m| m.get_mut("manual_tasks"))
+        .and_then(Value::as_array_mut)
+    {
+        set_manual_rows(rows, key, &value);
     }
 }
 pub fn validate(config: &Config, body: &Value) -> Result<Vec<Value>> {
@@ -632,10 +763,10 @@ pub fn validate(config: &Config, body: &Value) -> Result<Vec<Value>> {
         if ["path", "size", "mtime_ns"]
             .iter()
             .any(|key| t[*key] != e["task"][*key])
-            || text_evidence(t) != e["text"]
+            || !text_matches(t, &e)
             || health.state(config, t)? != e["health"]
             || dispositions.get(&vid).cloned().unwrap_or(Value::Null) != e["disposition"]
-            || material.material_only(config, &e["scope"])? != e["material"]
+            || !material_matches(material.material_only(config, &e["scope"])?, &e)
         {
             return Err(changed());
         }
@@ -690,7 +821,7 @@ pub fn execute(engine: &mut Engine, command: &str, body: Value) -> Result<Value>
                     };
                     e[key] = json!(index);
                 }
-                let snapshot = json!({"schema_version":1,"evidence":evidence,"clusters":review::read(config,"clusters.json",json!([]))?.1});
+                let snapshot = json!({"schema_version":2,"evidence":evidence,"clusters":compact_clusters(review::read(config,"clusters.json",json!([]))?.1)});
                 let raw = serde_json::to_string(&snapshot)?;
                 if raw.len() > 64 * 1024 * 1024 {
                     return Err(Error::new(
@@ -699,27 +830,62 @@ pub fn execute(engine: &mut Engine, command: &str, body: Value) -> Result<Value>
                         "核对记录过多，请缩小处理范围",
                     ));
                 }
+                let replace_session = body["replace_session"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .map(str::to_owned);
                 let expires = {
                     let _guard = session_write_lock()
                         .lock()
                         .unwrap_or_else(|e| e.into_inner());
-                    let mut conn = schema(config)?;
-                    let tx = conn
-                        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-                    let expires = now(&tx)? + TTL;
-                    let has_expired: bool = tx.query_row(
-                        "SELECT EXISTS(SELECT 1 FROM review_sessions WHERE expires<=unixepoch())",
-                        [],
-                        |r| r.get(0),
-                    )?;
-                    if has_expired {
-                        tx.execute("DELETE FROM review_sessions WHERE expires<=unixepoch()", [])?;
+                    let mut sidecar = sidecar_write(config)?;
+                    let expires = now(&sidecar)? + TTL;
+                    {
+                        let stx = sidecar
+                            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                        stx.execute(
+                            "INSERT OR REPLACE INTO session_snapshots VALUES(?,?,?)",
+                            params![&id, expires, &raw],
+                        )?;
+                        stx.commit()?;
                     }
-                    tx.execute(
-                        "INSERT INTO review_sessions VALUES(?,?,?)",
-                        params![id, expires, raw],
-                    )?;
-                    tx.commit()?;
+                    let active_ids: Vec<String> = {
+                        let mut conn = schema(config)?;
+                        let tx = conn
+                            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                        let has_expired: bool = tx.query_row(
+                            "SELECT EXISTS(SELECT 1 FROM review_sessions WHERE expires<=unixepoch())",
+                            [],
+                            |r| r.get(0),
+                        )?;
+                        if has_expired {
+                            tx.execute("DELETE FROM review_sessions WHERE expires<=unixepoch()", [])?;
+                        }
+                        if let Some(old_id) = &replace_session
+                            && old_id != &id
+                        {
+                            tx.execute("DELETE FROM review_sessions WHERE id=?", [old_id])?;
+                        }
+                        tx.execute(
+                            "DELETE FROM review_sessions WHERE id NOT IN (SELECT id FROM review_sessions ORDER BY expires DESC, rowid DESC LIMIT ?1)",
+                            [MAX_ACTIVE_SESSIONS - 1],
+                        )?;
+                        tx.execute(
+                            "INSERT INTO review_sessions VALUES(?,?,?)",
+                            params![&id, expires, SIDECAR_MARKER],
+                        )?;
+                        let active = {
+                            let mut stmt = tx.prepare("SELECT id FROM review_sessions")?;
+                            let rows = stmt
+                                .query_map([], |r| r.get::<_, String>(0))?
+                                .collect::<std::result::Result<Vec<_>, _>>()?;
+                            rows
+                        };
+                        tx.commit()?;
+                        active
+                    };
+                    let _ = prune_sidecar_with_conn(&mut sidecar, &active_ids);
                     expires
                 };
                 session_cache_put(&config.state_db(), &id, expires, Arc::new(snapshot));
@@ -757,7 +923,7 @@ pub fn execute(engine: &mut Engine, command: &str, body: Value) -> Result<Value>
             }
             for e in snapshot.iter().filter(|e| e["completed"] != true) {
                 if !live_ids.contains(e["task"]["vid"].as_str().unwrap_or(""))
-                    || material.material_only(config, &e["scope"])? != e["material"]
+                    || !material_matches(material.material_only(config, &e["scope"])?, e)
                     || health.state(config, &e["task"])? != e["health"]
                 {
                     changed_count += 1
@@ -829,7 +995,10 @@ pub fn execute(engine: &mut Engine, command: &str, body: Value) -> Result<Value>
                             c["cid"] == cluster
                                 && c["vids"]
                                     .as_array()
-                                    .is_some_and(|vs| vs.iter().any(|v| v["vid"] == t["vid"]))
+                                    .is_some_and(|vs| {
+                                        vs.iter()
+                                            .any(|v| v == &t["vid"] || v["vid"] == t["vid"])
+                                    })
                         })
                     }))
         })
@@ -1204,6 +1373,104 @@ mod alias_snapshot_tests {
         );
         drop(observer);
         drop(engine);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn review_sessions_sidecar_isolation_replace_and_hard_cap() {
+        let root = fs::canonicalize("/tmp")
+            .unwrap()
+            .join(format!("face-review-sidecar-{}", uuid::Uuid::new_v4()));
+        let base = root.join("base");
+        let media = root.join("media");
+        fs::create_dir_all(base.join("file-operations-rust")).unwrap();
+        fs::create_dir_all(base.join("processing")).unwrap();
+        fs::create_dir_all(&media).unwrap();
+        let config = Config {
+            base: base.clone(),
+            media,
+            ledger: root.join("ledger.db"),
+            bind: "127.0.0.1:0".into(),
+            token: None,
+            fixture: None,
+            parity_root: None,
+        };
+        drop(crate::store::Store::start(&config).unwrap());
+        let faces = rusqlite::Connection::open(base.join("faces.db")).unwrap();
+        faces
+            .execute_batch("CREATE TABLE videos(vid TEXT PRIMARY KEY,path TEXT);")
+            .unwrap();
+        let jobs = rusqlite::Connection::open(base.join("processing/processing.db")).unwrap();
+        jobs.execute_batch("CREATE TABLE tasks(vid TEXT PRIMARY KEY,path TEXT,stage TEXT,priority INTEGER,is_new INTEGER,created_at REAL,data TEXT,manual INTEGER,deferred INTEGER,note TEXT);").unwrap();
+        jobs.execute(
+            "INSERT INTO tasks VALUES('v1','/fixture/v1.mp4','review',0,0,0,?,0,0,'')",
+            [json!({"ready":true,"watermark":{"status":"done","pipeline":"ocr-v1","candidates":[]},"candidates":[]}).to_string()],
+        )
+        .unwrap();
+        fs::write(
+            base.join("clusters.json"),
+            json!([{"cid":"c1","total_gb":9.9,"vids":[{"vid":"v1","extra":"drop"}]}]).to_string(),
+        )
+        .unwrap();
+
+        let mut engine = Engine::open_preview(config.clone()).unwrap();
+        let first = execute(&mut engine, "review-page", json!({})).unwrap();
+        let first_id = first["session"].as_str().unwrap().to_owned();
+        let replaced =
+            execute(&mut engine, "review-page", json!({"replace_session": first_id})).unwrap();
+        let replaced_id = replaced["session"].as_str().unwrap().to_owned();
+        assert_ne!(first_id, replaced_id);
+        assert!(read(&config, &first_id).is_err());
+
+        for _ in 0..20 {
+            execute(&mut engine, "review-page", json!({})).unwrap();
+        }
+        let op_conn = db::open_readonly(&config.state_db()).unwrap();
+        let op_count: i64 = op_conn
+            .query_row("SELECT COUNT(*) FROM review_sessions", [], |r| r.get(0))
+            .unwrap();
+        let max_marker_len: i64 = op_conn
+            .query_row(
+                "SELECT MAX(length(snapshot)) FROM review_sessions",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let del_sessions: i64 = op_conn
+            .query_row(
+                "SELECT COUNT(DISTINCT session) FROM review_deliveries",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(op_count, MAX_ACTIVE_SESSIONS);
+        assert!(max_marker_len < 64);
+        assert!(del_sessions <= MAX_ACTIVE_SESSIONS);
+
+        let sc_conn = sidecar_readonly(&config).unwrap();
+        let sc_count: i64 = sc_conn
+            .query_row("SELECT COUNT(*) FROM session_snapshots", [], |r| r.get(0))
+            .unwrap();
+        let sc_raw: String = sc_conn
+            .query_row(
+                "SELECT snapshot FROM session_snapshots ORDER BY rowid DESC LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(sc_count, MAX_ACTIVE_SESSIONS);
+        let sc_val: Value = serde_json::from_str(&sc_raw).unwrap();
+        assert_eq!(sc_val["schema_version"], 2);
+        assert_eq!(sc_val["clusters"][0]["vids"][0], "v1");
+        assert!(sc_val["evidence"][0].get("material").is_none());
+        assert!(sc_val["evidence"][0].get("text").is_none());
+        assert!(sc_val["evidence"][0]["material_hash"].is_string());
+
+        drop(sc_conn);
+        drop(op_conn);
+        drop(engine);
+        drop(jobs);
+        drop(faces);
         fs::remove_dir_all(root).unwrap();
     }
 }

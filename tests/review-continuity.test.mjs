@@ -15,6 +15,9 @@ test('idle boundary and responses started before new activity never replace a re
  assert.equal(canAutoRefreshReview({...state,protectedWork:true}),false)
  assert.equal(canAutoRefreshReview({...state,currentActivity:8}),false)
  assert.equal(canAutoRefreshReview({...state,lastActivity:1}),false)
+ assert.equal(canAutoRefreshReview({...state,now:REVIEW_IDLE_MS*10,lastAutoRefresh:REVIEW_IDLE_MS,lastAutoRefreshActivity:7}),false)
+ assert.equal(canAutoRefreshReview({...state,now:REVIEW_IDLE_MS+5000,lastActivity:1,requestActivity:8,currentActivity:8,lastAutoRefresh:REVIEW_IDLE_MS,lastAutoRefreshActivity:7}),false)
+ assert.equal(canAutoRefreshReview({...state,now:REVIEW_IDLE_MS*2+1,lastActivity:1,requestActivity:8,currentActivity:8,lastAutoRefresh:REVIEW_IDLE_MS,lastAutoRefreshActivity:7}),true)
 })
 
 test('ready face evidence remains reviewable after terminal failure, without reviving text failures or missing evidence',()=>{

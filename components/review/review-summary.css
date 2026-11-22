@@ -13,3 +13,22 @@
 @media(max-width:767px){.review-summary-media{grid-row:1}.review-mark-proof.ws-control{width:100px;height:44px;min-height:44px}}
 
 .review-summary .ws-path-compact>div{position:relative}.review-summary .ws-path-compact>div>span[role=status]{display:block;position:absolute;width:1px;height:1px;overflow:hidden;clip-path:inset(50%);white-space:nowrap}
+
+/* Compact cards inside /review when center inline video stage is open */
+.ws-workarea-review[data-stage-open=true] .ws-row.review-summary[data-slot=card]{grid-template-columns:30px 88px minmax(0,1fr);gap:6px 9px;padding:8px 9px;margin:4px 0}
+.ws-workarea-review[data-stage-open=true] .review-summary-check{grid-row:1}
+.ws-workarea-review[data-stage-open=true] .review-summary-media{grid-row:1;gap:4px}
+.ws-workarea-review[data-stage-open=true] .review-summary-cover.ws-control{width:88px;height:62px;min-height:62px}
+.ws-workarea-review[data-stage-open=true] .review-mark-proof.ws-control{width:88px;height:30px;min-height:30px}
+.ws-workarea-review[data-stage-open=true] .review-summary-title.ws-control{min-height:24px;font-size:12px}
+.ws-workarea-review[data-stage-open=true] .review-summary .ws-path-compact{display:none}
+.ws-workarea-review[data-stage-open=true] .review-summary-facts{grid-column:2 / -1;gap:5px}
+@media(min-width:768px) and (max-width:1099px){
+  .ws-workarea-review[data-stage-open=true] .ws-row.review-summary[data-slot=card]{grid-template-columns:32px 144px minmax(0,1fr);gap:8px 12px;padding:12px;margin:6px 0}
+  .ws-workarea-review[data-stage-open=true] .review-summary-check,.ws-workarea-review[data-stage-open=true] .review-summary-media{grid-row:1 / span 2}
+  .ws-workarea-review[data-stage-open=true] .review-summary-cover.ws-control{width:144px;height:104px;min-height:104px}
+  .ws-workarea-review[data-stage-open=true] .review-mark-proof.ws-control{width:144px;height:36px;min-height:36px}
+  .ws-workarea-review[data-stage-open=true] .review-summary-title.ws-control{min-height:32px;font-size:13px}
+  .ws-workarea-review[data-stage-open=true] .review-summary .ws-path-compact{display:flex}
+  .ws-workarea-review[data-stage-open=true] .review-summary-facts{grid-column:3;gap:8px}
+}

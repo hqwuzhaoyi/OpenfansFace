@@ -884,16 +884,23 @@ export function BackgroundOperationsProvider({
           void poll();
         }
 
-        let result: PersonFileResult;
-        try {
-          result = await api<PersonFileResult>("/api/persons/manage", {
+        type ApplyOutcome =
+          | PersonFileResult
+          | { id: string; status: string; accepted: true };
+        const submitApply = () =>
+          api<ApplyOutcome>("/api/persons/manage", {
             method: "POST",
             body: JSON.stringify({
               mode: "apply",
+              async: true,
               request: currentPlan.request,
               version: currentPlan.version,
             }),
           });
+
+        let outcome: ApplyOutcome;
+        try {
+          outcome = await submitApply();
         } catch (applyErr) {
           const msg = (applyErr as Error).message || "";
           if (
@@ -907,14 +914,7 @@ export function BackgroundOperationsProvider({
             updateTask(initialTask.id, (t) =>
               t.kind === "person-file" ? { ...t, plan: currentPlan } : t,
             );
-            result = await api<PersonFileResult>("/api/persons/manage", {
-              method: "POST",
-              body: JSON.stringify({
-                mode: "apply",
-                request: currentPlan.request,
-                version: currentPlan.version,
-              }),
-            });
+            outcome = await submitApply();
           } else {
             throw applyErr;
           }
@@ -922,6 +922,100 @@ export function BackgroundOperationsProvider({
 
         pollController.abort();
         clearTimeout(pollTimer);
+
+        let result: PersonFileResult;
+        if (
+          "accepted" in outcome &&
+          outcome.accepted === true &&
+          !("ok" in outcome)
+        ) {
+          let transientErrors = 0;
+          let terminalReceipt: FileReceipt | null = null;
+          while (true) {
+            await new Promise((resolve) => setTimeout(resolve, 1000));
+            let receipt: FileReceipt;
+            try {
+              receipt = await api<FileReceipt>(
+                `/api/persons/manage?id=${encodeURIComponent(currentPlan.id)}`,
+              );
+              transientErrors = 0;
+            } catch (pollErr) {
+              transientErrors++;
+              if (transientErrors >= 5) {
+                throw pollErr;
+              }
+              continue;
+            }
+            updateTask(initialTask.id, (t) =>
+              t.kind === "person-file"
+                ? { ...t, phase: receipt.phase || t.phase || "" }
+                : t,
+            );
+            if (
+              [
+                "complete",
+                "rolled_back",
+                "failed",
+                "recovery_needed",
+                "cancelled",
+              ].includes(receipt.status)
+            ) {
+              terminalReceipt = receipt;
+              break;
+            }
+          }
+          if (terminalReceipt.status === "complete" && terminalReceipt.result) {
+            result = terminalReceipt.result;
+          } else {
+            const detail =
+              [
+                terminalReceipt.error,
+                terminalReceipt.failure?.step,
+                terminalReceipt.failure?.path,
+              ]
+                .filter(Boolean)
+                .join(" · ") || "文件操作未完成";
+            const nextStatus: BackgroundTaskStatus =
+              terminalReceipt.status === "rolled_back"
+                ? "rolled_back"
+                : terminalReceipt.status === "recovery_needed"
+                  ? "recovery_needed"
+                  : "failed";
+            if (nextStatus === "rolled_back") {
+              try {
+                localStorage.removeItem(FILE_OPERATION_STORAGE_KEY);
+              } catch {}
+            }
+            deleteWorkbenchCache("persons:library:" + initialTask.person);
+            if (terminalReceipt.result?.person) {
+              deleteWorkbenchCache(
+                "persons:library:" + terminalReceipt.result.person,
+              );
+            }
+            invalidateReviewCaches({ resetSession: true, includePeople: true });
+            setOpen(true);
+            let settledTask: PersonFileTask | null = null;
+            updateTask(initialTask.id, (t) => {
+              if (t.kind !== "person-file") return t;
+              settledTask = {
+                ...t,
+                plan: currentPlan,
+                status: nextStatus,
+                result: terminalReceipt.result || t.result,
+                error: detail,
+                finishedAt: Date.now(),
+              };
+              return settledTask;
+            });
+            if (settledTask) {
+              emit({ type: "person-file-settled", task: settledTask });
+            }
+            return;
+          }
+        } else {
+          result = outcome as PersonFileResult;
+        }
+
         try {
           localStorage.removeItem(FILE_OPERATION_STORAGE_KEY);
         } catch {}
@@ -1029,20 +1123,65 @@ export function BackgroundOperationsProvider({
             vids: initialTask.vids,
             version: currentVersion,
             operation_id: initialTask.operationId,
+            async: true,
           }),
         });
         const data = await response.json();
         pollController.abort();
         clearTimeout(pollTimer);
 
-        const result: ArchiveTaskResult = response.ok
-          ? data
-          : {
-              ok: false,
-              moved: 0,
-              remaining: initialTask.vids.length,
-              errors: [data.error || "归档请求未被接受"],
+        let result: ArchiveTaskResult;
+        if (response.status === 202 && data?.accepted === true) {
+          let transientErrors = 0;
+          let polledResult: ArchiveTaskResult | null = null;
+          while (true) {
+            await new Promise((resolve) => setTimeout(resolve, 1000));
+            let prog: {
+              job: ArchiveJobProgress | null;
+              result?: ArchiveTaskResult | null;
             };
+            try {
+              prog = await api<{
+                job: ArchiveJobProgress | null;
+                result?: ArchiveTaskResult | null;
+              }>(
+                `/api/plan/progress?id=${encodeURIComponent(initialTask.operationId)}`,
+              );
+              transientErrors = 0;
+            } catch (pollErr) {
+              transientErrors++;
+              if (transientErrors >= 5) {
+                throw pollErr;
+              }
+              continue;
+            }
+            if (prog.job) {
+              updateTask(initialTask.id, (t) =>
+                t.kind === "archive" ? { ...t, progress: prog.job } : t,
+              );
+            }
+            if (prog.result) {
+              polledResult = prog.result;
+              break;
+            }
+            if (
+              prog.job &&
+              (prog.job.status === "complete" || prog.job.status === "error")
+            ) {
+              throw new Error(prog.job.error || "归档结果尚未返回");
+            }
+          }
+          result = polledResult;
+        } else {
+          result = response.ok
+            ? data
+            : {
+                ok: false,
+                moved: 0,
+                remaining: initialTask.vids.length,
+                errors: [data.error || "归档请求未被接受"],
+              };
+        }
 
         for (const creator of initialTask.creators) {
           deleteWorkbenchCache("persons:library:" + creator);

@@ -3,7 +3,7 @@ import {useCallback,useEffect,useRef} from 'react'
 import {canAutoRefreshReview} from '@/lib/review-continuity-model'
 
 export function useReviewActivity(protectedWork:boolean){
-  const activity=useRef({at:Date.now(),version:0}),protectedRef=useRef(protectedWork)
+  const activity=useRef({at:Date.now(),version:0}),autoRefresh=useRef<{at:number;version?:number}>({at:0,version:undefined}),protectedRef=useRef(protectedWork)
   protectedRef.current=protectedWork
   useEffect(()=>{
     const touch=(event?:Event)=>{if(event?.type==='pointermove'&&Date.now()-activity.current.at<500)return;activity.current={at:Date.now(),version:activity.current.version+1}}
@@ -14,6 +14,7 @@ export function useReviewActivity(protectedWork:boolean){
     return()=>{for(const name of events)document.removeEventListener(name,touch,true);window.removeEventListener('focus',touch);document.removeEventListener('visibilitychange',visible)}
   },[])
   const version=useCallback(()=>activity.current.version,[])
-  const canApply=useCallback((requestActivity=activity.current.version)=>canAutoRefreshReview({now:Date.now(),lastActivity:activity.current.at,protectedWork:document.visibilityState!=='visible'||!!document.querySelector('[role="dialog"][data-state="open"],[role="alertdialog"][data-state="open"]')||protectedRef.current||[...document.querySelectorAll('video')].some(v=>!v.paused&&!v.ended),requestActivity,currentActivity:activity.current.version}),[])
-  return {version,canApply}
+  const markAutoRefreshed=useCallback((requestActivity:number)=>{autoRefresh.current={at:Date.now(),version:requestActivity}},[])
+  const canApply=useCallback((requestActivity=activity.current.version)=>canAutoRefreshReview({now:Date.now(),lastActivity:activity.current.at,protectedWork:document.visibilityState!=='visible'||!!document.querySelector('[role="dialog"][data-state="open"],[role="alertdialog"][data-state="open"]')||protectedRef.current||[...document.querySelectorAll('video')].some(v=>!v.paused&&!v.ended),requestActivity,currentActivity:activity.current.version,lastAutoRefresh:autoRefresh.current.at,lastAutoRefreshActivity:autoRefresh.current.version}),[])
+  return {version,canApply,markAutoRefreshed}
 }

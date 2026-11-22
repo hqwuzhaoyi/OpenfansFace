@@ -3,7 +3,8 @@ export interface NativeResponsePolicy {
   label:string
   // These synchronous adapters require a completed response. Acceptance alone
   // must never become a confirmation or a successful file-operation receipt.
-  completion:'required'
+  // Async background queues opt into `allow_accepted` so 202 hands off to status polling.
+  completion:'required'|'allow_accepted'
   error:(message:string,status:number)=>Error
 }
 export async function nativeJsonRequest<T>(route:string,body:unknown,policy:NativeResponsePolicy,id?:string):Promise<T>{
@@ -19,7 +20,12 @@ export async function nativeJsonRequest<T>(route:string,body:unknown,policy:Nati
   try{response=await fetch(url,{method:body===null?'GET':'POST',headers,...(body===null?{}:{body:JSON.stringify(body)}),cache:'no-store',signal:AbortSignal.timeout(120_000)})}
   catch{throw policy.error(`${policy.label}后端连接中断，结果尚未确认；请查询原操作回执，不要重复提交`,503)}
   const value=await response.json().catch(()=>null)
-  if(response.status===202&&policy.completion==='required')throw Object.assign(policy.error('操作已受理但尚未完成，请查询原操作回执',503),{code:'operation_pending'})
+  if(response.status===202){
+    if(policy.completion==='allow_accepted'&&value&&typeof value==='object'&&!Array.isArray(value)){
+      return {...value,accepted:true,status:typeof value.status==='string'?value.status:'running'} as T
+    }
+    throw Object.assign(policy.error('操作已受理但尚未完成，请查询原操作回执',503),{code:'operation_pending'})
+  }
   if(!response.ok){
     const message=[typeof value?.error==='string'?value.error:`${policy.label}后端拒绝请求`,value?.step,value?.path].filter(part=>typeof part==='string'&&part).join(' · ')
     throw Object.assign(policy.error(message,response.status),{code:value?.code,path:value?.path,step:value?.step})

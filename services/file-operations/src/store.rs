@@ -81,6 +81,16 @@ impl Store {
             [],
         );
         let _ = conn.execute(
+            "DELETE FROM review_sessions WHERE id NOT IN (SELECT id FROM review_sessions ORDER BY expires DESC, rowid DESC LIMIT ?1)",
+            [crate::review_sessions::MAX_ACTIVE_SESSIONS],
+        );
+        if let Ok(mut stmt) = conn.prepare("SELECT id FROM review_sessions")
+            && let Ok(rows) = stmt.query_map([], |r| r.get::<_, String>(0))
+        {
+            let active: Vec<String> = rows.flatten().collect();
+            let _ = crate::review_sessions::prune_sidecar(config, &active);
+        }
+        let _ = conn.execute(
             "DELETE FROM operations WHERE status='not_started' AND created_at < datetime('now','-2 hours') AND NOT EXISTS(SELECT 1 FROM steps WHERE operation_id=operations.id) AND NOT EXISTS(SELECT 1 FROM gates WHERE id=operations.id)",
             [],
         );
@@ -210,7 +220,15 @@ impl Store {
         Ok(())
     }
     pub fn rolled_back(&mut self, id: &str, cause: &Error) -> Result<()> {
-        self.db.execute("UPDATE operations SET status='rolled_back',phase='rolled_back',error=?,revision=MAX(revision,COALESCE((SELECT MAX(s.revision) FROM steps s WHERE s.operation_id=operations.id),0))+1,updated_at=CURRENT_TIMESTAMP WHERE id=?", params![serde_json::to_string(cause)?,id])?;
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE operations SET status='rolled_back',phase='rolled_back',error=?,revision=MAX(revision,COALESCE((SELECT MAX(s.revision) FROM steps s WHERE s.operation_id=operations.id),0))+1,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            params![serde_json::to_string(cause)?, id],
+        )?;
+        compact_terminal_blobs(&tx, id)?;
+        tx.commit()?;
         Ok(())
     }
     pub fn blocked(&self) -> Result<bool> {
@@ -245,13 +263,95 @@ impl Store {
         Ok(())
     }
     pub fn complete(&mut self, plan: &Plan, result: &Value) -> Result<()> {
-        self.db.execute("UPDATE operations SET status='complete',phase='complete',error=NULL,result=?,revision=MAX(revision,COALESCE((SELECT MAX(s.revision) FROM steps s WHERE s.operation_id=operations.id),0))+1,updated_at=CURRENT_TIMESTAMP WHERE id=?",params![serde_json::to_string(result)?,plan.id])?;
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        tx.execute(
+            "UPDATE operations SET status='complete',phase='complete',error=NULL,result=?,revision=MAX(revision,COALESCE((SELECT MAX(s.revision) FROM steps s WHERE s.operation_id=operations.id),0))+1,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            params![serde_json::to_string(result)?, plan.id],
+        )?;
+        compact_terminal_blobs(&tx, &plan.id)?;
+        tx.commit()?;
         Ok(())
     }
     pub fn fail(&mut self, id: &str, error: &Error, recovery: bool) -> Result<()> {
         self.db.execute("UPDATE operations SET status=?,error=?,revision=MAX(revision,COALESCE((SELECT MAX(s.revision) FROM steps s WHERE s.operation_id=operations.id),0))+1,updated_at=CURRENT_TIMESTAMP WHERE id=?",params![if recovery {"recovery_needed"}else{"failed"},serde_json::to_string(error)?,id])?;
         Ok(())
     }
+}
+/// Strip heavy rollback/snapshot mirrors after terminal completion while preserving
+/// file move provenance (`files`, `source_identity`, `gate`) and commit scope indexes.
+fn compact_terminal_blobs(tx: &rusqlite::Transaction, id: &str) -> Result<()> {
+    let ev: Option<Option<String>> = tx
+        .query_row("SELECT evidence FROM operations WHERE id=?", [id], |r| r.get(0))
+        .optional()?;
+    if let Some(Some(raw)) = ev
+        && let Ok(mut value) = serde_json::from_str::<Value>(&raw)
+        && let Some(obj) = value.as_object_mut()
+    {
+        let mut changed = false;
+        for key in ["domain", "metadata", "ledger", "before", "after"] {
+            if obj.remove(key).is_some() {
+                changed = true;
+            }
+        }
+        if changed {
+            obj.insert("compacted".into(), json!(true));
+            tx.execute(
+                "UPDATE operations SET evidence=? WHERE id=?",
+                params![serde_json::to_string(&value)?, id],
+            )?;
+        }
+    }
+    let scope_rows: Vec<(i64, String)> = {
+        let mut stmt = tx.prepare(
+            "SELECT revision, evidence FROM steps WHERE operation_id=? AND phase='commit_scope'",
+        )?;
+        let rows = stmt
+            .query_map([id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+    for (rev, raw) in scope_rows {
+        if let Ok(mut value) = serde_json::from_str::<Value>(&raw)
+            && let Some(obj) = value.as_object_mut()
+            && obj.remove("domain").is_some()
+        {
+            obj.insert("compacted".into(), json!(true));
+            tx.execute(
+                "UPDATE steps SET evidence=? WHERE operation_id=? AND revision=?",
+                params![serde_json::to_string(&value)?, id, rev],
+            )?;
+        }
+    }
+    let json_rows: Vec<(i64, String)> = {
+        let mut stmt = tx.prepare(
+            "SELECT revision, evidence FROM steps WHERE operation_id=? AND phase='json_replace_intent'",
+        )?;
+        let rows = stmt
+            .query_map([id], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+    for (rev, raw) in json_rows {
+        if let Ok(value) = serde_json::from_str::<Value>(&raw)
+            && value
+                .as_object()
+                .is_some_and(|o| o.contains_key("before") || o.contains_key("after"))
+        {
+            let compact = json!({
+                "name": value.get("name").cloned().unwrap_or(Value::Null),
+                "before_hash": value.get("before").map(hash),
+                "after_hash": value.get("after").map(hash),
+                "compacted": true,
+            });
+            tx.execute(
+                "UPDATE steps SET evidence=? WHERE operation_id=? AND revision=?",
+                params![serde_json::to_string(&compact)?, id, rev],
+            )?;
+        }
+    }
+    Ok(())
 }
 pub struct Record {
     pub plan: Plan,
@@ -558,6 +658,114 @@ mod perf_index_tests {
             )
             .unwrap();
         assert_eq!(step_count, 31);
+        drop(store);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn complete_compacts_recovery_blobs_while_preserving_relocation_and_commit_scope() {
+        let root = fs::canonicalize("/tmp")
+            .unwrap()
+            .join(format!("face-store-compact-{}", uuid::Uuid::new_v4()));
+        let base = root.join("base");
+        let media = root.join("media");
+        fs::create_dir_all(&base).unwrap();
+        fs::create_dir_all(&media).unwrap();
+        let config = Config {
+            base,
+            media,
+            ledger: root.join("ledger.db"),
+            bind: "127.0.0.1:0".into(),
+            token: None,
+            fixture: None,
+            parity_root: None,
+        };
+        let mut store = Store::start(&config).unwrap();
+        let plan = Plan {
+            id: "op-compact".into(),
+            request: crate::model::Request {
+                id: "op-compact".into(),
+                action: "move-files".into(),
+                person: "Alice".into(),
+                files: vec![],
+                filename: String::new(),
+                target_person: None,
+                target_folder: None,
+                payload: None,
+            },
+            version: "v1".into(),
+            action: "move-files".into(),
+            person: "Alice".into(),
+            target_person: String::new(),
+            files: vec![],
+            total_bytes: 0,
+            directories: vec![],
+            ledger_version: String::new(),
+            metadata_version: String::new(),
+            execution: None,
+        };
+        store.preview(&plan).unwrap();
+        store
+            .admit(
+                &plan,
+                json!({
+                    "schema": 2,
+                    "gate": {"marker": {"token": "g1"}},
+                    "files": [{"source_identity": {"dev": "1", "ino": "2", "size": "10", "mtime_ns": "3"}}],
+                    "domain": {"metadata": {"documents": ["huge"]}},
+                    "metadata": {"big": true},
+                    "ledger": {"assets": [1, 2, 3]}
+                }),
+            )
+            .unwrap();
+        store
+            .step(
+                &plan.id,
+                "running",
+                "commit_scope",
+                json!({"successful_file_indexes": [0], "domain": {"huge": "blob"}}),
+            )
+            .unwrap();
+        store
+            .step(
+                &plan.id,
+                "running",
+                "json_replace_intent",
+                json!({"name": "report.json", "before": "{\"a\":1}", "after": "{\"a\":2}"}),
+            )
+            .unwrap();
+        store.complete(&plan, &json!({"ok": true})).unwrap();
+
+        let ev: String = store
+            .db
+            .query_row(
+                "SELECT evidence FROM operations WHERE id=?",
+                [&plan.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let ev: Value = serde_json::from_str(&ev).unwrap();
+        assert!(ev.get("domain").is_none());
+        assert!(ev.get("metadata").is_none());
+        assert!(ev.get("ledger").is_none());
+        assert_eq!(ev["files"][0]["source_identity"]["ino"], "2");
+        assert_eq!(ev["gate"]["marker"]["token"], "g1");
+        assert_eq!(ev["compacted"], true);
+
+        assert_eq!(read_committed_file(&store.db, &plan.id, 0).unwrap(), true);
+        let scope = store.latest_step(&plan.id, "commit_scope").unwrap().unwrap();
+        assert!(scope.get("domain").is_none());
+
+        let jri = store
+            .latest_step(&plan.id, "json_replace_intent")
+            .unwrap()
+            .unwrap();
+        assert!(jri.get("before").is_none());
+        assert!(jri.get("after").is_none());
+        assert_eq!(jri["name"], "report.json");
+        assert!(jri["before_hash"].is_string());
+        assert!(jri["after_hash"].is_string());
+
         drop(store);
         fs::remove_dir_all(root).unwrap();
     }

@@ -127,4 +127,7 @@ impl Config {
     pub fn state_db(&self) -> PathBuf {
         self.state_dir().join("operations.sqlite3")
     }
+    pub fn review_sessions_db(&self) -> PathBuf {
+        self.state_dir().join("review-sessions.sqlite3")
+    }
 }

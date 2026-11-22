@@ -23,7 +23,8 @@ import {
   formatWaitingReasonDescription,
 } from '@/lib/processing-task-model'
 import { Button as NavigationButton } from '@/components/ui/button'
-import { WorkspaceButton as Button, WorkspaceSelect, WorkspaceField, WorkspaceMedia, WorkspacePath, WorkspaceSection, WorkspaceMessage } from '@/components/workbench/inner'
+import { WorkspaceButton as Button, WorkspaceSelect, WorkspaceField, WorkspaceMedia, WorkspacePath, WorkspaceSection, WorkspaceMessage, getMediaPosition, rememberMediaPosition } from '@/components/workbench/inner'
+import { VideoPreviewDialog } from '@/components/workbench/video-preview-dialog'
 import { useWorkspaceQuery, useWorkspaceScroll, readWorkbenchCache, writeWorkbenchCache } from '@/components/workbench/state'
 import * as Popover from '@radix-ui/react-popover'
 import { InputGroupButton } from '@/components/ui/input-group'
@@ -73,6 +74,7 @@ export default function ProcessingTaskQueue() {
   const [focused, setFocused] = useState<ProcessingTaskRecord | null>(null)
   const [detailOpen, setDetailOpen] = useState(false)
   const [attemptDrawerOpen, setAttemptDrawerOpen] = useState(false)
+  const [lightboxOpen, setLightboxOpen] = useState(false)
   const [taskAttempts, setTaskAttempts] = useState<TaskAttemptRecord[]>([])
   const [nodesList, setNodesList] = useState<{ node_id: string; hostname?: string }[]>([])
   const wide = useWideWorkspace()
@@ -110,6 +112,7 @@ export default function ProcessingTaskQueue() {
   }, [focused?.vid, focused?.attempts_history])
   const returnFocus = useRef<HTMLElement | null>(null)
   const focusId = focused?.vid || ''
+  const focusedMediaPath = focused?.video_path || focused?.path || ''
   const listScroll = useWorkspaceScroll(
     'operations:' + JSON.stringify([stage, batch, node_id, waiting_reason, search, data?.page ?? page]),
     !!data && query === search && loadedQuery === requestKey
@@ -123,6 +126,7 @@ export default function ProcessingTaskQueue() {
 
   useEffect(() => {
     if (wide || !focused) setDetailOpen(false)
+    if (!focused) setLightboxOpen(false)
   }, [wide, focused])
 
   const updateStage = (stage: string) => updateFilters({ stage, page: '0' })
@@ -288,8 +292,18 @@ export default function ProcessingTaskQueue() {
       <div className="ws-detail-content" data-sheet-scroll>
         <div className="ws-task-info">
           <h3 className="break-all text-sm font-medium">{focused.name}</h3>
-          {focused.video_path || focused.path ? (
-            <WorkspaceMedia path={focused.video_path || focused.path} name={focused.name} />
+          {focusedMediaPath ? (
+            !attemptDrawerOpen && !lightboxOpen && (wide || detailOpen) ? (
+              <WorkspaceMedia
+                path={focusedMediaPath}
+                name={focused.name}
+                onExpand={() => setLightboxOpen(true)}
+              />
+            ) : (
+              <div className="rounded-md border bg-muted/30 p-3 text-center text-xs text-muted-foreground">
+                {lightboxOpen ? '已在大窗中打开视频预览' : '视频正在历史尝试抽屉中预览'}
+              </div>
+            )
           ) : (
             <p className="text-xs text-muted-foreground p-3 border rounded-md text-center">暂无有效视频路径</p>
           )}
@@ -749,10 +763,19 @@ export default function ProcessingTaskQueue() {
 
             {/* Video Preview & Path in Drawer */}
             <div className="space-y-2">
-              {focused.video_path || focused.path ? (
+              {focusedMediaPath ? (
                 <>
-                  <WorkspaceMedia path={focused.video_path || focused.path} name={focused.name} />
-                  <WorkspacePath value={focused.video_path || focused.path} />
+                  {attemptDrawerOpen && !lightboxOpen && (
+                    <WorkspaceMedia
+                      path={focusedMediaPath}
+                      name={focused.name}
+                      onExpand={() => {
+                        setAttemptDrawerOpen(false)
+                        setLightboxOpen(true)
+                      }}
+                    />
+                  )}
+                  <WorkspacePath value={focusedMediaPath} />
                 </>
               ) : (
                 <p className="text-xs text-muted-foreground p-3 border rounded-md text-center">暂无有效视频路径</p>
@@ -829,6 +852,20 @@ export default function ProcessingTaskQueue() {
           </div>
         )}
       </Drawer>
+      {focused && focusedMediaPath && (
+        <VideoPreviewDialog
+          open={lightboxOpen}
+          onOpenChange={setLightboxOpen}
+          title={focused.name}
+          subtitle={TASK_STAGE_LABELS[focused.stage] || focused.stage}
+          path={focusedMediaPath}
+          src={`/api/video?p=${encodeURIComponent(focusedMediaPath)}`}
+          name={focused.name}
+          initialTime={getMediaPosition(focusedMediaPath)}
+          onTimeRemember={(t) => rememberMediaPosition(focusedMediaPath, t)}
+          instantEntry={instantEntry}
+        />
+      )}
     </main>
   )
 }

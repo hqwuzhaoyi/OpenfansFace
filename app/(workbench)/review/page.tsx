@@ -2,7 +2,7 @@
 
 import Link from 'next/link'
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
-import { Check, ChevronLeft, ChevronRight, Play, RefreshCw, SlidersHorizontal, X, ArrowLeft, ListChecks } from 'lucide-react'
+import { Check, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, Film, Play, RefreshCw, SlidersHorizontal, X, ArrowLeft, ListChecks } from 'lucide-react'
 import * as Popover from '@radix-ui/react-popover'
 import { workspaceToast as toast } from '@/components/workbench/feedback'
 import { api } from '@/lib/face-api'
@@ -19,9 +19,9 @@ import { QueueReceipt } from '@/components/review/workflow'
 import { ResponsiveDialogContent } from '@/components/review/responsive-dialog'
 import { Dialog, DialogTitle, DialogDescription } from '@/components/ui/dialog'
 import { Button as NavigationButton } from '@/components/ui/button'
-import { WorkspaceButton as Button, WorkspaceSelect, WorkspaceField, WorkspaceCard, WorkspacePath, WorkspaceMedia } from '@/components/workbench/inner'
+import { WorkspaceButton as Button, WorkspaceSelect, WorkspaceField, WorkspaceCard, WorkspacePath, WorkspaceMedia, getMediaPosition, rememberMediaPosition } from '@/components/workbench/inner'
 import { EvidencePanel } from '@/components/review/evidence-panel'
-import { ReferencePanel } from '@/components/review/reference-panel'
+import { ReferencePanel, usePersonReferences } from '@/components/review/reference-panel'
 import { useWorkspaceQuery, useWorkspaceScroll, readWorkbenchCache, readPersistedWorkbenchCache, writeWorkbenchCache, deleteWorkbenchCache, deletePersistedWorkbenchCache } from '@/components/workbench/state'
 import { hasProtectedReviewSelections, isCachedReviewPageReusable, resolveEmptyReviewPageTarget } from '@/lib/review-continuity-model'
 import { InputGroupButton } from '@/components/ui/input-group'
@@ -30,7 +30,8 @@ import { useReviewActivity } from '@/components/workbench/review-activity'
 import { useBackgroundOperations } from '@/components/workbench/background-operations'
 import { AlertDialog,AlertDialogContent,AlertDialogHeader,AlertDialogTitle,AlertDialogDescription,AlertDialogFooter,AlertDialogCancel,AlertDialogAction } from '@/components/ui/alert-dialog'
 import { ReviewSummaryRow } from '@/components/review/review-summary-row'
-import { WorkspaceSearch, WorkspaceTabs, useWideWorkspace } from '@/components/workbench/controls'
+import { VideoPreviewDialog } from '@/components/workbench/video-preview-dialog'
+import { WorkspaceSearch, WorkspaceTabs, useReviewDesktop } from '@/components/workbench/controls'
 
 type Group={key:string;label:string;kind:string;count:number}
 type Data={has_updates?:boolean;session?:string;session_at?:number;expires_at?:number;remaining?:number;next_page?:number|null;previous_page?:number|null;blocked?:{vid:string;message:string}[];counts:Record<string,number>;groups:Group[];group:Group|null;total:number;rows:ProcessingTask[];page:number;limit:number;waiting:number;online:boolean;folders:string[];focus_missing:boolean}
@@ -81,13 +82,23 @@ export default function Review() {
   const returnFocus=useRef<HTMLElement|null>(null),session=useRef<string|undefined>(readWorkbenchCache<string>('review:session',REVIEW_SESSION_TTL_MS)),noteBaseline=useRef<Record<string,string>>({}),notesRef=useRef(notes),polling=useRef(false),scrollAnchor=useRef<{vid:string;offset:number}[]|null>(null)
   notesRef.current=notes
   const [updates,setUpdates]=useState<{has_updates:boolean;refreshing:number;blocked:number;waiting?:number}|null>(null),[refreshConfirm,setRefreshConfirm]=useState(false),[sessionExpired,setSessionExpired]=useState(false)
+  const [groupsCollapsed,setGroupsCollapsed]=useState(false)
+  const groupsManualRef=useRef(false)
+  const [listWidth,setListWidth]=useState(356)
+  const [resizing,setResizing]=useState(false)
+  const [stageOpen,setStageOpen]=useState(true)
+  const [stageTab,setStageTab]=useState<'current'|'reference'>('current')
+  const [explicitStageRefName,setExplicitStageRefName]=useState<string|null>(null)
+  const [stageRefIndex,setStageRefIndex]=useState(0)
+  const [lightbox,setLightbox]=useState<{open:boolean;tab:'current'|'reference';initialTime:number}>({open:false,tab:'current',initialTime:0})
+  const lightboxTriggerRef=useRef<HTMLElement|null>(null)
   const hasManualSelections=hasProtectedReviewSelections(selections,autoSelectedScopes),hasDrafts=Object.values(drafts).some(d=>!!d.creator||!!d.watermarkKey)||Object.entries(notes).some(([id,note])=>note!==noteBaseline.current[id])
-  const protectedWork=busy||pendingVids.size>0||loading||hasManualSelections||hasDrafts||previewOpen||!!reference||refreshConfirm||detailMode==='selection'
+  const protectedWork=busy||pendingVids.size>0||loading||hasManualSelections||hasDrafts||previewOpen||lightbox.open||!!reference||refreshConfirm||detailMode==='selection'
   const protectedWorkRef=useRef(protectedWork)
   protectedWorkRef.current=protectedWork
-  const {version:activityVersion,canApply:canAutoApply}=useReviewActivity(protectedWork)
+  const {version:activityVersion,canApply:canAutoApply,markAutoRefreshed}=useReviewActivity(protectedWork)
 
-  const wide=useWideWorkspace(),sequence=useRef(0),selectionHeading=useRef<HTMLHeadingElement>(null)
+  const reviewDesktop=useReviewDesktop(),sequence=useRef(0),selectionHeading=useRef<HTMLHeadingElement>(null)
   const activeGroup=group||data?.group?.key||'',groupMatched=!group||data?.group?.key===group,scope=reviewSelectionKey(activeGroup,view==='deferred'),chosen=selections[scope]||[],rows=(groupMatched?data?.rows||[]:[]).filter(r=>!pendingVids.has(r.vid))
   const blockedIds=new Set((data?.blocked||[]).map(item=>item.vid))
   const selected=new Set(chosen.map(t=>t.vid)),originalFocus=(inspected[scope]&&!pendingVids.has(inspected[scope].vid)?inspected[scope]:undefined)||rows.find(t=>t.vid===linkFocus)||rows[0],focused=originalFocus?{...originalFocus,review_blocked:data?.blocked?.find(item=>item.vid===originalFocus.vid)?.message}:undefined,hiddenCount=chosen.filter(t=>!rows.some(r=>r.vid===t.vid)).length
@@ -155,10 +166,12 @@ export default function Review() {
     const token=++sequence.current,activityAtStart=activityVersion()
     if(!options.automatic&&!options.silent&&(options.refresh||!cachedPage&&(!data||!!group&&data.group?.key!==group)))setLoading(true)
     try{
-      const params=new URLSearchParams({view,group,q:search,folder,page:String(page),vid:linkFocus,person:personScope,cluster:clusterScope,...(!options.refresh&&session.current?{session:session.current}:{snapshot:'1'})})
+      const previousSession=session.current
+      const params=new URLSearchParams({view,group,q:search,folder,page:String(page),vid:linkFocus,person:personScope,cluster:clusterScope,...(!options.refresh&&previousSession?{session:previousSession}:{snapshot:'1',...(previousSession?{replace_session:previousSession}:{})})})
       const next=await api<Data>('/api/review?'+params)
       if(token!==sequence.current)return null
       if(options.automatic&&!canAutoApply(activityAtStart)||options.refresh&&activityAtStart!==activityVersion()){setUpdates({has_updates:true,refreshing:0,blocked:0});return null}
+      if(options.automatic)markAutoRefreshed(activityAtStart)
       session.current=next.session
       if(options.refresh||options.preservePosition||options.silent){deleteWorkbenchCache('review:page:');deleteWorkbenchCache('review:lastData')}
       if(next.session)writeWorkbenchCache('review:session',next.session)
@@ -220,7 +233,6 @@ export default function Review() {
         deleteWorkbenchCache('review:page:')
         deleteWorkbenchCache('review:lastData')
         if(!protectedWorkRef.current){
-          session.current=undefined
           void latestLoadRef.current({refresh:true})
         }else{
           setUpdates(prev=>({has_updates:true,refreshing:prev?.refreshing||0,blocked:prev?.blocked||0,waiting:prev?.waiting}))
@@ -232,7 +244,6 @@ export default function Review() {
         deleteWorkbenchCache('review:people')
         void loadPeople()
         if(!protectedWorkRef.current){
-          session.current=undefined
           void latestLoadRef.current({refresh:true})
         }else{
           setUpdates(prev=>({has_updates:true,refreshing:prev?.refreshing||0,blocked:prev?.blocked||0,waiting:prev?.waiting}))
@@ -242,16 +253,24 @@ export default function Review() {
   },[subscribe,loadPeople])
 
   useEffect(()=>{setReference(null);setSubmitError('')},[scope])
-  useEffect(()=>{if(wide)setPreviewOpen(false)},[wide])
+  useEffect(()=>{if(reviewDesktop)setPreviewOpen(false)},[reviewDesktop])
+  useEffect(()=>{
+    const mq=window.matchMedia('(min-width: 1100px) and (max-width: 1360px)')
+    const sync=()=>{if(!groupsManualRef.current)setGroupsCollapsed(mq.matches)}
+    sync()
+    mq.addEventListener('change',sync)
+    return()=>mq.removeEventListener('change',sync)
+  },[])
   useEffect(()=>{
     if(!initialized)return
     let cancelled=false
-    const poll=async()=>{if(polling.current||!session.current)return;polling.current=true;const id=session.current,requestSequence=sequence.current
+    const poll=async()=>{if(polling.current||!session.current||document.visibilityState!=='visible')return;polling.current=true;const id=session.current,requestSequence=sequence.current
       try{const next=await api<{has_updates:boolean;refreshing:number;blocked:number;waiting?:number}>('/api/review?status=1&session='+encodeURIComponent(id));if(cancelled||session.current!==id||requestSequence!==sequence.current)return;setUpdates(next);if(next.has_updates&&canAutoApply())await load({refresh:true,automatic:true})}
       catch(e:any){if(!cancelled&&session.current===id&&/核对已过期|本次核对已过期/.test(e.message)){setSessionExpired(true);if(canAutoApply())await load({refresh:true,automatic:true})}}
       finally{polling.current=false}}
-    const timer=setInterval(poll,10000);void poll();return()=>{cancelled=true;clearInterval(timer)}
-  },[initialized,load,canAutoApply])
+    const onVisibility=()=>{if(document.visibilityState==='visible')void poll()}
+    const timer=setInterval(poll,10000);document.addEventListener('visibilitychange',onVisibility);void poll();return()=>{cancelled=true;clearInterval(timer);document.removeEventListener('visibilitychange',onVisibility)}
+  },[initialized,load,canAutoApply,markAutoRefreshed])
   const evidenceTokens=(vids:string[])=>Object.fromEntries(vids.map(id=>[id,[...rows,...Object.values(selections).flat(),...Object.values(inspected)].find(t=>t.vid===id)?.review_token]));
   useEffect(()=>{if(!loading&&!refreshConfirm&&refreshFocus.current){const target=refreshFocus.current;requestAnimationFrame(()=>{if(!target.matches(':disabled')){target.focus({preventScroll:true});refreshFocus.current=null}})}},[loading,refreshConfirm])
   const requestRefresh=(event:{currentTarget:HTMLElement})=>{if(busy||loading)return;refreshFocus.current=event.currentTarget;if(hasManualSelections||hasDrafts)setRefreshConfirm(true);else void load({refresh:true})}
@@ -297,18 +316,35 @@ export default function Review() {
   const chooseGroup=(key:string)=>{advanceSequenceRef.current++;const targetScope=reviewSelectionKey(key,view==='deferred');if(!(selections[targetScope]?.length)){initializedScopesRef.current.delete(`${targetScope}:0`);forceSelectAllScopeRef.current=targetScope}setGroup(key);setPage(0);setLinkFocus('');setPreviewOpen(false)}
   const toggle=(tasks:ProcessingTask[])=>{markScopeManual(scope);setSelections(current=>({...current,[scope]:toggleReviewSelection(current[scope]||[],tasks)}));setWatermarkKey('')}
   const clear=()=>{markScopeManual(scope);setSelections(current=>({...current,[scope]:[]}))}
-  const inspect=(task:ProcessingTask)=>{setReference(null);if(!previewOpen){returnFocus.current=document.activeElement as HTMLElement;setInstantEntry(!!document.activeElement?.matches(':focus-visible')||matchMedia('(prefers-reduced-motion: reduce)').matches)}setInspected(current=>({...current,[scope]:task}));if(data?.group?.kind!=='suggested'&&chosen.length<=1)setDrafts(current=>({...current,[scope]:{creator:preferredTaskCreator(task),watermarkKey:''}}));setDetailMode('video');if(!wide)setPreviewOpen(true)}
-  const openSelection=()=>{if(!previewOpen){returnFocus.current=document.activeElement as HTMLElement;setInstantEntry(!!document.activeElement?.matches(':focus-visible')||matchMedia('(prefers-reduced-motion: reduce)').matches)}if(!chosen.length&&focused){markScopeManual(scope);setSelections(current=>({...current,[scope]:[focused]}))}if(!creator&&defaultCreator)setCreator(defaultCreator);setReference(null);setSubmitError('');setDetailMode('selection');if(!wide)setPreviewOpen(true);else requestAnimationFrame(()=>selectionHeading.current?.focus())}
+  const inspect=(task:ProcessingTask)=>{setReference(null);setSelectionPreviewVid(null);if(!reviewDesktop&&!previewOpen){returnFocus.current=document.activeElement as HTMLElement;setInstantEntry(!!document.activeElement?.matches(':focus-visible')||matchMedia('(prefers-reduced-motion: reduce)').matches)}setInspected(current=>({...current,[scope]:task}));if(data?.group?.kind!=='suggested'&&chosen.length<=1)setDrafts(current=>({...current,[scope]:{creator:preferredTaskCreator(task),watermarkKey:''}}));setDetailMode('video');setExplicitStageRefName(null);setStageTab('current');if(reviewDesktop)setStageOpen(true);else setPreviewOpen(true)}
+  const openSelection=()=>{if(!previewOpen){returnFocus.current=document.activeElement as HTMLElement;setInstantEntry(!!document.activeElement?.matches(':focus-visible')||matchMedia('(prefers-reduced-motion: reduce)').matches)}if(!chosen.length&&focused){markScopeManual(scope);setSelections(current=>({...current,[scope]:[focused]}))}if(!creator&&defaultCreator)setCreator(defaultCreator);setReference(null);setSubmitError('');setDetailMode('selection');if(!reviewDesktop)setPreviewOpen(true);else requestAnimationFrame(()=>selectionHeading.current?.focus())}
   const stepFocus=(delta:-1|1)=>{
     if(!rows.length)return
     const currentIdx=focused?rows.findIndex(t=>t.vid===focused.vid):-1
     const nextIdx=currentIdx<0?0:Math.max(0,Math.min(rows.length-1,currentIdx+delta))
     const nextTask=rows[nextIdx]
     if(!nextTask)return
+    setSelectionPreviewVid(null)
+    setExplicitStageRefName(null)
+    if(reviewDesktop)setStageTab('current')
     setInspected(current=>({...current,[scope]:nextTask}))
     if(chosen.length<=1){markScopeManual(scope);setSelections(current=>({...current,[scope]:[nextTask]}));if(data?.group?.kind!=='suggested')setDrafts(current=>({...current,[scope]:{creator:preferredTaskCreator(nextTask),watermarkKey:''}}))}
     requestAnimationFrame(()=>{document.querySelector<HTMLElement>(`[data-vid="${CSS.escape(nextTask.vid)}"]`)?.scrollIntoView({block:'nearest'})})
   }
+  const stepFocusRef=useRef(stepFocus)
+  stepFocusRef.current=stepFocus
+  useEffect(()=>{
+    if(!reviewDesktop||lightbox.open||previewOpen||refreshConfirm)return
+    const onKey=(e:KeyboardEvent)=>{
+      if(e.defaultPrevented||e.metaKey||e.ctrlKey||e.altKey)return
+      const target=e.target as HTMLElement|null
+      if(target&&(['INPUT','TEXTAREA','SELECT'].includes(target.tagName)||target.isContentEditable||target.closest('[role="dialog"],[role="alertdialog"]')))return
+      if(e.key==='['){e.preventDefault();stepFocusRef.current(-1)}
+      else if(e.key===']'){e.preventDefault();stepFocusRef.current(1)}
+    }
+    window.addEventListener('keydown',onKey)
+    return()=>window.removeEventListener('keydown',onKey)
+  },[reviewDesktop,lightbox.open,previewOpen,refreshConfirm])
   const advanceAfterComplete=(vids:string[])=>{
     const completedSet=new Set(vids)
     const remainingRows=rows.filter(r=>!completedSet.has(r.vid))
@@ -394,7 +430,7 @@ export default function Review() {
     const tokens=evidenceTokens(vids),confirmationSession=session.current,currentGroupKey=activeGroup,isDeferredLane=view==='deferred'
     addPendingVids(vids)
     advanceAfterComplete(vids)
-    if(!wide)setPreviewOpen(false)
+    if(!reviewDesktop)setPreviewOpen(false)
     const promise=mutate('/api/review',{action:actionKind,vids,note,review_tokens:tokens,review_session:confirmationSession,review_group:{key:currentGroupKey,deferred:isDeferredLane}})
     void trackReviewMutation({
       action:actionKind==='restore'?'restore':'defer',
@@ -433,7 +469,7 @@ export default function Review() {
     const fingerprints=Object.fromEntries(targets.map(t=>[t.vid,{path:t.path,size:t.size,mtime_ns:t.mtime_ns}]))
     addPendingVids(vids)
     advanceAfterComplete(vids)
-    if(!wide)setPreviewOpen(false)
+    if(!reviewDesktop)setPreviewOpen(false)
     const promise=mutate<{vids?:string[];rule_warning?:string}>('/api/plan/queue',{vids,creator:name,review_tokens:tokens,review_session:confirmationSession,source:'review',source_id:currentGroupKey,review_group:{key:currentGroupKey,deferred:isDeferredLane},watermark_key:currentWatermarkKey,fingerprints})
     void trackReviewMutation({
       action:'confirm',
@@ -493,18 +529,54 @@ export default function Review() {
       toast.error(e.message)
     }
   }
-  const openReference=(name:string)=>{setReference({name,returnTo:detailMode,scroll:document.querySelector('.ws-detail-content')?.scrollTop||0});requestAnimationFrame(()=>selectionHeading.current?.focus())}
+  const openReference=(name:string)=>{
+    if(reviewDesktop){
+      setReference(null)
+      setExplicitStageRefName(name)
+      setStageRefIndex(0)
+      setStageOpen(true)
+      setStageTab('reference')
+      return
+    }
+    setReference({name,returnTo:detailMode,scroll:document.querySelector('.ws-detail-content')?.scrollTop||0})
+    requestAnimationFrame(()=>selectionHeading.current?.focus())
+  }
   const backReference=()=>{const previous=reference;setReference(null);if(previous)requestAnimationFrame(()=>{const area=document.querySelector('.ws-detail-content');if(area)area.scrollTop=previous.scroll;const trigger=[...document.querySelectorAll<HTMLButtonElement>('.ws-detail-content button')].find(b=>b.getAttribute('aria-label')===`看 ${previous.name} 的对照视频`);trigger?.focus({preventScroll:true})})}
   const focusedIndex=focused?rows.findIndex(t=>t.vid===focused.vid):-1
   const nextAvailableGroup=data?findNextAvailableGroup(data.groups,activeGroup):null
+
+  const stageCurrentTask=selectionPreviewTask||focused||null
+  const stageRefName=explicitStageRefName||reference?.name||creator.trim()||defaultCreator||focused?.data.candidates?.[0]?.name||null
+  const {current:stageRefData,loading:stageRefLoading,retry:retryStageRef}=usePersonReferences(reviewDesktop||lightbox.open?stageRefName:null)
+  const refVideos=stageRefData?.videos||[]
+  const clampedRefIdx=refVideos.length?Math.min(stageRefIndex,refVideos.length-1):0
+  const activeRefVideo=refVideos[clampedRefIdx]||null
+  const activeStageTab=stageTab==='reference'&&stageRefName?'reference':'current'
+  const activeStageVideoPath=activeStageTab==='reference'?(activeRefVideo?activeRefVideo.path||activeRefVideo.vid:''):(stageCurrentTask?.path||'')
+  const activeStageTitle=activeStageTab==='reference'?(activeRefVideo?.name||`${stageRefName||'人物'} · 对照视频`):(stageCurrentTask?.name||'选择视频查看')
+  const formatStageSize=(size?:number,sizeGb?:number)=>typeof size==='number'&&size>0?(size>=2**30?`${(size/2**30).toFixed(2)} GB`:`${(size/2**20).toFixed(1)} MB`):typeof sizeGb==='number'?`${sizeGb} GB`:null
+  const activeStageSize=activeStageTab==='reference'?formatStageSize(undefined,activeRefVideo?.size_gb):(stageCurrentTask?formatStageSize(stageCurrentTask.size):null)
+  const activeLightboxTab=lightbox.tab==='reference'&&stageRefName?'reference':'current'
+  const lightboxVideoPath=activeLightboxTab==='reference'?(activeRefVideo?activeRefVideo.path||activeRefVideo.vid:''):(stageCurrentTask?.path||'')
+  const lightboxVideoName=activeLightboxTab==='reference'?(activeRefVideo?.name||`${stageRefName||'人物'} · 对照视频`):(stageCurrentTask?.name||'')
+  const lightboxPoster=activeLightboxTab==='reference'?(activeRefVideo?.thumb||undefined):undefined
+  const lightboxHasPrev=activeLightboxTab==='reference'?clampedRefIdx>0:focusedIndex>0
+  const lightboxHasNext=activeLightboxTab==='reference'?clampedRefIdx<refVideos.length-1:(focusedIndex>=0&&focusedIndex<rows.length-1)
+  const lightboxStep=(delta:-1|1)=>{
+    if(activeLightboxTab==='reference'){
+      setStageRefIndex(i=>Math.max(0,Math.min(refVideos.length-1,i+delta)))
+    }else{
+      stepFocus(delta)
+    }
+  }
   const detail=<>
 
-    <div className="ws-detail-heading"><h2 ref={selectionHeading} tabIndex={-1}>{reference?`${reference.name} · 对照视频`:detailMode==='selection'?<>核对所选 · <DigitSwap value={actionTargets.length}/></>:'视频与证据'}</h2><div className="ws-actions">{reference?<Button variant="ghost" onClick={backReference}><ArrowLeft size={14}/>返回{reference.returnTo==='selection'?'人物选择':'证据'}</Button>:detailMode==='selection'?<Button variant="ghost" size="sm" onClick={()=>setDetailMode('video')}><ArrowLeft size={14}/>返回证据</Button>:<Button variant="ghost" size="sm" disabled={!actionTargets.length} onClick={openSelection}><ListChecks size={14}/>改选人物 · <DigitSwap value={actionTargets.length}/></Button>}{wide&&!reference&&focused&&rows.length>0&&<div className="ws-actions"><Button className="ws-icon" variant="ghost" size="sm" aria-label="上一条视频" title="上一条视频" disabled={focusedIndex<=0} onClick={()=>stepFocus(-1)}><ChevronLeft size={14}/></Button><span className="ws-muted">{focusedIndex>=0?`${focusedIndex+1} / ${rows.length}`:'已查看'}</span><Button className="ws-icon" variant="ghost" size="sm" aria-label="下一条视频" title="下一条视频" disabled={focusedIndex<0||focusedIndex>=rows.length-1} onClick={()=>stepFocus(1)}><ChevronRight size={14}/></Button></div>}</div></div>
+    <div className="ws-detail-heading"><h2 ref={selectionHeading} tabIndex={-1}>{reference?`${reference.name} · 对照视频`:detailMode==='selection'?<>核对所选 · <DigitSwap value={actionTargets.length}/></>:'证据与归名'}</h2><div className="ws-actions">{reference?<Button variant="ghost" onClick={backReference}><ArrowLeft size={14}/>返回{reference.returnTo==='selection'?'人物选择':'证据'}</Button>:detailMode==='selection'?<Button variant="ghost" size="sm" onClick={()=>setDetailMode('video')}><ArrowLeft size={14}/>返回证据</Button>:<Button variant="ghost" size="sm" disabled={!actionTargets.length} onClick={openSelection}><ListChecks size={14}/>改选人物 · <DigitSwap value={actionTargets.length}/></Button>}{reviewDesktop&&!stageOpen&&!reference&&focused&&rows.length>0&&<div className="ws-actions"><Button className="ws-icon" variant="ghost" size="sm" aria-label="上一条视频" title="上一条视频" disabled={focusedIndex<=0} onClick={()=>stepFocus(-1)}><ChevronLeft size={14}/></Button><span className="ws-muted">{focusedIndex>=0?`${focusedIndex+1} / ${rows.length}`:'已查看'}</span><Button className="ws-icon" variant="ghost" size="sm" aria-label="下一条视频" title="下一条视频" disabled={focusedIndex<0||focusedIndex>=rows.length-1} onClick={()=>stepFocus(1)}><ChevronRight size={14}/></Button></div>}</div></div>
     <div className="ws-detail-content" data-sheet-scroll>
-      {reference?<ReferencePanel name={reference.name}/>:detailMode==='video'?(focused?<EvidencePanel key={focused.vid} task={focused} note={notes[focused.vid]??focused.note} onNoteChange={note=>{if(noteBaseline.current[focused.vid]===undefined)noteBaseline.current[focused.vid]=focused.note;setNotes(current=>{const next={...current};if(note===focused.note)delete next[focused.vid];else next[focused.vid]=note;return next})}} onSaveNote={()=>action('note',[focused.vid],notes[focused.vid]??focused.note)} onSource={sourceOnly} busy={busy} creator={creator} onChoose={name=>{setCreator(name);if(!chosen.length){markScopeManual(scope);setSelections(current=>({...current,[scope]:[focused]}))}}} onConfirmCandidate={name=>{setCreator(name);void confirmTargets(chosen.length>0?chosen:[focused],name)}} onReference={openReference}/>:<p className="ws-empty">选择视频查看证据</p>):<div className="ws-decision">
+      {reference?<ReferencePanel name={reference.name}/>:detailMode==='video'?(focused?<EvidencePanel key={focused.vid} hideMedia={reviewDesktop&&stageOpen} task={focused} note={notes[focused.vid]??focused.note} onNoteChange={note=>{if(noteBaseline.current[focused.vid]===undefined)noteBaseline.current[focused.vid]=focused.note;setNotes(current=>{const next={...current};if(note===focused.note)delete next[focused.vid];else next[focused.vid]=note;return next})}} onSaveNote={()=>action('note',[focused.vid],notes[focused.vid]??focused.note)} onSource={sourceOnly} busy={busy} creator={creator} onChoose={name=>{setCreator(name);if(!chosen.length){markScopeManual(scope);setSelections(current=>({...current,[scope]:[focused]}))}}} onConfirmCandidate={name=>{setCreator(name);void confirmTargets(chosen.length>0?chosen:[focused],name)}} onReference={openReference}/>:<p className="ws-empty">选择视频查看证据</p>):<div className="ws-decision">
         <div>
           <p className="mb-2 text-xs text-muted-foreground">{data?.group?.label||'当前确认组'} · <DigitSwap value={actionTargets.length}/> 个视频{hiddenCount>0?`，其中 ${hiddenCount} 个不在当前页`:''}</p>
-          <Collapsible open={Boolean(selectionPreviewTask)}>
+          {(!reviewDesktop||!stageOpen)&&<Collapsible open={Boolean(selectionPreviewTask)}>
             <CollapsibleContent>
               {selectionPreviewTask&&<Card size="compact" variant="muted" className="ws-confirm-preview" role="region" aria-label={`原位预览 ${selectionPreviewTask.name}`}>
                 <div className="ws-confirm-preview-head">
@@ -514,20 +586,20 @@ export default function Review() {
                     <Button variant="ghost" size="icon" aria-label="收起原位预览" title="收起预览" onClick={()=>setSelectionPreviewVid(null)}><X size={14}/></Button>
                   </div>
                 </div>
-                <WorkspaceMedia key={selectionPreviewTask.vid} path={selectionPreviewTask.path} name={selectionPreviewTask.name} autoPlay/>
+                <WorkspaceMedia key={selectionPreviewTask.vid} path={selectionPreviewTask.path} name={selectionPreviewTask.name} compact autoPlay/>
               </Card>}
             </CollapsibleContent>
-          </Collapsible>
+          </Collapsible>}
           <div className="ws-confirm-list" aria-label="本次完整归名范围">{actionTargets.map(t=>{
             const summary=reviewListSummary(t),faceThumbs=t.data.face?.thumbs?.slice(0,3)||[],isPreviewing=selectionPreviewTask?.vid===t.vid
             return <div key={t.vid} className="ws-confirm-file" data-active={isPreviewing||undefined}>
-              <button type="button" className="ws-confirm-thumb" aria-label={`原位播放 ${t.name}`} title="原位播放预览" onClick={()=>{setInspected(current=>({...current,[scope]:t}));setSelectionPreviewVid(prev=>prev===t.vid?null:t.vid)}}>
+              <button type="button" className="ws-confirm-thumb" aria-label={`预览 ${t.name}`} title="在舞台预览此视频" onClick={()=>{setInspected(current=>({...current,[scope]:t}));if(reviewDesktop){setSelectionPreviewVid(t.vid);setStageTab('current');setStageOpen(true)}else{setSelectionPreviewVid(prev=>prev===t.vid?null:t.vid)}}}>
                 <VideoCover video={{path:t.path,thumb:faceThumbs[0]?`/thumb?p=${encodeURIComponent(faceThumbs[0])}`:null,size:t.size,mtime_ns:t.mtime_ns}} sampleTime={summary.sampleTime}/>
                 <span className="ws-confirm-thumb-play"><Play size={11}/></span>
               </button>
               <div className="ws-confirm-body">
                 <div className="ws-confirm-top">
-                  <Button variant="ghost" className="ws-confirm-name" onClick={()=>{setInspected(current=>({...current,[scope]:t}));setSelectionPreviewVid(prev=>prev===t.vid?null:t.vid)}} aria-label={`核对所选 ${t.name}`}><Play size={12}/><span>{t.name}</span></Button>
+                  <Button variant="ghost" className="ws-confirm-name" onClick={()=>{setInspected(current=>({...current,[scope]:t}));if(reviewDesktop){setSelectionPreviewVid(t.vid);setStageTab('current');setStageOpen(true)}else{setSelectionPreviewVid(prev=>prev===t.vid?null:t.vid)}}} aria-label={`核对所选 ${t.name}`}><Play size={12}/><span>{t.name}</span></Button>
                   {faceThumbs.length>0&&<AvatarGroup size="sm" max={3} label="检出人脸" className="ws-confirm-faces" members={faceThumbs.map((path,idx)=>({id:`${t.vid}-${idx}`,name:`${t.name} 人脸 ${idx+1}`,src:`/thumb?p=${encodeURIComponent(path)}`}))}/>}
                   {chosen.length>0&&<Button className="ws-icon" variant="ghost" size="sm" aria-label={`取消选择 ${t.name}`} title="取消选择" onClick={()=>toggle([t])}><X size={14}/></Button>}
                 </div>
@@ -554,11 +626,20 @@ export default function Review() {
     {data?.focus_missing&&<p className="ws-error">链接中的视频尚未就绪或已归名。</p>}
     {(personScope||clusterScope)&&<div className="ws-toolbar"><span className="ws-muted">{personScope||`相似组 ${clusterScope}`}</span><Button size="sm" variant="ghost" onClick={()=>{advanceSequenceRef.current++;updateFilters({person:'',cluster:'',group:'',page:'0',vid:''})}}>查看全部</Button></div>}
     <div className="ws-view-tabs"><WorkspaceTabs value={view} onChange={value=>{setView(value);setGroup('');setPage(0);setLinkFocus('')}} label="确认状态" disabled={false} items={views.map(v=>({...v,count:data?.counts[v.value]}))}/></div>
-    <div className="ws-workarea">
-      <aside className="ws-groups" aria-label="确认组"><div className="ws-panel-heading"><h2>确认组</h2><span>{data?.groups.length??'—'}</span></div><div className="ws-group-list">{data?.groups.map(g=><button key={g.key} type="button" className="ws-group" aria-pressed={activeGroup===g.key} onClick={()=>chooseGroup(g.key)}><span>{g.label}</span><span className="ws-count">{g.count}</span>{(selections[reviewSelectionKey(g.key,view==='deferred')]||[]).length>0&&<Check size={12} aria-label="有已选视频"/>}</button>)}</div></aside>
+    <div className="ws-workarea ws-workarea-review" data-stage-open={reviewDesktop&&stageOpen?'true':'false'} style={{'--review-list-w':`${listWidth}px`} as React.CSSProperties}>
+      <aside className="ws-groups" data-collapsed={reviewDesktop&&groupsCollapsed?'true':'false'} aria-label="确认组">
+        <div className="ws-panel-heading">
+          <div className="ws-panel-heading-left">
+            <h2 className="ws-groups-title">确认组</h2>
+            <span className="ws-groups-total">{data?.groups.length??'—'}</span>
+          </div>
+          {reviewDesktop&&<Button className="ws-icon" variant="ghost" size="sm" aria-label={groupsCollapsed?'展开确认组':'收起确认组'} aria-expanded={!groupsCollapsed} title={groupsCollapsed?'展开确认组':'收起确认组'} onClick={()=>{groupsManualRef.current=true;setGroupsCollapsed(v=>!v)}}>{groupsCollapsed?<ChevronsRight size={14}/>:<ChevronsLeft size={14}/>}</Button>}
+        </div>
+        <div className="ws-group-list">{data?.groups.map(g=><button key={g.key} type="button" className="ws-group" title={`${g.label} (${g.count})`} aria-pressed={activeGroup===g.key} onClick={()=>chooseGroup(g.key)}><span className="ws-group-pill" aria-hidden="true">{g.label.slice(0,2)}</span><span className="ws-group-label">{g.label}</span><span className="ws-count">{g.count}</span>{(selections[reviewSelectionKey(g.key,view==='deferred')]||[]).length>0&&<Check size={12} className="ws-group-check" aria-label="有已选视频"/>}</button>)}</div>
+      </aside>
       <section className="ws-queue" aria-label="待确认视频">
 
-        <div className="ws-toolbar"><WorkspaceSearch value={query} onChange={changeQuery} label="搜索当前组视频" placeholder="搜索文件名或路径…" disabled={false}><Popover.Root><Popover.Trigger asChild><InputGroupButton size="icon-sm" aria-label="分组与筛选" title="分组与筛选" data-active={!!folder}><SlidersHorizontal size={15}/>{folder&&<span className="size-1.5 rounded-full bg-current"/>}</InputGroupButton></Popover.Trigger><Popover.Portal><Popover.Content className="ws-filter-content" align="end" sideOffset={6}><div className="ws-mobile-filter"><WorkspaceField label="确认组"><WorkspaceSelect label="选择确认组" value={activeGroup} onChange={chooseGroup} options={(data?.groups||[]).map(g=>({value:g.key,label:`${g.label} · ${g.count}`}))} placeholder="暂无确认组"/></WorkspaceField></div><WorkspaceField label="原文件夹"><WorkspaceSelect label="按原文件夹筛选" value={folder} onChange={value=>{setFolder(value);if(!group&&data?.group)setGroup(data.group.key)}} options={[{value:'',label:'全部文件夹'},...(data?.folders||[]).map(f=>({value:f,label:f}))]}/></WorkspaceField>{folder&&<Button className="mt-3" variant="ghost" size="sm" onClick={()=>{setFolder('');setPage(0)}}>清除筛选</Button>}</Popover.Content></Popover.Portal></Popover.Root></WorkspaceSearch></div>
+        <div className="ws-toolbar"><WorkspaceSearch value={query} onChange={changeQuery} label="搜索当前组视频" placeholder="搜索文件名或路径…" disabled={false}><Popover.Root><Popover.Trigger asChild><InputGroupButton size="icon-sm" aria-label="分组与筛选" title="分组与筛选" data-active={!!folder}><SlidersHorizontal size={15}/>{folder&&<span className="size-1.5 rounded-full bg-current"/>}</InputGroupButton></Popover.Trigger><Popover.Portal><Popover.Content className="ws-filter-content" align="end" sideOffset={6}><div className="ws-mobile-filter"><WorkspaceField label="确认组"><WorkspaceSelect label="选择确认组" value={activeGroup} onChange={chooseGroup} options={(data?.groups||[]).map(g=>({value:g.key,label:`${g.label} · ${g.count}`}))} placeholder="暂无确认组"/></WorkspaceField></div><WorkspaceField label="原文件夹"><WorkspaceSelect label="按原文件夹筛选" value={folder} onChange={value=>{setFolder(value);if(!group&&data?.group)setGroup(data.group.key)}} options={[{value:'',label:'全部文件夹'},...(data?.folders||[]).map(f=>({value:f,label:f}))]}/></WorkspaceField>{folder&&<Button className="mt-3" variant="ghost" size="sm" onClick={()=>{setFolder('');setPage(0)}}>清除筛选</Button>}</Popover.Content></Popover.Portal></Popover.Root></WorkspaceSearch>{reviewDesktop&&!stageOpen&&<Button variant="outline" size="sm" aria-label="展开中间视频舞台" title="展开视频舞台" onClick={()=>setStageOpen(true)}><Film size={14}/><span>展开舞台</span></Button>}</div>
         <div className="ws-selection"><Checkbox className="ws-check" aria-label="选择当前页视频" motionPreset="instant" checked={rows.length>0&&rows.every(t=>selected.has(t.vid))} indeterminate={rows.some(t=>selected.has(t.vid))&&!rows.every(t=>selected.has(t.vid))} disabled={disabled||!rows.length} onCheckedChange={()=>toggle(rows)}/><div className="ws-selection-summary"><strong>{chosen.length?`已选 ${chosen.length}`:data?.group?.label||'待确认'}</strong><span> · {hiddenCount?`${hiddenCount} 个在其他页或被筛选隐藏`:data?`${data.remaining??data.total} 个待核对`:'读取中'}</span></div>{chosen.length>0&&<Button className="ws-selection-clear" variant="ghost" size="sm" title="清空当前组选择" aria-label="清空当前组选择" onClick={clear}><X size={14}/><span>清空</span></Button>}</div>
         <div ref={listScroll.ref} className="ws-list" aria-busy={loading||query!==search} onScroll={listScroll.onScroll}>
           {loading&&(!data||!groupMatched)?<p role="status" className="ws-empty">加载视频…</p>:!rows.length?<div className="ws-empty"><p>{group&&!data?.group?'该组已处理完，选择另一组继续。':query||folder?'当前筛选下没有视频。':data?.remaining===0?'本组已完成，可选择其他组继续。':'本批已处理完，可继续下一批。'}</p>{(query||folder)&&<Button variant="ghost" onClick={()=>{changeQuery('');setFolder('')}}>清除筛选</Button>}{!query&&!folder&&(data?.remaining??0)>0&&(data?.next_page!=null||data?.previous_page!=null)&&<Button variant="outline" onClick={()=>{advanceSequenceRef.current++;setPage((data.next_page??data.previous_page)!);setLinkFocus('')}}>继续剩余批次</Button>}{!query&&!folder&&nextAvailableGroup&&<Button variant="outline" onClick={()=>chooseGroup(nextAvailableGroup.key)}>下一待确认组 · {nextAvailableGroup.label}（{nextAvailableGroup.count}）</Button>}</div>:rows.map(t=><ReviewSummaryRow key={t.vid} task={t} selected={selected.has(t.vid)} active={focused?.vid===t.vid} disabled={disabled||!!t.review_blocked&&!selected.has(t.vid)} onToggle={()=>toggle([t])} onInspect={()=>inspect(t)}/>)}
@@ -566,9 +647,81 @@ export default function Review() {
         {chosen.length>0&&<div className="ws-bulk" aria-label="所选视频操作"><span className="ws-muted ws-bulk-count">已选 {chosen.length}</span><Button className="ws-icon ws-bulk-clear" variant="ghost" size="sm" title="清空当前组选择" aria-label="清空当前组选择" onClick={clear}><X size={14}/></Button><Button className="ws-bulk-defer" variant="outline" size="sm" disabled={disabled||!chosen.length} onClick={()=>void action(view==='deferred'?'restore':'defer',chosen.map(t=>t.vid))}>{view==='deferred'?'恢复':'暂缓'}</Button>{creator.trim()&&<Button className="ws-bulk-confirm" size="sm" disabled={disabled||!chosen.length||chosen.some(t=>blockedIds.has(t.vid)||pendingVids.has(t.vid))} onClick={()=>void confirmTargets(chosen,creator)}><span className="ws-btn-truncate">归给 {creator.trim()}</span><span className="ws-btn-badge">· <DigitSwap value={chosen.length}/></span></Button>}<Button className="ws-bulk-inspect" variant={creator.trim()?'outline':'default'} size="sm" disabled={disabled||!chosen.length} onClick={openSelection}><ListChecks size={14} className="shrink-0"/><span>核对所选</span></Button></div>}
         <div className="ws-pagination"><span>{data?`${data.remaining??data.total} 个待核对 · 第 ${currentPage+1} / ${Math.max(1,Math.ceil(data.total/data.limit))} 批`:'读取中'}</span><div className="ws-actions"><Button className="ws-icon" variant="ghost" size="sm" aria-label="上一页" title="上一页" disabled={disabled||(data?.session?data.previous_page==null:currentPage===0)} onClick={()=>{advanceSequenceRef.current++;setPage(data?.previous_page??currentPage-1);setLinkFocus('')}}><ChevronLeft size={15}/></Button><Button className="ws-icon" variant="ghost" size="sm" aria-label="下一页" title="下一页" disabled={disabled||!data||(data.session?data.next_page==null:(currentPage+1)*data.limit>=data.total)} onClick={()=>{advanceSequenceRef.current++;setPage(data?.next_page??currentPage+1);setLinkFocus('')}}><ChevronRight size={15}/></Button></div></div>
       </section>
-      {wide&&<aside className="ws-inspector" aria-label="视频与归名">{detail}</aside>}
+      {reviewDesktop&&stageOpen&&<>
+        <div
+          className="ws-resizer"
+          role="separator"
+          aria-orientation="vertical"
+          aria-label="拖拽调整视频列表与舞台宽度"
+          aria-valuemin={280}
+          aria-valuemax={500}
+          aria-valuenow={listWidth}
+          data-dragging={resizing||undefined}
+          tabIndex={0}
+          title="拖拽或使用 ←/→ 调整列表宽度"
+          onPointerDown={e=>{
+            e.preventDefault()
+            const startX=e.clientX,startW=listWidth
+            setResizing(true)
+            const onMove=(ev:PointerEvent)=>{setListWidth(Math.max(280,Math.min(500,Math.round(startW+(ev.clientX-startX)))))}
+            const onUp=()=>{setResizing(false);window.removeEventListener('pointermove',onMove);window.removeEventListener('pointerup',onUp);window.removeEventListener('pointercancel',onUp)}
+            window.addEventListener('pointermove',onMove)
+            window.addEventListener('pointerup',onUp)
+            window.addEventListener('pointercancel',onUp)
+          }}
+          onKeyDown={e=>{
+            if(e.key==='ArrowLeft'){e.preventDefault();setListWidth(w=>Math.max(280,w-16))}
+            else if(e.key==='ArrowRight'){e.preventDefault();setListWidth(w=>Math.min(500,w+16))}
+          }}
+        ><span className="ws-resizer-grip" aria-hidden="true"/></div>
+        <section className="ws-stage-pane" aria-label="中间视频预览舞台">
+          <div className="ws-stage-header">
+            <div className="ws-stage-head-left">
+              <h2 className="ws-stage-title" title={activeStageTitle}>{activeStageTitle}</h2>
+              {activeStageSize&&<span className="ws-count ws-stage-size-badge">{activeStageSize}</span>}
+            </div>
+            {stageRefName&&<div className="ws-stage-tabs"><WorkspaceTabs value={activeStageTab} onChange={v=>{if(v==='reference')setStageRefIndex(0);setStageTab(v==='reference'?'reference':'current')}} label="预览模式" variant="segment" instant items={[{value:'current',label:'当前视频'},{value:'reference',label:'对照视频',count:stageRefData?stageRefData.total:undefined}]}/></div>}
+            <div className="ws-stage-head-right">
+              {activeStageTab==='current'&&focused&&rows.length>0&&<><Button className="ws-icon" variant="ghost" size="sm" aria-label="上一条视频" title="上一条 ([)" disabled={focusedIndex<=0} onClick={()=>stepFocus(-1)}><ChevronLeft size={14}/></Button><span className="ws-muted tabular-nums">{focusedIndex>=0?`${focusedIndex+1} / ${rows.length}`:'已查看'}</span><Button className="ws-icon" variant="ghost" size="sm" aria-label="下一条视频" title="下一条 (])" disabled={focusedIndex<0||focusedIndex>=rows.length-1} onClick={()=>stepFocus(1)}><ChevronRight size={14}/></Button></>}
+              <Button className="ws-icon" variant="ghost" size="sm" aria-label="收起中间视频舞台" title="收起视频舞台" onClick={()=>setStageOpen(false)}><X size={15}/></Button>
+            </div>
+          </div>
+          <div className="ws-stage-player-slot">
+            {lightbox.open?<div className="ws-stage-empty">正在居中放大窗口中预览…</div>:activeStageTab==='reference'?(activeRefVideo?<WorkspaceMedia key={`ref:${activeRefVideo.vid}`} path={activeRefVideo.path||activeRefVideo.vid} name={activeRefVideo.name} poster={activeRefVideo.thumb||undefined} fill showVolumeSlider initialTime={getMediaPosition(activeStageVideoPath)} onExpand={(t,el)=>{rememberMediaPosition(activeStageVideoPath,t);lightboxTriggerRef.current=el;setLightbox({open:true,tab:'reference',initialTime:t})}} onPrev={clampedRefIdx>0?()=>setStageRefIndex(i=>Math.max(0,i-1)):undefined} onNext={clampedRefIdx<refVideos.length-1?()=>setStageRefIndex(i=>Math.min(refVideos.length-1,i+1)):undefined} hasPrev={clampedRefIdx>0} hasNext={clampedRefIdx<refVideos.length-1}/>:<div className="ws-stage-empty">{stageRefLoading?'正在读取对照视频…':stageRefData?.error?<span>{stageRefData.error} <Button variant="outline" size="sm" onClick={retryStageRef}>重试</Button></span>:`${stageRefName||'当前人物'} 暂无已归档对照视频`}</div>):stageCurrentTask?<WorkspaceMedia key={`cur:${stageCurrentTask.vid}`} path={stageCurrentTask.path} name={stageCurrentTask.name} fill showVolumeSlider initialTime={getMediaPosition(stageCurrentTask.path)} onExpand={(t,el)=>{rememberMediaPosition(stageCurrentTask.path,t);lightboxTriggerRef.current=el;setLightbox({open:true,tab:'current',initialTime:t})}} onPrev={focusedIndex>0?()=>stepFocus(-1):undefined} onNext={focusedIndex>=0&&focusedIndex<rows.length-1?()=>stepFocus(1):undefined} hasPrev={focusedIndex>0} hasNext={focusedIndex>=0&&focusedIndex<rows.length-1}/>:<div className="ws-stage-empty">点击左侧列表中的视频开始预览</div>}
+          </div>
+          {activeStageTab==='reference'&&<div className="ws-stage-ref-strip">
+            <div className="ws-stage-ref-head"><span>{stageRefName} · 已归档对照样本</span><span className="tabular-nums">{refVideos.length?`${clampedRefIdx+1} / ${refVideos.length}`:'0 个'}</span></div>
+            {refVideos.length>0&&<div className="ws-stage-ref-row" role="listbox" aria-label="对照视频样本">{refVideos.map((v,idx)=><button key={v.vid} type="button" role="option" aria-selected={idx===clampedRefIdx} aria-pressed={idx===clampedRefIdx} className="ws-stage-ref-card" onClick={()=>setStageRefIndex(idx)} title={v.name}><span className="ws-stage-ref-thumb">{v.thumb?<img src={v.thumb} data-private-media draggable={false} alt="" loading="lazy"/>:<Play size={14}/>}</span><span className="ws-stage-ref-name">{v.name}</span></button>)}</div>}
+          </div>}
+          {activeStageVideoPath&&<div className="ws-stage-footer">
+            <div className="ws-stage-footer-path"><WorkspacePath value={activeStageVideoPath} compact/></div>
+            <div className="ws-stage-footer-badges">{activeStageTab==='current'&&focused&&<span className="ws-stage-pill">{reviewListSummary(focused).status}</span>}{activeStageTab==='reference'&&stageRefName&&<span className="ws-stage-pill">对照 · {stageRefName}</span>}</div>
+          </div>}
+        </section>
+      </>}
+      {reviewDesktop&&<aside className="ws-inspector" aria-label="视频与归名">{detail}</aside>}
     </div>
-    {!wide&&<Dialog open={previewOpen} onOpenChange={open=>setPreviewOpen(open)}><ResponsiveDialogContent open={previewOpen} className="ws-detail-sheet" style={{animationDuration:instantEntry?'0ms':'180ms'}} overlayProps={{style:{animationDuration:instantEntry?'0ms':'140ms'}}} inert={!previewOpen} onCloseAutoFocus={e=>{e.preventDefault();const target=returnFocus.current;if(target?.isConnected&&!target.matches(':disabled')&&!target.closest('[inert]'))target.focus();else document.querySelector<HTMLButtonElement>('[aria-label="更新人工确认列表"]')?.focus()}} onEscapeKeyDown={e=>{if(reference){e.preventDefault();backReference()}}}><DialogTitle className="sr-only">{reference?`${reference.name} 的对照视频`:detailMode==='selection'?'核对所选视频':'视频与证据'}</DialogTitle><DialogDescription className="sr-only">关闭后保留筛选、勾选与列表位置。</DialogDescription>{detail}</ResponsiveDialogContent></Dialog>}
+    {!reviewDesktop&&<Dialog open={previewOpen} onOpenChange={open=>setPreviewOpen(open)}><ResponsiveDialogContent open={previewOpen} className="ws-detail-sheet" style={{animationDuration:instantEntry?'0ms':'180ms'}} overlayProps={{style:{animationDuration:instantEntry?'0ms':'140ms'}}} inert={!previewOpen} onCloseAutoFocus={e=>{e.preventDefault();const target=returnFocus.current;if(target?.isConnected&&!target.matches(':disabled')&&!target.closest('[inert]'))target.focus();else document.querySelector<HTMLButtonElement>('[aria-label="更新人工确认列表"]')?.focus()}} onEscapeKeyDown={e=>{if(reference){e.preventDefault();backReference()}}}><DialogTitle className="sr-only">{reference?`${reference.name} 的对照视频`:detailMode==='selection'?'核对所选视频':'视频与证据'}</DialogTitle><DialogDescription className="sr-only">关闭后保留筛选、勾选与列表位置。</DialogDescription>{detail}</ResponsiveDialogContent></Dialog>}
+    <VideoPreviewDialog
+      open={lightbox.open&&!!lightboxVideoPath}
+      onOpenChange={open=>{if(!open)setLightbox(prev=>({...prev,open:false}))}}
+      title={lightboxVideoName}
+      badge={activeLightboxTab==='reference'&&stageRefName?<span className="ws-count">对照 · {stageRefName}</span>:undefined}
+      src={`/api/video?p=${encodeURIComponent(lightboxVideoPath)}`}
+      name={lightboxVideoName}
+      poster={lightboxPoster}
+      path={lightboxVideoPath}
+      initialTime={lightbox.initialTime}
+      onTimeRemember={t=>{if(lightboxVideoPath)rememberMediaPosition(lightboxVideoPath,t)}}
+      headerTabs={stageRefName?<WorkspaceTabs value={activeLightboxTab} onChange={v=>{setLightbox(prev=>({...prev,tab:v==='reference'?'reference':'current',initialTime:0}));setStageTab(v==='reference'?'reference':'current')}} label="预览模式" variant="segment" instant items={[{value:'current',label:'当前视频'},{value:'reference',label:'对照视频',count:stageRefData?stageRefData.total:undefined}]}/>:undefined}
+      onPrev={()=>lightboxStep(-1)}
+      onNext={()=>lightboxStep(1)}
+      hasPrev={lightboxHasPrev}
+      hasNext={lightboxHasNext}
+      counterText={activeLightboxTab==='reference'?(refVideos.length?`${clampedRefIdx+1} / ${refVideos.length}`:undefined):(focusedIndex>=0?`${focusedIndex+1} / ${rows.length}`:undefined)}
+      returnFocus={lightboxTriggerRef}
+      stripSlot={activeLightboxTab==='reference'&&refVideos.length>1?<div className="ws-stage-ref-strip"><div className="ws-stage-ref-row" role="listbox" aria-label="对照视频样本">{refVideos.map((v,idx)=><button key={v.vid} type="button" role="option" aria-selected={idx===clampedRefIdx} aria-pressed={idx===clampedRefIdx} className="ws-stage-ref-card" onClick={()=>setStageRefIndex(idx)} title={v.name}><span className="ws-stage-ref-thumb">{v.thumb?<img src={v.thumb} data-private-media draggable={false} alt="" loading="lazy"/>:<Play size={14}/>}</span><span className="ws-stage-ref-name">{v.name}</span></button>)}</div></div>:undefined}
+    />
     <AlertDialog open={refreshConfirm} onOpenChange={setRefreshConfirm}><AlertDialogContent onCloseAutoFocus={e=>{e.preventDefault();refreshFocus.current?.focus({preventScroll:true})}}><AlertDialogHeader><AlertDialogTitle>更新当前核对列表？</AlertDialogTitle><AlertDialogDescription>后台的新建议可能调整分组。更新会清空勾选、未保存的备注和人物输入。取消可继续当前核对。</AlertDialogDescription></AlertDialogHeader><AlertDialogFooter><AlertDialogCancel>继续当前核对</AlertDialogCancel><AlertDialogAction onClick={()=>void load({refresh:true})}>更新列表</AlertDialogAction></AlertDialogFooter></AlertDialogContent></AlertDialog>
   </main>
 }

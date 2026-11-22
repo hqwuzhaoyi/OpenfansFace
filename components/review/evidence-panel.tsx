@@ -7,11 +7,11 @@ import { ExternalProfiles } from '@/components/persons/external-profiles'
 import { WorkspaceButton as Button,WorkspaceCard,WorkspaceField,WorkspaceTextarea,WorkspaceSection,WorkspaceMessage,WorkspaceMedia,WorkspacePath } from '@/components/workbench/inner'
 
 export const sourceName:Record<string,string>={watermark:'水印',folder:'文件名 / 文件夹',face:'人脸相似度'}
-export function EvidencePanel({task,note,onNoteChange,onSaveNote,onSource,busy,creator,onChoose,onConfirmCandidate,onReference}:{task:ProcessingTask;note:string;onNoteChange:(note:string)=>void;onSaveNote:()=>void;onSource:(key:string)=>Promise<boolean>;busy:boolean;creator:string;onChoose:(name:string)=>void;onConfirmCandidate?:(name:string)=>void;onReference:(name:string)=>void}){
+export function EvidencePanel({task,note,onNoteChange,onSaveNote,onSource,busy,creator,onChoose,onConfirmCandidate,onReference,hideMedia=false}:{task:ProcessingTask;note:string;onNoteChange:(note:string)=>void;onSaveNote:()=>void;onSource:(key:string)=>Promise<boolean>;busy:boolean;creator:string;onChoose:(name:string)=>void;onConfirmCandidate?:(name:string)=>void;onReference:(name:string)=>void;hideMedia?:boolean}){
   const [sourceConfirm,setSourceConfirm]=useState<string|null>(null)
   const marks=task.data?.watermark?.candidates
   return <div className="ws-inner-body">
-    <h3 className="ws-media-title">{task.name}</h3><WorkspaceMedia path={task.path} name={task.name}/>
+    {!hideMedia&&<><h3 className="ws-media-title">{task.name}</h3><WorkspaceMedia path={task.path} name={task.name}/></>}
     {!!task.manual&&<WorkspaceMessage>已人工接管，部分分析未完成。</WorkspaceMessage>}
     <WorkspaceSection title="人物候选" count={task.data?.candidates?.length}>{task.data?.candidates?.length?task.data.candidates.map(candidate=>{
       const sources=(candidate.sources||[]).map(source=>sourceName[source]||source).join(' · ')

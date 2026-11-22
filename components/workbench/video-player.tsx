@@ -2,25 +2,32 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { AnimatePresence, motion, useReducedMotion } from 'motion/react'
+import * as DropdownMenu from '@radix-ui/react-dropdown-menu'
 import {
   Check,
   Copy,
   ExternalLink,
+  EyeOff,
   FastForward,
+  Maximize,
   Maximize2,
   Minimize2,
+  MoreHorizontal,
   Pause,
   Play,
   RotateCcw,
   RotateCw,
+  ShieldAlert,
+  SkipBack,
+  SkipForward,
   Volume2,
   VolumeX,
 } from 'lucide-react'
-import { PrivateVideo } from '@/components/private-media'
+import { PrivateVideo, useMediaPrivacy } from '@/components/private-media'
 import { ActionSwapIcon } from '@/components/beui/motion/action-swap'
 import { EASE_OUT } from '@/lib/beui/ease'
 
-const SPEEDS = [1, 1.25, 1.5, 2] as const
+const SPEEDS = [0.5, 0.75, 1, 1.25, 1.5, 2] as const
 
 export const strictEncodeURIComponent = (value: string) =>
   encodeURIComponent(value).replace(
@@ -142,11 +149,21 @@ export interface WorkbenchVideoPlayerProps {
   preload?: 'none' | 'metadata' | 'auto'
   initialTime?: number
   compact?: boolean
+  fill?: boolean
+  showVolumeSlider?: boolean
   enableGlobalHotkeys?: boolean
   className?: string
   videoRef?: React.RefObject<HTMLVideoElement | null>
   onTimeRemember?: (time: number) => void
   onError?: (event: React.SyntheticEvent<HTMLVideoElement>) => void
+  onExpand?: (currentTime: number, triggerEl: HTMLElement | null) => void
+  onPrev?: () => void
+  onNext?: () => void
+  hasPrev?: boolean
+  hasNext?: boolean
+  extraControls?: React.ReactNode
+  topOverlay?: React.ReactNode
+  onRevealChange?: (revealed: boolean) => void
 }
 
 export function WorkbenchVideoPlayer({
@@ -157,11 +174,21 @@ export function WorkbenchVideoPlayer({
   preload = 'metadata',
   initialTime = 0,
   compact = false,
+  fill = false,
+  showVolumeSlider = false,
   enableGlobalHotkeys = false,
   className = '',
   videoRef: externalVideoRef,
   onTimeRemember,
   onError,
+  onExpand,
+  onPrev,
+  onNext,
+  hasPrev = false,
+  hasNext = false,
+  extraControls,
+  topOverlay,
+  onRevealChange,
 }: WorkbenchVideoPlayerProps) {
   const reduce = useReducedMotion()
   const stageRef = useRef<HTMLDivElement>(null)
@@ -174,10 +201,16 @@ export function WorkbenchVideoPlayer({
   const holdingRight = useRef(false)
   const holdingTouch = useRef(false)
   const preHoldSpeed = useRef(1)
+  const pendingSeekRef = useRef(initialTime)
   const lastTapRef = useRef<{ time: number; x: number }>({ time: 0, x: 0 })
   const pointerDownPos = useRef<{ x: number; y: number; type: string } | null>(null)
 
-  const [paused, setPaused] = useState(!autoPlay)
+  const streamSrc = normalizeVideoApiPath(src, name)
+  const extLinks = buildExternalPlayerLinks(src, name)
+  const privacy = useMediaPrivacy(streamSrc)
+  const concealed = privacy.blocked
+
+  const [paused, setPaused] = useState(!autoPlay || concealed)
   const [muted, setMuted] = useState(false)
   const [volume, setVolume] = useState(1)
   const [speed, setSpeed] = useState<number>(1)
@@ -188,11 +221,19 @@ export function WorkbenchVideoPlayer({
   const [controlsVisible, setControlsVisible] = useState(true)
   const [speedMenuOpen, setSpeedMenuOpen] = useState(false)
   const [extMenuOpen, setExtMenuOpen] = useState(false)
+  const [overflowMenuOpen, setOverflowMenuOpen] = useState(false)
+  const [dialogHost, setDialogHost] = useState<HTMLElement | null>(null)
   const [isTouchDevice, setIsTouchDevice] = useState(false)
   const [hud, setHud] = useState<{ key: number; label: string } | null>(null)
 
-  const streamSrc = normalizeVideoApiPath(src, name)
-  const extLinks = buildExternalPlayerLinks(src, name)
+  const initialTimeRef = useRef(initialTime)
+  initialTimeRef.current = initialTime
+  const autoPlayRef = useRef(autoPlay)
+  autoPlayRef.current = autoPlay
+  const concealedRef = useRef(concealed)
+  concealedRef.current = concealed
+  const menuOpenRef = useRef(false)
+  menuOpenRef.current = speedMenuOpen || extMenuOpen || overflowMenuOpen
 
   const assignVideoRef = useCallback(
     (node: HTMLVideoElement | null) => {
@@ -201,6 +242,14 @@ export function WorkbenchVideoPlayer({
     },
     [externalVideoRef]
   )
+
+  useEffect(() => {
+    setDialogHost(stageRef.current?.closest<HTMLElement>('[role="dialog"], [role="alertdialog"]') ?? null)
+  }, [])
+
+  useEffect(() => {
+    onRevealChange?.(privacy.revealed)
+  }, [privacy.revealed, onRevealChange])
 
   const flashHud = useCallback((label: string) => {
     if (hudTimer.current) clearTimeout(hudTimer.current)
@@ -211,16 +260,11 @@ export function WorkbenchVideoPlayer({
   const scheduleHideControls = useCallback(() => {
     if (idleTimer.current) clearTimeout(idleTimer.current)
     idleTimer.current = setTimeout(() => {
-      if (
-        internalVideoRef.current &&
-        !internalVideoRef.current.paused &&
-        !speedMenuOpen &&
-        !extMenuOpen
-      ) {
+      if (internalVideoRef.current && !internalVideoRef.current.paused && !menuOpenRef.current) {
         setControlsVisible(false)
       }
     }, 2600)
-  }, [speedMenuOpen, extMenuOpen])
+  }, [])
 
   const revealControls = useCallback(() => {
     setControlsVisible(true)
@@ -250,31 +294,78 @@ export function WorkbenchVideoPlayer({
       video?.removeEventListener('webkitbeginfullscreen', onWebkitBegin)
       video?.removeEventListener('webkitendfullscreen', onWebkitEnd)
     }
-  }, [src])
+  }, [streamSrc])
 
   useEffect(() => {
-    setPaused(!autoPlay)
-    setCurrentTime(0)
-    setDuration(0)
+    const el = internalVideoRef.current
+    pendingSeekRef.current = initialTimeRef.current
+    setPaused(!autoPlayRef.current || concealedRef.current)
+    setCurrentTime(el && Number.isFinite(el.currentTime) ? el.currentTime : 0)
+    setDuration(el && Number.isFinite(el.duration) ? el.duration : 0)
     setSpeedMenuOpen(false)
     setExtMenuOpen(false)
+    setOverflowMenuOpen(false)
     revealControls()
-  }, [src, autoPlay, revealControls])
+  }, [streamSrc, revealControls])
+
+  useEffect(() => {
+    if (concealed) {
+      setSpeedMenuOpen(false)
+      setExtMenuOpen(false)
+      setOverflowMenuOpen(false)
+      setHoldingBoost(false)
+      setPaused(true)
+    }
+  }, [concealed])
+
+  const revealAndPlay = useCallback(() => {
+    privacy.reveal()
+    onRevealChange?.(true)
+    const el = internalVideoRef.current
+    if (el) {
+      el.setAttribute('data-privacy-revealed', 'true')
+      el.muted = muted
+      el.volume = volume
+      el.playbackRate = speed
+      if (Number.isFinite(el.duration) && el.duration > 0) {
+        setDuration(el.duration)
+      }
+      if (pendingSeekRef.current > 0 && Number.isFinite(el.duration) && pendingSeekRef.current < el.duration - 0.15) {
+        el.currentTime = pendingSeekRef.current
+        setCurrentTime(pendingSeekRef.current)
+        pendingSeekRef.current = 0
+      }
+      void el.play().catch(() => {})
+    }
+    revealControls()
+    flashHud('已解除遮挡并播放')
+  }, [privacy, onRevealChange, muted, volume, speed, revealControls, flashHud])
+
+  const concealVideo = useCallback(() => {
+    const el = internalVideoRef.current
+    if (el) {
+      el.pause()
+      el.removeAttribute('data-privacy-revealed')
+      el.muted = true
+    }
+    if (document.fullscreenElement === stageRef.current) {
+      void document.exitFullscreen().catch(() => {})
+    }
+    privacy.conceal()
+    onRevealChange?.(false)
+    setSpeedMenuOpen(false)
+    setExtMenuOpen(false)
+    setOverflowMenuOpen(false)
+    flashHud('已重新遮挡')
+  }, [privacy, onRevealChange, flashHud])
 
   const togglePlay = useCallback(() => {
-    const el = internalVideoRef.current
-    if (!el) return
-    // If privacy mode is blocking the video, click the reveal button first
-    const revealBtn = stageRef.current?.querySelector<HTMLButtonElement>(
-      '.privacy-video:not([data-revealed="true"]) .privacy-reveal'
-    )
-    if (revealBtn) {
-      revealBtn.click()
-      requestAnimationFrame(() => {
-        void internalVideoRef.current?.play().catch(() => {})
-      })
+    if (concealed) {
+      revealAndPlay()
       return
     }
+    const el = internalVideoRef.current
+    if (!el) return
     revealControls()
     if (el.paused) {
       void el.play().catch(() => {})
@@ -284,10 +375,11 @@ export function WorkbenchVideoPlayer({
       setControlsVisible(true)
       flashHud('暂停')
     }
-  }, [flashHud, revealControls])
+  }, [concealed, revealAndPlay, revealControls, flashHud])
 
   const seekBy = useCallback(
     (delta: number) => {
+      if (concealed) return
       const el = internalVideoRef.current
       if (!el) return
       revealControls()
@@ -296,11 +388,12 @@ export function WorkbenchVideoPlayer({
       setCurrentTime(el.currentTime)
       flashHud(delta > 0 ? `快进 +${delta}s` : `快退 ${delta}s`)
     },
-    [flashHud, revealControls]
+    [concealed, flashHud, revealControls]
   )
 
   const adjustVolume = useCallback(
     (delta: number) => {
+      if (concealed) return
       const el = internalVideoRef.current
       if (!el) return
       revealControls()
@@ -312,7 +405,7 @@ export function WorkbenchVideoPlayer({
       setMuted(next === 0)
       flashHud(next === 0 ? '静音' : `音量 ${Math.round(next * 100)}%`)
     },
-    [flashHud, revealControls]
+    [concealed, flashHud, revealControls]
   )
 
   const selectSpeed = useCallback(
@@ -326,17 +419,18 @@ export function WorkbenchVideoPlayer({
   )
 
   const toggleMute = useCallback(() => {
+    if (concealed) return
     const next = !muted
     setMuted(next)
     if (internalVideoRef.current) internalVideoRef.current.muted = next
     flashHud(next ? '静音' : `音量 ${Math.round(volume * 100)}%`)
-  }, [muted, volume, flashHud])
+  }, [concealed, muted, volume, flashHud])
 
   const toggleFullscreen = useCallback(() => {
+    if (privacy.enabled || concealed) return
     const container = stageRef.current
     const video = internalVideoRef.current as (HTMLVideoElement & {
       webkitEnterFullscreen?: () => void
-      webkitExitFullscreen?: () => void
     }) | null
     if (document.fullscreenElement) {
       void document.exitFullscreen().catch(() => {})
@@ -349,13 +443,21 @@ export function WorkbenchVideoPlayer({
     } else if (video?.webkitEnterFullscreen) {
       video.webkitEnterFullscreen()
     }
-  }, [])
+  }, [privacy.enabled, concealed])
 
   const handleKeyDown = useCallback(
     (e: KeyboardEvent | React.KeyboardEvent) => {
       if (e.defaultPrevented || e.metaKey || e.ctrlKey || e.altKey) return
       const target = e.target as HTMLElement | null
-      if (target && ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName)) return
+      if (target && (['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName) || target.isContentEditable)) return
+
+      if (concealed) {
+        if (e.key === ' ' || e.key === 'k' || e.key === 'K') {
+          e.preventDefault()
+          revealAndPlay()
+        }
+        return
+      }
 
       if (e.key === 'ArrowRight') {
         e.preventDefault()
@@ -405,11 +507,12 @@ export function WorkbenchVideoPlayer({
           break
       }
     },
-    [speed, togglePlay, seekBy, adjustVolume, toggleMute, toggleFullscreen]
+    [concealed, revealAndPlay, speed, togglePlay, seekBy, adjustVolume, toggleMute, toggleFullscreen]
   )
 
   const handleKeyUp = useCallback(
     (e: KeyboardEvent | React.KeyboardEvent) => {
+      if (concealed) return
       if (e.key === 'ArrowRight') {
         if (keyHoldTimer.current) {
           clearTimeout(keyHoldTimer.current)
@@ -426,7 +529,7 @@ export function WorkbenchVideoPlayer({
         }
       }
     },
-    [seekBy]
+    [concealed, seekBy]
   )
 
   useEffect(() => {
@@ -456,6 +559,7 @@ export function WorkbenchVideoPlayer({
   }, [])
 
   const progressRatio = duration > 0 ? Math.min(1, Math.max(0, currentTime / duration)) : 0
+  const portalContainer = isFullscreen ? stageRef.current ?? undefined : dialogHost ?? undefined
 
   return (
     <div
@@ -463,222 +567,260 @@ export function WorkbenchVideoPlayer({
       tabIndex={0}
       role="region"
       aria-label={`视频播放器 ${name}`}
-      className={`wb-vstage ${compact ? 'wb-vstage-compact' : ''} ${className}`}
+      className={`wb-vstage ${fill ? 'wb-vstage-fill' : ''} ${compact ? 'wb-vstage-compact' : ''} ${className}`.trim()}
+      data-concealed={concealed ? 'true' : 'false'}
       data-controls={controlsVisible || paused || holdingBoost ? 'visible' : 'hidden'}
       data-touch={isTouchDevice || undefined}
       onKeyDown={enableGlobalHotkeys ? undefined : handleKeyDown}
       onKeyUp={enableGlobalHotkeys ? undefined : handleKeyUp}
-      onPointerMove={e => {
-        if (e.pointerType === 'mouse') revealControls()
-        else if (pointerDownPos.current) {
-          const dx = Math.abs(e.clientX - pointerDownPos.current.x)
-          const dy = Math.abs(e.clientY - pointerDownPos.current.y)
-          if (dx > 12 || dy > 12) {
-            if (touchHoldTimer.current) {
-              clearTimeout(touchHoldTimer.current)
-              touchHoldTimer.current = null
+    >
+      <div
+        className="wb-vstage-canvas"
+        onPointerMove={e => {
+          if (e.pointerType === 'mouse') revealControls()
+          else if (pointerDownPos.current) {
+            const dx = Math.abs(e.clientX - pointerDownPos.current.x)
+            const dy = Math.abs(e.clientY - pointerDownPos.current.y)
+            if (dx > 12 || dy > 12) {
+              if (touchHoldTimer.current) {
+                clearTimeout(touchHoldTimer.current)
+                touchHoldTimer.current = null
+              }
             }
           }
-        }
-      }}
-      onPointerDown={e => {
-        const isTouch = e.pointerType !== 'mouse'
-        setIsTouchDevice(isTouch)
-        if ((e.target as HTMLElement).closest('.wb-vstage-bottom, .wb-vstage-center, .privacy-reveal')) {
-          return
-        }
-        pointerDownPos.current = { x: e.clientX, y: e.clientY, type: e.pointerType }
-        if (isTouch) {
-          preHoldSpeed.current = speed
-          if (touchHoldTimer.current) clearTimeout(touchHoldTimer.current)
-          touchHoldTimer.current = setTimeout(() => {
-            holdingTouch.current = true
-            setHoldingBoost(true)
-            if (internalVideoRef.current) {
-              if (internalVideoRef.current.paused) {
-                void internalVideoRef.current.play().catch(() => {})
-              }
-              internalVideoRef.current.playbackRate = 2.0
-            }
-          }, 300)
-        }
-      }}
-      onPointerCancel={() => {
-        pointerDownPos.current = null
-        endTouchBoost()
-      }}
-      onPointerUp={e => {
-        if ((e.target as HTMLElement).closest('.wb-vstage-bottom, .wb-vstage-center, .privacy-reveal')) {
-          pointerDownPos.current = null
-          endTouchBoost()
-          return
-        }
-        const wasHoldingBoost = endTouchBoost()
-        const down = pointerDownPos.current
-        pointerDownPos.current = null
-        if (wasHoldingBoost) return
-
-        if (e.pointerType !== 'mouse') {
-          if ( down && (Math.abs(e.clientX - down.x) > 14 || Math.abs(e.clientY - down.y) > 14) ) {
+        }}
+        onPointerDown={e => {
+          const isTouch = e.pointerType !== 'mouse'
+          setIsTouchDevice(isTouch)
+          if (concealed || (e.target as HTMLElement).closest('button, input, [role="dialog"], .wb-vstage-shield, .wb-vstage-center, .pw-theater-top, .pw-theater-shortcuts-sheet')) {
             return
           }
-          const now = Date.now()
-          const rect = stageRef.current?.getBoundingClientRect()
-          const relX = rect ? (e.clientX - rect.left) / Math.max(1, rect.width) : 0.5
-          if (now - lastTapRef.current.time < 280) {
-            if (singleTapTimer.current) {
-              clearTimeout(singleTapTimer.current)
-              singleTapTimer.current = null
+          pointerDownPos.current = { x: e.clientX, y: e.clientY, type: e.pointerType }
+          if (isTouch) {
+            preHoldSpeed.current = speed
+            if (touchHoldTimer.current) clearTimeout(touchHoldTimer.current)
+            touchHoldTimer.current = setTimeout(() => {
+              holdingTouch.current = true
+              setHoldingBoost(true)
+              if (internalVideoRef.current) {
+                if (internalVideoRef.current.paused) {
+                  void internalVideoRef.current.play().catch(() => {})
+                }
+                internalVideoRef.current.playbackRate = 2.0
+              }
+            }, 300)
+          }
+        }}
+        onPointerCancel={() => {
+          pointerDownPos.current = null
+          endTouchBoost()
+        }}
+        onPointerUp={e => {
+          if (concealed || (e.target as HTMLElement).closest('button, input, [role="dialog"], .wb-vstage-shield, .wb-vstage-center, .pw-theater-top, .pw-theater-shortcuts-sheet')) {
+            pointerDownPos.current = null
+            endTouchBoost()
+            return
+          }
+          const wasHoldingBoost = endTouchBoost()
+          const down = pointerDownPos.current
+          pointerDownPos.current = null
+          if (wasHoldingBoost) return
+
+          if (e.pointerType !== 'mouse') {
+            if (down && (Math.abs(e.clientX - down.x) > 14 || Math.abs(e.clientY - down.y) > 14)) {
+              return
             }
-            lastTapRef.current = { time: 0, x: 0 }
-            if (relX < 0.35) seekBy(-5)
-            else if (relX > 0.65) seekBy(5)
-            else togglePlay()
-          } else {
-            lastTapRef.current = { time: now, x: relX }
-            if (singleTapTimer.current) clearTimeout(singleTapTimer.current)
-            singleTapTimer.current = setTimeout(() => {
-              setControlsVisible(v => {
-                const next = !v
-                if (next) scheduleHideControls()
-                return next
-              })
-            }, 220)
-          }
-        }
-      }}
-      onClick={e => {
-        if ((e.target as HTMLElement).closest('.wb-vstage-bottom, .wb-vstage-center, .privacy-reveal')) {
-          return
-        }
-        // Desktop mouse click toggles play/pause; touch is handled in onPointerUp
-        if (!isTouchDevice) {
-          togglePlay()
-        }
-      }}
-      onDoubleClick={e => {
-        if ((e.target as HTMLElement).closest('.wb-vstage-bottom, .wb-vstage-center, .privacy-reveal')) {
-          return
-        }
-        if (!isTouchDevice) {
-          toggleFullscreen()
-        }
-      }}
-    >
-      <PrivateVideo
-        ref={assignVideoRef}
-        src={streamSrc}
-        poster={poster}
-        aria-label={`播放 ${name}`}
-        controls={false}
-        autoPlay={autoPlay}
-        playsInline
-        preload={preload}
-        className="ws-player wb-vstage-video"
-        onLoadedMetadata={e => {
-          const player = e.currentTarget
-          setDuration(player.duration || 0)
-          player.playbackRate = speed
-          player.muted = muted
-          player.volume = volume
-          if (initialTime > 0 && initialTime < (player.duration || 0) - 0.25) {
-            player.currentTime = initialTime
-            setCurrentTime(initialTime)
+            const now = Date.now()
+            const rect = e.currentTarget.getBoundingClientRect()
+            const relX = rect ? (e.clientX - rect.left) / Math.max(1, rect.width) : 0.5
+            if (now - lastTapRef.current.time < 280) {
+              if (singleTapTimer.current) {
+                clearTimeout(singleTapTimer.current)
+                singleTapTimer.current = null
+              }
+              lastTapRef.current = { time: 0, x: 0 }
+              if (relX < 0.35) seekBy(-5)
+              else if (relX > 0.65) seekBy(5)
+              else togglePlay()
+            } else {
+              lastTapRef.current = { time: now, x: relX }
+              if (singleTapTimer.current) clearTimeout(singleTapTimer.current)
+              singleTapTimer.current = setTimeout(() => {
+                setControlsVisible(v => {
+                  const next = !v
+                  if (next) scheduleHideControls()
+                  return next
+                })
+              }, 220)
+            }
           }
         }}
-        onTimeUpdate={e => {
-          const t = e.currentTarget.currentTime
-          setCurrentTime(t)
-          onTimeRemember?.(t)
-        }}
-        onPlay={() => {
-          setPaused(false)
-          scheduleHideControls()
-        }}
-        onPause={() => {
-          setPaused(true)
-          setControlsVisible(true)
-        }}
-        onVolumeChange={e => {
-          setMuted(e.currentTarget.muted)
-          setVolume(e.currentTarget.volume)
-        }}
-        onRateChange={e => {
-          if (!holdingRight.current && !holdingTouch.current) {
-            setSpeed(e.currentTarget.playbackRate)
+        onClick={e => {
+          if (concealed || (e.target as HTMLElement).closest('button, input, [role="dialog"], .wb-vstage-shield, .wb-vstage-center, .pw-theater-top, .pw-theater-shortcuts-sheet')) {
+            return
+          }
+          if (!isTouchDevice) {
+            togglePlay()
           }
         }}
-        onError={onError}
-      />
+        onDoubleClick={e => {
+          if (concealed || privacy.enabled || (e.target as HTMLElement).closest('button, input, [role="dialog"], .wb-vstage-shield, .wb-vstage-center, .pw-theater-top, .pw-theater-shortcuts-sheet')) {
+            return
+          }
+          if (!isTouchDevice) {
+            toggleFullscreen()
+          }
+        }}
+      >
+        <PrivateVideo
+          ref={assignVideoRef}
+          src={streamSrc}
+          poster={poster}
+          privacy={privacy}
+          hideRevealButton
+          aria-label={`播放 ${name}`}
+          controls={false}
+          autoPlay={autoPlay}
+          playsInline
+          preload={preload}
+          className="ws-player wb-vstage-video"
+          onDurationChange={e => setDuration(e.currentTarget.duration || 0)}
+          onLoadedMetadata={e => {
+            const player = e.currentTarget
+            setDuration(player.duration || 0)
+            player.playbackRate = speed
+            player.muted = concealed ? true : muted
+            player.volume = volume
+            if (pendingSeekRef.current > 0 && pendingSeekRef.current < (player.duration || 0) - 0.15) {
+              player.currentTime = pendingSeekRef.current
+              setCurrentTime(pendingSeekRef.current)
+              pendingSeekRef.current = 0
+            }
+          }}
+          onTimeUpdate={e => {
+            const t = e.currentTarget.currentTime
+            setCurrentTime(t)
+            onTimeRemember?.(t)
+          }}
+          onPlay={() => {
+            setPaused(false)
+            scheduleHideControls()
+          }}
+          onPause={() => {
+            setPaused(true)
+            setControlsVisible(true)
+          }}
+          onVolumeChange={e => {
+            if (!concealed) {
+              setMuted(e.currentTarget.muted)
+              setVolume(e.currentTarget.volume)
+            }
+          }}
+          onRateChange={e => {
+            if (!holdingRight.current && !holdingTouch.current) {
+              setSpeed(e.currentTarget.playbackRate)
+            }
+          }}
+          onError={onError}
+        />
 
-      {/* Bilibili-style Top HUD Pill (2.0x boost or Seek/Play feedback) */}
-      <AnimatePresence initial={false}>
-        {holdingBoost ? (
-          <motion.div
-            key="boost"
-            role="status"
-            className="wb-vstage-hud wb-vstage-hud-boost"
-            initial={reduce ? false : { opacity: 0, transform: 'translate(-50%, -6px) scale(0.95)' }}
-            animate={{ opacity: 1, transform: 'translate(-50%, 0px) scale(1)' }}
-            exit={reduce ? undefined : { opacity: 0, transform: 'translate(-50%, -6px) scale(0.95)' }}
-            transition={{ duration: reduce ? 0 : 0.14, ease: EASE_OUT }}
-          >
-            <FastForward size={13} />
-            <span>2.0x 倍速快进中</span>
-          </motion.div>
-        ) : hud ? (
-          <motion.div
-            key={hud.key}
-            role="status"
-            aria-live="polite"
-            className="wb-vstage-hud"
-            initial={reduce ? false : { opacity: 0, transform: 'translate(-50%, -6px) scale(0.95)' }}
-            animate={{ opacity: 1, transform: 'translate(-50%, 0px) scale(1)' }}
-            exit={reduce ? undefined : { opacity: 0, transform: 'translate(-50%, -6px) scale(0.95)' }}
-            transition={{ duration: reduce ? 0 : 0.14, ease: EASE_OUT }}
-          >
-            {hud.label}
-          </motion.div>
-        ) : null}
-      </AnimatePresence>
+        {topOverlay}
 
-      {/* Center Touch & Paused Controls (-5s / Play-Pause / +5s) */}
-      <div className="wb-vstage-center" data-visible={paused || (isTouchDevice && controlsVisible) || undefined}>
-        <button
-          type="button"
-          className="wb-vstage-center-seek"
-          aria-label="快退 5 秒"
-          title="快退 5 秒 (←)"
-          onClick={() => seekBy(-5)}
-        >
-          <RotateCcw size={15} />
-          <span>5s</span>
-        </button>
-        <button
-          type="button"
-          className="wb-vstage-center-play"
-          aria-label={paused ? '播放视频' : '暂停视频'}
-          title={paused ? '播放 (Space)' : '暂停 (Space)'}
-          onClick={togglePlay}
-        >
-          <ActionSwapIcon value={paused ? 'play' : 'pause'} animation="roll">
-            {paused ? <Play size={20} fill="currentColor" /> : <Pause size={20} fill="currentColor" />}
-          </ActionSwapIcon>
-        </button>
-        <button
-          type="button"
-          className="wb-vstage-center-seek"
-          aria-label="快进 5 秒"
-          title="快进 5 秒 (→)"
-          onClick={() => seekBy(5)}
-        >
-          <RotateCw size={15} />
-          <span>5s</span>
-        </button>
+        {/* Frosted Blur Privacy Shield */}
+        {concealed && (
+          <div className="wb-vstage-shield" role="region" aria-label="隐私模式已遮挡视频">
+            <div className="wb-vstage-shield-icon">
+              <ShieldAlert size={19} aria-hidden="true" />
+            </div>
+            <div className="wb-vstage-shield-meta tnum" title={name}>
+              {duration > 0 ? `${formatVideoClock(duration)} · ${name}` : name}
+            </div>
+            <button
+              type="button"
+              className="wb-vstage-shield-cta"
+              aria-label="显示并播放视频"
+              onClick={e => {
+                e.stopPropagation()
+                revealAndPlay()
+              }}
+            >
+              <Play size={14} fill="currentColor" aria-hidden="true" />
+              <span>显示并播放</span>
+            </button>
+          </div>
+        )}
+
+        {/* Bilibili-style Top HUD Pill */}
+        <AnimatePresence initial={false}>
+          {holdingBoost ? (
+            <motion.div
+              key="boost"
+              role="status"
+              className="wb-vstage-hud wb-vstage-hud-boost"
+              initial={reduce ? false : { opacity: 0, transform: 'translate(-50%, -6px) scale(0.95)' }}
+              animate={{ opacity: 1, transform: 'translate(-50%, 0px) scale(1)' }}
+              exit={reduce ? undefined : { opacity: 0, transform: 'translate(-50%, -6px) scale(0.95)' }}
+              transition={{ duration: reduce ? 0 : 0.14, ease: EASE_OUT }}
+            >
+              <FastForward size={13} />
+              <span>2.0x 倍速快进中</span>
+            </motion.div>
+          ) : hud ? (
+            <motion.div
+              key={hud.key}
+              role="status"
+              aria-live="polite"
+              className="wb-vstage-hud"
+              initial={reduce ? false : { opacity: 0, transform: 'translate(-50%, -6px) scale(0.95)' }}
+              animate={{ opacity: 1, transform: 'translate(-50%, 0px) scale(1)' }}
+              exit={reduce ? undefined : { opacity: 0, transform: 'translate(-50%, -6px) scale(0.95)' }}
+              transition={{ duration: reduce ? 0 : 0.14, ease: EASE_OUT }}
+            >
+              {hud.label}
+            </motion.div>
+          ) : null}
+        </AnimatePresence>
+
+        {/* Center Touch & Paused Controls */}
+        {!concealed && (
+          <div className="wb-vstage-center" data-visible={paused || (isTouchDevice && controlsVisible) || undefined}>
+            <button
+              type="button"
+              className="wb-vstage-center-seek"
+              aria-label="快退 5 秒"
+              title="快退 5 秒 (←)"
+              onClick={() => seekBy(-5)}
+            >
+              <RotateCcw size={15} />
+              <span>5s</span>
+            </button>
+            <button
+              type="button"
+              className="wb-vstage-center-play"
+              aria-label={paused ? '播放视频' : '暂停视频'}
+              title={paused ? '播放 (Space)' : '暂停 (Space)'}
+              onClick={togglePlay}
+            >
+              <ActionSwapIcon value={paused ? 'play' : 'pause'} animation="roll">
+                {paused ? <Play size={20} fill="currentColor" /> : <Pause size={20} fill="currentColor" />}
+              </ActionSwapIcon>
+            </button>
+            <button
+              type="button"
+              className="wb-vstage-center-seek"
+              aria-label="快进 5 秒"
+              title="快进 5 秒 (→)"
+              onClick={() => seekBy(5)}
+            >
+              <RotateCw size={15} />
+              <span>5s</span>
+            </button>
+          </div>
+        )}
       </div>
 
-      {/* Bottom Gradient Control Bar */}
-      <div className="wb-vstage-bottom">
+      {/* Dedicated Non-Overlapping Transport Bar */}
+      <div className="wb-vstage-transport">
         <div className="wb-vstage-timeline">
           <input
             type="range"
@@ -688,6 +830,7 @@ export function WorkbenchVideoPlayer({
             step={0.05}
             value={currentTime}
             onChange={e => {
+              if (concealed) return
               const next = Number(e.target.value)
               setCurrentTime(next)
               if (internalVideoRef.current) internalVideoRef.current.currentTime = next
@@ -722,7 +865,7 @@ export function WorkbenchVideoPlayer({
 
             <button
               type="button"
-              className="wb-vstage-btn wb-vstage-hide-xs"
+              className="wb-vstage-btn wb-vstage-fold-narrow"
               aria-label="快退 5 秒"
               title="快退 5 秒 (←)"
               onClick={() => seekBy(-5)}
@@ -732,25 +875,73 @@ export function WorkbenchVideoPlayer({
 
             <button
               type="button"
-              className="wb-vstage-btn wb-vstage-hide-xs"
+              className="wb-vstage-btn wb-vstage-fold-narrow"
               aria-label="快进 5 秒"
-              title="快进 5 秒 (→)"
+              title="快进 5 秒 (→) · 长按 2x"
               onClick={() => seekBy(5)}
             >
               <RotateCw size={14} />
             </button>
 
-            <button
-              type="button"
-              className="wb-vstage-btn"
-              aria-label={muted ? '取消静音' : '静音'}
-              title="静音 (M)"
-              onClick={toggleMute}
-            >
-              <ActionSwapIcon value={muted ? 'muted' : 'unmuted'} animation="roll">
-                {muted || volume === 0 ? <VolumeX size={15} /> : <Volume2 size={15} />}
-              </ActionSwapIcon>
-            </button>
+            {onPrev && (
+              <button
+                type="button"
+                className="wb-vstage-btn"
+                aria-label="上一条"
+                title="上一条 ([)"
+                disabled={!hasPrev}
+                onClick={onPrev}
+              >
+                <SkipBack size={14} />
+              </button>
+            )}
+
+            {onNext && (
+              <button
+                type="button"
+                className="wb-vstage-btn"
+                aria-label="下一条"
+                title="下一条 (])"
+                disabled={!hasNext}
+                onClick={onNext}
+              >
+                <SkipForward size={14} />
+              </button>
+            )}
+
+            <div className="wb-vstage-vol-wrap">
+              <button
+                type="button"
+                className="wb-vstage-btn"
+                aria-label={muted ? '取消静音' : '静音'}
+                title="静音 (M)"
+                onClick={toggleMute}
+              >
+                <ActionSwapIcon value={muted ? 'muted' : 'unmuted'} animation="roll">
+                  {muted || volume === 0 ? <VolumeX size={15} /> : <Volume2 size={15} />}
+                </ActionSwapIcon>
+              </button>
+              {showVolumeSlider && (
+                <input
+                  type="range"
+                  aria-label="音量"
+                  className="wb-vstage-vol-slider"
+                  min={0}
+                  max={1}
+                  step={0.05}
+                  value={muted ? 0 : volume}
+                  onChange={e => {
+                    const next = Number(e.target.value)
+                    setVolume(next)
+                    setMuted(next === 0)
+                    if (internalVideoRef.current) {
+                      internalVideoRef.current.volume = next
+                      internalVideoRef.current.muted = next === 0
+                    }
+                  }}
+                />
+              )}
+            </div>
 
             <span className="wb-vstage-time">
               {formatVideoClock(currentTime)} <em>/</em> {formatVideoClock(duration)}
@@ -758,122 +949,213 @@ export function WorkbenchVideoPlayer({
           </div>
 
           <div className="wb-vstage-controls-right">
-            {/* External Player Menu (Infuse / nPlayer / SenPlayer) */}
-            <div className="wb-vstage-speed-wrap">
+            {privacy.enabled && privacy.revealed && (
               <button
                 type="button"
                 className="wb-vstage-pill"
-                aria-label="外部播放器打开"
-                title="在 Infuse / nPlayer / SenPlayer 中打开"
-                aria-expanded={extMenuOpen}
-                onClick={() => {
-                  setSpeedMenuOpen(false)
-                  setExtMenuOpen(v => !v)
-                }}
+                aria-label="遮挡视频"
+                title="立即重新遮挡"
+                onClick={concealVideo}
               >
-                <ExternalLink size={12} />
-                <span className="wb-vstage-hide-xs">外部</span>
+                <EyeOff size={13} aria-hidden="true" />
+                <span className="wb-vstage-btn-label">遮挡视频</span>
               </button>
-              <AnimatePresence initial={false}>
-                {extMenuOpen && (
-                  <motion.div
-                    role="menu"
-                    aria-label="选择外部播放器"
-                    className="wb-vstage-speed-menu wb-vstage-ext-menu"
-                    initial={reduce ? false : { opacity: 0, transform: 'translateY(4px)' }}
-                    animate={{ opacity: 1, transform: 'translateY(0px)' }}
-                    exit={reduce ? undefined : { opacity: 0, transform: 'translateY(4px)' }}
-                    transition={{ duration: reduce ? 0 : 0.14, ease: EASE_OUT }}
-                  >
-                    <a
-                      href={extLinks.infuse}
-                      role="menuitem"
-                      onClick={() => setExtMenuOpen(false)}
-                    >
-                      Infuse
-                    </a>
-                    <a
-                      href={extLinks.nplayer}
-                      role="menuitem"
-                      onClick={() => setExtMenuOpen(false)}
-                    >
-                      nPlayer
-                    </a>
-                    <a
-                      href={extLinks.senplayer}
-                      role="menuitem"
-                      onClick={() => setExtMenuOpen(false)}
-                    >
-                      SenPlayer
-                    </a>
-                    <button
-                      type="button"
-                      role="menuitem"
-                      onClick={() => {
-                        setExtMenuOpen(false)
-                        void navigator.clipboard
-                          ?.writeText(extLinks.streamUrl)
-                          .then(() => flashHud('流地址已复制'))
-                          .catch(() => {})
-                      }}
-                    >
-                      复制流地址
-                    </button>
-                  </motion.div>
-                )}
-              </AnimatePresence>
-            </div>
+            )}
 
-            <div className="wb-vstage-speed-wrap">
-              <button
-                type="button"
-                className="wb-vstage-pill"
-                aria-label={`播放倍速 ${speed}x`}
-                aria-expanded={speedMenuOpen}
-                onClick={() => {
-                  setExtMenuOpen(false)
-                  setSpeedMenuOpen(v => !v)
-                }}
-              >
-                {speed === 1 ? '倍速' : `${speed}x`}
-              </button>
-              <AnimatePresence initial={false}>
-                {speedMenuOpen && (
-                  <motion.div
-                    role="menu"
-                    aria-label="选择倍速"
-                    className="wb-vstage-speed-menu"
-                    initial={reduce ? false : { opacity: 0, transform: 'translateY(4px)' }}
-                    animate={{ opacity: 1, transform: 'translateY(0px)' }}
-                    exit={reduce ? undefined : { opacity: 0, transform: 'translateY(4px)' }}
-                    transition={{ duration: reduce ? 0 : 0.14, ease: EASE_OUT }}
+            {/* External Player Portal Dropdown */}
+            <DropdownMenu.Root open={extMenuOpen} onOpenChange={setExtMenuOpen}>
+              <DropdownMenu.Trigger asChild>
+                <button
+                  type="button"
+                  className="wb-vstage-pill wb-vstage-fold-narrow"
+                  aria-label="外部播放器打开"
+                  title="在 Infuse / nPlayer / SenPlayer 中打开"
+                >
+                  <ExternalLink size={12} aria-hidden="true" />
+                  <span className="wb-vstage-btn-label">外部</span>
+                </button>
+              </DropdownMenu.Trigger>
+              <DropdownMenu.Portal container={portalContainer}>
+                <DropdownMenu.Content
+                  className="wb-vstage-portal-menu"
+                  side="top"
+                  align="end"
+                  sideOffset={6}
+                  collisionPadding={12}
+                >
+                  <DropdownMenu.Label className="wb-vstage-portal-title">外部播放器</DropdownMenu.Label>
+                  <DropdownMenu.Item asChild className="wb-vstage-portal-item">
+                    <a href={extLinks.infuse}>
+                      <span>Infuse</span>
+                      <ExternalLink size={12} aria-hidden="true" />
+                    </a>
+                  </DropdownMenu.Item>
+                  <DropdownMenu.Item asChild className="wb-vstage-portal-item">
+                    <a href={extLinks.nplayer}>
+                      <span>nPlayer</span>
+                      <ExternalLink size={12} aria-hidden="true" />
+                    </a>
+                  </DropdownMenu.Item>
+                  <DropdownMenu.Item asChild className="wb-vstage-portal-item">
+                    <a href={extLinks.senplayer}>
+                      <span>SenPlayer</span>
+                      <ExternalLink size={12} aria-hidden="true" />
+                    </a>
+                  </DropdownMenu.Item>
+                  <DropdownMenu.Separator className="wb-vstage-portal-sep" />
+                  <DropdownMenu.Item
+                    className="wb-vstage-portal-item"
+                    onSelect={() => {
+                      void navigator.clipboard
+                        ?.writeText(extLinks.streamUrl)
+                        .then(() => flashHud('流地址已复制'))
+                        .catch(() => {})
+                    }}
+                  >
+                    <span>复制流地址</span>
+                    <Copy size={12} aria-hidden="true" />
+                  </DropdownMenu.Item>
+                </DropdownMenu.Content>
+              </DropdownMenu.Portal>
+            </DropdownMenu.Root>
+
+            {/* Speed Portal Dropdown */}
+            <DropdownMenu.Root open={speedMenuOpen} onOpenChange={setSpeedMenuOpen}>
+              <DropdownMenu.Trigger asChild>
+                <button
+                  type="button"
+                  className="wb-vstage-pill"
+                  aria-label={`播放倍速 ${speed}x`}
+                  title="切换播放倍速"
+                >
+                  {speed === 1 ? '倍速' : `${speed}x`}
+                </button>
+              </DropdownMenu.Trigger>
+              <DropdownMenu.Portal container={portalContainer}>
+                <DropdownMenu.Content
+                  className="wb-vstage-portal-menu"
+                  side="top"
+                  align="end"
+                  sideOffset={6}
+                  collisionPadding={12}
+                >
+                  <DropdownMenu.Label className="wb-vstage-portal-title">播放倍速</DropdownMenu.Label>
+                  <DropdownMenu.RadioGroup
+                    value={String(speed)}
+                    onValueChange={val => selectSpeed(Number(val))}
                   >
                     {[...SPEEDS].reverse().map(item => (
-                      <button
+                      <DropdownMenu.RadioItem
                         key={item}
-                        type="button"
-                        role="menuitemradio"
-                        aria-checked={speed === item}
-                        data-active={speed === item || undefined}
-                        onClick={() => selectSpeed(item)}
+                        value={String(item)}
+                        className="wb-vstage-portal-item"
                       >
-                        {item.toFixed(item === 1.25 ? 2 : 1)}x
-                      </button>
+                        <span>{item.toFixed(item === 0.75 || item === 1.25 ? 2 : 1)}x</span>
+                        {speed === item && <Check size={12} aria-hidden="true" />}
+                      </DropdownMenu.RadioItem>
                     ))}
-                  </motion.div>
-                )}
-              </AnimatePresence>
-            </div>
+                  </DropdownMenu.RadioGroup>
+                </DropdownMenu.Content>
+              </DropdownMenu.Portal>
+            </DropdownMenu.Root>
 
-            <button
-              type="button"
-              className="wb-vstage-btn"
-              aria-label={isFullscreen ? '退出全屏' : '全屏播放'}
-              title="全屏 (F / 双击画面)"
-              onClick={toggleFullscreen}
-            >
-              {isFullscreen ? <Minimize2 size={15} /> : <Maximize2 size={15} />}
-            </button>
+            {extraControls}
+
+            {onExpand && (
+              <button
+                type="button"
+                className="wb-vstage-pill"
+                aria-label="居中放大预览"
+                title="居中放大并承接当前进度"
+                onClick={e => {
+                  const t = internalVideoRef.current?.currentTime || 0
+                  internalVideoRef.current?.pause()
+                  onExpand(t, e.currentTarget)
+                }}
+              >
+                <Maximize size={12} aria-hidden="true" />
+                <span className="wb-vstage-btn-label">居中放大</span>
+              </button>
+            )}
+
+            {/* Narrow Overflow Portal Menu (<= 400px @container) */}
+            <DropdownMenu.Root open={overflowMenuOpen} onOpenChange={setOverflowMenuOpen}>
+              <DropdownMenu.Trigger asChild>
+                <button
+                  type="button"
+                  className="wb-vstage-btn wb-vstage-overflow-trigger"
+                  aria-label="更多播放控制"
+                  title="更多控制"
+                >
+                  <MoreHorizontal size={15} aria-hidden="true" />
+                </button>
+              </DropdownMenu.Trigger>
+              <DropdownMenu.Portal container={portalContainer}>
+                <DropdownMenu.Content
+                  className="wb-vstage-portal-menu"
+                  side="top"
+                  align="end"
+                  sideOffset={6}
+                  collisionPadding={12}
+                >
+                  <DropdownMenu.Item className="wb-vstage-portal-item" onSelect={() => seekBy(-5)}>
+                    <span>快退 5 秒 (←)</span>
+                    <RotateCcw size={12} aria-hidden="true" />
+                  </DropdownMenu.Item>
+                  <DropdownMenu.Item className="wb-vstage-portal-item" onSelect={() => seekBy(5)}>
+                    <span>快进 5 秒 (→)</span>
+                    <RotateCw size={12} aria-hidden="true" />
+                  </DropdownMenu.Item>
+                  <DropdownMenu.Item className="wb-vstage-portal-item" onSelect={toggleMute}>
+                    <span>{muted ? '取消静音 (M)' : '静音 (M)'}</span>
+                    {muted ? <Volume2 size={12} aria-hidden="true" /> : <VolumeX size={12} aria-hidden="true" />}
+                  </DropdownMenu.Item>
+                  <DropdownMenu.Separator className="wb-vstage-portal-sep" />
+                  <DropdownMenu.Item asChild className="wb-vstage-portal-item">
+                    <a href={extLinks.infuse}>
+                      <span>在 Infuse 打开</span>
+                      <ExternalLink size={12} aria-hidden="true" />
+                    </a>
+                  </DropdownMenu.Item>
+                  <DropdownMenu.Item asChild className="wb-vstage-portal-item">
+                    <a href={extLinks.nplayer}>
+                      <span>在 nPlayer 打开</span>
+                      <ExternalLink size={12} aria-hidden="true" />
+                    </a>
+                  </DropdownMenu.Item>
+                  <DropdownMenu.Item asChild className="wb-vstage-portal-item">
+                    <a href={extLinks.senplayer}>
+                      <span>在 SenPlayer 打开</span>
+                      <ExternalLink size={12} aria-hidden="true" />
+                    </a>
+                  </DropdownMenu.Item>
+                  <DropdownMenu.Item
+                    className="wb-vstage-portal-item"
+                    onSelect={() => {
+                      void navigator.clipboard
+                        ?.writeText(extLinks.streamUrl)
+                        .then(() => flashHud('流地址已复制'))
+                        .catch(() => {})
+                    }}
+                  >
+                    <span>复制流地址</span>
+                    <Copy size={12} aria-hidden="true" />
+                  </DropdownMenu.Item>
+                </DropdownMenu.Content>
+              </DropdownMenu.Portal>
+            </DropdownMenu.Root>
+
+            {!privacy.enabled && (
+              <button
+                type="button"
+                className="wb-vstage-btn"
+                aria-label={isFullscreen ? '退出全屏' : '全屏播放'}
+                title="全屏 (F / 双击画面)"
+                onClick={toggleFullscreen}
+              >
+                {isFullscreen ? <Minimize2 size={15} /> : <Maximize2 size={15} />}
+              </button>
+            )}
           </div>
         </div>
       </div>

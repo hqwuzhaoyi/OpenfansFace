@@ -40,8 +40,8 @@
 .archive-row[data-selected=true] { background:color-mix(in srgb,var(--foreground) 4%,transparent); }
 .archive-row[data-active=true] { background:var(--accent); border-left-color:var(--ring); }
 .archive-rowOpen { display:flex; align-items:center; gap:9px; text-align:left; align-self:stretch; min-width:0; flex:1; }
-.archive-rowThumbnail { display:grid; place-items:center; width:44px; height:34px; overflow:hidden; flex-shrink:0; background:var(--muted); border-radius:4px; color:var(--muted-foreground); }
-.archive-rowThumbnail img { width:100%; height:100%; object-fit:cover; }
+.archive-rowThumbnail { display:grid; place-items:center; width:44px; height:34px; overflow:hidden; flex-shrink:0; background:var(--wb-player); border-radius:4px; color:var(--muted-foreground); }
+.archive-rowThumbnail img { width:100%; height:100%; object-fit:contain; }
 .archive-rowText { min-width:0; flex:1; }
 .archive-rowText strong { display:block; font-size:12px; font-weight:500; text-overflow:ellipsis; overflow:hidden; white-space:nowrap; }
 .archive-rowText small { display:block; color:var(--muted-foreground); font-size:10px; margin-top:5px; }
@@ -156,8 +156,8 @@
 .archive-waveVideo>button>span:first-child { flex:1; min-width:0; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; }
 .archive-waveVideo>button>small { color:var(--muted-foreground); white-space:nowrap; font-size:10px; }
 .archive-waveVideo>button>span:last-child { font-size:10px; max-width:80px; }
-.archive-inlinePlayer { margin:0; background:#000; border:1px solid var(--border); border-radius:6px; overflow:hidden; }
-.archive-inlinePlayer video { display:block; width:100%; height:clamp(200px,36dvh,480px); background:#000; object-fit:contain; }
+.archive-inlinePlayer { margin:0; background:var(--wb-player); border:1px solid var(--border); border-radius:10px; overflow:hidden; }
+.archive-inlinePlayer .wb-vstage { border:0; border-radius:0; }
 .archive-playerError { padding:14px; background:var(--card); color:var(--wb-warning); font-size:12px; }
 .archive-playerError p,.archive-playerError>div { display:flex; align-items:center; gap:8px; }
 .archive-playerError small { display:block; margin-top:8px; }
@@ -173,7 +173,6 @@
   .archive-waveVideo>button { gap:8px; font-size:11px; }
   .archive-waveVideo>button>small { display:none; }
   .archive-waveVideos { max-height:190px; }
-  .archive-inlinePlayer video { height:220px; }
 }
 .archive-inlinePlayer + .archive-paths { margin-top:20px; }
 

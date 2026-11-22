@@ -52,7 +52,7 @@ use crate::{
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Query, State},
-    http::HeaderMap,
+    http::{HeaderMap, StatusCode},
     routing::get,
 };
 use serde_json::{Value, json};
@@ -92,11 +92,29 @@ fn authorize(config: &Config, headers: &HeaderMap) -> Result<()> {
     }
     Ok(())
 }
+async fn wait_with_budget(
+    mut rx: oneshot::Receiver<Result<Value>>,
+    wait_ms: Option<u64>,
+) -> Result<Option<Value>> {
+    match wait_ms {
+        None => Ok(Some(rx.await.map_err(|_| {
+            Error::new(503, "outcome_unknown", "执行器连接中断，请按操作编号查询")
+        })??)),
+        Some(ms) => {
+            tokio::select! {
+                res = &mut rx => Ok(Some(res.map_err(|_| {
+                    Error::new(503, "outcome_unknown", "执行器连接中断，请按操作编号查询")
+                })??)),
+                _ = tokio::time::sleep(tokio::time::Duration::from_millis(ms.min(60_000))) => Ok(None),
+            }
+        }
+    }
+}
 async fn post(
     State(app): State<App>,
     headers: HeaderMap,
     payload: std::result::Result<Json<Envelope>, axum::extract::rejection::JsonRejection>,
-) -> Result<Json<Value>> {
+) -> Result<(StatusCode, Json<Value>)> {
     authorize(&app.config, &headers)?;
     let Json(envelope) = payload.map_err(|e| {
         Error::new(
@@ -128,15 +146,23 @@ async fn post(
             .map_err(|_| Error::new(503, "unavailable", "读取服务不可用"))?;
         let config = app.config;
         let request = envelope.request;
-        return Ok(Json(
-            tokio::task::spawn_blocking(move || {
-                let _permit = permit;
-                let mut engine = Engine::open_preview(config)?;
-                engine.preview(request)
-            })
-            .await
-            .map_err(|_| Error::new(503, "unavailable", "预览读取失败"))??,
+        return Ok((
+            StatusCode::OK,
+            Json(
+                tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    let mut engine = Engine::open_preview(config)?;
+                    engine.preview(request)
+                })
+                .await
+                .map_err(|_| Error::new(503, "unavailable", "预览读取失败"))??,
+            ),
         ));
+    }
+    let wait_ms = envelope.wait_ms.filter(|_| envelope.mode == "apply");
+    let op_id = envelope.request.id.clone();
+    if wait_ms.is_some() {
+        crate::model::validate_id(&op_id)?;
     }
     let (reply, wait) = oneshot::channel();
     app.worker.try_send(Work {
@@ -144,9 +170,13 @@ async fn post(
         reply,
     })?;
     // The dedicated worker owns execution. Dropping this receiver never aborts admitted work.
-    Ok(Json(wait.await.map_err(|_| {
-        Error::new(503, "outcome_unknown", "执行器连接中断，请按操作编号查询")
-    })??))
+    match wait_with_budget(wait, wait_ms).await? {
+        Some(value) => Ok((StatusCode::OK, Json(value))),
+        None => Ok((
+            StatusCode::ACCEPTED,
+            Json(json!({"id": op_id, "status": "running", "accepted": true})),
+        )),
+    }
 }
 async fn status(
     State(app): State<App>,
@@ -441,9 +471,9 @@ async fn archive_post(
     State(app): State<App>,
     headers: HeaderMap,
     payload: std::result::Result<Json<Value>, axum::extract::rejection::JsonRejection>,
-) -> Result<Json<Value>> {
+) -> Result<(StatusCode, Json<Value>)> {
     authorize(&app.config, &headers)?;
-    let Json(payload) = payload.map_err(|e| {
+    let Json(mut payload) = payload.map_err(|e| {
         Error::new(
             400,
             "invalid_request",
@@ -462,13 +492,16 @@ async fn archive_post(
             .await
             .map_err(|_| Error::new(503, "unavailable", "读取服务不可用"))?;
         let config = app.config;
-        return Ok(Json(
-            tokio::task::spawn_blocking(move || {
-                let _permit = permit;
-                archive::preview(&config)
-            })
-            .await
-            .map_err(|_| Error::new(503, "unavailable", "归档预览读取失败"))??,
+        return Ok((
+            StatusCode::OK,
+            Json(
+                tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    archive::preview(&config)
+                })
+                .await
+                .map_err(|_| Error::new(503, "unavailable", "归档预览读取失败"))??,
+            ),
         ));
     }
     if matches!(command.as_str(), "review-page" | "review-status")
@@ -482,15 +515,44 @@ async fn archive_post(
             .map_err(|_| Error::new(503, "unavailable", "读取服务不可用"))?;
         let config = app.config;
         let body = payload["body"].clone();
-        return Ok(Json(
-            tokio::task::spawn_blocking(move || {
-                let _permit = permit;
-                let mut engine = Engine::open_preview(config)?;
-                review_sessions::execute(&mut engine, &command, body)
-            })
-            .await
-            .map_err(|_| Error::new(503, "unavailable", "核对读取失败"))??,
+        return Ok((
+            StatusCode::OK,
+            Json(
+                tokio::task::spawn_blocking(move || {
+                    let _permit = permit;
+                    let mut engine = Engine::open_preview(config)?;
+                    review_sessions::execute(&mut engine, &command, body)
+                })
+                .await
+                .map_err(|_| Error::new(503, "unavailable", "核对读取失败"))??,
+            ),
         ));
+    }
+    let wait_ms = if command == "archive-apply" {
+        payload["wait_ms"].as_u64()
+    } else {
+        None
+    };
+    let mut op_id = String::new();
+    if wait_ms.is_some() {
+        let existing = payload["body"]
+            .get("operation_id")
+            .or_else(|| payload["body"].get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        op_id = match existing {
+            Some(id) => {
+                crate::model::validate_id(&id)?;
+                id
+            }
+            None => {
+                let id = uuid::Uuid::new_v4().to_string();
+                if let Some(obj) = payload["body"].as_object_mut() {
+                    obj.insert("operation_id".into(), json!(id));
+                }
+                id
+            }
+        };
     }
     let (reply, wait) = oneshot::channel();
     app.worker.try_send(Work {
@@ -500,9 +562,13 @@ async fn archive_post(
         },
         reply,
     })?;
-    Ok(Json(wait.await.map_err(|_| {
-        Error::new(503, "outcome_unknown", "执行连接中断")
-    })??))
+    match wait_with_budget(wait, wait_ms).await? {
+        Some(value) => Ok((StatusCode::OK, Json(value))),
+        None => Ok((
+            StatusCode::ACCEPTED,
+            Json(json!({"id": op_id, "status": "running", "accepted": true})),
+        )),
+    }
 }
 async fn archive_status(
     State(app): State<App>,

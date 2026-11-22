@@ -66,6 +66,17 @@ export function applyPersonFileOperation(request:PersonFileRequest,version:strin
   if(typeof version!=='string')throw new FileOperationRoutingError('请先预览操作',400)
   return dispatch(request).apply(request,version)
 }
+export interface AcceptedPersonFileOperation {
+  id:string; status:string; accepted:true
+}
+export function applyPersonFileOperationAsync(request:PersonFileRequest,version:string,waitMs=2000){
+  if(typeof version!=='string')throw new FileOperationRoutingError('请先预览操作',400)
+  validateFileOperationId(request.id)
+  const backend=selectedPersonFileBackend(request.action)
+  const owner=fileOperationOwner(BASE,request.id)
+  if(owner&&(owner.backend!==backend||owner.action!==request.action))throw new FileOperationRoutingError('旧操作不能转交新执行器，请重新预览')
+  return nativeJsonRequest<PersonFileResult|AcceptedPersonFileOperation>('v1/person-files',{mode:'apply',request,version,wait_ms:waitMs},{label:'文件操作',completion:'allow_accepted',error:(message,status)=>new FileOperationRoutingError(message,status)})
+}
 export function personFileOperationStatus(id:string){
   validateFileOperationId(id)
   const owner=fileOperationOwner(BASE,id)

@@ -1,21 +1,19 @@
 'use client'
 import { WorkspacePath } from '@/components/workbench/inner'
-import { ExternalPlayerBar, WorkbenchVideoPlayer } from '@/components/workbench/video-player'
+import { ExternalPlayerBar } from '@/components/workbench/video-player'
+import { VideoPreviewDialog } from '@/components/workbench/video-preview-dialog'
 import { useEffect, useRef, useState } from 'react'
 import Link from 'next/link'
 import { api } from '@/lib/face-api'
-import { ResponsiveDialogContent } from './responsive-dialog'
 import { cn } from '@/lib/utils'
-import { Copy, Play, AlertCircle } from 'lucide-react'
-import { toast } from 'sonner'
-import { Dialog, DialogDescription, DialogHeader, DialogTitle } from '@/components/ui/dialog'
+import { Play, AlertCircle } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { fileName, type ReviewVideo } from '@/lib/review-ui'
 
 export function PathText({value,label='原路径'}:{value:string;label?:string}){return <WorkspacePath value={value} label={label}/>}
 export function VideoThumbnail({ video, onPlay, className }: { video: ReviewVideo; onPlay: (v: ReviewVideo) => void; className?:string }) {
-  return <button type="button" className={cn("video-thumb group relative aspect-video w-28 shrink-0 overflow-hidden rounded-lg border bg-muted sm:w-36",className)} onClick={() => onPlay(video)} aria-label={`播放 ${video.name || fileName(video.vid)}`}>
-    {video.thumb && <img data-private-media draggable={false} src={video.thumb} alt="" loading="lazy" className="h-full w-full object-cover" />}
+  return <button type="button" className={cn("video-thumb group relative aspect-video w-28 shrink-0 overflow-hidden rounded-lg border bg-black sm:w-36",className)} onClick={() => onPlay(video)} aria-label={`播放 ${video.name || fileName(video.vid)}`}>
+    {video.thumb && <img data-private-media draggable={false} src={video.thumb} alt="" loading="lazy" className="h-full w-full object-contain" />}
     <span className="absolute inset-0 flex items-center justify-center bg-black/25"><span className="flex h-9 w-9 items-center justify-center rounded-full bg-black/65 text-white"><Play className="ml-0.5 h-4 w-4" fill="currentColor" /></span></span>
     <span className="absolute bottom-1 right-1 rounded bg-black/75 px-1.5 py-0.5 text-[10px] text-white">播放</span>
   </button>
@@ -23,7 +21,6 @@ export function VideoThumbnail({ video, onPlay, className }: { video: ReviewVide
 export function VideoPlayer({ video, onClose, returnFocus, instantEntry }: { video: ReviewVideo | null; onClose: () => void; returnFocus?: React.RefObject<HTMLButtonElement | null>; instantEntry?: boolean }) {
   const [failed, setFailed] = useState(false)
   const [reported,setReported]=useState(false),reportSequence=useRef(0)
-  const trigger=useRef<HTMLElement|null>(null)
   const guard=useRef<Promise<{fingerprint:string;path:string;material?:string}>|null>(null)
   useEffect(()=>{
     guard.current=video?api<{fingerprint:string;path:string;material?:string}>('/api/video-health?vid='+encodeURIComponent(video.vid)+(video.path?'&path='+encodeURIComponent(video.path):'')):null
@@ -41,14 +38,30 @@ export function VideoPlayer({ video, onClose, returnFocus, instantEntry }: { vid
       .then(()=>{if(reportSequence.current===sequence)setReported(true)}).catch(()=>{})
   }
   const src = video ? `/api/video?p=${encodeURIComponent(video.path || video.vid)}` : ''
-  return <Dialog open={!!video} onOpenChange={o => { if (!o) close() }}>
-    <ResponsiveDialogContent open={!!video} inert={!video} style={instantEntry === undefined ? undefined : { animationName: video ? 'review-dialog-in' : 'review-dialog-out', animationDuration: instantEntry ? '0ms' : '180ms' }} overlayProps={instantEntry === undefined ? undefined : { style: { animationName: video ? 'review-overlay-in' : 'review-dialog-out', animationDuration: instantEntry ? '0ms' : '140ms' } }} onOpenAutoFocus={()=>{trigger.current=document.activeElement instanceof HTMLElement?document.activeElement:null}} onCloseAutoFocus={event=>{event.preventDefault();const target=returnFocus?.current?.isConnected?returnFocus.current:trigger.current;if(target?.isConnected)target.focus({preventScroll:true})}} className="flex max-h-[92dvh] flex-col gap-0 overflow-hidden p-0 sm:max-w-4xl sm:p-0">
-      <DialogHeader className="shrink-0 border-b p-4 pr-14 text-left"><DialogTitle>视频预览</DialogTitle><DialogDescription>关闭后回到刚才的位置，勾选保持不变。</DialogDescription></DialogHeader>
-      {video&&<div data-sheet-scroll className="min-h-0 flex-1 space-y-3 overflow-y-auto p-4"><p className="break-all text-sm font-medium">{video.name}</p><WorkbenchVideoPlayer key={src} src={src} name={video.name||fileName(video.vid)} poster={video.thumb||undefined} autoPlay enableGlobalHotkeys onError={playbackError}/>
-        {failed&&<div role="alert" className="space-y-3 rounded-lg border border-amber-500/30 p-3 text-sm text-amber-300"><p className="flex items-start gap-2"><AlertCircle className="mt-0.5 h-4 w-4 shrink-0"/>暂时无法播放，可能是路径变化、网络中断或不支持此编码，可直接调用外部播放器。</p><ExternalPlayerBar src={src} name={video.name||fileName(video.vid)}/>{reported&&<p className="text-xs">已记下本次失败，下一次自动体检会优先复查。原文件保留。</p>}<Button asChild variant="outline" className="min-h-11"><Link href="/staging#video-health" onClick={close}>查看视频体检与失效记录</Link></Button></div>}<PathText value={video.path||video.vid}/></div>}
-      <div className="mobile-bottom-actions shrink-0 border-t p-3"><Button variant="outline" className="min-h-11 w-full" onClick={close}>关闭播放，继续核对</Button></div>
-    </ResponsiveDialogContent>
-  </Dialog>
+  const name = video ? (video.name || fileName(video.vid)) : ''
+  return (
+    <VideoPreviewDialog
+      open={!!video}
+      onOpenChange={open => { if (!open) close() }}
+      title={name || '视频预览'}
+      src={src}
+      name={name}
+      poster={video?.thumb || undefined}
+      path={video ? (video.path || video.vid) : undefined}
+      onError={playbackError}
+      returnFocus={returnFocus}
+      instantEntry={instantEntry}
+      errorSlot={failed ? (
+        <div role="alert" className="space-y-3 rounded-lg border border-amber-500/30 p-3 text-sm text-amber-300">
+          <p className="flex items-start gap-2"><AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />暂时无法播放，可能是路径变化、网络中断或不支持此编码，可直接调用外部播放器。</p>
+          <ExternalPlayerBar src={src} name={name} />
+          {reported && <p className="text-xs">已记下本次失败，下一次自动体检会优先复查。原文件保留。</p>}
+          <Button asChild variant="outline" className="min-h-11"><Link href="/staging#video-health" onClick={close}>查看视频体检与失效记录</Link></Button>
+        </div>
+      ) : undefined}
+      footerActions={<Button variant="outline" size="sm" onClick={close}>关闭播放</Button>}
+    />
+  )
 }
 export function VideoRow({ video, selected, onToggle, onPlay, children, disabled }: {
   video: ReviewVideo; selected: boolean; onToggle: () => void; onPlay: (v: ReviewVideo) => void; children?: React.ReactNode; disabled?: boolean
