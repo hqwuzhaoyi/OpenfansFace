@@ -15,7 +15,7 @@ export function VideoCover({video,sampleTime=.1,className=''}:{video:{path:strin
   useEffect(()=>{if(!visible||thumb)return;const abort=new AbortController();requestVideoPoster(video.path,stamp,sampleTime,abort.signal).then(poster=>{if(!abort.signal.aborted)setState({key,poster})}).catch(error=>{if(!abort.signal.aborted)setState({key,error:error.message})});return()=>abort.abort()},[visible,thumb,key,video.path,stamp,sampleTime])
   const image=thumb||current?.poster?.src,time=current?.poster?.time
   return <span ref={ref} className={`video-cover ${className}`} aria-hidden="true" data-frame-ready={!!image}>
-    {image?<img data-private-media draggable={false} src={image} alt="" loading="lazy" onError={()=>thumb?setBadThumb(thumb):setState({key,error:'截图暂不可用'})}/>:<span className="video-cover-placeholder"><FileVideo size={22}/><small>{current?.error?'截图暂不可用':visible?'读取截图…':'视频截图'}</small></span>}
-    <span className="video-cover-play"><Play size={14}/></span>{time!==undefined&&<span className="video-cover-time">{Math.floor(time/60)}:{String(Math.floor(time%60)).padStart(2,'0')}</span>}
+    {image?<img data-private-media draggable={false} src={image} alt="" loading="lazy" onError={()=>thumb?setBadThumb(thumb):setState({key,error:'截图暂不可用'})}/>:<span className="video-cover-placeholder"><FileVideo size={18} aria-hidden="true"/><small>{current?.error?'截图暂不可用':visible?'读取截图…':'视频截图'}</small></span>}
+    {image&&<span className="video-cover-play"><Play size={14} aria-hidden="true" className="translate-x-[1px]"/></span>}{image&&time!==undefined&&<span className="video-cover-time">{Math.floor(time/60)}:{String(Math.floor(time%60)).padStart(2,'0')}</span>}
   </span>
 }

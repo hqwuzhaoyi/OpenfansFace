@@ -5,6 +5,7 @@ import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { RefreshCw, Server, Cpu, CirclePause, CirclePlay } from 'lucide-react'
 import { workspaceToast as toast } from '@/components/workbench/feedback'
 import { WorkspaceCard, WorkspaceButton as Button } from '@/components/workbench/inner'
+import { InlineBeuiLoader, WorkbenchListSkeleton } from '@/components/workbench/loading-skeletons'
 import { WorkspaceTabs, WorkspaceSearch } from '@/components/workbench/controls'
 import { api } from '@/lib/face-api'
 import type { AgentNode, DeviceGroupPool, NodeListApiResponse } from '@/lib/processing-node-model'
@@ -137,11 +138,20 @@ export default function NodeView() {
       <div className="ws-node-view-header">
         <div>
           <h2>节点资源与设备池</h2>
-          <span>
-            {cluster
-              ? `${cluster.device_groups_count} 个物理设备 · ${cluster.total_nodes} 个 Agent (${cluster.accepting_nodes} 个可接单)`
-              : '正在连接节点服务…'}
-          </span>
+          {cluster ? (
+            <span>
+              {`${cluster.device_groups_count} 个物理设备 · ${cluster.total_nodes} 个 Agent (${cluster.accepting_nodes} 个可接单)`}
+            </span>
+          ) : (
+            <div className="mt-1.5">
+              <InlineBeuiLoader
+                size={13}
+                label="正在连接节点服务"
+                showLabel
+                className="!mt-0 !inline-flex [&>span]:!mt-0 [&>span]:!inline"
+              />
+            </div>
+          )}
         </div>
         <div className="ws-node-header-actions">
           <Button
@@ -212,7 +222,7 @@ export default function NodeView() {
       {/* Main Pools Grid */}
       <div className="ws-node-cards-list">
         {!data ? (
-          <p className="bm-empty">正在加载集群节点状态…</p>
+          <WorkbenchListSkeleton count={2} variant="card" label="正在加载集群节点状态" />
         ) : filteredPools.length === 0 ? (
           <p className="bm-empty">当前筛选无符合条件的计算设备</p>
         ) : (

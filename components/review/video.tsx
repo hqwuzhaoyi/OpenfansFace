@@ -13,9 +13,9 @@ import { fileName, type ReviewVideo } from '@/lib/review-ui'
 export function PathText({value,label='原路径'}:{value:string;label?:string}){return <WorkspacePath value={value} label={label}/>}
 export function VideoThumbnail({ video, onPlay, className }: { video: ReviewVideo; onPlay: (v: ReviewVideo) => void; className?:string }) {
   return <button type="button" className={cn("video-thumb group relative aspect-video w-28 shrink-0 overflow-hidden rounded-lg border bg-black sm:w-36",className)} onClick={() => onPlay(video)} aria-label={`播放 ${video.name || fileName(video.vid)}`}>
-    {video.thumb && <img data-private-media draggable={false} src={video.thumb} alt="" loading="lazy" className="h-full w-full object-contain" />}
-    <span className="absolute inset-0 flex items-center justify-center bg-black/25"><span className="flex h-9 w-9 items-center justify-center rounded-full bg-black/65 text-white"><Play className="ml-0.5 h-4 w-4" fill="currentColor" /></span></span>
-    <span className="absolute bottom-1 right-1 rounded bg-black/75 px-1.5 py-0.5 text-[10px] text-white">播放</span>
+    {video.thumb && <img data-private-media draggable={false} src={video.thumb} width={144} height={81} alt="" loading="lazy" className="h-full w-full object-contain" />}
+    <span className="absolute inset-0 flex items-center justify-center bg-black/25"><span className="flex h-9 w-9 items-center justify-center rounded-full bg-black/65 text-white"><Play className="ml-0.5 h-4 w-4" fill="currentColor" aria-hidden="true" /></span></span>
+    <span className="absolute bottom-1 right-1 rounded bg-black/75 px-1.5 py-0.5 text-[11px] text-white">播放</span>
   </button>
 }
 export function VideoPlayer({ video, onClose, returnFocus, instantEntry }: { video: ReviewVideo | null; onClose: () => void; returnFocus?: React.RefObject<HTMLButtonElement | null>; instantEntry?: boolean }) {
@@ -53,7 +53,7 @@ export function VideoPlayer({ video, onClose, returnFocus, instantEntry }: { vid
       instantEntry={instantEntry}
       errorSlot={failed ? (
         <div role="alert" className="space-y-3 rounded-lg border border-amber-500/30 p-3 text-sm text-amber-300">
-          <p className="flex items-start gap-2"><AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />暂时无法播放，可能是路径变化、网络中断或不支持此编码，可直接调用外部播放器。</p>
+          <p className="flex items-start gap-2"><AlertCircle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />暂时无法播放，可能是路径变化、网络中断或不支持此编码，可直接调用外部播放器。</p>
           <ExternalPlayerBar src={src} name={name} />
           {reported && <p className="text-xs">已记下本次失败，下一次自动体检会优先复查。原文件保留。</p>}
           <Button asChild variant="outline" className="min-h-11"><Link href="/staging#video-health" onClick={close}>查看视频体检与失效记录</Link></Button>

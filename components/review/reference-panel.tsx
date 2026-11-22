@@ -4,6 +4,7 @@ import { Play } from 'lucide-react'
 import { api } from '@/lib/face-api'
 import type { ReviewVideo } from '@/lib/review-ui'
 import { WorkspaceButton as Button, WorkspaceMessage, WorkspaceMedia, WorkspacePath, WorkspaceSection } from '@/components/workbench/inner'
+import { WorkbenchListSkeleton } from '@/components/workbench/loading-skeletons'
 import { ExternalProfiles } from '@/components/persons/external-profiles'
 
 export function usePersonReferences(name: string | null) {
@@ -53,7 +54,7 @@ export function ReferencePanel({ name }: { name: string }) {
         </>
       )}
       {!current ? (
-        <WorkspaceMessage>读取对照视频…</WorkspaceMessage>
+        <WorkbenchListSkeleton count={4} variant="task" label={`正在读取 ${name} 的对照视频`} />
       ) : current.error ? (
         <WorkspaceMessage error>
           {current.error}
@@ -75,13 +76,13 @@ export function ReferencePanel({ name }: { name: string }) {
                   onClick={() => setPlaying(video)}
                 >
                   <span className="ws-reference-thumb">
-                    {video.thumb ? <img src={video.thumb} data-private-media draggable={false} alt="" loading="lazy" /> : <Play size={16} />}
+                    {video.thumb ? <img src={video.thumb} width={64} height={40} data-private-media draggable={false} alt="" loading="lazy" /> : <Play size={16} aria-hidden="true" />}
                   </span>
                   <span className="ws-person-name">
                     {video.name}
                     <small>{video.size_gb == null ? '大小未记录' : `${video.size_gb} GB`}</small>
                   </span>
-                  <Play size={14} />
+                  <Play size={14} aria-hidden="true" />
                 </Button>
               ))}
             </div>

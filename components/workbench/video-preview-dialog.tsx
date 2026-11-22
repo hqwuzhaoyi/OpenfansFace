@@ -62,6 +62,14 @@ export function VideoPreviewDialog({
   instantEntry,
 }: VideoPreviewDialogProps) {
   const fallbackTrigger = useRef<HTMLElement | null>(null)
+  const wasOpen = useRef(false)
+  if (open && !wasOpen.current && typeof document !== 'undefined') {
+    const active = document.activeElement
+    if (active instanceof HTMLElement && !active.closest('[role="dialog"]')) {
+      fallbackTrigger.current = active
+    }
+  }
+  wasOpen.current = open
 
   useEffect(() => {
     if (!open || (!onPrev && !onNext)) return
@@ -105,14 +113,31 @@ export function VideoPreviewDialog({
               }
         }
         onOpenAutoFocus={() => {
-          fallbackTrigger.current = document.activeElement instanceof HTMLElement ? document.activeElement : null
+          if (!fallbackTrigger.current?.isConnected && document.activeElement instanceof HTMLElement && !document.activeElement.closest('[role="dialog"]')) {
+            fallbackTrigger.current = document.activeElement
+          }
         }}
         onCloseAutoFocus={event => {
           event.preventDefault()
-          const target = returnFocus?.current?.isConnected ? returnFocus.current : fallbackTrigger.current
-          if (target?.isConnected) target.focus({ preventScroll: true })
+          const restore = () => {
+            const target = returnFocus?.current?.isConnected
+              ? returnFocus.current
+              : fallbackTrigger.current?.isConnected
+                ? fallbackTrigger.current
+                : null
+            if (target) {
+              target.focus({ preventScroll: true })
+              return true
+            }
+            return false
+          }
+          if (!restore()) {
+            requestAnimationFrame(() => {
+              restore()
+            })
+          }
         }}
-        className="w-full max-w-[min(1120px,94vw)] lg:max-w-[min(1120px,94vw)] h-[min(88dvh,860px)] max-h-[92dvh] flex! flex-col! gap-0! p-0! overflow-hidden!"
+        className="w-full max-w-[min(1120px,94vw)] lg:max-w-[min(1120px,94vw)] h-[min(88dvh,860px)] max-h-[92dvh] flex! flex-col! gap-0! p-0! overflow-hidden! overscroll-contain"
       >
         <DialogHeader className="shrink-0 flex-row items-center justify-between gap-2 border-b px-4 py-2.5 pr-14 text-left">
           <div className="flex min-w-0 flex-1 items-center gap-2">
@@ -133,7 +158,7 @@ export function VideoPreviewDialog({
                   disabled={!hasPrev}
                   onClick={onPrev}
                 >
-                  <ChevronLeft size={15} />
+                  <ChevronLeft size={15} aria-hidden="true" />
                 </Button>
                 {counterText && (
                   <span className="px-1 text-xs tabular-nums text-muted-foreground">{counterText}</span>
@@ -147,7 +172,7 @@ export function VideoPreviewDialog({
                   disabled={!hasNext}
                   onClick={onNext}
                 >
-                  <ChevronRight size={15} />
+                  <ChevronRight size={15} aria-hidden="true" />
                 </Button>
               </>
             )}
@@ -158,7 +183,7 @@ export function VideoPreviewDialog({
           </DialogDescription>
         </DialogHeader>
 
-        {open && (
+        {src && (
           <>
             <div className="min-h-0 flex-1 flex flex-col overflow-hidden bg-black">
               <WorkbenchVideoPlayer
@@ -168,9 +193,9 @@ export function VideoPreviewDialog({
                 poster={poster}
                 initialTime={initialTime}
                 fill
-                autoPlay
+                autoPlay={open}
                 showVolumeSlider
-                enableGlobalHotkeys
+                enableGlobalHotkeys={open}
                 onTimeRemember={onTimeRemember}
                 onError={onError}
               />

@@ -1,10 +1,12 @@
 'use client'
 import { useLayoutEffect, useRef, useState } from 'react'
 import { AnimatePresence, motion } from 'motion/react'
-import { ArrowRight, Check, FolderCheck, FolderInput, FolderOutput, LoaderCircle } from 'lucide-react'
+import { ArrowRight, Check, FolderCheck, FolderInput, FolderOutput } from 'lucide-react'
 import { ActionSwapIcon } from '@/components/beui/motion/action-swap'
 import { AnimatedBadge, type AnimatedBadgeStatus } from '@/components/beui/motion/animated-badge'
 import { Avatar, AvatarGroup } from '@/components/beui/motion/avatar-group'
+import { Loader } from '@/components/beui/motion/loader'
+import { InlineBeuiLoader } from '@/components/workbench/loading-skeletons'
 import { VideoCover } from '@/components/review/video-cover'
 import { EASE_OUT, SPRING_LAYOUT } from '@/lib/beui/ease'
 import type { PersonBatchPlan, PersonBatchProgress, PersonBatchResult } from '@/lib/person-batch-model'
@@ -27,7 +29,7 @@ export function MergeFlow({
   people:string[];target:string;applying:boolean;progress:PersonBatchProgress|null;result:PersonBatchResult|null;totalVideos:number|null
   plan?:PersonBatchPlan|null;states?:Record<string,PersonPreviewState>;thumbs?:Record<string,string|null>;disabled?:boolean;onSelectTarget?:(name:string)=>void
 }){
-  const {instant,mode}=useWorkbenchMotion(),root=useRef<HTMLDivElement>(null),destination=useRef<HTMLDivElement>(null),nodes=useRef(new Map<string,HTMLDivElement>())
+  const {instant}=useWorkbenchMotion(),root=useRef<HTMLDivElement>(null),destination=useRef<HTMLDivElement>(null),nodes=useRef(new Map<string,HTMLDivElement>())
   const previous=useRef(new Set<string>()),cachedThumbs=useRef<Record<string,string>>({}),[flights,setFlights]=useState<Flight[]>([])
   const completed=result?result.completed.map(item=>item.person):progress?.completed||[],sources=people.filter(person=>person!==target),signature=JSON.stringify(completed)
 
@@ -85,7 +87,7 @@ export function MergeFlow({
               <Avatar name={name} src={getThumb(name)} size="sm" className="pw-merge-chip-avatar"/>
               <span className="pw-merge-pick-copy">
                 <strong>{name}</strong>
-                <small>{count!==null?`${count} 个视频`:'读取中…'}{dir?` · ${tailPath(dir)}`:''}</small>
+                <small>{count!==null?`${count} 个视频`:<InlineBeuiLoader label={`正在读取 ${name} 的视频数`} size={11}/>}{dir?` · ${tailPath(dir)}`:''}</small>
               </span>
             </Button>
           })}
@@ -141,7 +143,7 @@ export function MergeFlow({
                 {videos.slice(0,2).map(video=><span key={video.path} className="pw-merge-mini-frame"><VideoCover video={video} className="pw-merge-mini-cover"/></span>)}
               </div>}
               <ActionSwapIcon value={stateKey} animation="roll" className="pw-merge-source-state">
-                {done?<Check size={14}/>:active?<LoaderCircle size={14} className="pw-busy-icon" data-motion={mode}/>:<ArrowRight size={13} className="pw-merge-ready-icon"/>}
+                {done?<Check size={14}/>:active?<Loader variant="spinner" size={14} decorative/>:<ArrowRight size={13} className="pw-merge-ready-icon"/>}
               </ActionSwapIcon>
             </motion.div>
           })}

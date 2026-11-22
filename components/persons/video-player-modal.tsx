@@ -1,7 +1,7 @@
 'use client'
 
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { AnimatePresence, motion } from 'motion/react'
+import * as Popover from '@radix-ui/react-popover'
 import {
   Check,
   FolderOpen,
@@ -15,7 +15,6 @@ import { ActionSwapText } from '@/components/beui/motion/action-swap'
 import { Collapsible, CollapsibleContent } from '@/components/beui/motion/collapsible'
 import { ExternalPlayerBar, WorkbenchVideoPlayer } from '@/components/workbench/video-player'
 import { VideoCover } from '@/components/review/video-cover'
-import { EASE_OUT, SPRING_LAYOUT } from '@/lib/beui/ease'
 import { api } from '@/lib/face-api'
 import type { PersonVideo } from '@/lib/person-library-model'
 import type { PersonFileAction } from '@/lib/person-file-model'
@@ -24,7 +23,6 @@ import {
   WorkbenchCount as Count,
   WorkbenchDialogContent as DialogContent,
 } from './ui'
-import { useWorkbenchMotion } from './motion'
 
 export type PlayerContextKind = 'owned' | 'queued' | 'recommendation'
 
@@ -74,16 +72,15 @@ export function PersonVideoDialog({
   onRejectRecommendation,
   notify,
 }: PersonVideoDialogProps) {
-  const { instant } = useWorkbenchMotion()
   const videoRef = useRef<HTMLVideoElement | null>(null)
-  const hudTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
   const copyTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const wasDialogOpenRef = useRef(false)
 
   const [failed, setFailed] = useState(false)
   const [showEpisodes, setShowEpisodes] = useState(false)
   const [showShortcuts, setShowShortcuts] = useState(false)
   const [copied, setCopied] = useState(false)
-  const [hud, setHud] = useState<{ key: number; label: string } | null>(null)
+  const [hudSignal, setHudSignal] = useState<{ key: number; label: string } | null>(null)
 
   const rawVideoSrc = video ? `/api/video?p=${encodeURIComponent(video.path || video.vid)}` : ''
   const index = video ? playlist.findIndex(item => item.vid === video.vid) : -1
@@ -92,17 +89,23 @@ export function PersonVideoDialog({
   const checked = video ? selectedIds.includes(video.vid) : false
 
   const flashHud = useCallback((label: string) => {
-    if (hudTimer.current) clearTimeout(hudTimer.current)
-    setHud({ key: Date.now(), label })
-    hudTimer.current = setTimeout(() => setHud(null), 850)
+    setHudSignal({ key: Date.now(), label })
   }, [])
 
   useEffect(() => {
     return () => {
-      if (hudTimer.current) clearTimeout(hudTimer.current)
       if (copyTimer.current) clearTimeout(copyTimer.current)
     }
   }, [])
+
+  useEffect(() => {
+    const isOpen = Boolean(video)
+    if (isOpen && !wasDialogOpenRef.current) {
+      setShowEpisodes(typeof window !== 'undefined' ? window.innerHeight >= 780 : false)
+      setShowShortcuts(false)
+    }
+    wasDialogOpenRef.current = isOpen
+  }, [video])
 
   useEffect(() => {
     setFailed(false)
@@ -218,134 +221,128 @@ export function PersonVideoDialog({
   const railItems = playlist.slice(railStart, railStart + 8)
 
   const theaterTopOverlay = video ? (
-    <>
-      <div className="pw-theater-top">
-        <div className="pw-theater-title-group">
-          <span className="pw-theater-tag">
-            {personName ? `${personName} · ${folderLabel}` : folderLabel}
-          </span>
-          <strong className="pw-theater-title" title={video.name}>
-            {video.name}
-          </strong>
-          {sizeText(video.size) && <span className="pw-theater-size">{sizeText(video.size)}</span>}
-        </div>
-
-        <div className="pw-theater-top-actions">
-          {playlist.length > 1 && index >= 0 && (
-            <span className="pw-theater-counter">
-              <Count value={index + 1} /> / {playlist.length}
-            </span>
-          )}
-          <button
-            type="button"
-            className="pw-theater-icon-btn"
-            aria-label="快捷键说明"
-            aria-pressed={showShortcuts}
-            title="快捷键 (?)"
-            onClick={() => setShowShortcuts(v => !v)}
-          >
-            <Keyboard size={15} />
-          </button>
-          <button
-            type="button"
-            className="pw-theater-icon-btn"
-            aria-label="关闭视频预览"
-            title="关闭 (Esc)"
-            onClick={onClose}
-          >
-            <X size={16} />
-          </button>
-        </div>
+    <div className="pw-theater-top">
+      <div className="pw-theater-title-group">
+        <span className="pw-theater-tag">
+          {personName ? `${personName} · ${folderLabel}` : folderLabel}
+        </span>
+        <strong className="pw-theater-title" title={video.name}>
+          {video.name}
+        </strong>
+        {sizeText(video.size) && <span className="pw-theater-size">{sizeText(video.size)}</span>}
       </div>
 
-      <AnimatePresence initial={false}>
-        {hud && (
-          <motion.div
-            key={hud.key}
-            role="status"
-            aria-live="polite"
-            className="pw-theater-hud"
-            initial={instant ? false : { opacity: 0, transform: 'translate(-50%, -6px) scale(0.95)' }}
-            animate={{ opacity: 1, transform: 'translate(-50%, 0px) scale(1)' }}
-            exit={instant ? undefined : { opacity: 0, transform: 'translate(-50%, -6px) scale(0.95)' }}
-            transition={{ duration: instant ? 0 : 0.15, ease: EASE_OUT }}
-          >
-            {hud.label}
-          </motion.div>
+      <div className="pw-theater-top-actions">
+        {playlist.length > 1 && index >= 0 && (
+          <span className="pw-theater-counter">
+            <Count value={index + 1} /> / {playlist.length}
+          </span>
         )}
-      </AnimatePresence>
-
-      <AnimatePresence initial={false}>
-        {showShortcuts && (
-          <motion.div
-            role="dialog"
-            aria-label="键盘快捷键"
-            className="pw-theater-shortcuts-sheet"
-            initial={instant ? false : { opacity: 0, transform: 'scale(0.97)' }}
-            animate={{ opacity: 1, transform: 'scale(1)' }}
-            exit={instant ? undefined : { opacity: 0, transform: 'scale(0.97)' }}
-            transition={{ duration: instant ? 0 : 0.16, ease: EASE_OUT }}
+        {playlist.length > 1 && (
+          <button
+            type="button"
+            className="pw-theater-header-pill"
+            aria-expanded={showEpisodes}
+            aria-label={showEpisodes ? '收起选集' : '展开选集'}
+            title="选集 (E)"
+            onClick={() => setShowEpisodes(v => !v)}
           >
-            <div className="pw-theater-shortcuts-head">
-              <strong>键盘快捷键</strong>
-              <button type="button" aria-label="关闭快捷键说明" onClick={() => setShowShortcuts(false)}>
-                <X size={14} />
-              </button>
-            </div>
-            <div className="pw-theater-shortcuts-grid">
-              <div>
-                <span>播放 / 暂停</span>
-                <Kbd>Space</Kbd>
-              </div>
-              <div>
-                <span>快退 / 快进 5 秒</span>
-                <KbdGroup>
-                  <Kbd>←</Kbd>
-                  <Kbd>→</Kbd>
-                </KbdGroup>
-              </div>
-              <div>
-                <span>长按 2.0x 倍速</span>
-                <Kbd>长按 →</Kbd>
-              </div>
-              <div>
-                <span>调节音量</span>
-                <KbdGroup>
-                  <Kbd>↑</Kbd>
-                  <Kbd>↓</Kbd>
-                </KbdGroup>
-              </div>
-              <div>
-                <span>上一集 / 下一集</span>
-                <KbdGroup>
-                  <Kbd>[</Kbd>
-                  <Kbd>]</Kbd>
-                </KbdGroup>
-              </div>
-              <div>
-                <span>打开 / 收起选集</span>
-                <Kbd>E</Kbd>
-              </div>
-              <div>
-                <span>勾选当前视频</span>
-                <Kbd>X</Kbd>
-              </div>
-              <div>
-                <span>复制文件路径</span>
-                <Kbd>C</Kbd>
-              </div>
-              <div>
-                <span>全屏 / 静音</span>
-                <KbdGroup>
-                  <Kbd>F</Kbd>
-                  <Kbd>M</Kbd>
-                </KbdGroup>
-              </div>
-            </div>
-          </motion.div>
+            <LayoutList size={14} aria-hidden="true" />
+            <span>选集</span>
+          </button>
         )}
-      </AnimatePresence>
-    </>
+        <Popover.Root open={showShortcuts} onOpenChange={setShowShortcuts}>
+          <Popover.Trigger asChild>
+            <button
+              type="button"
+              className="pw-theater-icon-btn"
+              aria-label="快捷键说明"
+              aria-expanded={showShortcuts}
+              title="快捷键 (?)"
+            >
+              <Keyboard size={15} aria-hidden="true" />
+            </button>
+          </Popover.Trigger>
+          <Popover.Portal>
+            <Popover.Content
+              className="pw-theater-shortcuts-sheet"
+              align="end"
+              sideOffset={8}
+              collisionPadding={12}
+              aria-label="键盘快捷键说明"
+            >
+              <div className="pw-theater-shortcuts-head">
+                <strong>键盘快捷键</strong>
+                <Popover.Close asChild>
+                  <button type="button" aria-label="关闭快捷键说明">
+                    <X size={14} aria-hidden="true" />
+                  </button>
+                </Popover.Close>
+              </div>
+              <div className="pw-theater-shortcuts-grid">
+                <div>
+                  <span>播放 / 暂停</span>
+                  <Kbd>Space</Kbd>
+                </div>
+                <div>
+                  <span>快退 / 快进 5 秒</span>
+                  <KbdGroup>
+                    <Kbd>←</Kbd>
+                    <Kbd>→</Kbd>
+                  </KbdGroup>
+                </div>
+                <div>
+                  <span>长按 2.0x 倍速</span>
+                  <Kbd>长按 →</Kbd>
+                </div>
+                <div>
+                  <span>调节音量</span>
+                  <KbdGroup>
+                    <Kbd>↑</Kbd>
+                    <Kbd>↓</Kbd>
+                  </KbdGroup>
+                </div>
+                <div>
+                  <span>上一集 / 下一集</span>
+                  <KbdGroup>
+                    <Kbd>[</Kbd>
+                    <Kbd>]</Kbd>
+                  </KbdGroup>
+                </div>
+                <div>
+                  <span>打开 / 收起选集</span>
+                  <Kbd>E</Kbd>
+                </div>
+                <div>
+                  <span>勾选当前视频</span>
+                  <Kbd>X</Kbd>
+                </div>
+                <div>
+                  <span>复制文件路径</span>
+                  <Kbd>C</Kbd>
+                </div>
+                <div>
+                  <span>全屏 / 静音</span>
+                  <KbdGroup>
+                    <Kbd>F</Kbd>
+                    <Kbd>M</Kbd>
+                  </KbdGroup>
+                </div>
+              </div>
+            </Popover.Content>
+          </Popover.Portal>
+        </Popover.Root>
+        <button
+          type="button"
+          className="pw-theater-icon-btn"
+          aria-label="关闭视频预览"
+          title="关闭 (Esc)"
+          onClick={onClose}
+        >
+          <X size={16} aria-hidden="true" />
+        </button>
+      </div>
+    </div>
   ) : null
 
   return (
@@ -378,21 +375,7 @@ export function PersonVideoDialog({
                 hasPrev={hasPrev}
                 hasNext={hasNext}
                 topOverlay={theaterTopOverlay}
-                extraControls={
-                  playlist.length > 1 ? (
-                    <button
-                      type="button"
-                      className="wb-vstage-pill"
-                      aria-expanded={showEpisodes}
-                      aria-label="打开选集"
-                      title="选集 (E)"
-                      onClick={() => setShowEpisodes(v => !v)}
-                    >
-                      <LayoutList size={13} aria-hidden="true" />
-                      <span className="wb-vstage-btn-label">选集</span>
-                    </button>
-                  ) : undefined
-                }
+                hudSignal={hudSignal}
                 onError={() => {
                   setFailed(true)
                   const code = videoRef.current?.error?.code
@@ -420,8 +403,8 @@ export function PersonVideoDialog({
                 title="点击复制完整路径 (快捷键 C)"
                 onClick={() => void copyPath()}
               >
-                <FolderOpen size={13} />
-                <code>{video.path || video.vid}</code>
+                <FolderOpen size={13} aria-hidden="true" />
+                <code translate="no">{video.path || video.vid}</code>
                 <span className="pw-theater-copy-state">
                   <ActionSwapText value={copied ? 'copied' : 'copy'} animation="roll">
                     {copied ? '已复制' : '复制'}
@@ -437,7 +420,7 @@ export function PersonVideoDialog({
                       className="pw-primary"
                       onClick={() => onAcceptRecommendation(video)}
                     >
-                      <Check size={13} />
+                      <Check size={13} aria-hidden="true" />
                       <span>去人工确认</span>
                     </Button>
                   )}
@@ -453,7 +436,7 @@ export function PersonVideoDialog({
             {railItems.length > 1 && (
               <Collapsible open={showEpisodes} onOpenChange={setShowEpisodes} className="pw-theater-episodes-collapse">
                 <CollapsibleContent className="pw-theater-episodes-body">
-                  <div className="pw-player-rail" role="listbox" aria-label="同目录选集">
+                  <div className="pw-player-rail" role="region" aria-label="同目录选集">
                     {railItems.map(item => {
                       const active = item.vid === video.vid
                       const itemChecked = selectedIds.includes(item.vid)
@@ -461,25 +444,16 @@ export function PersonVideoDialog({
                         <button
                           key={item.vid}
                           type="button"
-                          role="option"
-                          aria-selected={active}
+                          aria-current={active ? 'true' : undefined}
                           className="pw-player-rail-item"
                           data-active={active || undefined}
                           onClick={() => onSelectVideo(item)}
                           title={item.name}
                         >
-                          {active && (
-                            <motion.span
-                              layoutId={instant ? undefined : 'pw-player-rail-active'}
-                              transition={SPRING_LAYOUT}
-                              className="pw-player-rail-ring"
-                              aria-hidden="true"
-                            />
-                          )}
                           <VideoCover video={item} className="pw-player-rail-cover" />
                           {itemChecked && (
                             <span className="pw-player-rail-check" aria-label="已勾选">
-                              <Check size={10} />
+                              <Check size={10} aria-hidden="true" />
                             </span>
                           )}
                           <span className="pw-player-rail-name">{item.name}</span>

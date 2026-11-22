@@ -1,5 +1,7 @@
 'use client'
 import { ExternalPlayerBar, WorkbenchVideoPlayer } from '@/components/workbench/video-player'
+import { InlineBeuiLoader } from '@/components/workbench/loading-skeletons'
+import { Skeleton } from '@/components/ui/skeleton'
 import { VideoCover } from '@/components/review/video-cover'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { Check, Copy, Folder, FolderCheck, FolderInput, X } from 'lucide-react'
@@ -65,7 +67,7 @@ export function MergePersonVideos({
         <Avatar name={name} src={thumb} size="sm" className="pw-merge-card-avatar"/>
         <div>
           <strong title={name}>{name}</strong>
-          <small>{data?`${data.total_videos} 个视频 · ${size(data.total_bytes)}`:state?.error?'读取失败':'读取视频…'}</small>
+          <small>{data?`${data.total_videos} 个视频 · ${size(data.total_bytes)}`:state?.error?'读取失败':<InlineBeuiLoader label={`正在读取 ${name} 的视频`} size={12}/>}</small>
         </div>
       </div>
       <Button aria-label={`保留人物 ${name}`} aria-pressed={isTarget} disabled={disabled} onClick={()=>onTarget(name)} className={isTarget?'pw-primary':'pw-outline'}>
@@ -83,10 +85,10 @@ export function MergePersonVideos({
       {target&&(isTarget?<b>目标保留目录</b>:<span>→ 合入 {target}</span>)}
     </div>}
     {active&&<div className="pw-merge-player"><div className="pw-merge-player-head"><span>{active.name}</span><div className="pw-merge-player-actions"><Button aria-label="复制视频路径" title="复制视频路径 (C)" onClick={()=>void navigator.clipboard.writeText(active.path).then(()=>{setCopied(true);setTimeout(()=>setCopied(false),1400)}).catch(()=>{})}><ActionSwapIcon value={copied?'copied':'copy'} animation="roll">{copied?<Check size={12}/>:<Copy size={12}/>}</ActionSwapIcon></Button><Button aria-label="关闭视频预览" onClick={()=>onPlay(null)}><X size={15}/></Button></div></div><WorkbenchVideoPlayer videoRef={player} key={active.path} src={videoUrl(active)} name={active.name} poster={active.thumb||undefined} autoPlay compact enableGlobalHotkeys onError={()=>setPlayError('暂时无法播放，请检查文件或浏览器编码支持，或使用外部播放器打开。')}/>{playError&&<div role="alert"><p>{playError}</p><ExternalPlayerBar src={videoUrl(active)} name={active.name}/></div>}<code>{active.path}</code></div>}
-    <div className="pw-merge-video-grid">{files.map(video=><Button key={video.path} className="pw-merge-video" aria-label={`预览 ${name} 的 ${video.name}`} disabled={disabled} onClick={()=>onPlay({person:name,video})}><VideoCover video={video} className="pw-merge-cover"/><strong title={video.name}>{video.name}</strong><small>{video.folder==='.'?'根目录':video.folder} · {size(video.size)}</small></Button>)}</div>
+    {!data&&!state?.error?<div role="status" aria-busy="true" className="pw-merge-video-grid"><span className="sr-only">正在读取 {name} 的视频预览</span>{[0,1].map(idx=><div key={idx} className="pw-merge-video"><Skeleton className="aspect-video w-full rounded-[6px]"/><Skeleton className="mt-1.5 h-3 w-4/5"/><Skeleton className="mt-1 h-2.5 w-1/2"/></div>)}</div>:<div className="pw-merge-video-grid">{files.map(video=><Button key={video.path} className="pw-merge-video" aria-label={`预览 ${name} 的 ${video.name}`} disabled={disabled} onClick={()=>onPlay({person:name,video})}><VideoCover video={video} className="pw-merge-cover"/><strong title={video.name}>{video.name}</strong><small>{video.folder==='.'?'根目录':video.folder} · {size(video.size)}</small></Button>)}</div>}
     {data&&!data.total_videos&&<p className="pw-merge-no-video">暂无视频，仍可合并人物资料。</p>}
     {state?.error&&<div className="pw-error" role="alert"><p>{state.error}</p><Button disabled={state.loading||disabled} onClick={()=>onLoad(name,data?.files.length||0)}>重新加载视频</Button></div>}
-    {data&&data.total_videos>files.length&&<Button className="pw-merge-more" disabled={state?.loading||disabled} onClick={()=>{if(!expanded){setExpanded(true);return}if(data.next_offset!==null)onLoad(name,data.next_offset)}}>{state?.loading?'读取中…':`查看更多视频（${files.length} / ${data.total_videos}）`}</Button>}
+    {data&&data.total_videos>files.length&&<Button className="pw-merge-more" disabled={state?.loading||disabled} onClick={()=>{if(!expanded){setExpanded(true);return}if(data.next_offset!==null)onLoad(name,data.next_offset)}}>{state?.loading?<InlineBeuiLoader label="正在读取更多视频" size={12}/>:`查看更多视频（${files.length} / ${data.total_videos}）`}</Button>}
     {expanded&&<Button className="pw-merge-more" disabled={disabled} onClick={()=>setExpanded(false)}>收起视频</Button>}
   </Card>
 }

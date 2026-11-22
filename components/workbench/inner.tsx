@@ -31,11 +31,11 @@ export function WorkspaceSelect({label,value,onChange,options,disabled=false,pla
 
 export function WorkspaceSection({title,count,defaultOpen=true,children}:{title:string;count?:number;defaultOpen?:boolean;children:ReactNode}){
   const [open,setOpen]=useState(defaultOpen)
-  return <Collapsible.Root open={open} onOpenChange={setOpen} className="ws-section"><Collapsible.Trigger className="ws-section-trigger"><span>{title}</span>{count!==undefined&&<span className="ws-count">{count}</span>}<ChevronDown size={14} className="ws-section-chevron"/></Collapsible.Trigger><Collapsible.Content className="ws-section-content" inert={!open}>{children}</Collapsible.Content></Collapsible.Root>
+  return <Collapsible.Root open={open} onOpenChange={setOpen} className="ws-section"><Collapsible.Trigger className="ws-section-trigger"><span>{title}</span>{count!==undefined&&<span className="ws-count">{count}</span>}<ChevronDown size={14} className="ws-section-chevron" aria-hidden="true"/></Collapsible.Trigger><Collapsible.Content className="ws-section-content" inert={!open}>{children}</Collapsible.Content></Collapsible.Root>
 }
 
 export function WorkspaceField({label,children}:{label:string;children:ReactNode}){return <label className="ws-field-label"><span>{label}</span>{children}</label>}
-export function WorkspaceMessage({children,error=false}:{children:ReactNode;error?:boolean}){return <p className={`ws-inline-message ${error?'ws-inline-error':''}`} role={error?'alert':'status'}>{error&&<AlertCircle size={14}/>}<span>{children}</span></p>}
+export function WorkspaceMessage({children,error=false}:{children:ReactNode;error?:boolean}){return <p className={`ws-inline-message ${error?'ws-inline-error':''}`} role={error?'alert':'status'}>{error&&<AlertCircle size={14} aria-hidden="true"/>}<span>{children}</span></p>}
 
 export function WorkspacePath({value,label='完整路径',compact=false}:{value:string;label?:string;compact?:boolean}){
   const [copied,setCopied]=useState(false),timer=useRef<ReturnType<typeof setTimeout>|null>(null)
@@ -48,7 +48,7 @@ export function WorkspacePath({value,label='完整路径',compact=false}:{value:
       setCopied(true);if(timer.current)clearTimeout(timer.current);timer.current=setTimeout(()=>setCopied(false),1800)
     }catch{toast.error('复制失败，可直接选择路径文字复制')}
   }
-  return <div className={`ws-path ${compact?'ws-path-compact':''}`}><div><span>{label}</span><WorkspaceButton variant="ghost" size="icon" aria-label={`复制${label}`} title={copied?'已复制':'复制路径'} onClick={copy}>{copied?<Check size={13}/>:<Copy size={13}/>}</WorkspaceButton><span role="status">{copied?'已复制':''}</span></div><code title={value}>{value}</code></div>
+  return <div className={`ws-path ${compact?'ws-path-compact':''}`}><div><span>{label}</span><WorkspaceButton variant="ghost" size="icon" aria-label={`复制${label}`} title={copied?'已复制':'复制路径'} onClick={copy}>{copied?<Check size={13} aria-hidden="true"/>:<Copy size={13} aria-hidden="true"/>}</WorkspaceButton><span role="status">{copied?'已复制':''}</span></div><code translate="no" title={value}>{value}</code></div>
 }
 
 const mediaPositions=new Map<string,number>()

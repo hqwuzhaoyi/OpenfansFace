@@ -16,14 +16,13 @@ export function ArchiveVideoPlayer({ video, detailVisibleOnMobile }: { video: Re
   const [reported, setReported] = useState(false)
   const [attempt, setAttempt] = useState(0)
   const [lightbox, setLightbox] = useState<{ open: boolean; initialTime: number }>({ open: false, initialTime: 0 })
-  const expandTriggerRef = useRef<HTMLElement | null>(null)
+  const hostRef = useRef<HTMLDivElement | null>(null)
   const reportSequence = useRef(0)
   const player = useRef<HTMLVideoElement>(null)
   const rawPath = video.path || video.vid
   const source = `/api/video?p=${encodeURIComponent(rawPath)}`
   useEffect(() => {
     const element = player.current
-    if (element && !element.getAttribute('src') && !lightbox.open) element.setAttribute('src', source)
     return () => {
       reportSequence.current++
       element?.pause()
@@ -47,7 +46,7 @@ export function ArchiveVideoPlayer({ video, detailVisibleOnMobile }: { video: Re
       .then(() => { if (sequence === reportSequence.current) setReported(true) }).catch(() => {})
   }
   return (
-    <div className="archive-inlinePlayer">
+    <div ref={hostRef} tabIndex={-1} className="archive-inlinePlayer outline-none">
       {!lightbox.open && (
         <WorkbenchVideoPlayer
           videoRef={player}
@@ -58,9 +57,8 @@ export function ArchiveVideoPlayer({ video, detailVisibleOnMobile }: { video: Re
           preload="metadata"
           initialTime={getMediaPosition(rawPath)}
           onTimeRemember={t => rememberMediaPosition(rawPath, t)}
-          onExpand={(t, triggerEl) => {
+          onExpand={(t) => {
             rememberMediaPosition(rawPath, t)
-            expandTriggerRef.current = triggerEl
             setLightbox({ open: true, initialTime: t })
           }}
           onError={playbackError}
@@ -68,12 +66,12 @@ export function ArchiveVideoPlayer({ video, detailVisibleOnMobile }: { video: Re
       )}
       {failed && (
         <div role="alert" className="archive-playerError">
-          <p><AlertCircle size={15} />暂时无法播放，请检查文件路径、网络或视频编码，或使用外部播放器打开。</p>
+          <p><AlertCircle size={15} aria-hidden="true" />暂时无法播放，请检查文件路径、网络或视频编码，或使用外部播放器打开。</p>
           <ExternalPlayerBar src={source} name={video.name} />
           {reported && <small>已记录播放失败，原文件保留。</small>}
           <div>
             <Button variant="outline" size="sm" onClick={() => { reportSequence.current++; setFailed(false); setReported(false); setAttempt(value => value + 1) }}>
-              <RefreshCw size={14} />重新加载
+              <RefreshCw size={14} aria-hidden="true" />重新加载
             </Button>
             <Link href="/staging#video-health">查看视频体检</Link>
           </div>
@@ -81,7 +79,18 @@ export function ArchiveVideoPlayer({ video, detailVisibleOnMobile }: { video: Re
       )}
       <VideoPreviewDialog
         open={lightbox.open}
-        onOpenChange={open => { if (!open) setLightbox(prev => ({ ...prev, open: false })) }}
+        onOpenChange={open => {
+          if (!open) {
+            setLightbox(prev => ({ ...prev, open: false }))
+            requestAnimationFrame(() => {
+              const target =
+                hostRef.current?.querySelector<HTMLElement>(
+                  '[aria-label="居中放大预览"], .wb-vstage-shield-cta, .wb-vstage'
+                ) || hostRef.current
+              target?.focus({ preventScroll: true })
+            })
+          }
+        }}
         title={video.name}
         src={source}
         name={video.name}
@@ -90,7 +99,7 @@ export function ArchiveVideoPlayer({ video, detailVisibleOnMobile }: { video: Re
         initialTime={lightbox.initialTime}
         onTimeRemember={t => rememberMediaPosition(rawPath, t)}
         onError={playbackError}
-        returnFocus={expandTriggerRef}
+        returnFocus={hostRef}
       />
     </div>
   )

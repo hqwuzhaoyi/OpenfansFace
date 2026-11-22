@@ -25,6 +25,7 @@ import {
 import { Button as NavigationButton } from '@/components/ui/button'
 import { WorkspaceButton as Button, WorkspaceSelect, WorkspaceField, WorkspaceMedia, WorkspacePath, WorkspaceSection, WorkspaceMessage, getMediaPosition, rememberMediaPosition } from '@/components/workbench/inner'
 import { VideoPreviewDialog } from '@/components/workbench/video-preview-dialog'
+import { InlineBeuiLoader, WorkbenchListSkeleton } from '@/components/workbench/loading-skeletons'
 import { useWorkspaceQuery, useWorkspaceScroll, readWorkbenchCache, writeWorkbenchCache } from '@/components/workbench/state'
 import * as Popover from '@radix-ui/react-popover'
 import { InputGroupButton } from '@/components/ui/input-group'
@@ -75,9 +76,12 @@ export default function ProcessingTaskQueue() {
   const [detailOpen, setDetailOpen] = useState(false)
   const [attemptDrawerOpen, setAttemptDrawerOpen] = useState(false)
   const [lightboxOpen, setLightboxOpen] = useState(false)
+  const [lightboxInitialTime, setLightboxInitialTime] = useState(0)
   const [taskAttempts, setTaskAttempts] = useState<TaskAttemptRecord[]>([])
   const [nodesList, setNodesList] = useState<{ node_id: string; hostname?: string }[]>([])
   const wide = useWideWorkspace()
+  const lightboxTriggerRef = useRef<HTMLElement | null>(null)
+  const inlineMediaHostRef = useRef<HTMLDivElement | null>(null)
 
   useEffect(() => {
     api<{ nodes: { node_id: string; hostname?: string }[] }>('/api/processing/nodes')
@@ -292,21 +296,28 @@ export default function ProcessingTaskQueue() {
       <div className="ws-detail-content" data-sheet-scroll>
         <div className="ws-task-info">
           <h3 className="break-all text-sm font-medium">{focused.name}</h3>
-          {focusedMediaPath ? (
-            !attemptDrawerOpen && !lightboxOpen && (wide || detailOpen) ? (
-              <WorkspaceMedia
-                path={focusedMediaPath}
-                name={focused.name}
-                onExpand={() => setLightboxOpen(true)}
-              />
+          <div ref={inlineMediaHostRef} tabIndex={-1} className="outline-none">
+            {focusedMediaPath ? (
+              !attemptDrawerOpen && !lightboxOpen && (wide || detailOpen) ? (
+                <WorkspaceMedia
+                  path={focusedMediaPath}
+                  name={focused.name}
+                  onExpand={(t, triggerEl) => {
+                    rememberMediaPosition(focusedMediaPath, t)
+                    lightboxTriggerRef.current = triggerEl?.isConnected ? triggerEl : inlineMediaHostRef.current
+                    setLightboxInitialTime(t)
+                    setLightboxOpen(true)
+                  }}
+                />
+              ) : (
+                <div className="rounded-md border bg-muted/30 p-3 text-center text-xs text-muted-foreground">
+                  {lightboxOpen ? '已在大窗中打开视频预览' : '视频正在历史尝试抽屉中预览'}
+                </div>
+              )
             ) : (
-              <div className="rounded-md border bg-muted/30 p-3 text-center text-xs text-muted-foreground">
-                {lightboxOpen ? '已在大窗中打开视频预览' : '视频正在历史尝试抽屉中预览'}
-              </div>
-            )
-          ) : (
-            <p className="text-xs text-muted-foreground p-3 border rounded-md text-center">暂无有效视频路径</p>
-          )}
+              <p className="text-xs text-muted-foreground p-3 border rounded-md text-center">暂无有效视频路径</p>
+            )}
+          </div>
           <dl>
             <dt>当前阶段</dt>
             <dd>{focused.manual ? '人工接管' : (TASK_STAGE_LABELS[focused.stage] || focused.stage)}</dd>
@@ -566,7 +577,7 @@ export default function ProcessingTaskQueue() {
             </WorkspaceSearch>
             <span className="ws-muted shrink-0">{data?.total ?? '—'} 个</span>
           </div>
-          <div ref={listScroll.ref} className="ws-list" onScroll={listScroll.onScroll}>
+          <div ref={listScroll.ref} className="ws-list" aria-busy={!data} onScroll={listScroll.onScroll}>
             {tasksList.map((task) => (
               <article
                 key={task.vid}
@@ -630,20 +641,24 @@ export default function ProcessingTaskQueue() {
               </article>
             ))}
             {!tasksList.length && (
-              <p role="status" className="ws-empty">
-                {!data
-                  ? '正在加载任务…'
-                  : (data.summary?.all_count ?? data.all_count)
-                  ? '当前筛选下没有任务。'
-                  : '正在等待媒体发现。'}
-              </p>
+              !data ? (
+                <WorkbenchListSkeleton count={8} variant="task" label="正在加载处理任务" />
+              ) : (
+                <p role="status" className="ws-empty">
+                  {(data.summary?.all_count ?? data.all_count)
+                    ? '当前筛选下没有任务。'
+                    : '正在等待媒体发现。'}
+                </p>
+              )
             )}
           </div>
           <div className="ws-pagination">
-            <span>
-              {data
-                ? `第 ${data.page + 1} / ${Math.max(1, Math.ceil(data.total / data.limit))} 页`
-                : '读取中'}
+            <span className="tabular-nums">
+              {data ? (
+                `第 ${data.page + 1} / ${Math.max(1, Math.ceil(data.total / data.limit))} 页`
+              ) : (
+                <InlineBeuiLoader size={12} label="读取中" showLabel />
+              )}
             </span>
             <div className="ws-actions">
               <Button
@@ -769,7 +784,10 @@ export default function ProcessingTaskQueue() {
                     <WorkspaceMedia
                       path={focusedMediaPath}
                       name={focused.name}
-                      onExpand={() => {
+                      onExpand={(t, triggerEl) => {
+                        rememberMediaPosition(focusedMediaPath, t)
+                        lightboxTriggerRef.current = triggerEl?.isConnected ? triggerEl : inlineMediaHostRef.current
+                        setLightboxInitialTime(t)
                         setAttemptDrawerOpen(false)
                         setLightboxOpen(true)
                       }}
@@ -855,14 +873,26 @@ export default function ProcessingTaskQueue() {
       {focused && focusedMediaPath && (
         <VideoPreviewDialog
           open={lightboxOpen}
-          onOpenChange={setLightboxOpen}
+          onOpenChange={(open) => {
+            setLightboxOpen(open)
+            if (!open) {
+              requestAnimationFrame(() => {
+                const target =
+                  inlineMediaHostRef.current?.querySelector<HTMLElement>(
+                    '[aria-label="居中放大预览"], .wb-vstage-shield-cta, .wb-vstage'
+                  ) || inlineMediaHostRef.current
+                target?.focus({ preventScroll: true })
+              })
+            }
+          }}
           title={focused.name}
           subtitle={TASK_STAGE_LABELS[focused.stage] || focused.stage}
           path={focusedMediaPath}
           src={`/api/video?p=${encodeURIComponent(focusedMediaPath)}`}
           name={focused.name}
-          initialTime={getMediaPosition(focusedMediaPath)}
+          initialTime={lightboxInitialTime || getMediaPosition(focusedMediaPath)}
           onTimeRemember={(t) => rememberMediaPosition(focusedMediaPath, t)}
+          returnFocus={inlineMediaHostRef}
           instantEntry={instantEntry}
         />
       )}

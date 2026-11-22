@@ -2,11 +2,16 @@ import {test} from 'node:test'
 import assert from 'node:assert/strict'
 import {
   REVIEW_IDLE_MS,
+  applyPendingReviewMutations,
   canAutoRefreshReview,
   hasProtectedReviewSelections,
   isCachedReviewPageReusable,
   isReviewAvailable,
+  pruneSettledReviewMutations,
   resolveEmptyReviewPageTarget,
+  reviewTaskBucket,
+  shouldAutoRecoverExpiredReviewSession,
+  shouldDiscardReviewRefreshResponse,
 } from '../lib/review-continuity-model.ts'
 test('idle boundary and responses started before new activity never replace a review snapshot',()=>{
  const state={now:REVIEW_IDLE_MS,lastActivity:0,protectedWork:false,requestActivity:7,currentActivity:7}
@@ -54,4 +59,96 @@ test('protected review selections ignore default auto-selected scopes until manu
  assert.equal(hasProtectedReviewSelections({'suggested:person:miao':[{vid:'v1'}]},auto),false)
  assert.equal(hasProtectedReviewSelections({'suggested:person:miao':[{vid:'v1'}],'suggested:person:other':[{vid:'v2'}]},auto),true)
  assert.equal(hasProtectedReviewSelections({'suggested:person:miao':[],'suggested:person:other':[]},auto),false)
+})
+
+test('expired review session only auto-recovers when idle without manual selections or drafts',()=>{
+ assert.equal(shouldAutoRecoverExpiredReviewSession({hasManualSelections:false,hasDrafts:false,inFlightCount:0}),true)
+ assert.equal(shouldAutoRecoverExpiredReviewSession({hasManualSelections:true,hasDrafts:false,inFlightCount:0}),false)
+ assert.equal(shouldAutoRecoverExpiredReviewSession({hasManualSelections:false,hasDrafts:true,inFlightCount:0}),false)
+ assert.equal(shouldAutoRecoverExpiredReviewSession({hasManualSelections:false,hasDrafts:false,inFlightCount:1}),false)
+ assert.equal(shouldAutoRecoverExpiredReviewSession({hasManualSelections:false,hasDrafts:false,inFlightCount:0,alreadyRecovered:true}),false)
+})
+
+test('only automatic background refreshes discard on activity; manual refresh and recovery always apply',()=>{
+ assert.equal(shouldDiscardReviewRefreshResponse({automatic:true,refresh:true,canAutoApply:true,activityChanged:false}),false)
+ assert.equal(shouldDiscardReviewRefreshResponse({automatic:true,refresh:true,canAutoApply:false,activityChanged:false}),true)
+ assert.equal(shouldDiscardReviewRefreshResponse({automatic:true,refresh:true,canAutoApply:true,activityChanged:true}),true)
+ assert.equal(shouldDiscardReviewRefreshResponse({automatic:false,refresh:true,canAutoApply:false,activityChanged:true}),false)
+ assert.equal(shouldDiscardReviewRefreshResponse({refresh:true,recovered:true,canAutoApply:false,activityChanged:true}),false)
+ assert.equal(shouldDiscardReviewRefreshResponse({canAutoApply:false,activityChanged:true}),false)
+})
+
+test('pending mutation projection keeps left group counts and right queue aligned across in-flight responses',()=>{
+ const base={
+  counts:{all:30,suggested:28,conflict:2,none:0,manual:0,deferred:1},
+  groups:[{key:'person:kittyxkum',label:'kittyxkum',kind:'suggested',count:13},{key:'person:xxapple',label:'xxapple',kind:'suggested',count:15}],
+  group:{key:'person:kittyxkum',label:'kittyxkum',kind:'suggested',count:13},
+  total:13,
+  remaining:13,
+  rows:Array.from({length:13},(_,i)=>({vid:`k-${i}`,manual:0,data:{kind:'suggested'}})),
+ }
+ const op={
+  id:'op-1',
+  action:'confirm',
+  groupKey:'person:kittyxkum',
+  isDeferred:false,
+  vids:base.rows.map(r=>r.vid),
+  buckets:{suggested:13},
+  settledAtSeq:null,
+ }
+ assert.equal(reviewTaskBucket({manual:1,data:{kind:'suggested'}}),'manual')
+ assert.equal(reviewTaskBucket({manual:0,data:{kind:'conflict'}}),'conflict')
+ assert.equal(reviewTaskBucket({manual:0,data:{}}),'none')
+
+ const inFlight=applyPendingReviewMutations(base,0,[op],'all')
+ assert.equal(inFlight.groups[0].count,0)
+ assert.equal(inFlight.groups[1].count,15)
+ assert.equal(inFlight.group.count,0)
+ assert.equal(inFlight.remaining,0)
+ assert.equal(inFlight.rows.length,0)
+ assert.equal(inFlight.counts.all,17)
+ assert.equal(inFlight.counts.suggested,15)
+
+ // Settled at seq=1 still projects against a stale fetch started at seq=0, preventing bounce-back.
+ const settled=[{...op,settledAtSeq:1}]
+ const staleAfterSettle=applyPendingReviewMutations(base,0,settled,'all')
+ assert.equal(staleAfterSettle.groups[0].count,0)
+ assert.equal(staleAfterSettle.remaining,0)
+ assert.equal(staleAfterSettle.rows.length,0)
+
+ // Once a post-settlement fetch (fetchedAtSeq=1) lands, the settled op is pruned and not double-subtracted.
+ const freshServer={...base,groups:[{key:'person:kittyxkum',label:'kittyxkum',kind:'suggested',count:0},base.groups[1]],group:{...base.group,count:0},total:0,remaining:0,rows:[],counts:{all:17,suggested:15,conflict:2,none:0,manual:0,deferred:1}}
+ assert.deepEqual(pruneSettledReviewMutations(settled,1),[])
+ const afterFresh=applyPendingReviewMutations(freshServer,1,settled,'all')
+ assert.equal(afterFresh.groups[0].count,0)
+ assert.equal(afterFresh.groups[1].count,15)
+})
+
+test('pending defer and restore mutations adjust deferred and view counts cleanly',()=>{
+ const base={
+  counts:{all:10,suggested:8,conflict:2,none:0,manual:0,deferred:4},
+  groups:[{key:'person:a',label:'a',kind:'suggested',count:5}],
+  group:{key:'person:a',label:'a',kind:'suggested',count:5},
+  total:5,
+  remaining:5,
+  rows:[{vid:'a-1'},{vid:'a-2'}],
+ }
+ const deferred=applyPendingReviewMutations(base,0,[{
+  id:'d-1',action:'defer',groupKey:'person:a',isDeferred:false,vids:['a-1','a-2'],buckets:{suggested:1,conflict:1},settledAtSeq:null,
+ }],'suggested')
+ assert.equal(deferred.counts.all,8)
+ assert.equal(deferred.counts.suggested,7)
+ assert.equal(deferred.counts.conflict,1)
+ assert.equal(deferred.counts.deferred,6)
+ assert.equal(deferred.groups[0].count,3)
+ assert.equal(deferred.remaining,3)
+
+ const restored=applyPendingReviewMutations({...base,group:{key:'person:a',label:'a',kind:'suggested',count:2},remaining:2,groups:[{key:'person:a',label:'a',kind:'suggested',count:2}]},0,[{
+  id:'r-1',action:'restore',groupKey:'person:a',isDeferred:true,vids:['a-1'],buckets:{suggested:1},settledAtSeq:null,
+ }],'deferred')
+ assert.equal(restored.counts.deferred,3)
+ assert.equal(restored.counts.all,11)
+ assert.equal(restored.counts.suggested,9)
+ assert.equal(restored.groups[0].count,1)
+ assert.equal(restored.remaining,1)
 })

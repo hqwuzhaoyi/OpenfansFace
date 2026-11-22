@@ -9,6 +9,8 @@ import { healthTitles, type VideoHealthRecord, type VideoHealthReport } from '@/
 import { fileName, type ReviewVideo } from '@/lib/review-ui'
 import { WorkspaceSearch, WorkspaceTabs, useWideWorkspace } from '@/components/workbench/controls'
 import { WorkspaceButton as Button, WorkspaceCard, WorkspaceMessage, WorkspacePath, WorkspaceSection } from '@/components/workbench/inner'
+import { InlineBeuiLoader, WorkbenchListSkeleton } from '@/components/workbench/loading-skeletons'
+import { Skeleton } from '@/components/ui/skeleton'
 import { VideoPlayer } from './video'
 import './staging.css'
 
@@ -85,10 +87,10 @@ export function VideoHealthPanel({ onBack }: { onBack?: () => void } = {}) {
     <WorkspaceCard className="staging-storage-card">
       <div className="staging-storage-title"><Archive size={16} /><h2>回收站</h2></div>
       <dl className="staging-storage-stats">
-        <div><dt>回收站文件</dt><dd>{storage ? number.format(storage.files) : '—'}<span>个</span></dd></div>
-        <div><dt><HardDrive size={12} />占用空间</dt><dd>{storage ? number.format(storage.gb) : '—'}<span>GB</span></dd></div>
+        <div><dt>回收站文件</dt><dd>{storage ? number.format(storage.files) : storageLoading ? <Skeleton className="inline-block h-6 w-14 align-middle" /> : '—'}<span>个</span></dd></div>
+        <div><dt><HardDrive size={12} aria-hidden="true" />占用空间</dt><dd>{storage ? number.format(storage.gb) : storageLoading ? <Skeleton className="inline-block h-6 w-14 align-middle" /> : '—'}<span>GB</span></dd></div>
       </dl>
-      {storageLoading && !storage && <p className="ws-muted" role="status">正在读取回收站…</p>}
+      {storageLoading && !storage && <InlineBeuiLoader label="正在读取回收站" />}
       {storageError && <><WorkspaceMessage error>{storageError}</WorkspaceMessage><Button variant="outline" disabled={storageLoading} onClick={loadStorage}>重试读取</Button></>}
       {storage?.files === 0 && <p className="ws-muted">回收站为空</p>}
     </WorkspaceCard>
@@ -122,8 +124,8 @@ export function VideoHealthPanel({ onBack }: { onBack?: () => void } = {}) {
         <div className="ws-view-tabs"><WorkspaceTabs value={filter} label="体检记录范围" onChange={value => { setFilter(value); setLimit(50) }} items={[{ value: 'all', label: '全部异常', count: data ? records.length : undefined }, { value: 'watch', label: '需核对', count: data ? records.length - hidden : undefined }, { value: 'hidden', label: '已收起', count: data ? hidden : undefined }]} /></div>
         <div className="ws-toolbar" ref={searchRef}><WorkspaceSearch label="搜索体检记录" placeholder="搜索文件名、路径或检查依据" value={query} onChange={value => { setQuery(value); setLimit(50) }} /></div>
         <div className="staging-record-columns" aria-hidden="true"><span>文件</span><span>检查结果</span><span>最近检查</span></div>
-        <div className="ws-list staging-records" aria-label="异常记录">
-          {!data && <div className="ws-empty" role="status"><Inbox size={28} /><p>{loading ? '正在读取体检记录…' : '体检记录暂不可用'}</p></div>}
+        <div className="ws-list staging-records" aria-label="异常记录" aria-busy={loading && !data}>
+          {!data && (loading ? <WorkbenchListSkeleton count={6} variant="health" label="正在读取体检记录" /> : <div className="ws-empty" role="status"><Inbox size={28} aria-hidden="true" /><p>体检记录暂不可用</p></div>)}
           {data && !rows.length && <div className="ws-empty" role="status"><Inbox size={28} /><p>{query ? '没有匹配的记录' : records.length ? '当前分类没有异常记录' : !data.last_success_at ? '尚无成功检查结果' : '暂无异常记录'}</p>{query && <Button variant="ghost" onClick={() => { setQuery(''); searchRef.current?.querySelector('input')?.focus() }}>清空搜索</Button>}</div>}
           {rows.slice(0, limit).map(record => <article key={record.vid} className="staging-record" data-active={record.vid === selected?.vid}>
             <button type="button" className="staging-record-open" aria-label={`查看检查详情 ${fileName(record.path || record.vid)}`} aria-expanded={record.vid === selected?.vid} onClick={event => { rowTrigger.current = event.currentTarget; setSelectedId(record.vid === selected?.vid ? null : record.vid) }}>

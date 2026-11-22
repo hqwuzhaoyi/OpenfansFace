@@ -2,6 +2,7 @@
 import { useCallback, useEffect, useState } from 'react'
 import { Check, Link2, Search, X } from 'lucide-react'
 import { Dialog, DialogDescription, DialogTitle } from '@/components/ui/dialog'
+import { InlineBeuiLoader, WorkbenchListSkeleton } from '@/components/workbench/loading-skeletons'
 import { api } from '@/lib/face-api'
 import type { CreatorDirectoryResult, CreatorMatch } from '@/lib/creator-directory-model'
 import type { PersonAccountLink } from '@/lib/person-account-model'
@@ -39,13 +40,13 @@ export function AccountAssociation({name,theme,onClose,onChanged}:{name:string;t
   return <Dialog open onOpenChange={open=>!open&&!busy&&onClose()}><DialogContent className="pw-modal pw-account-dialog" data-theme={theme} showCloseButton={!busy} onEscapeKeyDown={e=>busy&&e.preventDefault()} onInteractOutside={e=>busy&&e.preventDefault()}>
     <DialogTitle>给 {name} 关联账号</DialogTitle><DialogDescription>按昵称、账号或别名搜索，选中后确认关联。资料关联不会自动归名或移动视频。</DialogDescription>
     <div className="pw-account-scroll">
-      <section className="pw-account-linked"><h3>已关联 <span>{links.length}</span></h3>
-        {linksLoading&&<p role="status">正在读取已关联账号…</p>}{linksError&&<p role="alert">{linksError}<Button onClick={()=>void loadLinks()}>重新加载</Button></p>}
+      <section className="pw-account-linked" aria-busy={linksLoading}><h3>已关联 <span>{links.length}</span></h3>
+        {linksLoading&&<div className="py-1"><InlineBeuiLoader label="正在读取已关联账号"/></div>}{linksError&&<p role="alert">{linksError}<Button onClick={()=>void loadLinks()}>重新加载</Button></p>}
         {!linksLoading&&!linksError&&!links.length&&<p>还没有手动关联的账号。</p>}
         {links.map(link=><div key={link.id} className="pw-linked-row"><div><strong>{link.profile.name}</strong><a href={`https://x.com/${link.profile.handle}`} target="_blank" rel="noreferrer" referrerPolicy="no-referrer">@{link.profile.handle} ↗</a></div><Button disabled={busy} aria-label={`解除 @${link.profile.handle} 的关联`} onClick={()=>void remove(link)}><X size={13}/>解除关联</Button></div>)}
       </section>
       <form className="pw-account-search" onSubmit={event=>{event.preventDefault();if(input.trim()){setNotice('');setError('');setSearch({kind:'q',value:input.trim()})}}}><label className="pw-search"><Search size={15}/><Input aria-label="搜索要关联的账号" placeholder="昵称、@账号、别名或 X 主页链接" value={input} maxLength={100} onChange={e=>setInput(e.target.value)} disabled={busy}/></label><Button className="pw-outline" type="submit" disabled={busy||!input.trim()}>搜索</Button></form>
-      {loading&&<p role="status" className="pw-account-hint">正在搜索账号资料…</p>}
+      {loading&&<div className="mt-3"><WorkbenchListSkeleton count={2} variant="card" label="正在搜索账号资料"/></div>}
       {searchError&&<p role="alert" className="pw-error">{searchError}<Button onClick={()=>setRetry(n=>n+1)}>重试</Button></p>}
       {data?.warning&&<p className="pw-account-hint">{data.warning}</p>}
       {data&&(data.match_count||0)>data.matches.length&&<p className="pw-account-hint">找到 {data.match_count} 条，显示前 {data.matches.length} 条；可输入更完整的关键词缩小范围。</p>}
