@@ -37,8 +37,12 @@
 .bg-ops-trigger[data-variant="mobile"] {
   min-height: 36px;
   height: 36px;
-  padding: 0 8px;
+  min-width: 36px;
+  padding: 0 6px;
+  gap: 4px;
   border-radius: 9px;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .bg-ops-trigger:hover {
@@ -124,12 +128,13 @@
   align-items: center;
   gap: 3px;
   height: 20px;
-  padding: 0 7px;
+  padding: 0 6px;
   border-radius: 9999px;
   background: color-mix(in oklab, var(--foreground) 9%, transparent);
   color: var(--muted-foreground);
   font-size: 11px;
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 .bg-ops-panel {

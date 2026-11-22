@@ -381,12 +381,15 @@
   .home-topbar {
     height: 52px;
     min-height: 52px;
-    padding: 3px 10px 4px;
+    padding: 0 10px;
     gap: 6px;
   }
 
   .home-topbar-left {
-    gap: 6px;
+    flex: 1 1 0%;
+    min-width: 0;
+    overflow: hidden;
+    gap: 4px;
   }
 
   .home-topbar-trigger {
@@ -409,15 +412,36 @@
     display: inline-flex;
   }
 
+  .home-mobile-dock {
+    height: 44px;
+    padding: 3px;
+    gap: 2px;
+  }
+
+  .home-topbar-mobile-dock .bg-ops-trigger[data-variant="mobile"],
+  .home-topbar-mobile-dock .privacy-control-mobile,
+  .home-topbar-mobile-dock .home-mobile-theme {
+    height: 36px;
+    min-height: 36px;
+    min-width: 36px;
+  }
+
+  .home-topbar-mobile-dock .bg-ops-trigger[data-variant="mobile"] {
+    width: auto;
+  }
+
   .home-mobile-actionbar {
     display: flex;
     align-items: center;
     justify-content: flex-end;
-    flex-wrap: wrap;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    scrollbar-width: none;
     gap: 6px;
-    padding: 6px 12px;
+    padding: 4px 10px;
+    min-height: 44px;
     border-bottom: 1px solid var(--border);
-    background: var(--background);
+    background: color-mix(in oklab, var(--muted) 35%, var(--background));
     flex-shrink: 0;
   }
 
@@ -425,12 +449,16 @@
     display: none;
   }
 
-  .home-mobile-actionbar > .bm-online {
+  .home-mobile-actionbar > .bm-online,
+  .home-mobile-actionbar > .ws-review-status-link {
     margin-right: auto;
   }
 
   .home-mobile-actionbar :is(button, a, [data-slot="button"]) {
-    min-height: 40px;
+    min-height: 36px;
+    height: 36px;
+    flex-shrink: 0;
+    white-space: nowrap;
   }
 }
 

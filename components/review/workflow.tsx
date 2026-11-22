@@ -1,6 +1,6 @@
 'use client'
 import Link from 'next/link'
-import { ArrowRight, Check, Undo2 } from 'lucide-react'
+import { ArrowRight, Check, Undo2, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { WorkspaceButton,WorkspaceCard } from '@/components/workbench/inner'
 
@@ -12,6 +12,6 @@ export function ReviewFlow({ step = 1 }: { step?: 1 | 2 | 3 }) {
     <p className="text-xs leading-relaxed text-muted-foreground">{step === 1 ? '现在：核对视频属于谁。确认后进入待归档，文件暂不移动。' : step === 2 ? '现在：检查已确认的视频和目标路径。执行归档才移动文件；也可以撤销，退回上一步。' : '这里是已经完成归档的视频，显示实际存放位置。'}</p>
   </div>
 }
-export function QueueReceipt({ count, creator, onUndo, busy = false }: { count: number; creator: string; onUndo: () => void; busy?: boolean }) {
-  return <WorkspaceCard className="ws-result" role="status"><Check size={17}/><div className="min-w-0 flex-1"><strong>已确认 {count} 个视频属于 {creator}</strong><span>已加入待归档，文件暂未移动。</span></div><WorkspaceButton variant="ghost" onClick={onUndo} disabled={busy}><Undo2 size={14}/>撤销这次</WorkspaceButton><Button asChild size="sm"><Link href="/integration">查看待归档<ArrowRight size={14}/></Link></Button></WorkspaceCard>
+export function QueueReceipt({ count, creator, onUndo, onDismiss, busy = false }: { count: number; creator: string; onUndo: () => void; onDismiss?: () => void; busy?: boolean }) {
+  return <WorkspaceCard className="ws-result" role="status"><Check size={16} className="ws-result-icon shrink-0" aria-hidden="true"/><div className="ws-result-copy min-w-0 flex-1"><strong>已确认 {count} 个视频属于 {creator}</strong><span className="ws-result-desc">已加入待归档，文件暂未移动。</span></div><div className="ws-result-actions"><WorkspaceButton className="ws-result-undo" variant="ghost" onClick={onUndo} disabled={busy}><Undo2 size={14} aria-hidden="true"/><span>撤销这次</span></WorkspaceButton><Button asChild size="sm" className="ws-result-link"><Link href="/integration"><span>查看待归档</span><ArrowRight size={14} aria-hidden="true"/></Link></Button>{onDismiss&&<WorkspaceButton className="ws-icon ws-result-dismiss" variant="ghost" size="icon" aria-label="关闭确认提示" title="关闭" onClick={onDismiss}><X size={14} aria-hidden="true"/></WorkspaceButton>}</div></WorkspaceCard>
 }

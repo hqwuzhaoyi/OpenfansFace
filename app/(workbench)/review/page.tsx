@@ -2,7 +2,7 @@
 
 import Link from 'next/link'
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { Check, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, Film, Maximize2, Play, RefreshCw, SlidersHorizontal, Sparkles, Trash2, X, ArrowLeft, ListChecks } from 'lucide-react'
+import { Check, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, Film, Maximize2, Play, RefreshCw, Search, SlidersHorizontal, Sparkles, Trash2, X, ArrowLeft, ListChecks } from 'lucide-react'
 import * as Popover from '@radix-ui/react-popover'
 import { workspaceToast as toast } from '@/components/workbench/feedback'
 import { api } from '@/lib/face-api'
@@ -113,6 +113,8 @@ export default function Review() {
   const [listBounds,setListBounds]=useState<{min:number;max:number}>({min:280,max:500})
   const [resizing,setResizing]=useState(false)
   const workareaRef=useRef<HTMLDivElement>(null),queueRef=useRef<HTMLElement>(null),stageExpandBtnRef=useRef<HTMLButtonElement>(null)
+  const [mobileSearchOpen,setMobileSearchOpen]=useState(false)
+  const mobileSearchTriggerRef=useRef<HTMLButtonElement>(null),mobileToolbarRef=useRef<HTMLDivElement>(null)
   const [stageOpen,setStageOpen]=useState(true)
   const [stageTab,setStageTab]=useState<'current'|'reference'>('current')
   const [explicitStageRefName,setExplicitStageRefName]=useState<string|null>(null)
@@ -811,9 +813,29 @@ export default function Review() {
     ...(leafGroupSegment?[leafGroupSegment]:[]),
   ]
   useSyncWorkbenchBreadcrumb(breadcrumbItems)
+  const mobileSearchActive=mobileSearchOpen||Boolean(query)
+  const isSinglePage=Boolean(data&&groupMatched&&Math.ceil(data.total/data.limit)<=1&&data.previous_page==null&&data.next_page==null)
+  const renderFilterPopover=(trigger:React.ReactNode)=>(
+    <Popover.Root>
+      <Popover.Trigger asChild>{trigger}</Popover.Trigger>
+      <Popover.Portal>
+        <Popover.Content className="ws-filter-content" align="end" sideOffset={6}>
+          <div className="ws-mobile-filter">
+            <WorkspaceField label="确认组">
+              <WorkspaceSelect label="选择确认组" value={activeGroup} onChange={chooseGroup} options={(data?.groups||[]).map(g=>({value:g.key,label:`${g.label} · ${g.count}`}))} placeholder="暂无确认组"/>
+            </WorkspaceField>
+          </div>
+          <WorkspaceField label="原文件夹">
+            <WorkspaceSelect label="按原文件夹筛选" value={folder} onChange={value=>{setFolder(value);if(!group&&data?.group)setGroup(data.group.key)}} options={[{value:'',label:'全部文件夹'},...(data?.folders||[]).map(f=>({value:f,label:f}))]}/>
+          </WorkspaceField>
+          {folder&&<Button className="mt-3" variant="ghost" size="sm" onClick={()=>{setFolder('');setPage(0)}}>清除筛选</Button>}
+        </Popover.Content>
+      </Popover.Portal>
+    </Popover.Root>
+  )
   return <main className="ws-page" aria-label="人工确认工作区" data-review-session={data?.session}>
-    <WorkbenchHeaderActions>{((autoMergePreview?.eligible_count??0)>0||autoMergeActive)&&<Button ref={autoMergeTriggerRef} variant="outline" size="sm" aria-label={autoMergeActive?`自动合入（${autoMergeActiveLabel}）`:`自动合入 ${autoMergePreview!.eligible_count} 个已匹配视频`} title={autoMergeActive?`自动合入：${autoMergeActiveLabel}`:`可直接合入 ${autoMergePreview!.eligible_count} 个视频（${autoMergePreview!.group_count} 位人物）`} onClick={()=>setAutoMergeOpen(true)}><Sparkles size={14} aria-hidden="true"/><span>自动合入</span>{autoMergeActive?<AnimatedBadge size="sm" status={lockBadgeStatus(autoMergeActiveStatus)} className="ws-topbar-lock-badge">{autoMergeActiveLabel}</AnimatedBadge>:<span className="ws-count">{autoMergePreview!.eligible_count}</span>}</Button>}<NavigationButton variant="ghost" size="sm" asChild><Link href="/operations"><span className="ws-link-label">分析中</span><span className="ws-count">{updates?.waiting??data?.waiting??'—'}</span><ChevronRight size={14} aria-hidden="true"/></Link></NavigationButton><Button variant={updates?.has_updates||sessionExpired?"outline":"ghost"} aria-label="更新人工确认列表" title={updates?.refreshing?`后台正在更新 ${updates.refreshing} 条建议，当前列表保持不变`:'更新建议和分组'} disabled={loading} onClick={requestRefresh}><RefreshCw size={15} aria-hidden="true"/>{updates?.has_updates||sessionExpired?<span>有更新</span>:updates?.refreshing?<span className="ws-muted">后台更新中</span>:null}</Button></WorkbenchHeaderActions>
-    {receipt&&<div className="ws-receipt"><QueueReceipt count={receipt.vids.length} creator={receipt.creator} onUndo={undo} busy={false}/></div>}
+    <WorkbenchHeaderActions>{((autoMergePreview?.eligible_count??0)>0||autoMergeActive)&&<Button ref={autoMergeTriggerRef} variant="outline" size="sm" aria-label={autoMergeActive?`自动合入（${autoMergeActiveLabel}）`:`自动合入 ${autoMergePreview!.eligible_count} 个已匹配视频`} title={autoMergeActive?`自动合入：${autoMergeActiveLabel}`:`可直接合入 ${autoMergePreview!.eligible_count} 个视频（${autoMergePreview!.group_count} 位人物）`} onClick={()=>setAutoMergeOpen(true)}><Sparkles size={14} aria-hidden="true"/><span>自动合入</span>{autoMergeActive?<AnimatedBadge size="sm" status={lockBadgeStatus(autoMergeActiveStatus)} className="ws-topbar-lock-badge">{autoMergeActiveLabel}</AnimatedBadge>:<span className="ws-count">{autoMergePreview!.eligible_count}</span>}</Button>}<NavigationButton variant="ghost" size="sm" asChild className="ws-review-status-link"><Link href="/operations"><span className="ws-link-label">分析中</span><span className="ws-count">{updates?.waiting??data?.waiting??'—'}</span><ChevronRight size={14} aria-hidden="true"/></Link></NavigationButton><Button variant={updates?.has_updates||sessionExpired?"outline":"ghost"} aria-label="更新人工确认列表" title={updates?.refreshing?`后台正在更新 ${updates.refreshing} 条建议，当前列表保持不变`:'更新建议和分组'} disabled={loading} onClick={requestRefresh}><RefreshCw size={15} aria-hidden="true"/>{updates?.has_updates||sessionExpired?<span>有更新</span>:updates?.refreshing?<span className="ws-muted">后台更新中</span>:null}</Button></WorkbenchHeaderActions>
+    {receipt&&<div className="ws-receipt"><QueueReceipt count={receipt.vids.length} creator={receipt.creator} onUndo={undo} onDismiss={()=>setReceipt(null)} busy={false}/></div>}
     {error&&<p role="alert" className="ws-error">{error}</p>}
     {sessionExpired&&!error&&<p role="status" className="ws-error">本次核对已过期，勾选和草稿仍保留。请更新列表后继续。</p>}
     {data?.focus_missing&&<p className="ws-error">链接中的视频尚未就绪或已归名。</p>}
@@ -852,8 +874,27 @@ export default function Review() {
       </aside>
       <section ref={queueRef} className="ws-queue" aria-label="待确认视频" style={reviewDesktop&&stageOpen?{width:`${clampedListWidth}px`}:undefined}>
 
-        <div className="ws-toolbar"><WorkspaceSearch value={query} onChange={changeQuery} label="搜索当前组视频" placeholder="搜索文件名或路径…" disabled={false}><Popover.Root><Popover.Trigger asChild><InputGroupButton size="icon-sm" aria-label="分组与筛选" title="分组与筛选" data-active={!!folder}><SlidersHorizontal size={15} aria-hidden="true"/>{folder&&<span className="size-1.5 rounded-full bg-current"/>}</InputGroupButton></Popover.Trigger><Popover.Portal><Popover.Content className="ws-filter-content" align="end" sideOffset={6}><div className="ws-mobile-filter"><WorkspaceField label="确认组"><WorkspaceSelect label="选择确认组" value={activeGroup} onChange={chooseGroup} options={(data?.groups||[]).map(g=>({value:g.key,label:`${g.label} · ${g.count}`}))} placeholder="暂无确认组"/></WorkspaceField></div><WorkspaceField label="原文件夹"><WorkspaceSelect label="按原文件夹筛选" value={folder} onChange={value=>{setFolder(value);if(!group&&data?.group)setGroup(data.group.key)}} options={[{value:'',label:'全部文件夹'},...(data?.folders||[]).map(f=>({value:f,label:f}))]}/></WorkspaceField>{folder&&<Button className="mt-3" variant="ghost" size="sm" onClick={()=>{setFolder('');setPage(0)}}>清除筛选</Button>}</Popover.Content></Popover.Portal></Popover.Root></WorkspaceSearch>{reviewDesktop&&!stageOpen&&<Button variant="outline" size="sm" aria-label="展开中间视频舞台" title="展开视频舞台" onClick={()=>setStageOpen(true)}><Film size={14} aria-hidden="true"/><span>展开舞台</span></Button>}</div>
-        <div className="ws-selection"><Checkbox className="ws-check" aria-label="选择当前页视频" motionPreset="instant" checked={groupMatched&&unlockedRows.length>0&&unlockedRows.every(t=>selected.has(t.vid))} indeterminate={groupMatched&&unlockedRows.some(t=>selected.has(t.vid))&&!unlockedRows.every(t=>selected.has(t.vid))} disabled={disabled||!groupMatched||!unlockedRows.length} onCheckedChange={()=>toggle(unlockedRows)}/><div className="ws-selection-summary"><strong>{chosen.length?`已选 ${chosen.length}`:activeGroupInfo?.label||'待确认'}</strong><span> · {hiddenCount?`${hiddenCount} 个在其他页或被筛选隐藏`:activeGroupRemaining!==null?`${activeGroupRemaining} 个待核对`:'读取中'}</span></div>{chosen.length>0&&<Button className="ws-selection-clear" variant="ghost" size="sm" title="清空当前组选择" aria-label="清空当前组选择" onClick={clear}><X size={14} aria-hidden="true"/><span>清空</span></Button>}</div>
+        <div
+          ref={mobileToolbarRef}
+          className="ws-toolbar"
+          data-mobile-open={mobileSearchActive?'true':'false'}
+          onKeyDown={e=>{if(e.key==='Escape'&&!query&&mobileSearchOpen&&!e.nativeEvent.isComposing){e.preventDefault();setMobileSearchOpen(false);requestAnimationFrame(()=>mobileSearchTriggerRef.current?.focus({preventScroll:true}))}}}
+        >
+          <WorkspaceSearch value={query} onChange={changeQuery} label="搜索当前组视频" placeholder="搜索文件名或路径…" disabled={false}>
+            {renderFilterPopover(<InputGroupButton size="icon-sm" aria-label="分组与筛选" title="分组与筛选" data-active={!!folder}><SlidersHorizontal size={15} aria-hidden="true"/>{folder&&<span className="size-1.5 rounded-full bg-current"/>}</InputGroupButton>)}
+          </WorkspaceSearch>
+          {mobileSearchActive&&<Button className="ws-mobile-search-close" variant="ghost" size="sm" aria-label="收起搜索" onClick={()=>{if(query)changeQuery('');setMobileSearchOpen(false);requestAnimationFrame(()=>mobileSearchTriggerRef.current?.focus({preventScroll:true}))}}>取消</Button>}
+          {reviewDesktop&&!stageOpen&&<Button variant="outline" size="sm" aria-label="展开中间视频舞台" title="展开视频舞台" onClick={()=>setStageOpen(true)}><Film size={14} aria-hidden="true"/><span>展开舞台</span></Button>}
+        </div>
+        <div className="ws-selection">
+          <Checkbox className="ws-check" aria-label="选择当前页视频" motionPreset="instant" checked={groupMatched&&unlockedRows.length>0&&unlockedRows.every(t=>selected.has(t.vid))} indeterminate={groupMatched&&unlockedRows.some(t=>selected.has(t.vid))&&!unlockedRows.every(t=>selected.has(t.vid))} disabled={disabled||!groupMatched||!unlockedRows.length} onCheckedChange={()=>toggle(unlockedRows)}/>
+          <div className="ws-selection-summary"><strong>{chosen.length?`已选 ${chosen.length}`:activeGroupInfo?.label||'待确认'}</strong><span> · {hiddenCount?`${hiddenCount} 个在其他页或被筛选隐藏`:activeGroupRemaining!==null?`${activeGroupRemaining} 个待核对`:'读取中'}</span></div>
+          {chosen.length>0&&<Button className="ws-selection-clear" variant="ghost" size="sm" title="清空当前组选择" aria-label="清空当前组选择" onClick={clear}><X size={14} aria-hidden="true"/><span>清空</span></Button>}
+          {!mobileSearchActive&&<div className="ws-selection-tools">
+            <Button ref={mobileSearchTriggerRef} className="ws-icon ws-selection-tool" variant="ghost" size="icon" aria-label="搜索文件名或路径" title="搜索" onClick={()=>{setMobileSearchOpen(true);requestAnimationFrame(()=>mobileToolbarRef.current?.querySelector<HTMLInputElement>('input[type="search"]')?.focus())}}><Search size={16} aria-hidden="true"/></Button>
+            {renderFilterPopover(<Button className="ws-icon ws-selection-tool" variant="ghost" size="icon" aria-label="分组与筛选" title="分组与筛选" data-active={!!folder}><SlidersHorizontal size={16} aria-hidden="true"/>{folder&&<span className="size-1.5 rounded-full bg-current"/>}</Button>)}
+          </div>}
+        </div>
         <div ref={listScroll.ref} className="ws-list" aria-busy={loading||!groupMatched||query!==search} onScroll={listScroll.onScroll}>
           {(!data||!groupMatched)&&!error?<ReviewQueueSkeleton count={6} label="正在读取待确认视频"/>:!rows.length?<div className="ws-empty"><p>{group&&!data?.group?'该组已处理完，选择另一组继续。':query||folder?'当前筛选下没有视频。':data?.remaining===0?'本组已完成，可选择其他组继续。':'本批已处理完，可继续下一批。'}</p>{(query||folder)&&<Button variant="ghost" onClick={()=>{changeQuery('');setFolder('')}}>清除筛选</Button>}{!query&&!folder&&(data?.remaining??0)>0&&(data?.next_page!=null||data?.previous_page!=null)&&<Button variant="outline" onClick={()=>{advanceSequenceRef.current++;setPage((data.next_page??data.previous_page)!);setLinkFocus('')}}>继续剩余批次</Button>}{!query&&!folder&&nextAvailableGroup&&<Button variant="outline" onClick={()=>chooseGroup(nextAvailableGroup.key)}>下一待确认组 · {nextAvailableGroup.label}（{nextAvailableGroup.count}）</Button>}</div>:rows.map(t=><ReviewSummaryRow key={t.vid} task={t} selected={selected.has(t.vid)} active={focused?.vid===t.vid} disabled={disabled||!!t.review_blocked&&!selected.has(t.vid)} lock={lockedVids.get(t.vid)} onToggle={()=>toggle([t])} onInspect={()=>inspect(t)}/>)}
         </div>
@@ -875,7 +916,7 @@ export default function Review() {
             </>
           )}
         </div>}
-        <div className="ws-pagination"><span className="tabular-nums">{data&&groupMatched?`${data.remaining??data.total} 个待核对 · 第 ${currentPage+1} / ${Math.max(1,Math.ceil(data.total/data.limit))} 批`:activeGroupInfo?`${activeGroupInfo.count} 个待核对 · 读取中`:'读取中'}</span><div className="ws-actions"><Button className="ws-icon" variant="ghost" size="sm" aria-label="上一页" title="上一页" disabled={disabled||!groupMatched||(data?.session?data.previous_page==null:currentPage===0)} onClick={()=>{advanceSequenceRef.current++;setPage(data?.previous_page??currentPage-1);setLinkFocus('')}}><ChevronLeft size={15} aria-hidden="true"/></Button><Button className="ws-icon" variant="ghost" size="sm" aria-label="下一页" title="下一页" disabled={disabled||!groupMatched||!data||(data.session?data.next_page==null:(currentPage+1)*data.limit>=data.total)} onClick={()=>{advanceSequenceRef.current++;setPage(data?.next_page??currentPage+1);setLinkFocus('')}}><ChevronRight size={15} aria-hidden="true"/></Button></div></div>
+        <div className="ws-pagination" data-single-page={isSinglePage?'true':undefined}><span className="tabular-nums">{data&&groupMatched?`${data.remaining??data.total} 个待核对 · 第 ${currentPage+1} / ${Math.max(1,Math.ceil(data.total/data.limit))} 批`:activeGroupInfo?`${activeGroupInfo.count} 个待核对 · 读取中`:'读取中'}</span><div className="ws-actions"><Button className="ws-icon" variant="ghost" size="sm" aria-label="上一页" title="上一页" disabled={disabled||!groupMatched||(data?.session?data.previous_page==null:currentPage===0)} onClick={()=>{advanceSequenceRef.current++;setPage(data?.previous_page??currentPage-1);setLinkFocus('')}}><ChevronLeft size={15} aria-hidden="true"/></Button><Button className="ws-icon" variant="ghost" size="sm" aria-label="下一页" title="下一页" disabled={disabled||!groupMatched||!data||(data.session?data.next_page==null:(currentPage+1)*data.limit>=data.total)} onClick={()=>{advanceSequenceRef.current++;setPage(data?.next_page??currentPage+1);setLinkFocus('')}}><ChevronRight size={15} aria-hidden="true"/></Button></div></div>
       </section>
       {reviewDesktop&&stageOpen&&<>
         <div

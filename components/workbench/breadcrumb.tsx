@@ -118,7 +118,7 @@ export function WorkbenchBreadcrumb({
                       <h1
                         className={cn(
                           'wb-breadcrumb-heading m-0 min-w-0 truncate font-semibold tracking-[-0.01em]',
-                          compact ? 'max-w-[140px]' : 'max-w-[min(36vw,300px)]',
+                          compact ? 'max-w-full' : 'max-w-[min(36vw,300px)]',
                         )}
                       >
                         {item.label}
@@ -127,7 +127,7 @@ export function WorkbenchBreadcrumb({
                       <span
                         className={cn(
                           'min-w-0 truncate font-medium',
-                          compact ? 'max-w-[140px]' : 'max-w-[min(36vw,300px)]',
+                          compact ? 'max-w-full' : 'max-w-[min(36vw,300px)]',
                         )}
                       >
                         {item.label}
@@ -164,7 +164,7 @@ export function WorkbenchBreadcrumb({
                     }
                   >
                     {iconEl}
-                    <span className="truncate max-w-[160px]">{item.label}</span>
+                    <span className={cn('truncate', compact ? 'max-w-[96px]' : 'max-w-[160px]')}>{item.label}</span>
                   </BreadcrumbLink>
                 ) : (
                   <span
@@ -175,7 +175,7 @@ export function WorkbenchBreadcrumb({
                     )}
                   >
                     {iconEl}
-                    <span className="truncate max-w-[160px]">{item.label}</span>
+                    <span className={cn('truncate', compact ? 'max-w-[96px]' : 'max-w-[160px]')}>{item.label}</span>
                   </span>
                 )}
               </BreadcrumbItem>

@@ -57,6 +57,8 @@ export interface DockItemProps {
   /** When set, the item renders as a <button>. Omit when children carry their own link or button. */
   onClick?: () => void;
   active?: boolean;
+  /** Allow variable-width content inside the dock item instead of a fixed square. */
+  autoWidth?: boolean;
   "aria-label"?: string;
 }
 
@@ -65,6 +67,7 @@ export function DockItem({
   className,
   onClick,
   active,
+  autoWidth,
   ...rest
 }: DockItemProps) {
   const dock = useContext(DockContext);
@@ -79,7 +82,7 @@ export function DockItem({
       className="absolute inset-0.5 -z-10 rounded-xl bg-muted/60"
     />
   ) : null;
-  const sharedStyle = { width: size, height: size };
+  const sharedStyle = autoWidth ? { minWidth: size, height: size } : { width: size, height: size };
   const sharedClass = cn(
     "relative flex shrink-0 items-center justify-center rounded-full text-foreground",
     className,

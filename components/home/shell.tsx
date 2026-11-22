@@ -205,6 +205,12 @@ function WorkbenchTopBar({
   const { tasks, open: opsOpen } = useBackgroundOperations()
   const syncedItems = useWorkbenchBreadcrumbItems()
   const breadcrumbItems = syncedItems ?? buildFallbackBreadcrumb(pathname)
+  const displayBreadcrumbItems =
+    isMobile &&
+    breadcrumbItems.length > 1 &&
+    breadcrumbItems[0]?.key === 'home'
+      ? breadcrumbItems.slice(1)
+      : breadcrumbItems
 
   return (
     <header className="home-topbar">
@@ -223,7 +229,7 @@ function WorkbenchTopBar({
         </Link>
         <span className="home-topbar-divider" aria-hidden="true" />
         <WorkbenchBreadcrumb
-          items={breadcrumbItems}
+          items={displayBreadcrumbItems}
           maxItems={isMobile ? 3 : 4}
           compact={isMobile}
           asHeading
@@ -235,7 +241,7 @@ function WorkbenchTopBar({
         <Dock size={36} className="home-mobile-dock">
           {tasks.length > 0 && (
             <>
-              <DockItem active={opsOpen} className="w-auto">
+              <DockItem active={opsOpen} autoWidth className="w-auto">
                 <BackgroundOperationsDock mobile />
               </DockItem>
               <DockSeparator />
