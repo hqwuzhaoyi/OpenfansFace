@@ -29,7 +29,7 @@ const labels: Record<Action, string> = { 'restore-files': '恢复文件', 'delet
 const pendingKey = 'face-staging-native-operation', legacyPendingKey = 'face-staging-native-delete'
 const videoFile = /\.(mp4|m4v|mov|mkv|webm|avi|wmv|ts|mts|m2ts)$/i
 const bytes = (value: number) => value < 1024 ? `${value} B` : value < 2 ** 20 ? `${(value / 1024).toFixed(1)} KB` : value < 2 ** 30 ? `${(value / 2 ** 20).toFixed(1)} MB` : `${(value / 2 ** 30).toFixed(2)} GB`
-const origin = (file: StagedFile) => !file.origin?.original_path ? '来源待核对' : file.origin.action === 'stage-duplicate' ? '归档重复件' : file.origin.action?.startsWith('delete-') ? '人物删除' : '来源已记录'
+const origin = (file: StagedFile) => !file.origin?.original_path ? '来源待核对' : file.origin.action === 'stage-duplicate' ? '归档重复件' : file.origin.action === 'review-delete' ? '人工确认删除' : file.origin.action?.startsWith('delete-') ? '人物删除' : '来源已记录'
 const picked = ({ vid, path, version }: StagedFile) => ({ vid, path, version })
 const terminal = (status?: string) => ['complete', 'partial', 'rolled_back', 'cancelled', 'recovery_needed'].includes(status || '')
 const statusLabel = (state?: string) => ({ complete: '已完成', partial: '部分完成', rolled_back: '已回退', cancelled: '已取消', recovery_needed: '需要核对恢复', not_started: '尚未开始', deleted_pending_records: '内容已删除，记录待核对', failed: '失败', running: '处理中' } as Record<string, string>)[state || ''] || '处理中'

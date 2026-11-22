@@ -19,6 +19,7 @@ mod engine;
 mod fault;
 mod files;
 mod ledger;
+mod locks;
 mod metadata;
 mod model;
 mod native;
@@ -39,6 +40,7 @@ mod processing_result;
 mod processing_scheduler;
 mod reference_relocation;
 mod review;
+mod review_delete;
 mod review_sessions;
 mod shared_metadata;
 mod staging;
@@ -75,11 +77,13 @@ enum Command {
 struct Work {
     command: Command,
     reply: oneshot::Sender<Result<Value>>,
+    lock: Option<locks::LockGuard>,
 }
 #[derive(Clone)]
 struct App {
     config: Config,
     worker: admission::Worker,
+    locks: Arc<locks::ActiveLockRegistry>,
     auto_archive_wake: Arc<auto_archive::AutoArchiveWake>,
     // Local journal reads must remain available while media/NFS reads are stalled.
     status_reads: Arc<Semaphore>,
@@ -168,10 +172,19 @@ async fn post(
     if wait_ms.is_some() {
         crate::model::validate_id(&op_id)?;
     }
+    let lock = if envelope.mode == "apply"
+        && crate::model::validate_id(&op_id).is_ok()
+        && let Some((action, vids, people)) = locks::extract_from_request(&envelope.request)
+    {
+        Some(app.locks.register_queued(&op_id, action, vids, people))
+    } else {
+        None
+    };
     let (reply, wait) = oneshot::channel();
     app.worker.try_send(Work {
         command: Command::Files(Box::new(envelope)),
         reply,
+        lock,
     })?;
     // The dedicated worker owns execution. Dropping this receiver never aborts admitted work.
     match wait_with_budget(wait, wait_ms).await? {
@@ -309,7 +322,9 @@ fn media_listing_checkpoint(config: &Config, offset: usize) -> Result<()> {
 async fn serve() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let config = Config::from_env()?;
     let mut engine = Engine::new(config.clone())?;
+    let locks = engine.locks();
     let auto_archive_wake = auto_archive::AutoArchiveWake::new();
+    auto_archive_wake.set_locks(locks.clone());
     engine.set_auto_archive_wake(auto_archive_wake.clone());
     if config.parity_root.is_none() {
         match video_health::needs_recovery(&config) {
@@ -330,7 +345,12 @@ async fn serve() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let executor = thread::Builder::new()
         .name("file-operation-executor".into())
         .spawn(move || {
-            for Work { command, reply } in queue {
+            for Work {
+                command,
+                reply,
+                mut lock,
+            } in queue
+            {
                 let result = match command {
                     Command::Batch(body) => person_batch::execute(&mut engine, body),
                     Command::Archive { command, body } => {
@@ -362,6 +382,9 @@ async fn serve() -> std::result::Result<(), Box<dyn std::error::Error>> {
                         _ => Err(Error::new(400, "invalid_request", "操作模式无效")),
                     },
                 };
+                if let Some(guard) = lock.take() {
+                    guard.finish_with_result(&result);
+                }
                 completion.complete();
                 let _ = reply.send(result);
             }
@@ -392,6 +415,7 @@ async fn serve() -> std::result::Result<(), Box<dyn std::error::Error>> {
     let app = App {
         config: config.clone(),
         worker,
+        locks: locks.clone(),
         auto_archive_wake: auto_archive_wake.clone(),
         status_reads: Arc::new(Semaphore::new(4)),
         media_reads: Arc::new(Semaphore::new(4)),
@@ -403,6 +427,8 @@ async fn serve() -> std::result::Result<(), Box<dyn std::error::Error>> {
             get(|| async { Json(json!({"ok":true,"service":"face-file-operations"})) }),
         )
         .route("/v1/readiness", get(readiness))
+        .route("/v1/locks", get(locks_get))
+        .route("/v1/locks/stream", get(locks_stream))
         .route("/v1/admission", axum::routing::post(admission_control))
         .route("/v1/person-files", get(status).post(post))
         .route("/v1/person-batch", get(batch_status).post(batch_post))
@@ -468,8 +494,12 @@ async fn serve() -> std::result::Result<(), Box<dyn std::error::Error>> {
         }
     });
 
+    let shutdown_locks = locks.clone();
     axum::serve(listener, router)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            shutdown_locks.close_streams();
+        })
         .await?;
     health_stop.store(true, std::sync::atomic::Ordering::Relaxed);
     auto_archive_stop.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -578,27 +608,39 @@ async fn archive_post(
     } else {
         None
     };
+    let mutating_lock = locks::extract_from_archive_body(&command, &payload["body"]);
     let mut op_id = String::new();
-    if wait_ms.is_some() {
+    if wait_ms.is_some() || mutating_lock.is_some() {
         let existing = payload["body"]
             .get("operation_id")
-            .or_else(|| payload["body"].get("id"))
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        op_id = match existing {
-            Some(id) => {
-                crate::model::validate_id(&id)?;
-                id
+            .or_else(|| payload["body"].get("id"));
+        match existing {
+            Some(value) => {
+                if let Some(id) = value.as_str() {
+                    if wait_ms.is_some() {
+                        crate::model::validate_id(id)?;
+                    }
+                    op_id = id.to_owned();
+                } else if wait_ms.is_some() {
+                    return Err(Error::new(400, "invalid_request", "操作编号无效"));
+                }
             }
             None => {
                 let id = uuid::Uuid::new_v4().to_string();
                 if let Some(obj) = payload["body"].as_object_mut() {
                     obj.insert("operation_id".into(), json!(id));
                 }
-                id
+                op_id = id;
             }
-        };
+        }
     }
+    let lock = if let Some((action, vids, people)) = mutating_lock
+        && crate::model::validate_id(&op_id).is_ok()
+    {
+        Some(app.locks.register_queued(&op_id, action, vids, people))
+    } else {
+        None
+    };
     let (reply, wait) = oneshot::channel();
     app.worker.try_send(Work {
         command: Command::Archive {
@@ -606,6 +648,7 @@ async fn archive_post(
             body: payload["body"].clone(),
         },
         reply,
+        lock,
     })?;
     match wait_with_budget(wait, wait_ms).await? {
         Some(value) => Ok((StatusCode::OK, Json(value))),
@@ -743,6 +786,7 @@ async fn metadata_post(
             body: payload["body"].clone(),
         },
         reply,
+        lock: None,
     })?;
     Ok(Json(wait.await.map_err(|_| {
         Error::new(503, "outcome_unknown", "执行连接中断")
@@ -773,10 +817,22 @@ async fn batch_post(
             .map_err(|_| Error::new(503, "unavailable", "批次预览读取失败"))??,
         ));
     }
+    let lock = if body["mode"] == "apply" {
+        let config = app.config.clone();
+        let body_clone = body.clone();
+        tokio::task::spawn_blocking(move || locks::extract_from_batch_apply(&config, &body_clone))
+            .await
+            .ok()
+            .flatten()
+            .map(|(id, action, vids, people)| app.locks.register_queued(id, action, vids, people))
+    } else {
+        None
+    };
     let (reply, wait) = oneshot::channel();
     app.worker.try_send(Work {
         command: Command::Batch(body),
         reply,
+        lock,
     })?;
     Ok(Json(wait.await.map_err(|_| {
         Error::new(503, "outcome_unknown", "执行器连接中断，请查询原批次")
@@ -850,10 +906,27 @@ async fn health_report(
             body,
         },
         reply,
+        lock: None,
     })?;
     Ok(Json(wait.await.map_err(|_| {
         Error::new(503, "outcome_unknown", "报告回执未知，请查询原操作编号")
     })??))
+}
+
+async fn locks_get(
+    State(app): State<App>,
+    headers: HeaderMap,
+) -> Result<axum::response::Response> {
+    authorize(&app.config, &headers)?;
+    Ok(locks::snapshot_response(&app.locks))
+}
+
+async fn locks_stream(
+    State(app): State<App>,
+    headers: HeaderMap,
+) -> Result<axum::response::Response> {
+    authorize(&app.config, &headers)?;
+    Ok(locks::stream_response(&app.locks))
 }
 
 async fn readiness(State(app): State<App>, headers: HeaderMap) -> Result<Json<Value>> {

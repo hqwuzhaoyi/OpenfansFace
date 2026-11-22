@@ -14,6 +14,7 @@ test('all migrated writes use native authority regardless of old configuration',
  assert.equal(selectedPersonFileBackend('rename-file',enabled),'rust')
  assert.equal(selectedPersonFileBackend('move-files',enabled),'rust')
  assert.equal(selectedPersonFileBackend('delete-files',enabled),'rust')
+ assert.equal(selectedPersonFileBackend('review-delete',enabled),'rust')
  assert.equal(selectedPersonFileBackend('restore-files',enabled),'rust')
  assert.equal(selectedPersonFileBackend('rename-person',enabled),'rust')
  assert.equal(selectedPersonFileBackend('delete-person',enabled),'rust')

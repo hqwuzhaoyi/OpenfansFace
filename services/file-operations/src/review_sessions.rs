@@ -459,7 +459,7 @@ fn dispositions(config: &Config) -> Result<BTreeMap<String, Value>> {
                 CASE WHEN json_type(plan,'$.request.payload.vid')='text' THEN json_extract(plan,'$.request.payload.vid') END \
          FROM operations INDEXED BY idx_operations_complete_action \
          WHERE status='complete' \
-           AND json_extract(plan,'$.action') IN ('queue-confirm','queue-undo','review-note','review-defer','review-restore','claim-decide') \
+           AND json_extract(plan,'$.action') IN ('queue-confirm','queue-undo','review-note','review-defer','review-restore','review-delete','claim-decide') \
          ORDER BY rowid",
     )?;
     let mut rows = stmt.query([])?;
@@ -707,7 +707,7 @@ fn amended(config: &Config, id: &str, snapshot: Arc<Value>) -> Result<AmendedSna
                 .or_insert_with(|| base_evidence[index].clone());
             e["disposition"] = plan["id"].clone();
             match action {
-                "queue-confirm" => e["completed"] = json!(true),
+                "queue-confirm" | "review-delete" => e["completed"] = json!(true),
                 "queue-undo" => {
                     e["completed"] = json!(false);
                     let restored:Option<String>=conn.query_row("SELECT plan FROM operations WHERE status='complete' AND json_extract(plan,'$.action')='queue-restore' AND json_extract(plan,'$.request.payload.parent_id')=?",[plan["id"].as_str().unwrap_or("")],|r|r.get(0)).optional()?;
@@ -1663,7 +1663,7 @@ mod alias_snapshot_tests {
             ("op-1", "queue-confirm", json!({"vids": ["v1", 99, "v2"]})),
             ("op-2", "review-note", json!({"vid": "v3", "vids": "not-array"})),
             ("op-3", "review-defer", json!({"vids": ["v1"]})),
-            ("op-4", "review-restore", json!({"vids": ["v4"]})),
+            ("op-4", "review-delete", json!({"vids": ["v4"]})),
             ("op-5", "claim-decide", json!({"vid": 123})),
             ("op-6", "archive", json!({"vids": ["v1"]})),
             ("op-7", "auto-archive", json!({"vids": ["v2"]})),
@@ -1700,7 +1700,7 @@ mod alias_snapshot_tests {
                  CASE WHEN json_type(plan,'$.request.payload.vid')='text' THEN json_extract(plan,'$.request.payload.vid') END \
                  FROM operations INDEXED BY idx_operations_complete_action \
                  WHERE status='complete' \
-                   AND json_extract(plan,'$.action') IN ('queue-confirm','queue-undo','review-note','review-defer','review-restore','claim-decide') \
+                   AND json_extract(plan,'$.action') IN ('queue-confirm','queue-undo','review-note','review-defer','review-restore','review-delete','claim-decide') \
                  ORDER BY rowid",
             )
             .unwrap()

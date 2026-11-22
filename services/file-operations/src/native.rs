@@ -37,6 +37,7 @@ pub fn validate(request: &Request) -> Result<()> {
             Ok(())
         }
         "delete-files" | "restore-files" => crate::staging::validate(request),
+        "review-delete" => crate::review_delete::validate(request),
         "delete-staged" | "clear-staging" => crate::staging_delete::validate(request),
         "rename-person" => crate::person_rename::validate(request),
         "merge-person" => crate::person_merge::validate(request),
@@ -54,6 +55,7 @@ pub fn plan(config: &Config, request: Request) -> Result<Plan> {
         "metadata-write" => crate::shared_metadata::plan(config, request),
         action if review_action(action) => crate::review::plan(config, request),
         "delete-files" | "restore-files" => crate::staging::plan(config, request),
+        "review-delete" => crate::review_delete::plan(config, request),
         "rename-person" => crate::person_rename::plan(config, request),
         "merge-person" => crate::person_merge::plan(config, request),
         "delete-person" => crate::person_delete::plan(config, request),
@@ -70,6 +72,7 @@ pub fn snapshot(config: &Config, plan: &Plan, successful: &[usize]) -> Result<Do
         "metadata-write" => crate::shared_metadata::snapshot(config, plan, successful),
         action if review_action(action) => crate::review::snapshot(config, plan, successful),
         "delete-files" | "restore-files" => crate::staging::snapshot(config, plan, successful),
+        "review-delete" => crate::review_delete::snapshot(config, plan, successful),
         "rename-person" => crate::person_rename::snapshot(config, plan, successful),
         "merge-person" => crate::person_merge::snapshot(config, plan, successful),
         "delete-person" => crate::person_delete::snapshot(config, plan, successful),
@@ -86,6 +89,7 @@ pub fn revalidate(config: &Config, plan: &Plan) -> Result<()> {
         "metadata-write" => crate::shared_metadata::revalidate(config, plan),
         action if review_action(action) => crate::review::revalidate(config, plan),
         "delete-files" | "restore-files" => crate::staging::revalidate(config, plan),
+        "review-delete" => crate::review_delete::revalidate(config, plan),
         "rename-person" => crate::person_rename::revalidate(config, plan),
         "merge-person" => crate::person_merge::revalidate(config, plan),
         "delete-person" => crate::person_delete::revalidate(config, plan),

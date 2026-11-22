@@ -225,3 +225,6 @@ body:has(.archive-confirmDialog[data-instant=true]) [data-slot=alert-dialog-over
 .archive-rowMeta { display:flex!important; align-items:center; gap:6px; flex-wrap:wrap; }
 .archive-row[data-undone=true] .archive-rowOpen { opacity:.62; }
 .archive-inlineConfirm { display:inline-flex; align-items:center; flex-wrap:wrap; gap:8px; padding:6px 10px; border:1px solid var(--border-strong); border-radius:8px; background:var(--card); font-size:12px; color:var(--muted-foreground); }
+.archive-lockBadge { height:20px; padding-inline:6px; gap:4px; font-size:10px; }
+.archive-batch[data-locked=true]:not([data-active=true]),.archive-waveVideo[data-locked=true]:not([data-active=true]),.archive-row[data-locked=true]:not([data-active=true]) { background:color-mix(in oklab,var(--muted) 42%,transparent); }
+.archive-waveHeadingTitle { display:flex; align-items:center; flex-wrap:wrap; gap:8px; }

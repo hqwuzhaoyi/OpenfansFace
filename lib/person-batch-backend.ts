@@ -4,7 +4,7 @@ import { randomUUID } from 'node:crypto'
 import { BASE } from './env'
 import { rustRequest } from './file-operation-backend'
 import { fileOperationOwner, validateFileOperationId, FileOperationRoutingError } from './file-operation-routing'
-import { invalidateIntegrationCache } from './integration'
+import { invalidateIntegrationCacheAsync } from './integration'
 import type { PersonBatchRequest, PersonBatchPlan, PersonBatchProgress, PersonBatchResult } from './person-batch-model'
 const route='v1/person-batch'
 function legacyJournal(id:string){
@@ -35,7 +35,7 @@ export async function applyPersonBatchOperation(id:string,version:string):Promis
   }
   const result=await rustRequest<PersonBatchResult>({mode:'apply',id,version},undefined,route)
   if(typeof result.ok!=='boolean'||!Array.isArray(result.completed)||!Array.isArray(result.remaining))throw new FileOperationRoutingError('批次执行回执不完整，请查询原编号',502)
-  invalidateIntegrationCache();return result
+  await invalidateIntegrationCacheAsync();return result
 }
 export async function personBatchOperationProgress(id:string):Promise<PersonBatchProgress>{
   if(owner(id)==='legacy'){
@@ -43,7 +43,7 @@ export async function personBatchOperationProgress(id:string):Promise<PersonBatc
     return {status:saved.status,completed:saved.result?.completed.map((item:{person:string})=>item.person)||[],remaining:saved.result?.remaining||saved.plan.plans.map((plan:{person:string})=>plan.person),active_person:saved.active_person,error:saved.result?.error,result:saved.result}
   }
   const progress=await rustRequest<PersonBatchProgress>(null,id,route)
-  if(progress.status==='complete')invalidateIntegrationCache()
+  if(progress.status==='complete')await invalidateIntegrationCacheAsync()
   return progress
 }
 
@@ -51,5 +51,5 @@ export async function reconcilePersonBatchOperation(id:string,version:string):Pr
   if(owner(id)!=='rust')throw new FileOperationRoutingError('此批次没有 Rust 执行记录')
   if(typeof version!=='string')throw new FileOperationRoutingError('缺少原预览版本',400)
   const result=await rustRequest<PersonBatchResult>({mode:'reconcile',id,version},undefined,route)
-  invalidateIntegrationCache();return result
+  await invalidateIntegrationCacheAsync();return result
 }

@@ -18,6 +18,7 @@ pub mod engine;
 pub mod fault;
 pub mod files;
 pub mod ledger;
+pub mod locks;
 pub mod metadata;
 pub mod model;
 pub mod native;
@@ -38,6 +39,7 @@ pub mod processing_result;
 pub mod processing_scheduler;
 pub mod reference_relocation;
 pub mod review;
+pub mod review_delete;
 pub mod review_sessions;
 pub mod shared_metadata;
 pub mod staging;
@@ -62,4 +64,5 @@ pub enum Command {
 pub struct Work {
     pub command: Command,
     pub reply: oneshot::Sender<Result<Value>>,
+    pub lock: Option<locks::LockGuard>,
 }

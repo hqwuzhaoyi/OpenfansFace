@@ -812,13 +812,21 @@ fn background_publisher_respects_pause_toggle_admission_and_wakes_for_new_tasks(
     engine.set_auto_archive_wake(wake.clone());
 
     let executor = thread::spawn(move || {
-        for Work { command, reply } in queue {
+        for Work {
+            command,
+            reply,
+            mut lock,
+        } in queue
+        {
             let res = match command {
                 Command::Archive { command, body } => {
                     archive_api::execute(&mut engine, &command, body)
                 }
                 _ => panic!("unexpected command in bg publisher test"),
             };
+            if let Some(guard) = lock.take() {
+                guard.finish_with_result(&res);
+            }
             completion.complete();
             let _ = reply.send(res);
         }

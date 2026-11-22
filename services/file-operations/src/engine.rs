@@ -15,18 +15,23 @@ pub struct Engine {
     pub config: Config,
     pub store: Store,
     pub auto_archive_wake: Option<Arc<crate::auto_archive::AutoArchiveWake>>,
+    pub locks: Arc<crate::locks::ActiveLockRegistry>,
 }
 impl Engine {
     pub fn new(config: Config) -> Result<Self> {
         let store = Store::start(&config)?;
+        let locks = crate::locks::ActiveLockRegistry::new();
         let mut engine = Self {
             config,
             store,
             auto_archive_wake: None,
+            locks,
         };
         if engine.config.parity_root.is_none() {
             engine.recover_startup()?;
             crate::person_batch::recover(&mut engine)?;
+            engine.locks = crate::locks::ActiveLockRegistry::new();
+            engine.locks.seed_from_store(&engine.store)?;
         }
         Ok(engine)
     }
@@ -36,7 +41,11 @@ impl Engine {
             config,
             store,
             auto_archive_wake: None,
+            locks: crate::locks::ActiveLockRegistry::new(),
         })
+    }
+    pub fn locks(&self) -> Arc<crate::locks::ActiveLockRegistry> {
+        Arc::clone(&self.locks)
     }
     pub fn set_auto_archive_wake(&mut self, wake: Arc<crate::auto_archive::AutoArchiveWake>) {
         self.auto_archive_wake = Some(wake);
@@ -213,6 +222,23 @@ impl Engine {
         version: String,
         gate: WriteGate,
     ) -> Result<Value> {
+        self.apply_under_gate_inner(stored, version, gate, false)
+    }
+    pub(crate) fn apply_child_under_gate(
+        &mut self,
+        stored: Plan,
+        version: String,
+        gate: WriteGate,
+    ) -> Result<Value> {
+        self.apply_under_gate_inner(stored, version, gate, true)
+    }
+    fn apply_under_gate_inner(
+        &mut self,
+        stored: Plan,
+        version: String,
+        gate: WriteGate,
+        is_batch_child: bool,
+    ) -> Result<Value> {
         let request = stored.request.clone();
         self.store.remember_gate(&request.id, &gate.evidence()?)?;
         crate::fault::checkpoint(&self.config, "gate_acquired")?;
@@ -220,7 +246,36 @@ impl Engine {
             return crate::processing_result::apply(self, &stored, gate);
         }
         if crate::staging_delete::action(&stored.action) {
-            return crate::staging_delete::apply(self, &stored, gate);
+            let (lock_action, lock_vids, lock_people) = crate::locks::entities_from_plan(&stored);
+            let track_lock = !is_batch_child && crate::locks::tracks_action(&lock_action);
+            if track_lock {
+                self.locks.mark_running(
+                    &stored.id,
+                    &lock_action,
+                    lock_vids.clone(),
+                    lock_people.clone(),
+                );
+            }
+            let outcome = crate::staging_delete::apply(self, &stored, gate);
+            let needs_recovery = self
+                .store
+                .get(&stored.id)
+                .ok()
+                .flatten()
+                .is_some_and(|rec| {
+                    matches!(
+                        rec.status.as_str(),
+                        "accepted" | "running" | "recovery_needed" | "rolling_back"
+                    )
+                });
+            if needs_recovery {
+                self.locks
+                    .mark_recovery_needed(&stored.id, &lock_action, lock_vids, lock_people);
+            } else if track_lock {
+                let status = if outcome.is_ok() { "complete" } else { "failed" };
+                self.locks.settle(&stored.id, status, lock_vids, lock_people);
+            }
+            return outcome;
         }
         let prepared = (|| {
             let current = if stored.execution.is_some() {
@@ -269,9 +324,23 @@ impl Engine {
             Ok(p) => p,
             Err(e) => {
                 gate.release()?;
+                if !is_batch_child {
+                    let (_, vids, people) = crate::locks::entities_from_plan(&stored);
+                    self.locks.settle(&stored.id, "failed", vids, people);
+                }
                 return Err(e);
             }
         };
+        let (lock_action, lock_vids, lock_people) = crate::locks::entities_from_plan(&plan);
+        let track_lock = !is_batch_child && crate::locks::tracks_action(&lock_action);
+        if track_lock {
+            self.locks.mark_running(
+                &plan.id,
+                &lock_action,
+                lock_vids.clone(),
+                lock_people.clone(),
+            );
+        }
         // An admission COMMIT error is uncertain too: keep the marker even before media changes.
         if let Err(error) = self.store.admit(&plan, evidence) {
             let failure = Error::new(
@@ -280,14 +349,24 @@ impl Engine {
                 format!("意图持久化结果未知，保留写锁：{error}"),
             );
             let _ = self.store.fail(&plan.id, &failure, true);
+            self.locks
+                .mark_recovery_needed(&plan.id, &lock_action, lock_vids, lock_people);
             return Err(failure);
         }
-        crate::fault::checkpoint(&self.config, "admitted")?;
+        if let Err(error) = crate::fault::checkpoint(&self.config, "admitted") {
+            self.locks
+                .mark_recovery_needed(&plan.id, &lock_action, lock_vids, lock_people);
+            return Err(error);
+        }
         let executed = self.execute(&plan, &domain);
         match executed {
             Ok(result) => {
                 crate::archive_cancel::release_scanner_lease(&self.config, &plan.id, "committed");
                 gate.release()?;
+                if track_lock {
+                    self.locks
+                        .settle(&plan.id, "complete", lock_vids, lock_people);
+                }
                 crate::fault::checkpoint(&self.config, "complete")?;
                 Ok(result)
             }
@@ -301,6 +380,10 @@ impl Engine {
                             "committed",
                         );
                         gate.release()?;
+                        if track_lock {
+                            self.locks
+                                .settle(&plan.id, "complete", lock_vids, lock_people);
+                        }
                         Ok(result)
                     }
                     Ok(None) => {
@@ -310,10 +393,16 @@ impl Engine {
                             "rolled_back",
                         );
                         gate.release()?;
+                        if track_lock {
+                            self.locks
+                                .settle(&plan.id, "rolled_back", lock_vids, lock_people);
+                        }
                         Err(error)
                     }
                     Err(unknown) => {
                         self.recovery_failure(&plan, &unknown)?;
+                        self.locks
+                            .mark_recovery_needed(&plan.id, &lock_action, lock_vids, lock_people);
                         Err(self.store.get(&plan.id)?.unwrap().error.unwrap())
                     }
                 }
@@ -361,13 +450,23 @@ impl Engine {
             {
                 return Err(Error::conflict("核对范围与原操作不一致"));
             }
+            let (_, vids, people) = crate::locks::entities_from_plan(&record.plan);
             if record.status == "not_started" {
                 self.store.fence(&request, version.as_deref())?;
+                self.locks.settle(&request.id, "cancelled", vids, people);
             } else if record.status == "recovery_needed" || record.status == "rolling_back" {
                 self.recover_one(&request.id);
+            } else if matches!(
+                record.status.as_str(),
+                "complete" | "rolled_back" | "cancelled" | "failed"
+            ) {
+                self.locks
+                    .settle(&request.id, &record.status, vids, people);
             }
         } else {
             self.store.fence(&request, version.as_deref())?;
+            self.locks
+                .settle(&request.id, "cancelled", Vec::<String>::new(), Vec::<String>::new());
         }
         crate::store::status(&self.config.state_db(), &request.id)
     }
@@ -469,6 +568,18 @@ impl Engine {
             && let Ok(Some(record)) = self.store.get(id)
         {
             let _ = self.recovery_failure(&record.plan, &error);
+        }
+        if let Ok(Some(record)) = self.store.get(id) {
+            let (action, vids, people) = crate::locks::entities_from_plan(&record.plan);
+            match record.status.as_str() {
+                "complete" | "rolled_back" | "cancelled" | "failed" => {
+                    self.locks.settle(id, &record.status, vids, people);
+                }
+                "recovery_needed" | "rolling_back" => {
+                    self.locks.mark_recovery_needed(id, &action, vids, people);
+                }
+                _ => {}
+            }
         }
     }
     pub(crate) fn require_resolved_mutation(&self, id: &str, cause: Option<&Error>) -> Result<()> {
@@ -1844,7 +1955,7 @@ impl Engine {
                     .as_ref()
                     .and_then(|e| e.data["timestamp"].as_str())
                     .unwrap_or("1970-01-01T00:00:00Z");
-                let deleting = plan.action == "delete-files";
+                let deleting = matches!(plan.action.as_str(), "delete-files" | "review-delete");
                 let changed_owner =
                     !deleting && !plan.target_person.is_empty() && plan.person != plan.target_person;
                 let src_eid: Option<i64> = if changed_owner && !plan.person.is_empty() {

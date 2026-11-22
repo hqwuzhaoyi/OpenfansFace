@@ -104,7 +104,9 @@ pub(crate) fn origin(config: &Config, path: &str, origins: &Value) -> Result<Val
         .map_err(|_| Error::conflict("路径不属于暂存区"))?;
     let parts: Vec<_> = relative.iter().collect();
     if parts.len() >= 3
-        && parts[0] == "person-deletions"
+        && parts[0]
+            .to_str()
+            .is_some_and(|kind| matches!(kind, "person-deletions" | "review-deletions"))
         && let Some(id) = parts[1]
             .to_str()
             .filter(|id| crate::model::validate_id(id).is_ok())
@@ -406,7 +408,7 @@ pub fn snapshot(config: &Config, plan: &Plan, successful: &[usize]) -> Result<Do
     if successful.iter().copied().ne(0..plan.files.len()) {
         return Err(Error::conflict("暂存操作必须提交完整范围"));
     }
-    let deleting = ["delete-files", "delete-person"].contains(&plan.action.as_str());
+    let deleting = ["delete-files", "delete-person", "review-delete"].contains(&plan.action.as_str());
     let mut domain_plan = plan.clone();
     if !deleting && !plan.target_person.is_empty() {
         domain_plan.action = "move-files".into();

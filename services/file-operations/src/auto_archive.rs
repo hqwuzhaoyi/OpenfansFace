@@ -44,6 +44,7 @@ struct WakeState {
     vids: BTreeSet<String>,
     notified: bool,
     stopped: bool,
+    locks: Option<Arc<crate::locks::ActiveLockRegistry>>,
 }
 
 /// Non-blocking wakeup signal connecting post-commit `processing-result` completions
@@ -59,6 +60,16 @@ impl AutoArchiveWake {
             state: Mutex::new(WakeState::default()),
             cv: Condvar::new(),
         })
+    }
+
+    pub fn set_locks(&self, locks: Arc<crate::locks::ActiveLockRegistry>) {
+        let mut guard = self.state.lock().unwrap();
+        guard.locks = Some(locks);
+    }
+
+    pub fn locks(&self) -> Option<Arc<crate::locks::ActiveLockRegistry>> {
+        let guard = self.state.lock().unwrap();
+        guard.locks.clone()
     }
 
     pub fn notify_vid(&self, vid: &str) {
@@ -148,6 +159,7 @@ fn configured_u64(key: &str, default: u64, min: u64, max: u64) -> u64 {
 fn dispatch_auto_archive(
     publisher: &crate::admission::AcceptedPublisher,
     body: Value,
+    lock: Option<crate::locks::LockGuard>,
 ) -> Result<Value> {
     let (reply, wait) = tokio::sync::oneshot::channel();
     publisher
@@ -157,6 +169,7 @@ fn dispatch_auto_archive(
                 body,
             },
             reply,
+            lock,
         })
         .map_err(|_| Error::new(503, "writer_busy", "执行队列已满或执行器不可用"))?;
     wait.blocking_recv()
@@ -224,7 +237,7 @@ fn run_publisher_loop(
 
         // Pre-filter read-only so ineligible completions never allocate an operation journal row.
         let vid_set: BTreeSet<String> = batch_vids.iter().cloned().collect();
-        match auto_watermark::evaluate_for_vids(&config, Some(&vid_set)) {
+        let eligible = match auto_watermark::evaluate_for_vids(&config, Some(&vid_set)) {
             Ok(eligible) if eligible.is_empty() => {
                 consecutive_busy = 0;
                 if has_more {
@@ -232,12 +245,12 @@ fn run_publisher_loop(
                 }
                 continue;
             }
-            Ok(_) => {}
+            Ok(eligible) => eligible,
             Err(err) => {
                 eprintln!("auto-archive pre-evaluate failed: {}", err.error);
                 continue;
             }
-        }
+        };
 
         let publisher = match worker.begin_publisher() {
             Ok(p) => p,
@@ -247,12 +260,28 @@ fn run_publisher_loop(
             }
         };
 
+        let op_id = uuid::Uuid::new_v4().to_string();
+        let lock_guard = wake.locks().map(|locks| {
+            let lock_vids: Vec<String> = eligible
+                .iter()
+                .take(max_batch)
+                .map(|e| e.vid.clone())
+                .collect();
+            let lock_people: Vec<String> = eligible
+                .iter()
+                .take(max_batch)
+                .map(|e| e.person.clone())
+                .collect();
+            locks.register_queued(&op_id, "auto-archive", lock_vids, lock_people)
+        });
+
         let body = json!({
+            "operation_id": op_id,
             "background": true,
             "vids": batch_vids,
             "max_items": max_batch,
         });
-        match dispatch_auto_archive(&publisher, body) {
+        match dispatch_auto_archive(&publisher, body, lock_guard) {
             Ok(_) => {
                 consecutive_busy = 0;
             }

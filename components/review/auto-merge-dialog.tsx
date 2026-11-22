@@ -25,6 +25,7 @@ import {
   CollapsibleIndicator,
   CollapsibleTrigger,
 } from '@/components/beui/motion/collapsible'
+import { AnimatedBadge } from '@/components/beui/motion/animated-badge'
 import { DigitSwap } from '@/components/beui/motion/digit-swap'
 import { Badge } from '@/components/ui/badge'
 import { Button as NavigationButton } from '@/components/ui/button'
@@ -47,6 +48,7 @@ import {
   formatAutoMergeSize,
   type AutoWatermarkPreview,
 } from '@/lib/archive-actions'
+import { isAutoMergeAction, lockBadgeStatus } from '@/lib/locks-model'
 
 export interface AutoMergeDialogProps {
   open: boolean
@@ -65,7 +67,8 @@ export function AutoMergeDialog({
   onRefreshPreview,
   returnFocus,
 }: AutoMergeDialogProps) {
-  const { tasks, enqueueAutoMerge, subscribe } = useBackgroundOperations()
+  const { tasks, serverActiveOps, enqueueAutoMerge, subscribe } =
+    useBackgroundOperations()
   const [instantEntry, setInstantEntry] = useState(false)
   const [trackedTaskId, setTrackedTaskId] = useState<string | null>(null)
   const [settledSnapshot, setSettledSnapshot] = useState<AutoMergeTask | null>(
@@ -78,6 +81,21 @@ export function AutoMergeDialog({
       (t): t is AutoMergeTask =>
         t.kind === 'auto-merge' &&
         (t.status === 'queued' || t.status === 'running'),
+    ) ?? null
+
+  const activeServerAutoMerge =
+    serverActiveOps.find(
+      (op) =>
+        isAutoMergeAction(op.action) &&
+        (op.status === 'running' ||
+          op.status === 'queued' ||
+          op.status === 'recovery_needed'),
+    ) ?? null
+
+  const activeLocalRecoveryTask =
+    tasks.find(
+      (t): t is AutoMergeTask =>
+        t.kind === 'auto-merge' && t.status === 'recovery_needed',
     ) ?? null
 
   const liveTrackedTask =
@@ -147,13 +165,31 @@ export function AutoMergeDialog({
     ['complete', 'failed', 'rolled_back', 'recovery_needed'].includes(
       trackedTask.status,
     )
+  const blockingAutoMerge = !isRunning && !isSettled
+    ? activeServerAutoMerge ??
+      (activeLocalRecoveryTask
+        ? {
+            status: 'recovery_needed' as const,
+            label: '待恢复',
+            video_count: activeLocalRecoveryTask.vids.length,
+          }
+        : null)
+    : null
+  const isServerAutoMerging = Boolean(blockingAutoMerge)
 
   const eligibleCount = preview?.eligible_count ?? 0
   const groupCount = preview?.group_count ?? preview?.groups.length ?? 0
   const groups = preview?.groups ?? []
 
   const handleApply = () => {
-    if (!preview || eligibleCount <= 0 || isRunning || loading) return
+    if (
+      !preview ||
+      eligibleCount <= 0 ||
+      isRunning ||
+      isServerAutoMerging ||
+      loading
+    )
+      return
     const items = buildAutoMergeApplyItems(preview)
     if (!items.length) return
     setSettledSnapshot(null)
@@ -399,11 +435,62 @@ export function AutoMergeDialog({
             </div>
           ) : groups.length === 0 ? (
             <div className="flex flex-col items-center justify-center gap-2 py-10 text-center text-xs text-muted-foreground">
-              <CheckCircle2 size={22} aria-hidden="true" />
-              <span>当前没有可直接自动合入的视频</span>
+              {blockingAutoMerge ? (
+                <>
+                  <AnimatedBadge
+                    size="sm"
+                    status={lockBadgeStatus(blockingAutoMerge.status)}
+                  >
+                    {blockingAutoMerge.label ||
+                      (blockingAutoMerge.status === 'recovery_needed'
+                        ? '待恢复'
+                        : '合入中')}
+                  </AnimatedBadge>
+                  <span>
+                    {blockingAutoMerge.status === 'recovery_needed'
+                      ? '自动合入待核对恢复'
+                      : '后台自动合入进行中'}
+                  </span>
+                </>
+              ) : (
+                <>
+                  <CheckCircle2 size={22} aria-hidden="true" />
+                  <span>当前没有可直接自动合入的视频</span>
+                </>
+              )}
             </div>
           ) : (
-            groups.map((group) => (
+            <>
+              {blockingAutoMerge && (
+                <div
+                  role="status"
+                  aria-live="polite"
+                  className="flex items-center justify-between gap-2 rounded-xl border bg-card px-3 py-2 text-xs"
+                >
+                  <div className="flex min-w-0 items-center gap-2">
+                    <AnimatedBadge
+                      size="sm"
+                      status={lockBadgeStatus(blockingAutoMerge.status)}
+                    >
+                      {blockingAutoMerge.label ||
+                        (blockingAutoMerge.status === 'recovery_needed'
+                          ? '待恢复'
+                          : '合入中')}
+                    </AnimatedBadge>
+                    <span className="truncate text-muted-foreground">
+                      {blockingAutoMerge.status === 'recovery_needed'
+                        ? '自动合入待核对恢复'
+                        : '后台正在执行自动合入'}
+                    </span>
+                  </div>
+                  {blockingAutoMerge.video_count > 0 && (
+                    <span className="shrink-0 tabular-nums text-muted-foreground">
+                      {blockingAutoMerge.video_count} 个视频
+                    </span>
+                  )}
+                </div>
+              )}
+              {groups.map((group) => (
               <Collapsible
                 key={group.person}
                 defaultOpen={groups.length <= 3}
@@ -513,7 +600,8 @@ export function AutoMergeDialog({
                   </div>
                 </CollapsibleContent>
               </Collapsible>
-            ))
+            ))}
+            </>
           )}
         </div>
 
@@ -540,14 +628,21 @@ export function AutoMergeDialog({
           ) : (
             <>
               <Button variant="outline" onClick={() => onOpenChange(false)}>
-                取消
+                {isServerAutoMerging ? '关闭' : '取消'}
               </Button>
               <Button
-                disabled={loading || eligibleCount <= 0}
+                disabled={loading || eligibleCount <= 0 || isServerAutoMerging}
                 onClick={handleApply}
               >
                 <Sparkles size={14} aria-hidden="true" />
-                <span>直接合入 {eligibleCount} 个视频</span>
+                <span>
+                  {blockingAutoMerge
+                    ? blockingAutoMerge.label ||
+                      (blockingAutoMerge.status === 'recovery_needed'
+                        ? '待恢复'
+                        : '合入中')
+                    : `直接合入 ${eligibleCount} 个视频`}
+                </span>
               </Button>
             </>
           )}

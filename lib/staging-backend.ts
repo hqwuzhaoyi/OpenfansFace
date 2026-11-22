@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { BASE } from './env'
-import { invalidateIntegrationCache } from './integration'
+import { invalidateIntegrationCacheAsync } from './integration'
 import { rustRequest, personFileOperationStatus } from './file-operation-backend'
 import { fileOperationOwner, selectedPersonFileBackend, validateFileOperationId, FileOperationRoutingError } from './file-operation-routing'
 import type { PersonFileMove, PersonFileResult } from './person-file-model'
@@ -30,6 +30,6 @@ export async function stagingOperation(mode:unknown,input:RestoreRequest|DeleteR
   if(mode==='apply'&&request.action!=='restore-files'&&confirmation!==(request.action==='clear-staging'?'清空回收站':'永久删除'))throw new FileOperationRoutingError('请输入完整确认文字',400)
   const result=await rustRequest<RestorePlan|DeletePlan|PersonFileResult|DeleteResult|{id:string;status:string}>({mode,request,...(mode!=='preview'?{version}:{}),...(mode==='apply'&&request.action!=='restore-files'?{confirmation}:{})})
   if(result.id!==request.id)throw new FileOperationRoutingError('暂存回执编号不匹配',502)
-  if(mode!=='preview')invalidateIntegrationCache()
+  if(mode!=='preview')await invalidateIntegrationCacheAsync()
   return result
 }

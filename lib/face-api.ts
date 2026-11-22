@@ -10,7 +10,7 @@ export async function api<T=any>(path:string,opts?:RequestInit):Promise<T> {
   for(let attempt=0;attempt<attempts;attempt++){
     try{
       const headers=new Headers(opts?.headers);if(!headers.has('Content-Type'))headers.set('Content-Type','application/json')
-      const res=await fetch(path,{...opts,headers})
+      const res=await fetch(path,{...opts,cache:opts?.cache??(method==='GET'?'no-store':undefined),headers})
       if(!res.ok){const message=await res.json().catch(()=>({}));throw Object.assign(new Error(message.error||`请求失败（${res.status}）`),{status:res.status,code:message.code,resultUnknown:res.status>=500})}
       return await res.json() as T
     }catch(error){

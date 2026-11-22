@@ -152,3 +152,48 @@ test('pending defer and restore mutations adjust deferred and view counts cleanl
  assert.equal(restored.groups[0].count,1)
  assert.equal(restored.remaining,1)
 })
+
+test('pending delete mutations project across normal and deferred lanes and prune cleanly',()=>{
+ const base={
+  counts:{all:12,suggested:9,conflict:2,none:1,manual:0,deferred:3},
+  groups:[{key:'person:菠萝啤beer',label:'菠萝啤beer',kind:'suggested',count:5}],
+  group:{key:'person:菠萝啤beer',label:'菠萝啤beer',kind:'suggested',count:5},
+  total:5,
+  remaining:5,
+  rows:[{vid:'b-1'},{vid:'b-2'},{vid:'b-3'}],
+ }
+ const op={
+  id:'del-1',
+  action:'delete',
+  groupKey:'person:菠萝啤beer',
+  isDeferred:false,
+  vids:['b-1','b-2'],
+  buckets:{suggested:2},
+  settledAtSeq:null,
+ }
+ const inFlight=applyPendingReviewMutations(base,0,[op],'all')
+ assert.equal(inFlight.counts.all,10)
+ assert.equal(inFlight.counts.suggested,7)
+ assert.equal(inFlight.counts.deferred,3)
+ assert.equal(inFlight.groups[0].count,3)
+ assert.equal(inFlight.group.count,3)
+ assert.equal(inFlight.remaining,3)
+ assert.deepEqual(inFlight.rows.map(r=>r.vid),['b-3'])
+
+ const settled=[{...op,settledAtSeq:2}]
+ const stillProjected=applyPendingReviewMutations(base,1,settled,'all')
+ assert.equal(stillProjected.rows.length,1)
+ assert.deepEqual(pruneSettledReviewMutations(settled,2),[])
+
+ const deferredDelete=applyPendingReviewMutations(
+  {...base,counts:{...base.counts},rows:[{vid:'d-1'},{vid:'d-2'}]},
+  0,
+  [{id:'del-2',action:'delete',groupKey:'person:菠萝啤beer',isDeferred:true,vids:['d-1'],buckets:{conflict:1},settledAtSeq:null}],
+  'deferred',
+ )
+ assert.equal(deferredDelete.counts.deferred,2)
+ assert.equal(deferredDelete.counts.all,12)
+ assert.equal(deferredDelete.counts.conflict,2)
+ assert.equal(deferredDelete.groups[0].count,4)
+ assert.deepEqual(deferredDelete.rows.map(r=>r.vid),['d-2'])
+})

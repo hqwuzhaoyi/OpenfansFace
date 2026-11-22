@@ -75,7 +75,7 @@ export interface ReviewProjectionSnapshot<
 
 export interface PendingReviewMutation{
   id:string
-  action:'confirm'|'defer'|'restore'
+  action:'confirm'|'defer'|'restore'|'delete'
   groupKey:string
   isDeferred:boolean
   vids:string[]
@@ -114,7 +114,7 @@ export function applyPendingReviewMutations<TSnapshot extends ReviewProjectionSn
     if(op.isDeferred===viewDeferred){
       groupDelta.set(op.groupKey,(groupDelta.get(op.groupKey)??0)+op.vids.length)
     }
-    if(op.action==='confirm'){
+    if(op.action==='confirm'||op.action==='delete'){
       if(op.isDeferred){
         counts.deferred=Math.max(0,(counts.deferred??0)-op.vids.length)
       }else{

@@ -3,7 +3,7 @@ import fs from 'node:fs'
 import path from 'node:path'
 import { randomUUID } from 'node:crypto'
 import { BASE } from './env'
-import { invalidateIntegrationCache } from './integration'
+import { invalidateIntegrationCacheAsync } from './integration'
 import { fileOperationOwner, selectedPersonFileBackend, validateFileOperationId, FileOperationRoutingError, type FileOperationBackendName } from './file-operation-routing'
 import type { PersonFileRequest, PersonFilePlan, PersonFileResult } from './person-file-model'
 
@@ -38,13 +38,13 @@ const rust:PersonFileBackend={
   async apply(request,version){
     const result=await rustRequest<PersonFileResult>({mode:'apply',request,version})
     if(result.id!==request.id||typeof result.ok!=='boolean')throw new FileOperationRoutingError('执行结果与操作编号不匹配，请核对原操作',502)
-    if(result.ok)invalidateIntegrationCache()
+    if(result.ok)await invalidateIntegrationCacheAsync()
     return result
   },
   async status(id){
     const status=await rustRequest<PersonFileOperationStatus>(null,id)
     if(status.id!==id||typeof status.status!=='string')throw new FileOperationRoutingError('查询结果与操作编号不匹配',502)
-    if(status.status==='complete'||status.status==='rolled_back')invalidateIntegrationCache()
+    if(['complete','rolled_back','failed','recovery_needed'].includes(status.status))await invalidateIntegrationCacheAsync()
     return {...status,backend:'rust'}
   },
 }
@@ -69,13 +69,18 @@ export function applyPersonFileOperation(request:PersonFileRequest,version:strin
 export interface AcceptedPersonFileOperation {
   id:string; status:string; accepted:true
 }
-export function applyPersonFileOperationAsync(request:PersonFileRequest,version:string,waitMs=2000){
+export async function applyPersonFileOperationAsync(request:PersonFileRequest,version:string,waitMs=2000){
   if(typeof version!=='string')throw new FileOperationRoutingError('请先预览操作',400)
   validateFileOperationId(request.id)
   const backend=selectedPersonFileBackend(request.action)
   const owner=fileOperationOwner(BASE,request.id)
   if(owner&&(owner.backend!==backend||owner.action!==request.action))throw new FileOperationRoutingError('旧操作不能转交新执行器，请重新预览')
-  return nativeJsonRequest<PersonFileResult|AcceptedPersonFileOperation>('v1/person-files',{mode:'apply',request,version,wait_ms:waitMs},{label:'文件操作',completion:'allow_accepted',error:(message,status)=>new FileOperationRoutingError(message,status)})
+  const outcome=await nativeJsonRequest<PersonFileResult|AcceptedPersonFileOperation>('v1/person-files',{mode:'apply',request,version,wait_ms:waitMs},{label:'文件操作',completion:'allow_accepted',error:(message,status)=>new FileOperationRoutingError(message,status)})
+  if('accepted'in outcome&&outcome.accepted===true&&!('ok'in outcome))return outcome
+  const result=outcome as PersonFileResult
+  if(result.id!==request.id||typeof result.ok!=='boolean')throw new FileOperationRoutingError('执行结果与操作编号不匹配，请核对原操作',502)
+  await invalidateIntegrationCacheAsync()
+  return result
 }
 export function personFileOperationStatus(id:string){
   validateFileOperationId(id)
@@ -91,6 +96,6 @@ export async function reconcilePersonFileOperation(request:PersonFileRequest,ver
   if(owner?.backend!=='rust'||owner.action!==request.action)throw new FileOperationRoutingError('此操作没有 Rust 执行记录',409)
   const status=await rustRequest<PersonFileOperationStatus>({mode:'reconcile',request,version})
   if(status.id!==request.id)throw new FileOperationRoutingError('核对回执编号不匹配',502)
-  if(status.status==='complete'||status.status==='rolled_back')invalidateIntegrationCache()
+  if(['complete','rolled_back','failed','recovery_needed'].includes(status.status))await invalidateIntegrationCacheAsync()
   return {...status,backend:'rust' as const}
 }

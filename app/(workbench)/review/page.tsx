@@ -2,7 +2,7 @@
 
 import Link from 'next/link'
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { Check, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, Film, Maximize2, Play, RefreshCw, SlidersHorizontal, Sparkles, X, ArrowLeft, ListChecks } from 'lucide-react'
+import { Check, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, Film, Maximize2, Play, RefreshCw, SlidersHorizontal, Sparkles, Trash2, X, ArrowLeft, ListChecks } from 'lucide-react'
 import * as Popover from '@radix-ui/react-popover'
 import { workspaceToast as toast } from '@/components/workbench/feedback'
 import { api } from '@/lib/face-api'
@@ -11,6 +11,7 @@ import { reviewSelectionKey, toggleReviewSelection, removeReviewSelection, type 
 import { PersonPicker, type PersonChoice, type PersonNameHint } from '@/components/review/person-picker'
 import { VideoCover } from '@/components/review/video-cover'
 import { Card } from '@/components/beui/motion/card'
+import { AnimatedBadge } from '@/components/beui/motion/animated-badge'
 import { Collapsible, CollapsibleContent } from '@/components/beui/motion/collapsible'
 import { AvatarGroup } from '@/components/beui/motion/avatar-group'
 import { DigitSwap } from '@/components/beui/motion/digit-swap'
@@ -29,9 +30,12 @@ import { InputGroupButton } from '@/components/ui/input-group'
 import { Checkbox } from '@/components/beui/motion/checkbox'
 import { useReviewActivity } from '@/components/workbench/review-activity'
 import { useBackgroundOperations } from '@/components/workbench/background-operations'
+import { isAutoMergeAction, isDestructivePersonAction, lockBadgeStatus } from '@/lib/locks-model'
 import { AlertDialog,AlertDialogContent,AlertDialogHeader,AlertDialogTitle,AlertDialogDescription,AlertDialogFooter,AlertDialogCancel,AlertDialogAction } from '@/components/ui/alert-dialog'
 import { ReviewSummaryRow } from '@/components/review/review-summary-row'
 import { AutoMergeDialog } from '@/components/review/auto-merge-dialog'
+import { ReviewDeleteDialog } from '@/components/review/review-delete-dialog'
+import type { PersonFilePlan } from '@/lib/person-file-model'
 import { fetchAutoMergePreview, type AutoWatermarkPreview } from '@/lib/archive-actions'
 import { VideoPreviewDialog } from '@/components/workbench/video-preview-dialog'
 import { ReviewQueueSkeleton, StageMediaLoader } from '@/components/workbench/loading-skeletons'
@@ -47,7 +51,12 @@ const REVIEW_CACHE_TTL_MS=5*60*1000
 const uuid=()=>{if(typeof crypto!=='undefined'&&typeof crypto.randomUUID==='function')return crypto.randomUUID();const bytes=crypto.getRandomValues(new Uint8Array(16));bytes[6]=(bytes[6]&15)|64;bytes[8]=(bytes[8]&63)|128;const hex=[...bytes].map(b=>b.toString(16).padStart(2,'0')).join('');return `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}`}
 
 export default function Review() {
-  const {trackReviewMutation,subscribe}=useBackgroundOperations()
+  const {trackReviewMutation,enqueuePersonFile,subscribe,lockedVids,lockedPeople,tasks,serverActiveOps}=useBackgroundOperations()
+  const lockedVidsRef=useRef(lockedVids)
+  lockedVidsRef.current=lockedVids
+  const lockedPeopleRef=useRef(lockedPeople)
+  lockedPeopleRef.current=lockedPeople
+  const localReviewOpIdsRef=useRef(new Set<string>())
   const {values:filters,ready:initialized,update:updateFilters}=useWorkspaceQuery({view:'all',group:'',q:'',folder:'',page:'0',person:'',cluster:'',vid:''},{view:views.map(v=>v.value)})
   const {view,group,q:query,folder,person:personScope,cluster:clusterScope,vid:linkFocus}=filters,page=Number(filters.page)
   const [rawData,setRawData]=useState<{payload:Data;fetchedAtSeq:number}|null>(null),[error,setError]=useState(''),[loading,setLoading]=useState(true),[busy,setBusy]=useState(false)
@@ -87,13 +96,16 @@ export default function Review() {
   const [reference,setReference]=useState<{name:string;returnTo:'video'|'selection';scroll:number}|null>(null)
   const [people,setPeople]=useState<PersonChoice[]>(()=>readWorkbenchCache<PersonChoice[]>('review:people',REVIEW_CACHE_TTL_MS)??[]),[peopleError,setPeopleError]=useState(''),[receipt,setReceipt]=useState<{vids:string[];creator:string;session:string}|null>(null)
   const pendingMutations=useRef(new Map<string,string>())
-  const mutate=async<T=any>(path:string,body:Record<string,unknown>,method='POST'):Promise<T>=>{const key=JSON.stringify([path,method,body]),id=pendingMutations.current.get(key)||uuid();pendingMutations.current.set(key,id);try{const result=await api<T>(path,{method,body:JSON.stringify({...body,operation_id:id})});pendingMutations.current.delete(key);return result}catch(error:any){if(!error.resultUnknown)pendingMutations.current.delete(key);else error.message+=`（操作 ${id}，重试将查询同一回执）`;throw error}}
+  const mutate=async<T=any>(path:string,body:Record<string,unknown>,method='POST',explicitId?:string):Promise<T>=>{const key=JSON.stringify([path,method,body]),id=explicitId||pendingMutations.current.get(key)||uuid();pendingMutations.current.set(key,id);localReviewOpIdsRef.current.add(id);if(localReviewOpIdsRef.current.size>256){const oldest=localReviewOpIdsRef.current.values().next().value;if(oldest!==undefined)localReviewOpIdsRef.current.delete(oldest)};try{const result=await api<T>(path,{method,body:JSON.stringify({...body,operation_id:id})});pendingMutations.current.delete(key);return result}catch(error:any){if(!error.resultUnknown)pendingMutations.current.delete(key);else error.message+=`（操作 ${id}，重试将查询同一回执）`;throw error}}
   const refreshFocus=useRef<HTMLElement|null>(null)
   const returnFocus=useRef<HTMLElement|null>(null),session=useRef<string|undefined>(undefined),pendingSessionResetRef=useRef(false),noteBaseline=useRef<Record<string,string>>({}),notesRef=useRef(notes),polling=useRef(false),scrollAnchor=useRef<{vid:string;offset:number}[]|null>(null)
   notesRef.current=notes
   const [updates,setUpdates]=useState<{has_updates:boolean;refreshing:number;blocked:number;waiting?:number}|null>(null),[refreshConfirm,setRefreshConfirm]=useState(false),[sessionExpired,setSessionExpired]=useState(false)
   const [autoMergePreview,setAutoMergePreview]=useState<AutoWatermarkPreview|null>(null),[autoMergeOpen,setAutoMergeOpen]=useState(false),[autoMergeLoading,setAutoMergeLoading]=useState(false)
   const autoMergeTriggerRef=useRef<HTMLButtonElement>(null),autoMergeSeqRef=useRef(0)
+  const [deleteDialog,setDeleteDialog]=useState<{open:boolean;mode:'single'|'batch';targets:ProcessingTask[]}|null>(null)
+  const deleteTriggerRef=useRef<HTMLElement|null>(null)
+  const pendingDeleteTasksRef=useRef(new Map<string,{pendingId:string;vids:string[]}>())
   const loadAutoMergePreview=useCallback(async()=>{const seq=++autoMergeSeqRef.current;setAutoMergeLoading(true);try{const next=await fetchAutoMergePreview();if(seq===autoMergeSeqRef.current)setAutoMergePreview(next)}catch{}finally{if(seq===autoMergeSeqRef.current)setAutoMergeLoading(false)}},[])
   const [groupsCollapsed,setGroupsCollapsed]=useState(false)
   const groupsManualRef=useRef(false)
@@ -113,7 +125,7 @@ export default function Review() {
   hasManualSelectionsRef.current=hasManualSelections
   const hasDraftsRef=useRef(hasDrafts)
   hasDraftsRef.current=hasDrafts
-  const protectedWork=busy||pendingVids.size>0||loading||hasManualSelections||hasDrafts||previewOpen||lightbox.open||autoMergeOpen||!!reference||(reviewDesktop&&stageOpen&&stageTab==='reference')||refreshConfirm||detailMode==='selection'
+  const protectedWork=busy||pendingVids.size>0||loading||hasManualSelections||hasDrafts||previewOpen||lightbox.open||autoMergeOpen||Boolean(deleteDialog?.open)||!!reference||(reviewDesktop&&stageOpen&&stageTab==='reference')||refreshConfirm||detailMode==='selection'
   const protectedWorkRef=useRef(protectedWork)
   protectedWorkRef.current=protectedWork
   const {version:activityVersion,canApply:canAutoApply,markAutoRefreshed}=useReviewActivity(protectedWork)
@@ -163,7 +175,7 @@ export default function Review() {
     initializedScopesRef.current.add(pageScopeKey)
     if(forceSelectAllScopeRef.current===targetScope)forceSelectAllScopeRef.current=null
     const pageBlocked=new Set((pageData.blocked||[]).map(item=>item.vid))
-    const selectable=visible.filter(r=>!pageBlocked.has(r.vid))
+    const selectable=visible.filter(r=>!pageBlocked.has(r.vid)&&!lockedVidsRef.current.has(r.vid))
     const first=selectable[0]||visible[0]
     setInspected(current=>({...current,[targetScope]:first}))
     if(selectable.length>0){
@@ -264,11 +276,48 @@ export default function Review() {
           clearReviewSessionCaches(false)
           setUpdates(prev=>({has_updates:true,refreshing:prev?.refreshing||0,blocked:prev?.blocked||0,waiting:prev?.waiting}))
         }
+      }else if(event.type==='person-file-settled'&&event.task.action==='review-delete'){
+        const tracked=pendingDeleteTasksRef.current.get(event.task.id)
+        if(tracked){
+          pendingDeleteTasksRef.current.delete(event.task.id)
+          const ok=event.task.status==='complete'
+          settlePendingMutation(tracked.pendingId,ok)
+          clearReviewSessionCaches(false)
+          void loadAutoMergePreview()
+          if(ok)toast.success(`已移入回收站（${tracked.vids.length} 个视频）`)
+          else toast.error(event.task.error||'移入回收站未完成，视频已保留')
+          if(inFlightCountRef.current===0)void latestLoadRef.current({preservePosition:true,silent:true})
+        }else{
+          void loadAutoMergePreview()
+          if(!protectedWorkRef.current){
+            clearReviewSessionCaches(false)
+            void latestLoadRef.current({preservePosition:true,silent:true})
+          }else{
+            clearReviewSessionCaches(false)
+            setUpdates(prev=>({has_updates:true,refreshing:prev?.refreshing||0,blocked:prev?.blocked||0,waiting:prev?.waiting}))
+          }
+        }
       }else if(event.type==='person-batch-settled'||event.type==='person-file-settled'){
         deleteWorkbenchCache('review:people')
         void loadPeople()
         void loadAutoMergePreview()
         if(!protectedWorkRef.current){
+          clearReviewSessionCaches(true)
+          void latestLoadRef.current({refresh:true})
+        }else{
+          pendingSessionResetRef.current=true
+          clearReviewSessionCaches(false)
+          setUpdates(prev=>({has_updates:true,refreshing:prev?.refreshing||0,blocked:prev?.blocked||0,waiting:prev?.waiting}))
+        }
+      }else if(event.type==='server-op-settled'){
+        const {settled}=event
+        if(localReviewOpIdsRef.current.has(settled.op_id))return
+        void loadAutoMergePreview()
+        if(isDestructivePersonAction(settled.action)||settled.people.length>0){
+          deleteWorkbenchCache('review:people')
+          void loadPeople()
+        }
+        if(!protectedWorkRef.current&&inFlightCountRef.current===0){
           clearReviewSessionCaches(true)
           void latestLoadRef.current({refresh:true})
         }else{
@@ -364,10 +413,10 @@ export default function Review() {
   const selectionPreviewTask=selectionPreviewVid?actionTargets.find(t=>t.vid===selectionPreviewVid)||null:null
   const changeQuery=(value:string)=>{advanceSequenceRef.current++;if(!group&&data?.group)setGroup(data.group.key);updateFilters({q:value,page:'0',vid:''})}
   const chooseGroup=(key:string)=>{advanceSequenceRef.current++;const targetScope=reviewSelectionKey(key,view==='deferred');if(!(selections[targetScope]?.length)){initializedScopesRef.current.delete(`${targetScope}:0`);forceSelectAllScopeRef.current=targetScope}setGroup(key);setPage(0);setLinkFocus('');setPreviewOpen(false)}
-  const toggle=(tasks:ProcessingTask[])=>{markScopeManual(scope);setSelections(current=>({...current,[scope]:toggleReviewSelection(current[scope]||[],tasks)}));setWatermarkKey('')}
+  const toggle=(tasks:ProcessingTask[])=>{const currentIds=new Set((selectionsRef.current[scope]||[]).map(t=>t.vid));const allowed=tasks.filter(t=>!lockedVidsRef.current.has(t.vid)||currentIds.has(t.vid));if(!allowed.length)return;markScopeManual(scope);setSelections(current=>({...current,[scope]:toggleReviewSelection(current[scope]||[],allowed)}));setWatermarkKey('')}
   const clear=()=>{markScopeManual(scope);setSelections(current=>({...current,[scope]:[]}))}
   const inspect=(task:ProcessingTask)=>{setReference(null);setSelectionPreviewVid(null);if(!reviewDesktop&&!previewOpen){returnFocus.current=document.activeElement as HTMLElement;setInstantEntry(!!document.activeElement?.matches(':focus-visible')||matchMedia('(prefers-reduced-motion: reduce)').matches)}setInspected(current=>({...current,[scope]:task}));if(data?.group?.kind!=='suggested'&&chosen.length<=1)setDrafts(current=>({...current,[scope]:{creator:preferredTaskCreator(task),watermarkKey:''}}));setDetailMode('video');setExplicitStageRefName(null);setStageTab('current');if(reviewDesktop)setStageOpen(true);else setPreviewOpen(true)}
-  const openSelection=()=>{if(!previewOpen){returnFocus.current=document.activeElement as HTMLElement;setInstantEntry(!!document.activeElement?.matches(':focus-visible')||matchMedia('(prefers-reduced-motion: reduce)').matches)}if(!chosen.length&&focused){markScopeManual(scope);setSelections(current=>({...current,[scope]:[focused]}))}if(!creator&&defaultCreator)setCreator(defaultCreator);setReference(null);setSubmitError('');setDetailMode('selection');if(!reviewDesktop)setPreviewOpen(true);else requestAnimationFrame(()=>selectionHeading.current?.focus())}
+  const openSelection=()=>{if(!previewOpen){returnFocus.current=document.activeElement as HTMLElement;setInstantEntry(!!document.activeElement?.matches(':focus-visible')||matchMedia('(prefers-reduced-motion: reduce)').matches)}if(!chosen.length&&focused&&!lockedVidsRef.current.has(focused.vid)){markScopeManual(scope);setSelections(current=>({...current,[scope]:[focused]}))}if(!creator&&defaultCreator)setCreator(defaultCreator);setReference(null);setSubmitError('');setDetailMode('selection');if(!reviewDesktop)setPreviewOpen(true);else requestAnimationFrame(()=>selectionHeading.current?.focus())}
   const stepFocus=(delta:-1|1)=>{
     if(!rows.length)return
     const currentIdx=focused?rows.findIndex(t=>t.vid===focused.vid):-1
@@ -383,7 +432,7 @@ export default function Review() {
   const stepFocusRef=useRef(stepFocus)
   stepFocusRef.current=stepFocus
   useEffect(()=>{
-    if(!reviewDesktop||lightbox.open||previewOpen||refreshConfirm||autoMergeOpen)return
+    if(!reviewDesktop||lightbox.open||previewOpen||refreshConfirm||autoMergeOpen||Boolean(deleteDialog?.open))return
     const onKey=(e:KeyboardEvent)=>{
       if(e.defaultPrevented||e.metaKey||e.ctrlKey||e.altKey)return
       const target=e.target as HTMLElement|null
@@ -393,18 +442,20 @@ export default function Review() {
     }
     window.addEventListener('keydown',onKey)
     return()=>window.removeEventListener('keydown',onKey)
-  },[reviewDesktop,lightbox.open,previewOpen,refreshConfirm,autoMergeOpen])
+  },[reviewDesktop,lightbox.open,previewOpen,refreshConfirm,autoMergeOpen,deleteDialog])
   const advanceAfterComplete=(vids:string[])=>{
     const completedSet=new Set(vids)
     const remainingRows=rows.filter(r=>!completedSet.has(r.vid))
     const anchorVid=vids[vids.length-1]||focused?.vid
     const anchorIdx=anchorVid?rows.findIndex(r=>r.vid===anchorVid):-1
-    const nextRow=(anchorIdx>=0?rows.slice(anchorIdx+1).find(r=>!completedSet.has(r.vid))||rows.slice(0,anchorIdx).reverse().find(r=>!completedSet.has(r.vid)):remainingRows[0])||null
+    const isNextUnlocked=(r:ProcessingTask)=>!completedSet.has(r.vid)&&!lockedVidsRef.current.has(r.vid)
+    const nextUnlockedRow=(anchorIdx>=0?rows.slice(anchorIdx+1).find(isNextUnlocked)||rows.slice(0,anchorIdx).reverse().find(isNextUnlocked):remainingRows.find(r=>!lockedVidsRef.current.has(r.vid)))||null
+    const nextRow=nextUnlockedRow||(anchorIdx>=0?rows.slice(anchorIdx+1).find(r=>!completedSet.has(r.vid))||rows.slice(0,anchorIdx).reverse().find(r=>!completedSet.has(r.vid)):remainingRows[0])||null
     const nextRemainingInGroup=Math.max(0,(data?.remaining??rows.length)-vids.length)
     setSelectionPreviewVid(prev=>prev&&completedSet.has(prev)?null:prev)
     if(nextRow){
       setInspected(current=>{const next=Object.fromEntries(Object.entries(current).filter(([,task])=>!completedSet.has(task.vid)));next[scope]=nextRow;return next})
-      setSelections(current=>{const cleaned=removeReviewSelection(current,vids);const remainingChosen=cleaned[scope]||[];cleaned[scope]=remainingChosen.length>0?remainingChosen:[nextRow];return cleaned})
+      setSelections(current=>{const cleaned=removeReviewSelection(current,vids);const remainingChosen=cleaned[scope]||[];cleaned[scope]=remainingChosen.length>0?remainingChosen:(lockedVidsRef.current.has(nextRow.vid)?[]:[nextRow]);return cleaned})
       setDrafts(current=>({...current,[scope]:{creator:data?.group?.kind==='suggested'?data.group.label:preferredTaskCreator(nextRow),watermarkKey:''}}))
       setLinkFocus('')
       requestAnimationFrame(()=>{document.querySelector<HTMLElement>(`[data-vid="${CSS.escape(nextRow.vid)}"]`)?.scrollIntoView({block:'nearest'})})
@@ -488,6 +539,7 @@ export default function Review() {
       }catch(e:any){setSubmitError(e.message);if(isSessionExpiredError(e?.message)){clearReviewSessionCaches(true);setSessionExpired(true)}toast.error(e.message)}finally{setBusy(false)}
       return
     }
+    if(vids.some(id=>lockedVidsRef.current.has(id)))return
     clearReviewSessionCaches(false)
     ++advanceSequenceRef.current
     const tokens=evidenceTokens(vids),confirmationSession=session.current,currentGroupKey=activeGroup,isDeferredLane=view==='deferred'
@@ -497,12 +549,14 @@ export default function Review() {
     const pendingId=beginPendingMutation({action:pendingAction,groupKey:currentGroupKey,isDeferred:isDeferredLane,vids,buckets:countBuckets(resolvedTargets)})
     advanceAfterComplete(vids)
     if(!reviewDesktop)setPreviewOpen(false)
-    const promise=mutate('/api/review',{action:actionKind,vids,note,review_tokens:tokens,review_session:confirmationSession,review_group:{key:currentGroupKey,deferred:isDeferredLane}})
+    const opId=uuid()
+    const promise=mutate('/api/review',{action:actionKind,vids,note,review_tokens:tokens,review_session:confirmationSession,review_group:{key:currentGroupKey,deferred:isDeferredLane}},'POST',opId)
     void trackReviewMutation({
       action:actionKind==='restore'?'restore':'defer',
       title:actionKind==='restore'?'恢复待确认':'移至暂缓核对',
       subtitle:`${vids.length} 个视频`,
       vids,
+      operationId:opId,
       promise,
     }).catch(()=>{})
     let succeeded=false
@@ -527,7 +581,8 @@ export default function Review() {
   }
   const confirmTargets=async(targets:ProcessingTask[],targetCreator:string)=>{
     const name=targetCreator.trim()
-    if(!session.current||!targets.length||!name||sessionExpired||targets.some(t=>blockedIds.has(t.vid)||pendingVidsRef.current.has(t.vid)))return
+    const personLock=name?lockedPeopleRef.current.get(name):undefined
+    if(!session.current||!targets.length||!name||sessionExpired||targets.some(t=>blockedIds.has(t.vid)||pendingVidsRef.current.has(t.vid)||lockedVidsRef.current.has(t.vid))||(personLock&&isDestructivePersonAction(personLock.action)))return
     setSubmitError('')
     clearReviewSessionCaches(false)
     const vids=targets.map(t=>t.vid),confirmationSession=session.current,tokens=evidenceTokens(vids),currentGroupKey=activeGroup,isDeferredLane=view==='deferred',currentWatermarkKey=watermarkKey||undefined
@@ -536,13 +591,15 @@ export default function Review() {
     const pendingId=beginPendingMutation({action:'confirm',groupKey:currentGroupKey,isDeferred:isDeferredLane,vids,buckets:countBuckets(targets)})
     advanceAfterComplete(vids)
     if(!reviewDesktop)setPreviewOpen(false)
-    const promise=mutate<{vids?:string[];rule_warning?:string}>('/api/plan/queue',{vids,creator:name,review_tokens:tokens,review_session:confirmationSession,source:'review',source_id:currentGroupKey,review_group:{key:currentGroupKey,deferred:isDeferredLane},watermark_key:currentWatermarkKey,fingerprints})
+    const opId=uuid()
+    const promise=mutate<{vids?:string[];rule_warning?:string}>('/api/plan/queue',{vids,creator:name,review_tokens:tokens,review_session:confirmationSession,source:'review',source_id:currentGroupKey,review_group:{key:currentGroupKey,deferred:isDeferredLane},watermark_key:currentWatermarkKey,fingerprints},'POST',opId)
     void trackReviewMutation({
       action:'confirm',
       title:`归给 ${name}`,
       subtitle:`${vids.length} 个视频 · 加入待归档`,
       vids,
       creator:name,
+      operationId:opId,
       promise,
     }).catch(()=>{})
     let succeeded=false
@@ -571,17 +628,37 @@ export default function Review() {
     }
   }
   const confirm=()=>confirmTargets(actionTargets,creator)
+  const openDeleteDialog=(mode:'single'|'batch',targets:ProcessingTask[],trigger?:HTMLElement|null)=>{
+    if(!targets.length||sessionExpired||targets.some(t=>blockedIds.has(t.vid)||pendingVidsRef.current.has(t.vid)||lockedVidsRef.current.has(t.vid)))return
+    deleteTriggerRef.current=trigger??(document.activeElement as HTMLElement|null)
+    if(lightbox.open)setLightbox(prev=>({...prev,open:false}))
+    setDeleteDialog({open:true,mode,targets})
+  }
+  const confirmDeletePlan=(plan:PersonFilePlan,targets:ProcessingTask[])=>{
+    setDeleteDialog(prev=>prev?{...prev,open:false}:null)
+    if(!reviewDesktop)setPreviewOpen(false)
+    clearReviewSessionCaches(false)
+    ++advanceSequenceRef.current
+    const vids=targets.map(t=>t.vid)
+    const pendingId=beginPendingMutation({action:'delete',groupKey:activeGroup,isDeferred:view==='deferred',vids,buckets:countBuckets(targets)})
+    advanceAfterComplete(vids)
+    const taskId=enqueuePersonFile({plan,person:'',label:activeGroupInfo?.label||'人工确认'})
+    pendingDeleteTasksRef.current.set(taskId,{pendingId,vids})
+    toast.success(`已提交后台移入回收站（${vids.length} 个视频）`)
+  }
   const undo=async()=>{
     if(!receipt)return
     const currentReceipt=receipt
     setReceipt(null)
-    const promise=mutate<{warning?:string}>('/api/plan/queue',{vids:currentReceipt.vids,review_session:currentReceipt.session},'DELETE')
+    const opId=uuid()
+    const promise=mutate<{warning?:string}>('/api/plan/queue',{vids:currentReceipt.vids,review_session:currentReceipt.session},'DELETE',opId)
     void trackReviewMutation({
       action:'undo',
       title:`撤销归给 ${currentReceipt.creator}`,
       subtitle:`${currentReceipt.vids.length} 个视频`,
       vids:currentReceipt.vids,
       creator:currentReceipt.creator,
+      operationId:opId,
       promise,
     }).catch(()=>{})
     try{
@@ -647,11 +724,25 @@ export default function Review() {
       stepFocus(delta)
     }
   }
+  const targetLock=actionTargets.map(t=>lockedVids.get(t.vid)).find(Boolean)
+  const hasLockedTarget=Boolean(targetLock)
+  const focusedLock=focused?lockedVids.get(focused.vid):undefined
+  const stageCurrentLock=stageCurrentTask?lockedVids.get(stageCurrentTask.vid):undefined
+  const trimmedCreator=creator.trim()
+  const creatorLock=trimmedCreator?lockedPeople.get(trimmedCreator):undefined
+  const creatorDestructiveLock=creatorLock&&isDestructivePersonAction(creatorLock.action)?creatorLock:undefined
+  const chosenLocked=chosen.some(t=>lockedVids.has(t.vid))
+  const unlockedRows=rows.filter(t=>!lockedVids.has(t.vid))
+  const activeLocalAutoMerge=tasks.find(t=>t.kind==='auto-merge'&&(t.status==='running'||t.status==='queued'||t.status==='recovery_needed'))
+  const activeServerAutoMerge=serverActiveOps.find(op=>isAutoMergeAction(op.action)&&(op.status==='running'||op.status==='queued'||op.status==='recovery_needed'))
+  const autoMergeActive=Boolean(activeLocalAutoMerge||activeServerAutoMerge)
+  const autoMergeActiveStatus=activeLocalAutoMerge?.status??activeServerAutoMerge?.status
+  const autoMergeActiveLabel=activeLocalAutoMerge?.status==='recovery_needed'?'待恢复':activeLocalAutoMerge?.status==='queued'?'排队合入':activeLocalAutoMerge?'合入中':(activeServerAutoMerge?.label||(activeServerAutoMerge?.status==='recovery_needed'?'待恢复':'合入中'))
   const detail=<>
 
-    <div className="ws-detail-heading"><h2 ref={selectionHeading} tabIndex={-1}>{reference?`${reference.name} · 对照视频`:detailMode==='selection'?<>核对所选 · <DigitSwap value={actionTargets.length}/></>:'证据与归名'}</h2><div className="ws-actions">{reference?<Button variant="ghost" onClick={backReference}><ArrowLeft size={14} aria-hidden="true"/>返回{reference.returnTo==='selection'?'人物选择':'证据'}</Button>:detailMode==='selection'?<Button variant="ghost" size="sm" onClick={()=>setDetailMode('video')}><ArrowLeft size={14} aria-hidden="true"/>返回证据</Button>:<Button variant="ghost" size="sm" disabled={!actionTargets.length} onClick={openSelection}><ListChecks size={14} aria-hidden="true"/>改选人物 · <DigitSwap value={actionTargets.length}/></Button>}{reviewDesktop&&!stageOpen&&!reference&&focused&&rows.length>0&&<div className="ws-actions"><Button className="ws-icon" variant="ghost" size="sm" aria-label="上一条视频" title="上一条视频" disabled={focusedIndex<=0} onClick={()=>stepFocus(-1)}><ChevronLeft size={14} aria-hidden="true"/></Button><span className="ws-muted tabular-nums">{focusedIndex>=0?`${focusedIndex+1} / ${rows.length}`:'已查看'}</span><Button className="ws-icon" variant="ghost" size="sm" aria-label="下一条视频" title="下一条视频" disabled={focusedIndex<0||focusedIndex>=rows.length-1} onClick={()=>stepFocus(1)}><ChevronRight size={14} aria-hidden="true"/></Button></div>}</div></div>
+    <div className="ws-detail-heading"><h2 ref={selectionHeading} tabIndex={-1}>{reference?`${reference.name} · 对照视频`:detailMode==='selection'?<>核对所选 · <DigitSwap value={actionTargets.length}/></>:'证据与归名'}</h2><div className="ws-actions">{detailMode==='video'&&!reference&&focused&&<Button className="ws-icon ws-danger-icon" variant="ghost" size="sm" aria-label="将当前视频移入回收站" title={focusedLock?`${focusedLock.label}，暂不可删除`:'删除当前视频（移入回收站）'} disabled={disabled||Boolean(focusedLock)||blockedIds.has(focused.vid)||pendingVids.has(focused.vid)} onClick={e=>openDeleteDialog('single',[focused],e.currentTarget)}><Trash2 size={14} aria-hidden="true"/></Button>}{reference?<Button variant="ghost" onClick={backReference}><ArrowLeft size={14} aria-hidden="true"/>返回{reference.returnTo==='selection'?'人物选择':'证据'}</Button>:detailMode==='selection'?<Button variant="ghost" size="sm" onClick={()=>setDetailMode('video')}><ArrowLeft size={14} aria-hidden="true"/>返回证据</Button>:<Button variant="ghost" size="sm" disabled={!actionTargets.length} onClick={openSelection}><ListChecks size={14} aria-hidden="true"/>改选人物 · <DigitSwap value={actionTargets.length}/></Button>}{reviewDesktop&&!stageOpen&&!reference&&focused&&rows.length>0&&<div className="ws-actions"><Button className="ws-icon" variant="ghost" size="sm" aria-label="上一条视频" title="上一条视频" disabled={focusedIndex<=0} onClick={()=>stepFocus(-1)}><ChevronLeft size={14} aria-hidden="true"/></Button><span className="ws-muted tabular-nums">{focusedIndex>=0?`${focusedIndex+1} / ${rows.length}`:'已查看'}</span><Button className="ws-icon" variant="ghost" size="sm" aria-label="下一条视频" title="下一条视频" disabled={focusedIndex<0||focusedIndex>=rows.length-1} onClick={()=>stepFocus(1)}><ChevronRight size={14} aria-hidden="true"/></Button></div>}</div></div>
     <div className="ws-detail-content" data-sheet-scroll>
-      {reference?<ReferencePanel name={reference.name}/>:detailMode==='video'?(focused?<EvidencePanel key={focused.vid} hideMedia={reviewDesktop&&stageOpen} activeReferenceName={reviewDesktop&&stageOpen?stageRefName:null} poster={stageCurrentTask?.vid===focused.vid?stageCurrentPoster:undefined} task={focused} note={notes[focused.vid]??focused.note} onNoteChange={note=>{if(noteBaseline.current[focused.vid]===undefined)noteBaseline.current[focused.vid]=focused.note;setNotes(current=>{const next={...current};if(note===focused.note)delete next[focused.vid];else next[focused.vid]=note;return next})}} onSaveNote={()=>action('note',[focused.vid],notes[focused.vid]??focused.note)} onSource={sourceOnly} busy={busy} creator={creator} onChoose={name=>{setCreator(name);if(!chosen.length){markScopeManual(scope);setSelections(current=>({...current,[scope]:[focused]}))}}} onConfirmCandidate={name=>{setCreator(name);void confirmTargets(chosen.length>0?chosen:[focused],name)}} onReference={openReference}/>:<p className="ws-empty">选择视频查看证据</p>):<div className="ws-decision">
+      {reference?<ReferencePanel name={reference.name}/>:detailMode==='video'?(focused?<EvidencePanel key={focused.vid} hideMedia={reviewDesktop&&stageOpen} activeReferenceName={reviewDesktop&&stageOpen?stageRefName:null} poster={stageCurrentTask?.vid===focused.vid?stageCurrentPoster:undefined} task={focused} note={notes[focused.vid]??focused.note} onNoteChange={note=>{if(noteBaseline.current[focused.vid]===undefined)noteBaseline.current[focused.vid]=focused.note;setNotes(current=>{const next={...current};if(note===focused.note)delete next[focused.vid];else next[focused.vid]=note;return next})}} onSaveNote={()=>action('note',[focused.vid],notes[focused.vid]??focused.note)} onSource={sourceOnly} busy={busy} locked={hasLockedTarget||Boolean(focusedLock)} lockedPeople={lockedPeople} creator={creator} onChoose={name=>{setCreator(name);if(!chosen.length&&!lockedVidsRef.current.has(focused.vid)){markScopeManual(scope);setSelections(current=>({...current,[scope]:[focused]}))}}} onConfirmCandidate={name=>{setCreator(name);void confirmTargets(chosen.length>0?chosen:[focused],name)}} onReference={openReference}/>:<p className="ws-empty">选择视频查看证据</p>):<div className="ws-decision">
         <div>
           <p className="mb-2 text-xs text-muted-foreground">{data?.group?.label||'当前确认组'} · <DigitSwap value={actionTargets.length}/> 个视频{hiddenCount>0?`，其中 ${hiddenCount} 个不在当前页`:''}</p>
           {(!reviewDesktop||!stageOpen)&&<Collapsible open={Boolean(selectionPreviewTask)}>
@@ -669,8 +760,8 @@ export default function Review() {
             </CollapsibleContent>
           </Collapsible>}
           <div className="ws-confirm-list" aria-label="本次完整归名范围">{actionTargets.map(t=>{
-            const summary=reviewListSummary(t),faceThumbs=t.data.face?.thumbs?.slice(0,3)||[],isPreviewing=selectionPreviewTask?.vid===t.vid
-            return <div key={t.vid} className="ws-confirm-file" data-active={isPreviewing||undefined}>
+            const summary=reviewListSummary(t),faceThumbs=t.data.face?.thumbs?.slice(0,3)||[],isPreviewing=selectionPreviewTask?.vid===t.vid,itemLock=lockedVids.get(t.vid)
+            return <div key={t.vid} className="ws-confirm-file" data-active={isPreviewing||undefined} data-locked={Boolean(itemLock)||undefined}>
               <button type="button" className="ws-confirm-thumb" aria-label={`预览 ${t.name}`} title="在舞台预览此视频" onClick={()=>{setInspected(current=>({...current,[scope]:t}));if(reviewDesktop){setSelectionPreviewVid(t.vid);setStageTab('current');setStageOpen(true)}else{setSelectionPreviewVid(prev=>prev===t.vid?null:t.vid)}}}>
                 <VideoCover video={{path:t.path,thumb:faceThumbs[0]?`/thumb?p=${encodeURIComponent(faceThumbs[0])}`:null,size:t.size,mtime_ns:t.mtime_ns}} sampleTime={summary.sampleTime}/>
                 <span className="ws-confirm-thumb-play"><Play size={11} aria-hidden="true"/></span>
@@ -678,6 +769,7 @@ export default function Review() {
               <div className="ws-confirm-body">
                 <div className="ws-confirm-top">
                   <Button variant="ghost" className="ws-confirm-name" onClick={()=>{setInspected(current=>({...current,[scope]:t}));if(reviewDesktop){setSelectionPreviewVid(t.vid);setStageTab('current');setStageOpen(true)}else{setSelectionPreviewVid(prev=>prev===t.vid?null:t.vid)}}} aria-label={`核对所选 ${t.name}`}><Play size={12} aria-hidden="true"/><span>{t.name}</span></Button>
+                  {itemLock&&<AnimatedBadge size="sm" status={lockBadgeStatus(itemLock.status)} className="h-5 px-1.5 text-[10px]">{itemLock.label}</AnimatedBadge>}
                   {faceThumbs.length>0&&<AvatarGroup size="sm" max={3} label="检出人脸" className="ws-confirm-faces" members={faceThumbs.map((path,idx)=>({id:`${t.vid}-${idx}`,name:`${t.name} 人脸 ${idx+1}`,src:`/thumb?p=${encodeURIComponent(path)}`}))}/>}
                   {chosen.length>0&&<Button className="ws-icon" variant="ghost" size="sm" aria-label={`取消选择 ${t.name}`} title="取消选择" onClick={()=>toggle([t])}><X size={14} aria-hidden="true"/></Button>}
                 </div>
@@ -690,11 +782,13 @@ export default function Review() {
         {commonMarks.length>0&&<WorkspaceField label="共同账号规则"><WorkspaceSelect label="保存共同账号规则" value={watermarkKey} disabled={false} onChange={setWatermarkKey} options={[{value:'',label:'仅归名，不保存账号规则'},...commonMarks.map(c=>({value:c.key,label:`${c.platform} · ${c.token}`}))]}/></WorkspaceField>}
         <p className="text-xs text-muted-foreground">确认后自动选中下一条并在后台加入待归档，文件暂不移动。</p>
       </div>}
+      {targetLock&&<div role="status" className="ws-lock-notice"><AnimatedBadge size="sm" status={lockBadgeStatus(targetLock.status)}>{targetLock.label}</AnimatedBadge><span>当前视频正在处理，暂不可操作</span></div>}
+      {creatorDestructiveLock&&<div role="status" className="ws-lock-notice"><AnimatedBadge size="sm" status={lockBadgeStatus(creatorDestructiveLock.status)}>{creatorDestructiveLock.label}</AnimatedBadge><span>「{trimmedCreator}」暂不可归名</span></div>}
       {actionTargets.some(t=>blockedIds.has(t.vid))&&<p role="alert" className="ws-error">部分已选项的文件或规则已变化，请更新列表后重新核对。</p>}
       {focused?.review_blocked&&detailMode==='video'&&<p role="alert" className="ws-error">{focused.review_blocked}</p>}
       {submitError&&<p role="alert" className="ws-error">{submitError}</p>}
     </div>
-    <div className="ws-detail-actions">{reference?<><Button variant="outline" onClick={backReference}>返回{reference.returnTo==='selection'?'人物选择':'证据'}</Button><Button className="ws-action-primary" onClick={()=>{setCreator(reference.name);backReference()}}><span className="ws-btn-truncate">选择 {reference.name}</span></Button></>:detailMode==='selection'?<><Button variant="outline" disabled={!actionTargets.length||sessionExpired} onClick={()=>void action(view==='deferred'?'restore':'defer',actionTargets.map(t=>t.vid))}>{view==='deferred'?'恢复':'暂缓'}</Button><Button className="ws-action-primary" disabled={!actionTargets.length||!creator.trim()||sessionExpired||actionTargets.some(t=>blockedIds.has(t.vid)||pendingVids.has(t.vid))} onClick={()=>void confirm()}><span className="ws-btn-truncate">归给 {creator.trim()||'所选人物'}</span><span className="ws-btn-badge">· <DigitSwap value={actionTargets.length}/></span></Button></>:<><Button variant="outline" disabled={!focused||!!focused?.review_blocked&&!selected.has(focused.vid)} onClick={()=>focused&&toggle([focused])}>{focused&&selected.has(focused.vid)?'取消选择':'选择此项'}</Button><Button variant="outline" disabled={!actionTargets.length||sessionExpired} onClick={()=>void action(view==='deferred'?'restore':'defer',actionTargets.map(t=>t.vid))}>{view==='deferred'?'恢复':'暂缓'}</Button>{creator.trim()?<Button className="ws-action-primary" disabled={!actionTargets.length||sessionExpired||actionTargets.some(t=>blockedIds.has(t.vid)||pendingVids.has(t.vid))} onClick={()=>void confirm()}><span className="ws-btn-truncate">归给 {creator.trim()}</span><span className="ws-btn-badge">· <DigitSwap value={actionTargets.length}/></span></Button>:<Button className="ws-action-primary" disabled={!actionTargets.length} onClick={openSelection}><span>核对所选</span><span className="ws-btn-badge">· <DigitSwap value={actionTargets.length}/></span></Button>}</>}</div>
+    <div className="ws-detail-actions">{reference?<><Button variant="outline" onClick={backReference}>返回{reference.returnTo==='selection'?'人物选择':'证据'}</Button><Button className="ws-action-primary" onClick={()=>{setCreator(reference.name);backReference()}}><span className="ws-btn-truncate">选择 {reference.name}</span></Button></>:detailMode==='selection'?<><Button variant="outline" disabled={!actionTargets.length||sessionExpired||hasLockedTarget} onClick={()=>void action(view==='deferred'?'restore':'defer',actionTargets.map(t=>t.vid))}>{view==='deferred'?'恢复':'暂缓'}</Button><Button className="ws-danger-btn" variant="outline" disabled={!actionTargets.length||disabled||hasLockedTarget||actionTargets.some(t=>blockedIds.has(t.vid)||pendingVids.has(t.vid))} aria-label={`将所选 ${actionTargets.length} 个视频移入回收站`} onClick={e=>openDeleteDialog('batch',actionTargets,e.currentTarget)}><Trash2 size={14} aria-hidden="true"/><span>移入回收站</span></Button><Button className="ws-action-primary" disabled={!actionTargets.length||!trimmedCreator||sessionExpired||hasLockedTarget||Boolean(creatorDestructiveLock)||actionTargets.some(t=>blockedIds.has(t.vid)||pendingVids.has(t.vid))} title={creatorDestructiveLock?`${trimmedCreator} ${creatorDestructiveLock.label}`:undefined} onClick={()=>void confirm()}><span className="ws-btn-truncate">归给 {trimmedCreator||'所选人物'}</span><span className="ws-btn-badge">· <DigitSwap value={actionTargets.length}/></span></Button></>:<><Button variant="outline" disabled={!focused||(Boolean(focusedLock)&&!selected.has(focused.vid))||(!!focused?.review_blocked&&!selected.has(focused.vid))} onClick={()=>focused&&toggle([focused])}>{focused&&selected.has(focused.vid)?'取消选择':'选择此项'}</Button><Button variant="outline" disabled={!actionTargets.length||sessionExpired||hasLockedTarget} onClick={()=>void action(view==='deferred'?'restore':'defer',actionTargets.map(t=>t.vid))}>{view==='deferred'?'恢复':'暂缓'}</Button>{trimmedCreator?<Button className="ws-action-primary" disabled={!actionTargets.length||sessionExpired||hasLockedTarget||Boolean(creatorDestructiveLock)||actionTargets.some(t=>blockedIds.has(t.vid)||pendingVids.has(t.vid))} title={creatorDestructiveLock?`${trimmedCreator} ${creatorDestructiveLock.label}`:undefined} onClick={()=>void confirm()}><span className="ws-btn-truncate">归给 {trimmedCreator}</span><span className="ws-btn-badge">· <DigitSwap value={actionTargets.length}/></span></Button>:<Button className="ws-action-primary" disabled={!actionTargets.length} onClick={openSelection}><span>核对所选</span><span className="ws-btn-badge">· <DigitSwap value={actionTargets.length}/></span></Button>}</>}</div>
   </>
   const midScopeSegment:WorkbenchBreadcrumbSegment|null=personScope?{key:`person:${personScope}`,label:personScope}:clusterScope?{key:`cluster:${clusterScope}`,label:`相似组 ${clusterScope}`}:view!=='all'?{key:`view:${view}`,label:views.find(v=>v.value===view)?.label||view}:null
   const leafGroupSegment:WorkbenchBreadcrumbSegment|null=data?.group?.label?{key:`group:${data.group.key}`,label:data.group.label}:null
@@ -718,7 +812,7 @@ export default function Review() {
   ]
   useSyncWorkbenchBreadcrumb(breadcrumbItems)
   return <main className="ws-page" aria-label="人工确认工作区" data-review-session={data?.session}>
-    <WorkbenchHeaderActions>{(autoMergePreview?.eligible_count??0)>0&&<Button ref={autoMergeTriggerRef} variant="outline" size="sm" aria-label={`自动合入 ${autoMergePreview!.eligible_count} 个已匹配视频`} title={`可直接合入 ${autoMergePreview!.eligible_count} 个视频（${autoMergePreview!.group_count} 位人物）`} onClick={()=>setAutoMergeOpen(true)}><Sparkles size={14} aria-hidden="true"/><span>自动合入</span><span className="ws-count">{autoMergePreview!.eligible_count}</span></Button>}<NavigationButton variant="ghost" size="sm" asChild><Link href="/operations"><span className="ws-link-label">分析中</span><span className="ws-count">{updates?.waiting??data?.waiting??'—'}</span><ChevronRight size={14} aria-hidden="true"/></Link></NavigationButton><Button variant={updates?.has_updates||sessionExpired?"outline":"ghost"} aria-label="更新人工确认列表" title={updates?.refreshing?`后台正在更新 ${updates.refreshing} 条建议，当前列表保持不变`:'更新建议和分组'} disabled={loading} onClick={requestRefresh}><RefreshCw size={15} aria-hidden="true"/>{updates?.has_updates||sessionExpired?<span>有更新</span>:updates?.refreshing?<span className="ws-muted">后台更新中</span>:null}</Button></WorkbenchHeaderActions>
+    <WorkbenchHeaderActions>{((autoMergePreview?.eligible_count??0)>0||autoMergeActive)&&<Button ref={autoMergeTriggerRef} variant="outline" size="sm" aria-label={autoMergeActive?`自动合入（${autoMergeActiveLabel}）`:`自动合入 ${autoMergePreview!.eligible_count} 个已匹配视频`} title={autoMergeActive?`自动合入：${autoMergeActiveLabel}`:`可直接合入 ${autoMergePreview!.eligible_count} 个视频（${autoMergePreview!.group_count} 位人物）`} onClick={()=>setAutoMergeOpen(true)}><Sparkles size={14} aria-hidden="true"/><span>自动合入</span>{autoMergeActive?<AnimatedBadge size="sm" status={lockBadgeStatus(autoMergeActiveStatus)} className="ws-topbar-lock-badge">{autoMergeActiveLabel}</AnimatedBadge>:<span className="ws-count">{autoMergePreview!.eligible_count}</span>}</Button>}<NavigationButton variant="ghost" size="sm" asChild><Link href="/operations"><span className="ws-link-label">分析中</span><span className="ws-count">{updates?.waiting??data?.waiting??'—'}</span><ChevronRight size={14} aria-hidden="true"/></Link></NavigationButton><Button variant={updates?.has_updates||sessionExpired?"outline":"ghost"} aria-label="更新人工确认列表" title={updates?.refreshing?`后台正在更新 ${updates.refreshing} 条建议，当前列表保持不变`:'更新建议和分组'} disabled={loading} onClick={requestRefresh}><RefreshCw size={15} aria-hidden="true"/>{updates?.has_updates||sessionExpired?<span>有更新</span>:updates?.refreshing?<span className="ws-muted">后台更新中</span>:null}</Button></WorkbenchHeaderActions>
     {receipt&&<div className="ws-receipt"><QueueReceipt count={receipt.vids.length} creator={receipt.creator} onUndo={undo} busy={false}/></div>}
     {error&&<p role="alert" className="ws-error">{error}</p>}
     {sessionExpired&&!error&&<p role="status" className="ws-error">本次核对已过期，勾选和草稿仍保留。请更新列表后继续。</p>}
@@ -750,29 +844,34 @@ export default function Review() {
                 </div>
               ))}
             </div>
-          ):data?.groups.map(g=><button key={g.key} type="button" className="ws-group" title={`${g.label} (${g.count})`} aria-pressed={activeGroup===g.key} onClick={()=>chooseGroup(g.key)}><span className="ws-group-pill" aria-hidden="true">{Array.from(g.label).slice(0,2).join('')}</span><span className="ws-group-label">{g.label}</span><span className="ws-count">{g.count}</span>{(selections[reviewSelectionKey(g.key,view==='deferred')]||[]).length>0&&<><Check size={12} className="ws-group-check" aria-hidden="true"/><span className="sr-only">（有已选视频）</span></>}</button>)}
+          ):data?.groups.map(g=>{
+            const personLock=g.key.startsWith('person:')?(lockedPeople.get(g.label)??lockedPeople.get(g.key.slice('person:'.length))):undefined
+            return <button key={g.key} type="button" className="ws-group" data-locked={Boolean(personLock)||undefined} title={`${g.label} (${g.count})${personLock?` · ${personLock.label}`:''}`} aria-pressed={activeGroup===g.key} onClick={()=>chooseGroup(g.key)}><span className="ws-group-pill" aria-hidden="true">{Array.from(g.label).slice(0,2).join('')}</span><span className="ws-group-label">{g.label}</span>{personLock&&<AnimatedBadge size="sm" status={lockBadgeStatus(personLock.status)} className="ws-group-lock">{personLock.label}</AnimatedBadge>}<span className="ws-count">{g.count}</span>{(selections[reviewSelectionKey(g.key,view==='deferred')]||[]).length>0&&<><Check size={12} className="ws-group-check" aria-hidden="true"/><span className="sr-only">（有已选视频）</span></>}</button>
+          })}
         </div>
       </aside>
       <section ref={queueRef} className="ws-queue" aria-label="待确认视频" style={reviewDesktop&&stageOpen?{width:`${clampedListWidth}px`}:undefined}>
 
         <div className="ws-toolbar"><WorkspaceSearch value={query} onChange={changeQuery} label="搜索当前组视频" placeholder="搜索文件名或路径…" disabled={false}><Popover.Root><Popover.Trigger asChild><InputGroupButton size="icon-sm" aria-label="分组与筛选" title="分组与筛选" data-active={!!folder}><SlidersHorizontal size={15} aria-hidden="true"/>{folder&&<span className="size-1.5 rounded-full bg-current"/>}</InputGroupButton></Popover.Trigger><Popover.Portal><Popover.Content className="ws-filter-content" align="end" sideOffset={6}><div className="ws-mobile-filter"><WorkspaceField label="确认组"><WorkspaceSelect label="选择确认组" value={activeGroup} onChange={chooseGroup} options={(data?.groups||[]).map(g=>({value:g.key,label:`${g.label} · ${g.count}`}))} placeholder="暂无确认组"/></WorkspaceField></div><WorkspaceField label="原文件夹"><WorkspaceSelect label="按原文件夹筛选" value={folder} onChange={value=>{setFolder(value);if(!group&&data?.group)setGroup(data.group.key)}} options={[{value:'',label:'全部文件夹'},...(data?.folders||[]).map(f=>({value:f,label:f}))]}/></WorkspaceField>{folder&&<Button className="mt-3" variant="ghost" size="sm" onClick={()=>{setFolder('');setPage(0)}}>清除筛选</Button>}</Popover.Content></Popover.Portal></Popover.Root></WorkspaceSearch>{reviewDesktop&&!stageOpen&&<Button variant="outline" size="sm" aria-label="展开中间视频舞台" title="展开视频舞台" onClick={()=>setStageOpen(true)}><Film size={14} aria-hidden="true"/><span>展开舞台</span></Button>}</div>
-        <div className="ws-selection"><Checkbox className="ws-check" aria-label="选择当前页视频" motionPreset="instant" checked={groupMatched&&rows.length>0&&rows.every(t=>selected.has(t.vid))} indeterminate={groupMatched&&rows.some(t=>selected.has(t.vid))&&!rows.every(t=>selected.has(t.vid))} disabled={disabled||!groupMatched||!rows.length} onCheckedChange={()=>toggle(rows)}/><div className="ws-selection-summary"><strong>{chosen.length?`已选 ${chosen.length}`:activeGroupInfo?.label||'待确认'}</strong><span> · {hiddenCount?`${hiddenCount} 个在其他页或被筛选隐藏`:activeGroupRemaining!==null?`${activeGroupRemaining} 个待核对`:'读取中'}</span></div>{chosen.length>0&&<Button className="ws-selection-clear" variant="ghost" size="sm" title="清空当前组选择" aria-label="清空当前组选择" onClick={clear}><X size={14} aria-hidden="true"/><span>清空</span></Button>}</div>
+        <div className="ws-selection"><Checkbox className="ws-check" aria-label="选择当前页视频" motionPreset="instant" checked={groupMatched&&unlockedRows.length>0&&unlockedRows.every(t=>selected.has(t.vid))} indeterminate={groupMatched&&unlockedRows.some(t=>selected.has(t.vid))&&!unlockedRows.every(t=>selected.has(t.vid))} disabled={disabled||!groupMatched||!unlockedRows.length} onCheckedChange={()=>toggle(unlockedRows)}/><div className="ws-selection-summary"><strong>{chosen.length?`已选 ${chosen.length}`:activeGroupInfo?.label||'待确认'}</strong><span> · {hiddenCount?`${hiddenCount} 个在其他页或被筛选隐藏`:activeGroupRemaining!==null?`${activeGroupRemaining} 个待核对`:'读取中'}</span></div>{chosen.length>0&&<Button className="ws-selection-clear" variant="ghost" size="sm" title="清空当前组选择" aria-label="清空当前组选择" onClick={clear}><X size={14} aria-hidden="true"/><span>清空</span></Button>}</div>
         <div ref={listScroll.ref} className="ws-list" aria-busy={loading||!groupMatched||query!==search} onScroll={listScroll.onScroll}>
-          {(!data||!groupMatched)&&!error?<ReviewQueueSkeleton count={6} label="正在读取待确认视频"/>:!rows.length?<div className="ws-empty"><p>{group&&!data?.group?'该组已处理完，选择另一组继续。':query||folder?'当前筛选下没有视频。':data?.remaining===0?'本组已完成，可选择其他组继续。':'本批已处理完，可继续下一批。'}</p>{(query||folder)&&<Button variant="ghost" onClick={()=>{changeQuery('');setFolder('')}}>清除筛选</Button>}{!query&&!folder&&(data?.remaining??0)>0&&(data?.next_page!=null||data?.previous_page!=null)&&<Button variant="outline" onClick={()=>{advanceSequenceRef.current++;setPage((data.next_page??data.previous_page)!);setLinkFocus('')}}>继续剩余批次</Button>}{!query&&!folder&&nextAvailableGroup&&<Button variant="outline" onClick={()=>chooseGroup(nextAvailableGroup.key)}>下一待确认组 · {nextAvailableGroup.label}（{nextAvailableGroup.count}）</Button>}</div>:rows.map(t=><ReviewSummaryRow key={t.vid} task={t} selected={selected.has(t.vid)} active={focused?.vid===t.vid} disabled={disabled||!!t.review_blocked&&!selected.has(t.vid)} onToggle={()=>toggle([t])} onInspect={()=>inspect(t)}/>)}
+          {(!data||!groupMatched)&&!error?<ReviewQueueSkeleton count={6} label="正在读取待确认视频"/>:!rows.length?<div className="ws-empty"><p>{group&&!data?.group?'该组已处理完，选择另一组继续。':query||folder?'当前筛选下没有视频。':data?.remaining===0?'本组已完成，可选择其他组继续。':'本批已处理完，可继续下一批。'}</p>{(query||folder)&&<Button variant="ghost" onClick={()=>{changeQuery('');setFolder('')}}>清除筛选</Button>}{!query&&!folder&&(data?.remaining??0)>0&&(data?.next_page!=null||data?.previous_page!=null)&&<Button variant="outline" onClick={()=>{advanceSequenceRef.current++;setPage((data.next_page??data.previous_page)!);setLinkFocus('')}}>继续剩余批次</Button>}{!query&&!folder&&nextAvailableGroup&&<Button variant="outline" onClick={()=>chooseGroup(nextAvailableGroup.key)}>下一待确认组 · {nextAvailableGroup.label}（{nextAvailableGroup.count}）</Button>}</div>:rows.map(t=><ReviewSummaryRow key={t.vid} task={t} selected={selected.has(t.vid)} active={focused?.vid===t.vid} disabled={disabled||!!t.review_blocked&&!selected.has(t.vid)} lock={lockedVids.get(t.vid)} onToggle={()=>toggle([t])} onInspect={()=>inspect(t)}/>)}
         </div>
         {chosen.length>0&&<div className="ws-bulk" aria-label="所选视频操作">
           <span className="ws-muted ws-bulk-count tabular-nums">已选 {chosen.length}</span>
           {reviewDesktop&&stageOpen?(
             <>
-              <Button className="ws-bulk-clear" variant="ghost" size="sm" title="清空当前组选择" aria-label="清空当前组选择" onClick={clear}><X size={14} aria-hidden="true"/><span>清空</span></Button>
+              <Button className="ws-icon ws-bulk-clear" variant="ghost" size="sm" title="清空当前组选择" aria-label="清空当前组选择" onClick={clear}><X size={14} aria-hidden="true"/></Button>
+              <Button className="ws-bulk-delete ws-danger-btn" variant="outline" size="sm" aria-label={`将已选 ${chosen.length} 个视频移入回收站`} title={`移入回收站（${chosen.length} 个视频）`} disabled={disabled||!chosen.length||chosenLocked||chosen.some(t=>blockedIds.has(t.vid)||pendingVids.has(t.vid))} onClick={e=>openDeleteDialog('batch',chosen,e.currentTarget)}><Trash2 size={14} aria-hidden="true"/><span>删除</span></Button>
               <Button className="ws-bulk-inspect" variant="outline" size="sm" disabled={disabled||!chosen.length} onClick={openSelection}><ListChecks size={14} aria-hidden="true" className="shrink-0"/><span>核对所选</span></Button>
             </>
           ):(
             <>
               <Button className="ws-icon ws-bulk-clear" variant="ghost" size="sm" title="清空当前组选择" aria-label="清空当前组选择" onClick={clear}><X size={14} aria-hidden="true"/></Button>
-              <Button className="ws-bulk-defer" variant="outline" size="sm" disabled={disabled||!chosen.length} onClick={()=>void action(view==='deferred'?'restore':'defer',chosen.map(t=>t.vid))}>{view==='deferred'?'恢复':'暂缓'}</Button>
-              {creator.trim()&&<Button className="ws-bulk-confirm" size="sm" disabled={disabled||!chosen.length||chosen.some(t=>blockedIds.has(t.vid)||pendingVids.has(t.vid))} onClick={()=>void confirmTargets(chosen,creator)}><span className="ws-btn-truncate">归给 {creator.trim()}</span><span className="ws-btn-badge">· <DigitSwap value={chosen.length}/></span></Button>}
-              <Button className="ws-bulk-inspect" variant={creator.trim()?'outline':'default'} size="sm" disabled={disabled||!chosen.length} onClick={openSelection}><ListChecks size={14} aria-hidden="true" className="shrink-0"/><span>核对所选</span></Button>
+              <Button className="ws-bulk-defer" variant="outline" size="sm" disabled={disabled||!chosen.length||chosenLocked} onClick={()=>void action(view==='deferred'?'restore':'defer',chosen.map(t=>t.vid))}>{view==='deferred'?'恢复':'暂缓'}</Button>
+              <Button className="ws-bulk-delete ws-danger-btn" variant="outline" size="sm" aria-label={`将已选 ${chosen.length} 个视频移入回收站`} title={`移入回收站（${chosen.length} 个视频）`} disabled={disabled||!chosen.length||chosenLocked||chosen.some(t=>blockedIds.has(t.vid)||pendingVids.has(t.vid))} onClick={e=>openDeleteDialog('batch',chosen,e.currentTarget)}><Trash2 size={14} aria-hidden="true"/><span>删除</span></Button>
+              {trimmedCreator&&<Button className="ws-bulk-confirm" size="sm" disabled={disabled||!chosen.length||chosenLocked||Boolean(creatorDestructiveLock)||chosen.some(t=>blockedIds.has(t.vid)||pendingVids.has(t.vid))} title={creatorDestructiveLock?`${trimmedCreator} ${creatorDestructiveLock.label}`:undefined} onClick={()=>void confirmTargets(chosen,creator)}><span className="ws-btn-truncate">归给 {trimmedCreator}</span><span className="ws-btn-badge">· <DigitSwap value={chosen.length}/></span></Button>}
+              <Button className="ws-bulk-inspect" variant={trimmedCreator?'outline':'default'} size="sm" disabled={disabled||!chosen.length} onClick={openSelection}><ListChecks size={14} aria-hidden="true" className="shrink-0"/><span>核对所选</span></Button>
             </>
           )}
         </div>}
@@ -847,6 +946,7 @@ export default function Review() {
             {stageRefName&&<div className="ws-stage-tabs"><WorkspaceTabs value={activeStageTab} onChange={v=>{if(v==='reference')setStageRefIndex(0);setStageTab(v==='reference'?'reference':'current')}} label="预览模式" variant="segment" instant items={[{value:'current',label:'当前视频'},{value:'reference',label:'对照视频',count:stageRefData?stageRefData.total:undefined}]}/></div>}
             <div className="ws-stage-head-right">
               {activeStageTab==='reference'&&refVideos.length>0?<><Button className="ws-icon" variant="ghost" size="sm" aria-label="上一条对照视频" title="上一条对照视频" disabled={clampedRefIdx<=0} onClick={()=>setStageRefIndex(i=>Math.max(0,i-1))}><ChevronLeft size={14} aria-hidden="true"/></Button><span className="ws-muted tabular-nums">{`${clampedRefIdx+1} / ${refVideos.length}`}</span><Button className="ws-icon" variant="ghost" size="sm" aria-label="下一条对照视频" title="下一条对照视频" disabled={clampedRefIdx>=refVideos.length-1} onClick={()=>setStageRefIndex(i=>Math.min(refVideos.length-1,i+1))}><ChevronRight size={14} aria-hidden="true"/></Button></>:activeStageTab==='current'&&focused&&rows.length>0&&<><Button className="ws-icon" variant="ghost" size="sm" aria-label="上一条视频" title="上一条 ([)" disabled={focusedIndex<=0} onClick={()=>stepFocus(-1)}><ChevronLeft size={14} aria-hidden="true"/></Button><span className="ws-muted tabular-nums">{focusedIndex>=0?`${focusedIndex+1} / ${rows.length}`:'已查看'}</span><Button className="ws-icon" variant="ghost" size="sm" aria-label="下一条视频" title="下一条 (])" disabled={focusedIndex<0||focusedIndex>=rows.length-1} onClick={()=>stepFocus(1)}><ChevronRight size={14} aria-hidden="true"/></Button></>}
+              {activeStageTab==='current'&&stageCurrentTask&&<Button className="ws-icon ws-danger-icon" variant="ghost" size="sm" aria-label="将当前视频移入回收站" title={stageCurrentLock?`${stageCurrentLock.label}，暂不可删除`:'删除当前视频（移入回收站）'} disabled={disabled||Boolean(stageCurrentLock)||blockedIds.has(stageCurrentTask.vid)||pendingVids.has(stageCurrentTask.vid)} onClick={e=>openDeleteDialog('single',[stageCurrentTask],e.currentTarget)}><Trash2 size={14} aria-hidden="true"/></Button>}
               <Button ref={stageExpandBtnRef} className="ws-icon" variant="ghost" size="sm" aria-label="居中放大预览视频" title="居中放大预览" disabled={!activeStageVideoPath} onClick={()=>{if(!activeStageVideoPath)return;lightboxTriggerRef.current=stageExpandBtnRef.current;setLightbox({open:true,tab:activeStageTab,initialTime:getMediaPosition(activeStageVideoPath)})}}><Maximize2 size={14} aria-hidden="true"/></Button>
               <Button className="ws-icon" variant="ghost" size="sm" aria-label="收起中间视频舞台" title="收起视频舞台" onClick={()=>setStageOpen(false)}><X size={15} aria-hidden="true"/></Button>
             </div>
@@ -885,9 +985,24 @@ export default function Review() {
       hasNext={lightboxHasNext}
       counterText={activeLightboxTab==='reference'?(refVideos.length?`${clampedRefIdx+1} / ${refVideos.length}`:undefined):(focusedIndex>=0?`${focusedIndex+1} / ${rows.length}`:undefined)}
       returnFocus={lightboxTriggerRef}
+      footerActions={activeLightboxTab==='current'&&stageCurrentTask?<Button className="ws-danger-btn" variant="outline" size="sm" disabled={disabled||Boolean(stageCurrentLock)||blockedIds.has(stageCurrentTask.vid)||pendingVids.has(stageCurrentTask.vid)} onClick={()=>openDeleteDialog('single',[stageCurrentTask],stageExpandBtnRef.current)}><Trash2 size={14} aria-hidden="true"/><span>移入回收站</span></Button>:undefined}
       stripSlot={activeLightboxTab==='reference'&&refVideos.length>1?<div className="ws-stage-ref-strip"><div className="ws-stage-ref-row" role="group" aria-label="对照视频样本">{refVideos.map((v,idx)=><button key={v.vid} type="button" aria-pressed={idx===clampedRefIdx} className="ws-stage-ref-card" onClick={()=>setStageRefIndex(idx)} title={v.name}><span className="ws-stage-ref-thumb">{v.thumb?<img src={v.thumb} width={108} height={68} data-private-media draggable={false} alt="" loading="lazy"/>:<Play size={14} aria-hidden="true"/>}</span><span className="ws-stage-ref-name">{v.name}</span></button>)}</div></div>:undefined}
     />
     <AutoMergeDialog open={autoMergeOpen} onOpenChange={setAutoMergeOpen} preview={autoMergePreview} loading={autoMergeLoading} onRefreshPreview={loadAutoMergePreview} returnFocus={autoMergeTriggerRef}/>
+    <ReviewDeleteDialog
+      open={Boolean(deleteDialog?.open)}
+      onOpenChange={open=>setDeleteDialog(prev=>prev?{...prev,open}:null)}
+      mode={deleteDialog?.mode??'single'}
+      targets={deleteDialog?.targets??[]}
+      groupLabel={activeGroupInfo?.label}
+      isAutoSelected={autoSelectedScopes.has(scope)}
+      otherSelectedCount={deleteDialog?.mode==='single'?chosen.filter(t=>!deleteDialog.targets.some(target=>target.vid===t.vid)).length:0}
+      reviewSession={data?.session??session.current}
+      reviewGroup={{key:activeGroup,deferred:view==='deferred'}}
+      onConfirm={confirmDeletePlan}
+      onSessionExpired={()=>{clearReviewSessionCaches(true);setSessionExpired(true)}}
+      returnFocus={deleteTriggerRef}
+    />
     <AlertDialog open={refreshConfirm} onOpenChange={setRefreshConfirm}><AlertDialogContent onCloseAutoFocus={e=>{e.preventDefault();refreshFocus.current?.focus({preventScroll:true})}}><AlertDialogHeader><AlertDialogTitle>更新当前核对列表？</AlertDialogTitle><AlertDialogDescription>后台的新建议可能调整分组。更新会清空勾选、未保存的备注和人物输入。取消可继续当前核对。</AlertDialogDescription></AlertDialogHeader><AlertDialogFooter><AlertDialogCancel>继续当前核对</AlertDialogCancel><AlertDialogAction onClick={()=>void load({refresh:true})}>更新列表</AlertDialogAction></AlertDialogFooter></AlertDialogContent></AlertDialog>
   </main>
 }

@@ -485,7 +485,17 @@ pub fn snapshot(config: &Config, plan: &Plan) -> Result<Snapshot> {
                 next["name"] = json!(Path::new(&file.dst).file_name().unwrap().to_string_lossy());
                 next["size"] = json!({"$integer":file.size.to_string()});
                 next["mtime_ns"] = json!(files::mtime_ns(&stat));
-                next["stage"] = json!("excluded");
+                next["stage"] = if plan.action == "restore-files" && plan.target_person.is_empty() {
+                    json!(if crate::review::number(&row["manual"]).unwrap_or(0) != 0 {
+                        "error"
+                    } else if data["ready"] == true {
+                        "review"
+                    } else {
+                        "queued"
+                    })
+                } else {
+                    json!("excluded")
+                };
                 next["updated_at"] = json!(updated_at);
                 next["data"] = json!(serde_json::to_string(&owner_transform(
                     &metadata::transform(config, &data, plan),

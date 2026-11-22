@@ -119,6 +119,9 @@ export function VideoPreviewDialog({
         }}
         onCloseAutoFocus={event => {
           event.preventDefault()
+          if (typeof document !== 'undefined' && document.querySelector('[role="dialog"][data-state="open"]')) {
+            return
+          }
           const restore = () => {
             const target = returnFocus?.current?.isConnected
               ? returnFocus.current

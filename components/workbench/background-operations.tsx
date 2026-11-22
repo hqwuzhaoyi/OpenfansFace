@@ -47,6 +47,19 @@ import {
 import { ButtonGroup } from "@/components/ui/button-group";
 import { FILE_OPERATION_STORAGE_KEY } from "@/components/persons/file-actions";
 import { deleteWorkbenchCache } from "@/components/workbench/state";
+import { settleBackgroundTask } from "@/lib/background-operations-model";
+
+function invalidatePersonLibraryCaches(
+  people: Iterable<string | undefined | null>,
+) {
+  for (const person of people) {
+    if (person) {
+      deleteWorkbenchCache("persons:library:" + person);
+    }
+  }
+  deleteWorkbenchCache("persons:list");
+  deleteWorkbenchCache("persons:stats");
+}
 
 function invalidateReviewCaches({
   resetSession = false,
@@ -82,7 +95,24 @@ import type {
   PersonFilePlan,
   PersonFileResult,
 } from "@/lib/person-file-model";
+import {
+  isDestructivePersonAction,
+  lockStatusRank,
+  mergeScopeLocks,
+  parseLockSnapshotJson,
+  type ScopeLockInfo,
+  type ServerActiveOp,
+  type ServerLockSnapshot,
+  type ServerSettledOp,
+} from "@/lib/locks-model";
 import "./background-operations.css";
+
+export type {
+  ScopeLockInfo,
+  ServerActiveOp,
+  ServerLockSnapshot,
+  ServerSettledOp,
+};
 
 const BATCH_STORAGE_KEY = "person-batch-operation-v1";
 const ARCHIVE_STORAGE_KEY = "face-archive-operation";
@@ -239,13 +269,11 @@ export type BackgroundTaskEvent =
   | {
       type: "auto-merge-settled";
       task: AutoMergeTask;
+    }
+  | {
+      type: "server-op-settled";
+      settled: ServerSettledOp;
     };
-
-export type ScopeLockInfo = {
-  label: string;
-  status: "running" | "queued";
-  taskId: string;
-};
 
 interface BackgroundOperationsContextValue {
   tasks: BackgroundTask[];
@@ -253,6 +281,7 @@ interface BackgroundOperationsContextValue {
   setOpen: (open: boolean) => void;
   lockedPeople: Map<string, ScopeLockInfo>;
   lockedVids: Map<string, ScopeLockInfo>;
+  serverActiveOps: ServerActiveOp[];
   hasActiveWrite: boolean;
   enqueuePersonBatch: (input: {
     plan: PersonBatchPlan;
@@ -262,6 +291,7 @@ interface BackgroundOperationsContextValue {
   enqueuePersonFile: (input: {
     plan: PersonFilePlan;
     person: string;
+    label?: string;
   }) => string;
   enqueueArchive: (input: {
     vids: string[];
@@ -281,6 +311,7 @@ interface BackgroundOperationsContextValue {
     subtitle: string;
     vids: string[];
     creator?: string;
+    operationId?: string;
     promise: Promise<T>;
   }) => Promise<T>;
   cancelQueuedTask: (taskId: string) => void;
@@ -307,10 +338,44 @@ const fileActionLabels: Record<PersonFileAction, string> = {
   "rename-file": "重命名视频",
   "move-files": "移动视频",
   "delete-files": "删除视频",
+  "review-delete": "移入回收站",
   "rename-person": "重命名人物",
   "merge-person": "合并人物",
   "delete-person": "删除人物",
 };
+
+function localPersonFileLockLabel(
+  action: PersonFileAction,
+  status: "running" | "queued" | "recovery_needed",
+): string {
+  if (status === "recovery_needed") return "待恢复";
+  const running = status === "running";
+  if (
+    action === "delete-files" ||
+    action === "review-delete" ||
+    action === "delete-person"
+  ) {
+    return running ? "删除中" : "排队删除";
+  }
+  if (action === "merge-person") return running ? "合并中" : "排队合并";
+  if (action === "rename-person" || action === "rename-file") {
+    return running ? "改名中" : "排队改名";
+  }
+  if (action === "move-files") return running ? "移动中" : "排队移动";
+  return running ? "处理中" : "排队中";
+}
+
+function setLocalLock(
+  map: Map<string, ScopeLockInfo>,
+  key: string,
+  lock: ScopeLockInfo,
+) {
+  if (!key) return;
+  const existing = map.get(key);
+  if (!existing || lockStatusRank(lock.status) > lockStatusRank(existing.status)) {
+    map.set(key, lock);
+  }
+}
 
 function isActiveStatus(status: BackgroundTaskStatus) {
   return status === "queued" || status === "running";
@@ -356,6 +421,23 @@ export function BackgroundOperationsProvider({
   const listenersRef = useRef(new Set<(event: BackgroundTaskEvent) => void>());
   const runningIdRef = useRef<string | null>(null);
   const reconcilingRef = useRef(new Set<string>());
+  const localTaskIdsRef = useRef(new Set<string>());
+  const [serverSnapshot, setServerSnapshot] = useState<ServerLockSnapshot | null>(
+    null,
+  );
+  const hasInitialSnapshotRef = useRef(false);
+  const handledSettledOpIdsRef = useRef(new Set<string>());
+  const sseFramesRef = useRef(0);
+
+  const rememberLocalOpId = useCallback((id?: string) => {
+    if (!id) return;
+    const set = localTaskIdsRef.current;
+    set.add(id);
+    if (set.size > 256) {
+      const oldest = set.values().next().value;
+      if (oldest !== undefined) set.delete(oldest);
+    }
+  }, []);
 
   const emit = useCallback((event: BackgroundTaskEvent) => {
     for (const listener of listenersRef.current) {
@@ -366,6 +448,169 @@ export function BackgroundOperationsProvider({
       }
     }
   }, []);
+
+  const applyServerSnapshot = useCallback(
+    (snapshot: ServerLockSnapshot) => {
+      setServerSnapshot(snapshot);
+      const settled = snapshot.last_settled;
+      if (!hasInitialSnapshotRef.current) {
+        hasInitialSnapshotRef.current = true;
+        if (settled?.op_id) {
+          handledSettledOpIdsRef.current.add(settled.op_id);
+        }
+        return;
+      }
+      if (!settled?.op_id) return;
+      const handled = handledSettledOpIdsRef.current;
+      if (handled.has(settled.op_id)) return;
+      handled.add(settled.op_id);
+      if (handled.size > 256) {
+        const oldest = handled.values().next().value;
+        if (oldest !== undefined) handled.delete(oldest);
+      }
+      const isLocal =
+        localTaskIdsRef.current.has(settled.op_id) ||
+        tasksRef.current.some(
+          (t) =>
+            t.id === settled.op_id ||
+            (t.kind === "archive" && t.operationId === settled.op_id) ||
+            (t.kind === "auto-merge" && t.operationId === settled.op_id) ||
+            (t.kind === "person-batch" && t.plan.id === settled.op_id) ||
+            (t.kind === "person-file" && t.plan.id === settled.op_id),
+        );
+      if (isLocal || settled.outcome === "cancelled") return;
+
+      invalidateReviewCaches({
+        includePeople:
+          isDestructivePersonAction(settled.action) ||
+          settled.people.length > 0,
+      });
+      deleteWorkbenchCache("persons:list");
+      deleteWorkbenchCache("persons:stats");
+      for (const p of settled.people) {
+        if (p) deleteWorkbenchCache("persons:library:" + p);
+      }
+      deleteWorkbenchCache("integration:plan");
+      deleteWorkbenchCache("staging:list:");
+      emit({ type: "server-op-settled", settled });
+    },
+    [emit],
+  );
+
+  // Subscribe to server-authoritative entity lock SSE stream with initial GET fallback & backoff reconnect.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    let disposed = false;
+    let es: EventSource | null = null;
+    let reconnectTimer: ReturnType<typeof setTimeout> | undefined;
+    let fallbackController: AbortController | null = null;
+    let retryAttempt = 0;
+
+    const fetchFallbackSnapshot = async () => {
+      fallbackController?.abort();
+      const controller = new AbortController();
+      fallbackController = controller;
+      const framesAtStart = sseFramesRef.current;
+      try {
+        const res = await fetch("/api/locks", {
+          cache: "no-store",
+          signal: controller.signal,
+        });
+        if (!res.ok || disposed || controller.signal.aborted) return;
+        const text = await res.text();
+        if (
+          disposed ||
+          controller.signal.aborted ||
+          sseFramesRef.current !== framesAtStart
+        ) {
+          return;
+        }
+        const snap = parseLockSnapshotJson(text);
+        if (snap) applyServerSnapshot(snap);
+      } catch {
+        // Ignore transient fallback failures; SSE reconnect will retry.
+      }
+    };
+
+    const scheduleReconnect = () => {
+      if (disposed || reconnectTimer !== undefined) return;
+      const base = Math.min(15_000, 1000 * 2 ** Math.min(retryAttempt, 4));
+      const jitter = Math.floor(Math.random() * 400);
+      retryAttempt++;
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = undefined;
+        if (disposed) return;
+        void fetchFallbackSnapshot();
+        connectStream();
+      }, base + jitter);
+    };
+
+    const connectStream = () => {
+      if (disposed || typeof EventSource === "undefined") return;
+      if (es) {
+        es.close();
+        es = null;
+      }
+      const source = new EventSource("/api/locks/stream");
+      es = source;
+
+      const handleEvent = (ev: MessageEvent) => {
+        if (disposed) return;
+        const snap = parseLockSnapshotJson(String(ev.data ?? ""));
+        if (!snap) return;
+        sseFramesRef.current++;
+        applyServerSnapshot(snap);
+      };
+
+      source.addEventListener("locks", handleEvent as EventListener);
+      source.onmessage = handleEvent;
+      source.onopen = () => {
+        retryAttempt = 0;
+      };
+      source.onerror = () => {
+        if (disposed) return;
+        if (es === source) {
+          source.close();
+          es = null;
+        }
+        scheduleReconnect();
+      };
+    };
+
+    const onVisibilityChange = () => {
+      if (
+        disposed ||
+        document.visibilityState !== "visible" ||
+        typeof EventSource === "undefined"
+      ) {
+        return;
+      }
+      if (!es || es.readyState === EventSource.CLOSED) {
+        if (reconnectTimer !== undefined) {
+          clearTimeout(reconnectTimer);
+          reconnectTimer = undefined;
+        }
+        retryAttempt = 0;
+        void fetchFallbackSnapshot();
+        connectStream();
+      }
+    };
+
+    void fetchFallbackSnapshot();
+    connectStream();
+    document.addEventListener("visibilitychange", onVisibilityChange);
+
+    return () => {
+      disposed = true;
+      if (reconnectTimer !== undefined) clearTimeout(reconnectTimer);
+      fallbackController?.abort();
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      if (es) {
+        es.close();
+        es = null;
+      }
+    };
+  }, [applyServerSnapshot]);
 
   const subscribe = useCallback(
     (listener: (event: BackgroundTaskEvent) => void) => {
@@ -391,6 +636,20 @@ export function BackgroundOperationsProvider({
       if (rawFile) {
         const plan = JSON.parse(rawFile) as PersonFilePlan;
         if (plan?.backend === "rust" && plan.id && plan.request?.id === plan.id) {
+          rememberLocalOpId(plan.id);
+          const payloadVids = Array.isArray(plan.request.payload?.vids)
+            ? plan.request.payload.vids.filter((v): v is string => typeof v === "string")
+            : [];
+          const restoredVids = [
+            ...new Set([
+              ...payloadVids,
+              ...plan.files.flatMap((f) => f.vids || []),
+            ]),
+          ];
+          const restoredTitle =
+            plan.action === "review-delete"
+              ? "移入回收站 · 人工确认"
+              : `${fileActionLabels[plan.action] || "文件操作"} · ${plan.person}${plan.target_person ? ` → ${plan.target_person}` : ""}`;
           setTasks((prev) =>
             prev.some((t) => t.id === plan.id)
               ? prev
@@ -400,11 +659,11 @@ export function BackgroundOperationsProvider({
                     id: plan.id,
                     kind: "person-file",
                     action: plan.action,
-                    title: `${fileActionLabels[plan.action] || "文件操作"} · ${plan.person}${plan.target_person ? ` → ${plan.target_person}` : ""}`,
+                    title: restoredTitle,
                     subtitle: `${plan.files.length} 个文件 · ${(plan.total_bytes / 2 ** 20).toFixed(1)} MB`,
                     person: plan.person,
                     targetPerson: plan.target_person,
-                    vids: plan.files.flatMap((f) => f.vids || []),
+                    vids: restoredVids,
                     plan,
                     status: "running",
                     createdAt: Date.now(),
@@ -426,6 +685,7 @@ export function BackgroundOperationsProvider({
           thumbs?: Record<string, string | null>;
         };
         if (saved?.plan?.id) {
+          rememberLocalOpId(saved.plan.id);
           const merging = saved.plan.request.action === "merge";
           const totalFiles = saved.plan.plans.reduce(
             (s, p) => s + p.files.length,
@@ -463,7 +723,7 @@ export function BackgroundOperationsProvider({
     } catch {
       // Ignore malformed storage
     }
-  }, []);
+  }, [rememberLocalOpId]);
 
   const enqueuePersonBatch = useCallback(
     ({
@@ -501,17 +761,30 @@ export function BackgroundOperationsProvider({
         createdAt: Date.now(),
         needsFreshPreview: hasPriorActive,
       };
+      rememberLocalOpId(task.id);
       setTasks((prev) => [...prev.filter((t) => t.id !== task.id), task]);
       return task.id;
     },
-    [],
+    [rememberLocalOpId],
   );
 
   const enqueuePersonFile = useCallback(
-    ({ plan, person }: { plan: PersonFilePlan; person: string }) => {
+    ({
+      plan,
+      person,
+      label: scopeLabel,
+    }: {
+      plan: PersonFilePlan;
+      person: string;
+      label?: string;
+    }) => {
+      const payloadVids = Array.isArray(plan.request.payload?.vids)
+        ? plan.request.payload.vids.filter((v): v is string => typeof v === "string")
+        : [];
       const vids = [
         ...new Set([
           ...(plan.request.files?.map((f) => f.vid) || []),
+          ...payloadVids,
           ...plan.files.flatMap((f) => f.vids || []),
         ]),
       ];
@@ -520,9 +793,13 @@ export function BackgroundOperationsProvider({
       );
       const label = fileActionLabels[plan.action] || "文件操作";
       const title =
-        plan.action === "merge-person" || plan.action === "rename-person"
-          ? `${label} · ${person} → ${plan.target_person}`
-          : `${label} · ${person}`;
+        plan.action === "review-delete"
+          ? scopeLabel
+            ? `${label} · ${scopeLabel}`
+            : `${label} · 人工确认`
+          : plan.action === "merge-person" || plan.action === "rename-person"
+            ? `${label} · ${person} → ${plan.target_person}`
+            : `${label} · ${person}`;
       const subtitle =
         plan.files.length > 0
           ? `${plan.files.length} 个文件 · ${(plan.total_bytes / 2 ** 20).toFixed(1)} MB`
@@ -541,10 +818,11 @@ export function BackgroundOperationsProvider({
         createdAt: Date.now(),
         needsFreshPreview: hasPriorActive,
       };
+      rememberLocalOpId(task.id);
       setTasks((prev) => [...prev.filter((t) => t.id !== task.id), task]);
       return task.id;
     },
-    [],
+    [rememberLocalOpId],
   );
 
   const enqueueArchive = useCallback(
@@ -586,10 +864,11 @@ export function BackgroundOperationsProvider({
         createdAt: Date.now(),
         needsFreshPreview: hasPriorActive,
       };
+      rememberLocalOpId(operationId);
       setTasks((prev) => [...prev, task]);
       return task.id;
     },
-    [],
+    [rememberLocalOpId],
   );
 
   const enqueueAutoMerge = useCallback(
@@ -623,10 +902,11 @@ export function BackgroundOperationsProvider({
         status: "queued",
         createdAt: Date.now(),
       };
+      rememberLocalOpId(operationId);
       setTasks((prev) => [...prev, task]);
       return task.id;
     },
-    [],
+    [rememberLocalOpId],
   );
 
   const trackReviewMutation = useCallback(
@@ -636,6 +916,7 @@ export function BackgroundOperationsProvider({
       subtitle,
       vids,
       creator,
+      operationId,
       promise,
     }: {
       action: "confirm" | "defer" | "restore" | "undo";
@@ -643,9 +924,11 @@ export function BackgroundOperationsProvider({
       subtitle: string;
       vids: string[];
       creator?: string;
+      operationId?: string;
       promise: Promise<T>;
     }): Promise<T> => {
-      const id = makeUuid();
+      const id = operationId || makeUuid();
+      rememberLocalOpId(id);
       const now = Date.now();
       const task: ReviewMutationTask = {
         id,
@@ -685,7 +968,7 @@ export function BackgroundOperationsProvider({
         throw e;
       }
     },
-    [updateTask],
+    [rememberLocalOpId, updateTask],
   );
 
   const cancelQueuedTask = useCallback((taskId: string) => {
@@ -775,6 +1058,7 @@ export function BackgroundOperationsProvider({
       try {
         if (initialTask.needsFreshPreview) {
           currentPlan = await refreshPreviewIfUnchanged();
+          rememberLocalOpId(currentPlan.id);
           updateTask(initialTask.id, (t) =>
             t.kind === "person-batch" ? { ...t, plan: currentPlan } : t,
           );
@@ -811,6 +1095,7 @@ export function BackgroundOperationsProvider({
             pollController.abort();
             clearTimeout(pollTimer);
             currentPlan = await refreshPreviewIfUnchanged();
+            rememberLocalOpId(currentPlan.id);
             updateTask(initialTask.id, (t) =>
               t.kind === "person-batch" ? { ...t, plan: currentPlan } : t,
             );
@@ -833,9 +1118,10 @@ export function BackgroundOperationsProvider({
         for (const item of saved.completed) {
           deleteWorkbenchCache("persons:library:" + item.person);
         }
-        if (saved.target) {
-          deleteWorkbenchCache("persons:library:" + saved.target);
-        }
+        invalidatePersonLibraryCaches([
+          ...initialTask.people,
+          saved.target,
+        ]);
         invalidateReviewCaches({ resetSession: true, includePeople: true });
 
         const nextStatus: BackgroundTaskStatus = saved.ok
@@ -851,42 +1137,44 @@ export function BackgroundOperationsProvider({
           setOpen(true);
         }
 
-        let settledTask: PersonBatchTask | null = null;
-        updateTask(initialTask.id, (t) => {
-          if (t.kind !== "person-batch") return t;
-          settledTask = {
+        const finishedAt = Date.now();
+        settleBackgroundTask({
+          tasks: tasksRef.current,
+          fallback: initialTask,
+          apply: (t) => ({
             ...t,
             plan: currentPlan,
             status: nextStatus,
             result: saved,
             error: saved.error,
-            finishedAt: Date.now(),
-          };
-          return settledTask;
+            finishedAt,
+          }),
+          updateTask,
+          emit: (settledTask) => {
+            emit({ type: "person-batch-settled", task: settledTask });
+          },
         });
-        if (settledTask) {
-          emit({ type: "person-batch-settled", task: settledTask });
-        }
       } catch (e) {
         pollController.abort();
         clearTimeout(pollTimer);
         const message = (e as Error).message || "批次执行异常";
         setOpen(true);
-        let settledTask: PersonBatchTask | null = null;
-        updateTask(initialTask.id, (t) => {
-          if (t.kind !== "person-batch") return t;
-          settledTask = {
+        const finishedAt = Date.now();
+        settleBackgroundTask({
+          tasks: tasksRef.current,
+          fallback: initialTask,
+          apply: (t) => ({
             ...t,
             plan: currentPlan,
-            status: "failed",
+            status: "failed" as const,
             error: `${message}（可点击「核对恢复」查询同一批次结果）`,
-            finishedAt: Date.now(),
-          };
-          return settledTask;
+            finishedAt,
+          }),
+          updateTask,
+          emit: (settledTask) => {
+            emit({ type: "person-batch-settled", task: settledTask });
+          },
         });
-        if (settledTask) {
-          emit({ type: "person-batch-settled", task: settledTask });
-        }
       }
     },
     [emit, updateTask],
@@ -924,6 +1212,7 @@ export function BackgroundOperationsProvider({
       try {
         if (initialTask.needsFreshPreview && currentPlan.backend === "rust") {
           currentPlan = await refreshPreviewIfUnchanged();
+          rememberLocalOpId(currentPlan.id);
           updateTask(initialTask.id, (t) =>
             t.kind === "person-file" ? { ...t, plan: currentPlan } : t,
           );
@@ -978,11 +1267,12 @@ export function BackgroundOperationsProvider({
           if (
             !initialTask.needsFreshPreview &&
             currentPlan.backend === "rust" &&
-            msg.includes("已变化")
+            msg.includes("变化")
           ) {
             pollController.abort();
             clearTimeout(pollTimer);
             currentPlan = await refreshPreviewIfUnchanged();
+            rememberLocalOpId(currentPlan.id);
             updateTask(initialTask.id, (t) =>
               t.kind === "person-file" ? { ...t, plan: currentPlan } : t,
             );
@@ -1058,30 +1348,40 @@ export function BackgroundOperationsProvider({
                 localStorage.removeItem(FILE_OPERATION_STORAGE_KEY);
               } catch {}
             }
-            deleteWorkbenchCache("persons:library:" + initialTask.person);
-            if (terminalReceipt.result?.person) {
-              deleteWorkbenchCache(
-                "persons:library:" + terminalReceipt.result.person,
-              );
+            invalidatePersonLibraryCaches([
+              initialTask.person,
+              initialTask.targetPerson,
+              terminalReceipt.result?.person,
+            ]);
+            if (
+              currentPlan.action === "review-delete" ||
+              currentPlan.action === "delete-files" ||
+              currentPlan.action === "delete-person"
+            ) {
+              deleteWorkbenchCache("staging:list:");
             }
-            invalidateReviewCaches({ resetSession: true, includePeople: true });
+            invalidateReviewCaches({
+              resetSession: currentPlan.action !== "review-delete",
+              includePeople: currentPlan.action !== "review-delete",
+            });
             setOpen(true);
-            let settledTask: PersonFileTask | null = null;
-            updateTask(initialTask.id, (t) => {
-              if (t.kind !== "person-file") return t;
-              settledTask = {
+            const finishedAt = Date.now();
+            settleBackgroundTask({
+              tasks: tasksRef.current,
+              fallback: initialTask,
+              apply: (t) => ({
                 ...t,
                 plan: currentPlan,
                 status: nextStatus,
                 result: terminalReceipt.result || t.result,
                 error: detail,
-                finishedAt: Date.now(),
-              };
-              return settledTask;
+                finishedAt,
+              }),
+              updateTask,
+              emit: (settledTask) => {
+                emit({ type: "person-file-settled", task: settledTask });
+              },
             });
-            if (settledTask) {
-              emit({ type: "person-file-settled", task: settledTask });
-            }
             return;
           }
         } else {
@@ -1092,48 +1392,61 @@ export function BackgroundOperationsProvider({
           localStorage.removeItem(FILE_OPERATION_STORAGE_KEY);
         } catch {}
 
-        deleteWorkbenchCache("persons:library:" + initialTask.person);
-        if (result.person) {
-          deleteWorkbenchCache("persons:library:" + result.person);
+        invalidatePersonLibraryCaches([
+          initialTask.person,
+          initialTask.targetPerson,
+          result.person,
+        ]);
+        if (
+          currentPlan.action === "review-delete" ||
+          currentPlan.action === "delete-files" ||
+          currentPlan.action === "delete-person"
+        ) {
+          deleteWorkbenchCache("staging:list:");
         }
-        invalidateReviewCaches({ resetSession: true, includePeople: true });
+        invalidateReviewCaches({
+          resetSession: currentPlan.action !== "review-delete",
+          includePeople: currentPlan.action !== "review-delete",
+        });
 
-        let settledTask: PersonFileTask | null = null;
-        updateTask(initialTask.id, (t) => {
-          if (t.kind !== "person-file") return t;
-          settledTask = {
+        const finishedAt = Date.now();
+        settleBackgroundTask({
+          tasks: tasksRef.current,
+          fallback: initialTask,
+          apply: (t) => ({
             ...t,
             plan: currentPlan,
-            status: "complete",
+            status: "complete" as const,
             result,
-             error: "",
-            finishedAt: Date.now(),
-          };
-          return settledTask;
+            error: "",
+            finishedAt,
+          }),
+          updateTask,
+          emit: (settledTask) => {
+            emit({ type: "person-file-settled", task: settledTask });
+          },
         });
-        if (settledTask) {
-          emit({ type: "person-file-settled", task: settledTask });
-        }
       } catch (e) {
         pollController.abort();
         clearTimeout(pollTimer);
         const message = (e as Error).message || "文件操作失败";
         setOpen(true);
-        let settledTask: PersonFileTask | null = null;
-        updateTask(initialTask.id, (t) => {
-          if (t.kind !== "person-file") return t;
-          settledTask = {
+        const finishedAt = Date.now();
+        settleBackgroundTask({
+          tasks: tasksRef.current,
+          fallback: initialTask,
+          apply: (t) => ({
             ...t,
             plan: currentPlan,
-            status: "failed",
+            status: "failed" as const,
             error: message,
-            finishedAt: Date.now(),
-          };
-          return settledTask;
+            finishedAt,
+          }),
+          updateTask,
+          emit: (settledTask) => {
+            emit({ type: "person-file-settled", task: settledTask });
+          },
         });
-        if (settledTask) {
-          emit({ type: "person-file-settled", task: settledTask });
-        }
       }
     },
     [emit, updateTask],
@@ -1255,9 +1568,7 @@ export function BackgroundOperationsProvider({
               };
         }
 
-        for (const creator of initialTask.creators) {
-          deleteWorkbenchCache("persons:library:" + creator);
-        }
+        invalidatePersonLibraryCaches(initialTask.creators);
         deleteWorkbenchCache("integration:plan");
         invalidateReviewCaches({ resetSession: true });
 
@@ -1279,41 +1590,43 @@ export function BackgroundOperationsProvider({
           setOpen(true);
         }
 
-        let settledTask: ArchiveTask | null = null;
-        updateTask(initialTask.id, (t) => {
-          if (t.kind !== "archive") return t;
-          settledTask = {
+        const finishedAt = Date.now();
+        settleBackgroundTask({
+          tasks: tasksRef.current,
+          fallback: initialTask,
+          apply: (t) => ({
             ...t,
             version: currentVersion,
             status: nextStatus,
             result,
             error: result.errors?.[0] || "",
-            finishedAt: Date.now(),
-          };
-          return settledTask;
+            finishedAt,
+          }),
+          updateTask,
+          emit: (settledTask) => {
+            emit({ type: "archive-settled", task: settledTask });
+          },
         });
-        if (settledTask) {
-          emit({ type: "archive-settled", task: settledTask });
-        }
       } catch (e) {
         pollController.abort();
         clearTimeout(pollTimer);
         const message = (e as Error).message || "归档连接中断";
         setOpen(true);
-        let settledTask: ArchiveTask | null = null;
-        updateTask(initialTask.id, (t) => {
-          if (t.kind !== "archive") return t;
-          settledTask = {
+        const finishedAt = Date.now();
+        settleBackgroundTask({
+          tasks: tasksRef.current,
+          fallback: initialTask,
+          apply: (t) => ({
             ...t,
-            status: "failed",
+            status: "failed" as const,
             error: `${message}（可点击「核对恢复」查询本次归档结果）`,
-            finishedAt: Date.now(),
-          };
-          return settledTask;
+            finishedAt,
+          }),
+          updateTask,
+          emit: (settledTask) => {
+            emit({ type: "archive-settled", task: settledTask });
+          },
         });
-        if (settledTask) {
-          emit({ type: "archive-settled", task: settledTask });
-        }
       }
     },
     [emit, updateTask],
@@ -1416,9 +1729,7 @@ export function BackgroundOperationsProvider({
               };
         }
 
-        for (const creator of initialTask.creators) {
-          deleteWorkbenchCache("persons:library:" + creator);
-        }
+        invalidatePersonLibraryCaches(initialTask.creators);
         deleteWorkbenchCache("integration:plan");
         invalidateReviewCaches({ resetSession: true });
 
@@ -1452,39 +1763,43 @@ export function BackgroundOperationsProvider({
           );
         }
 
-        const latest =
-          tasksRef.current.find(
-            (t): t is AutoMergeTask =>
-              t.kind === "auto-merge" && t.id === initialTask.id,
-          ) ?? initialTask;
-        const settledTask: AutoMergeTask = {
-          ...latest,
-          status: nextStatus,
-          result,
-          error: result.errors?.[0] || "",
-          finishedAt: Date.now(),
-        };
-        updateTask(initialTask.id, () => settledTask);
-        emit({ type: "auto-merge-settled", task: settledTask });
+        const finishedAt = Date.now();
+        settleBackgroundTask({
+          tasks: tasksRef.current,
+          fallback: initialTask,
+          apply: (t) => ({
+            ...t,
+            status: nextStatus,
+            result,
+            error: result.errors?.[0] || "",
+            finishedAt,
+          }),
+          updateTask,
+          emit: (settledTask) => {
+            emit({ type: "auto-merge-settled", task: settledTask });
+          },
+        });
       } catch (e) {
         pollController.abort();
         clearTimeout(pollTimer);
         const message = (e as Error).message || "自动合入连接中断";
         setOpen(true);
         toast.error(message);
-        const latest =
-          tasksRef.current.find(
-            (t): t is AutoMergeTask =>
-              t.kind === "auto-merge" && t.id === initialTask.id,
-          ) ?? initialTask;
-        const settledTask: AutoMergeTask = {
-          ...latest,
-          status: "failed",
-          error: `${message}（可点击「核对恢复」查询本次合入结果）`,
-          finishedAt: Date.now(),
-        };
-        updateTask(initialTask.id, () => settledTask);
-        emit({ type: "auto-merge-settled", task: settledTask });
+        const finishedAt = Date.now();
+        settleBackgroundTask({
+          tasks: tasksRef.current,
+          fallback: initialTask,
+          apply: (t) => ({
+            ...t,
+            status: "failed" as const,
+            error: `${message}（可点击「核对恢复」查询本次合入结果）`,
+            finishedAt,
+          }),
+          updateTask,
+          emit: (settledTask) => {
+            emit({ type: "auto-merge-settled", task: settledTask });
+          },
+        });
       }
     },
     [emit, updateTask],
@@ -1559,32 +1874,27 @@ export function BackgroundOperationsProvider({
               localStorage.removeItem(BATCH_STORAGE_KEY);
             } catch {}
           }
-          for (const person of target.people) {
-            deleteWorkbenchCache("persons:library:" + person);
-          }
-          if (target.target) {
-            deleteWorkbenchCache("persons:library:" + target.target);
-          }
-          for (const item of saved.completed || []) {
-            deleteWorkbenchCache("persons:library:" + item.person);
-          }
-          if (saved.target) {
-            deleteWorkbenchCache("persons:library:" + saved.target);
-          }
+          invalidatePersonLibraryCaches([
+            ...target.people,
+            target.target,
+            ...(saved.completed || []).map((item) => item.person),
+            saved.target,
+          ]);
           invalidateReviewCaches({ resetSession: true, includePeople: true });
-          let settled: PersonBatchTask | null = null;
-          updateTask(taskId, (t) => {
-            if (t.kind !== "person-batch") return t;
-            settled = {
+          const finishedAt = Date.now();
+          settleBackgroundTask({
+            tasks: tasksRef.current,
+            fallback: target,
+            apply: (t) => ({
               ...t,
               status: nextStatus,
               result: saved,
               error: saved.error || "",
-              finishedAt: Date.now(),
-            };
-            return settled;
+              finishedAt,
+            }),
+            updateTask,
+            emit: (settled) => emit({ type: "person-batch-settled", task: settled }),
           });
-          if (settled) emit({ type: "person-batch-settled", task: settled });
         } else if (target.kind === "person-file") {
           const receipt = await api<{
             status: string;
@@ -1611,27 +1921,36 @@ export function BackgroundOperationsProvider({
               localStorage.removeItem(FILE_OPERATION_STORAGE_KEY);
             } catch {}
           }
-          deleteWorkbenchCache("persons:library:" + target.person);
-          if (target.targetPerson) {
-            deleteWorkbenchCache("persons:library:" + target.targetPerson);
+          invalidatePersonLibraryCaches([
+            target.person,
+            target.targetPerson,
+            receipt.result?.person,
+          ]);
+          if (
+            target.action === "review-delete" ||
+            target.action === "delete-files" ||
+            target.action === "delete-person"
+          ) {
+            deleteWorkbenchCache("staging:list:");
           }
-          if (receipt.result?.person) {
-            deleteWorkbenchCache("persons:library:" + receipt.result.person);
-          }
-          invalidateReviewCaches({ resetSession: true, includePeople: true });
-          let settled: PersonFileTask | null = null;
-          updateTask(taskId, (t) => {
-            if (t.kind !== "person-file") return t;
-            settled = {
+          invalidateReviewCaches({
+            resetSession: target.action !== "review-delete",
+            includePeople: target.action !== "review-delete",
+          });
+          const finishedAt = Date.now();
+          settleBackgroundTask({
+            tasks: tasksRef.current,
+            fallback: target,
+            apply: (t) => ({
               ...t,
               status: nextStatus,
               result: receipt.result || t.result,
               error: receipt.error || "",
-              finishedAt: Date.now(),
-            };
-            return settled;
+              finishedAt,
+            }),
+            updateTask,
+            emit: (settled) => emit({ type: "person-file-settled", task: settled }),
           });
-          if (settled) emit({ type: "person-file-settled", task: settled });
         } else if (target.kind === "archive") {
           const prog = await api<{
             job: ArchiveJobProgress | null;
@@ -1654,24 +1973,23 @@ export function BackgroundOperationsProvider({
                 localStorage.removeItem(ARCHIVE_STORAGE_KEY);
               } catch {}
             }
-            for (const creator of target.creators) {
-              deleteWorkbenchCache("persons:library:" + creator);
-            }
+            invalidatePersonLibraryCaches(target.creators);
             deleteWorkbenchCache("integration:plan");
             invalidateReviewCaches({ resetSession: true });
-            let settled: ArchiveTask | null = null;
-            updateTask(taskId, (t) => {
-              if (t.kind !== "archive") return t;
-              settled = {
+            const finishedAt = Date.now();
+            settleBackgroundTask({
+              tasks: tasksRef.current,
+              fallback: target,
+              apply: (t) => ({
                 ...t,
                 status: nextStatus,
                 result: res,
                 error: res.errors?.[0] || "",
-                finishedAt: Date.now(),
-              };
-              return settled;
+                finishedAt,
+              }),
+              updateTask,
+              emit: (settled) => emit({ type: "archive-settled", task: settled }),
             });
-            if (settled) emit({ type: "archive-settled", task: settled });
           }
         } else if (target.kind === "auto-merge") {
           const prog = await api<{
@@ -1691,25 +2009,23 @@ export function BackgroundOperationsProvider({
                 : res.ok || archivedCount > 0 || (res.fallback_queued ?? 0) > 0
                   ? "complete"
                   : "failed";
-            for (const creator of target.creators) {
-              deleteWorkbenchCache("persons:library:" + creator);
-            }
+            invalidatePersonLibraryCaches(target.creators);
             deleteWorkbenchCache("integration:plan");
             invalidateReviewCaches({ resetSession: true });
-            const latest =
-              tasksRef.current.find(
-                (t): t is AutoMergeTask =>
-                  t.kind === "auto-merge" && t.id === taskId,
-              ) ?? target;
-            const settled: AutoMergeTask = {
-              ...latest,
-              status: nextStatus,
-              result: res,
-              error: res.errors?.[0] || "",
-              finishedAt: Date.now(),
-            };
-            updateTask(taskId, () => settled);
-            emit({ type: "auto-merge-settled", task: settled });
+            const finishedAt = Date.now();
+            settleBackgroundTask({
+              tasks: tasksRef.current,
+              fallback: target,
+              apply: (t) => ({
+                ...t,
+                status: nextStatus,
+                result: res,
+                error: res.errors?.[0] || "",
+                finishedAt,
+              }),
+              updateTask,
+              emit: (settled) => emit({ type: "auto-merge-settled", task: settled }),
+            });
           }
         }
       } catch (e) {
@@ -1724,15 +2040,20 @@ export function BackgroundOperationsProvider({
     [emit, updateTask],
   );
 
-  // Compute scope locks for people and videos
-  const { lockedPeople, lockedVids, hasActiveWrite } = useMemo(() => {
-    const peopleMap = new Map<string, ScopeLockInfo>();
-    const vidsMap = new Map<string, ScopeLockInfo>();
-    let activeWrite = false;
+  // Compute scope locks for people and videos (merging local optimistic locks with server-authoritative SSE locks)
+  const { lockedPeople, lockedVids, serverActiveOps, hasActiveWrite } = useMemo(() => {
+    const localPeopleMap = new Map<string, ScopeLockInfo>();
+    const localVidsMap = new Map<string, ScopeLockInfo>();
+    let localActiveWrite = false;
 
     for (const task of tasks) {
-      if (!isActiveStatus(task.status)) continue;
-      const lockStatus = task.status === "running" ? "running" : "queued";
+      const isRecovery = task.status === "recovery_needed";
+      if (!isActiveStatus(task.status) && !isRecovery) continue;
+      const lockStatus: ScopeLockInfo["status"] = isRecovery
+        ? "recovery_needed"
+        : task.status === "running"
+          ? "running"
+          : "queued";
       if (task.kind === "review-mutation") {
         const label =
           task.action === "confirm"
@@ -1743,79 +2064,154 @@ export function BackgroundOperationsProvider({
                 ? "恢复中"
                 : "撤销中";
         for (const vid of task.vids) {
-          if (!vidsMap.has(vid)) {
-            vidsMap.set(vid, { label, status: lockStatus, taskId: task.id });
-          }
+          setLocalLock(localVidsMap, vid, {
+            label,
+            status: lockStatus,
+            taskId: task.id,
+            action: task.action,
+            source: "local",
+          });
         }
         continue;
       }
-      activeWrite = true;
+      if (isActiveStatus(task.status)) {
+        localActiveWrite = true;
+      }
 
       if (task.kind === "person-batch") {
+        const action = task.action === "merge" ? "batch-merge" : "batch-delete";
         const label =
-          task.action === "merge"
-            ? lockStatus === "running"
-              ? "合并中"
-              : "排队合并"
-            : lockStatus === "running"
-              ? "删除中"
-              : "排队删除";
+          lockStatus === "recovery_needed"
+            ? "待恢复"
+            : task.action === "merge"
+              ? lockStatus === "running"
+                ? "合并中"
+                : "排队合并"
+              : lockStatus === "running"
+                ? "删除中"
+                : "排队删除";
         for (const p of task.people) {
-          if (!peopleMap.has(p)) {
-            peopleMap.set(p, { label, status: lockStatus, taskId: task.id });
-          }
+          setLocalLock(localPeopleMap, p, {
+            label,
+            status: lockStatus,
+            taskId: task.id,
+            action,
+            source: "local",
+          });
+        }
+        if (task.target) {
+          setLocalLock(localPeopleMap, task.target, {
+            label,
+            status: lockStatus,
+            taskId: task.id,
+            action,
+            source: "local",
+          });
         }
       } else if (task.kind === "person-file") {
         const isPersonLevel =
           task.action === "merge-person" ||
           task.action === "rename-person" ||
           task.action === "delete-person";
-        const label =
-          lockStatus === "running"
-            ? fileActionLabels[task.action]?.slice(0, 2) + "中"
-            : "排队中";
+        const label = localPersonFileLockLabel(task.action, lockStatus);
         if (isPersonLevel) {
-          peopleMap.set(task.person, {
+          setLocalLock(localPeopleMap, task.person, {
             label,
             status: lockStatus,
             taskId: task.id,
+            action: task.action,
+            source: "local",
           });
           if (task.targetPerson) {
-            peopleMap.set(task.targetPerson, {
+            setLocalLock(localPeopleMap, task.targetPerson, {
               label,
               status: lockStatus,
               taskId: task.id,
+              action: task.action,
+              source: "local",
             });
           }
         }
         for (const vid of task.vids) {
-          if (!vidsMap.has(vid)) {
-            vidsMap.set(vid, { label, status: lockStatus, taskId: task.id });
-          }
+          setLocalLock(localVidsMap, vid, {
+            label,
+            status: lockStatus,
+            taskId: task.id,
+            action: task.action,
+            source: "local",
+          });
         }
       } else if (task.kind === "archive") {
-        const label = lockStatus === "running" ? "归档中" : "排队归档";
+        const label =
+          lockStatus === "recovery_needed"
+            ? "待恢复"
+            : lockStatus === "running"
+              ? "归档中"
+              : "排队归档";
         for (const vid of task.vids) {
-          if (!vidsMap.has(vid)) {
-            vidsMap.set(vid, { label, status: lockStatus, taskId: task.id });
-          }
+          setLocalLock(localVidsMap, vid, {
+            label,
+            status: lockStatus,
+            taskId: task.id,
+            action: "archive",
+            source: "local",
+          });
+        }
+        const creators = task.personName
+          ? [...new Set([...task.creators, task.personName])]
+          : task.creators;
+        for (const creator of creators) {
+          setLocalLock(localPeopleMap, creator, {
+            label,
+            status: lockStatus,
+            taskId: task.id,
+            action: "archive",
+            source: "local",
+          });
         }
       } else if (task.kind === "auto-merge") {
-        const label = lockStatus === "running" ? "合入中" : "排队合入";
+        const label =
+          lockStatus === "recovery_needed"
+            ? "待恢复"
+            : lockStatus === "running"
+              ? "合入中"
+              : "排队合入";
         for (const vid of task.vids) {
-          if (!vidsMap.has(vid)) {
-            vidsMap.set(vid, { label, status: lockStatus, taskId: task.id });
-          }
+          setLocalLock(localVidsMap, vid, {
+            label,
+            status: lockStatus,
+            taskId: task.id,
+            action: "auto-merge",
+            source: "local",
+          });
+        }
+        for (const creator of task.creators) {
+          setLocalLock(localPeopleMap, creator, {
+            label,
+            status: lockStatus,
+            taskId: task.id,
+            action: "auto-merge",
+            source: "local",
+          });
         }
       }
     }
 
+    const activeOps = serverSnapshot?.active_ops ?? [];
+    const mergedPeople = mergeScopeLocks(localPeopleMap, serverSnapshot?.people);
+    const mergedVids = mergeScopeLocks(localVidsMap, serverSnapshot?.videos);
+
     return {
-      lockedPeople: peopleMap,
-      lockedVids: vidsMap,
-      hasActiveWrite: activeWrite,
+      lockedPeople: mergedPeople,
+      lockedVids: mergedVids,
+      serverActiveOps: activeOps,
+      hasActiveWrite:
+        localActiveWrite ||
+        activeOps.some(
+          (op) => op.status === "running" || op.status === "queued",
+        ),
     };
-  }, [tasks]);
+  }, [tasks, serverSnapshot]);
 
   const value = useMemo<BackgroundOperationsContextValue>(
     () => ({
@@ -1824,6 +2220,7 @@ export function BackgroundOperationsProvider({
       setOpen,
       lockedPeople,
       lockedVids,
+      serverActiveOps,
       hasActiveWrite,
       enqueuePersonBatch,
       enqueuePersonFile,
@@ -1841,6 +2238,7 @@ export function BackgroundOperationsProvider({
       open,
       lockedPeople,
       lockedVids,
+      serverActiveOps,
       hasActiveWrite,
       enqueuePersonBatch,
       enqueuePersonFile,
@@ -1886,6 +2284,7 @@ const PERSON_FILE_STEP_LABEL: Record<PersonFileAction, string> = {
   "rename-file": "校验并重命名文件",
   "move-files": "校验并移动媒体文件",
   "delete-files": "校验并移入回收站",
+  "review-delete": "校验并移入回收站",
   "rename-person": "校验并重命名人物目录",
   "merge-person": "合并人物目录文件",
   "delete-person": "删除人物目录并移入回收站",
@@ -1895,6 +2294,7 @@ const PERSON_FILE_DONE_SUMMARY: Record<PersonFileAction, string> = {
   "rename-file": "已完成文件重命名与账本同步",
   "move-files": "已完成文件移动与账本同步",
   "delete-files": "已移入回收站并同步账本",
+  "review-delete": "已移入回收站并同步账本",
   "rename-person": "已完成人物重命名与账本同步",
   "merge-person": "已完成人物合并与账本同步",
   "delete-person": "已移入回收站并清理记录",
@@ -2109,7 +2509,11 @@ function TaskIcon({ task }: { task: BackgroundTask }) {
       <Trash2 className="size-3.5" />
     );
   }
-  if (task.action === "delete-files" || task.action === "delete-person") {
+  if (
+    task.action === "delete-files" ||
+    task.action === "review-delete" ||
+    task.action === "delete-person"
+  ) {
     return <Trash2 className="size-3.5" />;
   }
   if (task.action === "move-files") return <FolderInput className="size-3.5" />;
@@ -2313,7 +2717,8 @@ export function BackgroundOperationsDock({
                   !!task.target) ||
                 (isComplete &&
                   task.kind === "person-file" &&
-                  !!(task.result?.person || task.person)) ||
+                  (task.action === "review-delete" ||
+                    !!(task.result?.person || task.person))) ||
                 (isComplete &&
                   task.kind === "auto-merge" &&
                   ((task.result?.fallback_queued ?? 0) > 0 ||
@@ -2444,6 +2849,23 @@ export function BackgroundOperationsDock({
 
                         {isComplete &&
                           task.kind === "person-file" &&
+                          task.action === "review-delete" && (
+                            <button
+                              type="button"
+                              className="bg-ops-group-btn"
+                              onClick={() => {
+                                router.push("/staging");
+                                setOpen(false);
+                              }}
+                            >
+                              查看回收站
+                              <ArrowUpRight className="size-3" />
+                            </button>
+                          )}
+
+                        {isComplete &&
+                          task.kind === "person-file" &&
+                          task.action !== "review-delete" &&
                           (task.result?.person || task.person) && (
                             <button
                               type="button"

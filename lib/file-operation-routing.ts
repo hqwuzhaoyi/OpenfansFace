@@ -13,7 +13,7 @@ export function validateFileOperationId(value:unknown):asserts value is string {
 
 /** The legacy writer is retired; configuration cannot revive it. */
 export function selectedPersonFileBackend(action:string,_env:NodeJS.ProcessEnv=process.env):'rust' {
-  if(!['rename-file','move-files','delete-files','restore-files','delete-staged','clear-staging','rename-person','merge-person','delete-person'].includes(action))throw new FileOperationRoutingError('不支持的文件操作',400)
+  if(!['rename-file','move-files','delete-files','review-delete','restore-files','delete-staged','clear-staging','rename-person','merge-person','delete-person'].includes(action))throw new FileOperationRoutingError('不支持的文件操作',400)
   return 'rust'
 }
 function ownerPath(base:string,id:string){validateFileOperationId(id);return path.join(base,'file-operation-routing',id+'.json')}

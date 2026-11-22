@@ -289,6 +289,49 @@ fn finish(engine: &mut Engine, parent: &Plan, error: Option<&str>) -> Result<Val
         Ok(None) => (),
     }
     engine.store.complete(parent, &value)?;
+    let (batch_action, batch_vids, batch_people) = crate::locks::entities_from_plan(parent);
+    if value["recovery_needed"] == true {
+        let mut marked_child = false;
+        if let Ok(child_plans) = children(parent) {
+            for child in child_plans {
+                if let Ok(Some(rec)) = engine.store.get(&child.id)
+                    && matches!(
+                        rec.status.as_str(),
+                        "accepted" | "running" | "recovery_needed" | "rolling_back"
+                    )
+                {
+                    let (child_action, child_vids, child_people) =
+                        crate::locks::entities_from_plan(&rec.plan);
+                    engine.locks.mark_recovery_needed(
+                        &child.id,
+                        &child_action,
+                        child_vids,
+                        child_people,
+                    );
+                    marked_child = true;
+                }
+            }
+        }
+        if marked_child {
+            engine.locks.release_op(&parent.id);
+        } else {
+            engine.locks.mark_recovery_needed(
+                &parent.id,
+                &batch_action,
+                batch_vids,
+                batch_people,
+            );
+        }
+    } else {
+        let outcome = if value["ok"] == true {
+            "complete"
+        } else {
+            "failed"
+        };
+        engine
+            .locks
+            .settle(&parent.id, outcome, batch_vids, batch_people);
+    }
     Ok(value)
 }
 fn apply(engine: &mut Engine, body: Value) -> Result<Value> {
@@ -328,9 +371,19 @@ fn apply(engine: &mut Engine, body: Value) -> Result<Value> {
     engine
         .store
         .remember_gate(&plans[0].id, &gate.evidence()?)?;
+    let (batch_action, batch_vids, batch_people) = crate::locks::entities_from_plan(&parent);
+    engine.locks.mark_running(
+        &parent.id,
+        &batch_action,
+        batch_vids.clone(),
+        batch_people.clone(),
+    );
     let checked = plans.iter().try_for_each(|p| verify_original(engine, p));
     if let Err(error) = checked {
         gate.release()?;
+        engine
+            .locks
+            .settle(&parent.id, "failed", batch_vids, batch_people);
         return Err(error);
     }
     engine.store.step(
@@ -381,7 +434,7 @@ fn apply(engine: &mut Engine, body: Value) -> Result<Value> {
             }
         };
         crate::fault::checkpoint(&engine.config, &format!("batch_child_prepared:{index}"))?;
-        let outcome = engine.apply_under_gate(child.clone(), child.version, gate);
+        let outcome = engine.apply_child_under_gate(child.clone(), child.version, gate);
         // A child commit may be durable even if the parent did not receive it.
         crate::fault::checkpoint(&engine.config, &format!("batch_child_returned:{index}"))?;
         if let Err(e) = outcome {

@@ -1084,6 +1084,7 @@ fn dispatch(
                 body,
             },
             reply,
+            lock: None,
         })
         .map_err(|_| Error::new(503, "unavailable", "执行器不可用"))?;
     wait.blocking_recv()
