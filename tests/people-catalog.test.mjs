@@ -16,3 +16,8 @@ test('reusing a person preserves creation time and refreshes recent usage',()=>{
  const b=savePerson(a,'嗨酱','2026-11-04T07:00:00Z')
  assert.equal(b.length,1);assert.equal(b[0].created_at,a[0].created_at);assert.equal(b[0].rep_thumb,'face.jpg')
 })
+test('mergePeople preserves and deduplicates aliases from report identities',()=>{
+ const merged=mergePeople([{name:'hime_tsu',aliases:['Hime','onlyhimefans','Hime','hime_tsu']}],[],[{name:'hime_tsu',recent_at:'2026-11-23T15:51:58Z'}])
+ assert.equal(merged.length,1)
+ assert.deepEqual(merged[0].aliases,['Hime','onlyhimefans'])
+})

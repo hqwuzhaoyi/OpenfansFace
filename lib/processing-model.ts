@@ -3,6 +3,9 @@ export interface IdentityCandidate {
   name: string; sources: string[]; score: number | null
   evidence: { name: string; source: string; confirmed?: boolean; score?: number; support?: number; detail: string; thumb?: string; timestamp?: number; key?: string }[]
 }
+export interface FaceMatchClue {
+  name: string; source?: string; score?: number; support?: number; detail?: string; thumb?: string; timestamp?: number
+}
 export interface ProcessingTask {
   review_token?: string; review_blocked?: string
   vid: string; path: string; name: string; size: number; mtime_ns: string; duration?: number
@@ -13,8 +16,9 @@ export interface ProcessingTask {
     watermark?: import('./watermark-model').WatermarkRecord
     folder?: { name: string; source: string; detail: string }[]
     candidates?: IdentityCandidate[]; kind?: 'none' | 'conflict' | 'suggested'; suggested?: string | null
+    text_candidates?: { name: string; source: string; confirmed?: boolean; key?: string; detail?: string }[]
     face_skipped?: boolean; text_complete?: boolean; face_complete?: boolean; ready?: boolean
-    face?: { matches: unknown[]; face_count: number; thumbs: string[]; cache_reused: boolean; reference_people: number; sampled_frames: number | null; unknown_group?: string | null }
+    face?: { matches: FaceMatchClue[]; face_count: number; thumbs: string[]; cache_reused: boolean; reference_people: number; sampled_frames: number | null; unknown_group?: string | null }
   }
 }
 export const stageLabel: Record<ProcessingStage, string> = { queued: '排队中', text: '文字提取中', face_queued: '等待人脸分析', face: '人脸分析中', retry: '等待重试', review: '待人工确认', error: '异常', excluded: '已移出' }

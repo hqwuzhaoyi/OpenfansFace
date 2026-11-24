@@ -185,6 +185,25 @@ pub fn candidates_from_text(
     aliases: &Value,
 ) -> Vec<Value> {
     let mut result = folder.to_vec();
+    let telegram_tokens: BTreeSet<String> = watermark["candidates"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|mark| {
+            mark["platform"].as_str() == Some("Telegram")
+                && mark["key"]
+                    .as_str()
+                    .and_then(|k| mappings[k]["kind"].as_str())
+                    != Some("person")
+        })
+        .filter_map(|mark| {
+            mark["token"]
+                .as_str()
+                .or_else(|| mark["text"].as_str())
+                .map(|s| s.trim().trim_start_matches('@').trim().to_lowercase())
+                .filter(|s| !s.is_empty())
+        })
+        .collect();
     for mark in watermark["candidates"].as_array().into_iter().flatten() {
         let Some(key) = mark["key"].as_str() else {
             continue;
@@ -212,6 +231,10 @@ pub fn candidates_from_text(
                 .unwrap_or("")
                 .trim_start_matches('@')
                 .trim();
+            let platform = mark["platform"].as_str().unwrap_or("unknown");
+            if platform == "unknown" && telegram_tokens.contains(&token.to_lowercase()) {
+                continue;
+            }
             if !token.is_empty()
                 && token != "."
                 && token != ".."
@@ -313,7 +336,7 @@ pub fn resolve_candidates(candidates: &[Value]) -> Value {
         if stem_len < 3 {
             continue;
         }
-        let best_target = (0..grouped.len())
+        let mut best_target = (0..grouped.len())
             .filter(|&j| {
                 j != i
                     && grouped[j].sources.iter().any(|s| s == "watermark")
@@ -323,6 +346,24 @@ pub fn resolve_candidates(candidates: &[Value]) -> Value {
                     }
             })
             .max_by_key(|&j| (grouped[j].name.chars().count(), j));
+        if best_target.is_none() && stem_len >= 4 {
+            let mut cross_matches = (0..grouped.len()).filter(|&j| {
+                j != i
+                    && grouped[j]
+                        .sources
+                        .iter()
+                        .any(|s| s == "face" || s == "folder")
+                    && {
+                        let target_lower = grouped[j].name.to_lowercase();
+                        target_lower.chars().count() > stem_len && target_lower.starts_with(&stem)
+                    }
+            });
+            if let Some(first) = cross_matches.next()
+                && cross_matches.next().is_none()
+            {
+                best_target = Some(first);
+            }
+        }
         merge_into[i] = best_target;
     }
     if merge_into.iter().any(Option::is_some) {
@@ -415,12 +456,23 @@ pub fn re_resolve_task_data(data: &mut Value) {
     if candidates.is_empty() || !candidates.iter().all(|c| c["evidence"].is_array()) {
         return;
     }
-    let flat: Vec<Value> = candidates
-        .iter()
-        .filter_map(|c| c["evidence"].as_array())
-        .flatten()
-        .cloned()
-        .collect();
+    let mut raw_flat: Vec<Value> = Vec::new();
+    if let Some(text_candidates) = data["text_candidates"].as_array() {
+        raw_flat.extend(text_candidates.iter().cloned());
+    }
+    if let Some(face_matches) = data["face"]["matches"].as_array() {
+        raw_flat.extend(face_matches.iter().cloned());
+    }
+    let flat = if !raw_flat.is_empty() {
+        raw_flat
+    } else {
+        candidates
+            .iter()
+            .filter_map(|c| c["evidence"].as_array())
+            .flatten()
+            .cloned()
+            .collect()
+    };
     if flat.is_empty() {
         return;
     }
@@ -1602,6 +1654,60 @@ mod tests {
     }
 
     #[test]
+    fn re_resolve_uses_text_candidates_and_cross_source_prefix_merge() {
+        // When an alias rewrite changes "Hime" -> "hime_tsu" in text_candidates,
+        // re_resolve_task_data must recover it even if old candidates merged evidence to "Hime_".
+        let mut data = json!({
+            "kind": "suggested",
+            "suggested": "Hime_",
+            "candidates": [{
+                "name": "Hime_",
+                "sources": ["watermark"],
+                "score": null,
+                "evidence": [
+                    {"name": "Hime_", "source": "watermark", "confirmed": false, "key": "k1", "detail": "fansly.com/Hime_"},
+                    {"name": "Hime_", "source": "watermark", "confirmed": false, "key": "k2", "detail": "fansly.com/Hime"}
+                ]
+            }],
+            "text_candidates": [
+                {"name": "hime_tsu", "source": "watermark", "confirmed": false, "key": "k2", "detail": "fansly.com/Hime"},
+                {"name": "Hime_", "source": "watermark", "confirmed": false, "key": "k1", "detail": "fansly.com/Hime_"}
+            ],
+            "face": {"matches": []}
+        });
+        re_resolve_task_data(&mut data);
+        assert_eq!(data["kind"], "suggested");
+        assert_eq!(data["suggested"], "hime_tsu");
+        let cands = data["candidates"].as_array().unwrap();
+        assert_eq!(cands.len(), 1);
+        assert_eq!(cands[0]["name"], "hime_tsu");
+        assert_eq!(cands[0]["evidence"].as_array().unwrap().len(), 2);
+
+        // Unique cross-source prefix merge: cocop -> cocopie0218 (folder + face), preserving truthful sources.
+        let cross = resolve_candidates(&[
+            json!({"name": "cocop", "source": "watermark", "confirmed": false, "key": "k3", "detail": "onlyfans@cocop"}),
+            json!({"name": "cocopie0218", "source": "folder", "detail": "文件名命中"}),
+            json!({"name": "cocopie0218", "source": "face", "score": 0.79}),
+        ]);
+        assert_eq!(cross["kind"], "suggested");
+        assert_eq!(cross["suggested"], "cocopie0218");
+        let cross_cands = cross["candidates"].as_array().unwrap();
+        assert_eq!(cross_cands.len(), 1);
+        assert_eq!(cross_cands[0]["sources"], json!(["folder", "face"]));
+        assert_eq!(cross_cands[0]["evidence"].as_array().unwrap().len(), 3);
+
+        // Ambiguous prefix across multiple face/folder targets must not blindly merge.
+        let ambiguous = resolve_candidates(&[
+            json!({"name": "luna", "source": "watermark", "confirmed": false, "key": "k4", "detail": "OnlyFans.com/luna"}),
+            json!({"name": "luna_bunny", "source": "face", "score": 0.7}),
+            json!({"name": "LunaAoki", "source": "folder", "detail": "文件名命中"}),
+        ]);
+        assert_eq!(ambiguous["kind"], "suggested");
+        assert_eq!(ambiguous["suggested"], "luna");
+        assert_eq!(ambiguous["candidates"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
     fn assigned_reference_inputs_single_pass_preserves_vid_and_id_order() {
         let root = fs::canonicalize("/tmp")
             .unwrap()
@@ -1738,5 +1844,28 @@ mod tests {
         assert_eq!(err.status, 409);
         drop(conn);
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn suppresses_telegram_twin_handles_and_allows_text_watermark_rules() {
+        let wm = json!({
+            "candidates": [
+                {"key": "k-tg", "kind": "account", "platform": "Telegram", "token": "ZYFLS66", "text": "TG@ZYFLS66"},
+                {"key": "k-bare", "kind": "account", "platform": "unknown", "token": "@ZYFLS66", "text": "@ZYFLS66"},
+                {"key": "k-of", "kind": "account", "platform": "OnlyFans", "token": "real_actor", "text": "OnlyFans.com/real_actor"},
+                {"key": "k-dom", "kind": "text", "platform": "unknown", "token": "xiaogoupro.com", "text": "xiaogoupro.com"}
+            ]
+        });
+        let cands = candidates_from_text(&wm, &json!({}), &[], &json!({}));
+        let names: Vec<_> = cands.iter().filter_map(|c| c["name"].as_str()).collect();
+        assert_eq!(names, vec!["real_actor"]);
+
+        // Once explicitly mapped in mappings.json, even text watermarks promote cleanly to confirmed person candidates.
+        let mappings = json!({
+            "k-dom": {"key": "k-dom", "kind": "person", "creator": "xiaogoupro", "text": "xiaogoupro.com", "token": "xiaogoupro.com", "platform": "unknown"}
+        });
+        let mapped = candidates_from_text(&wm, &mappings, &[], &json!({}));
+        let mapped_names: Vec<_> = mapped.iter().filter_map(|c| c["name"].as_str()).collect();
+        assert_eq!(mapped_names, vec!["real_actor", "xiaogoupro"]);
     }
 }

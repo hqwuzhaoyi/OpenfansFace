@@ -585,11 +585,11 @@ pub fn prepare(
                         .and_then(|rows| {
                             rows.iter().find(|r| {
                                 r["key"] == key
-                                    && r["kind"] == "account"
+                                    && matches!(r["kind"].as_str(), Some("account" | "text"))
                                     && r["platform"] != "Telegram"
                             })
                         })
-                        .ok_or_else(|| Error::conflict("选中视频没有共同的作者账号证据"))?;
+                        .ok_or_else(|| Error::conflict("选中视频没有共同的可保存水印证据"))?;
                     rule = Some(candidate.clone());
                 }
                 // Confirmation reads readiness/evidence but does not own analysis progress.
@@ -851,8 +851,8 @@ fn prepare_rule(config: &Config, body: &Value) -> Result<Prepared> {
     let key = mark["key"]
         .as_str()
         .ok_or_else(|| Error::conflict("账号规则编号缺失"))?;
-    if mark["kind"] != "account" || mark["platform"] == "Telegram" {
-        return Err(Error::conflict("所选文字不是作者账号证据"));
+    if !matches!(mark["kind"].as_str(), Some("account" | "text")) || mark["platform"] == "Telegram" {
+        return Err(Error::conflict("所选文字不能作为人物水印规则"));
     }
     let at = body["at"]
         .as_str()

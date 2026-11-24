@@ -379,6 +379,8 @@ fn candidate_names(data: &Value) -> BTreeSet<String> {
         .into_iter()
         .flatten()
         .chain(data["folder"].as_array().into_iter().flatten())
+        .chain(data["text_candidates"].as_array().into_iter().flatten())
+        .chain(data["face"]["matches"].as_array().into_iter().flatten())
     {
         if let Some(name) = candidate["name"].as_str().filter(|name| !name.is_empty()) {
             names.insert(name.to_owned());
@@ -392,10 +394,12 @@ fn candidate_names(data: &Value) -> BTreeSet<String> {
 #[derive(Default)]
 struct LightFace {
     unknown_group: Option<String>,
+    matches: Value,
 }
 
 enum FaceField {
     UnknownGroup,
+    Matches,
     Ignore,
 }
 
@@ -408,10 +412,10 @@ impl<'de> Deserialize<'de> for FaceField {
                 f.write_str("face object key")
             }
             fn visit_str<E: de::Error>(self, v: &str) -> std::result::Result<FaceField, E> {
-                Ok(if v == "unknown_group" {
-                    FaceField::UnknownGroup
-                } else {
-                    FaceField::Ignore
+                Ok(match v {
+                    "unknown_group" => FaceField::UnknownGroup,
+                    "matches" => FaceField::Matches,
+                    _ => FaceField::Ignore,
                 })
             }
         }
@@ -460,6 +464,7 @@ impl<'de> Deserialize<'de> for LightFace {
                 mut map: A,
             ) -> std::result::Result<LightFace, A::Error> {
                 let mut unknown_group = None;
+                let mut matches = Value::Null;
                 while let Some(key) = map.next_key::<FaceField>()? {
                     match key {
                         FaceField::UnknownGroup => {
@@ -467,12 +472,18 @@ impl<'de> Deserialize<'de> for LightFace {
                                 unknown_group = Some(s);
                             }
                         }
+                        FaceField::Matches => {
+                            matches = map.next_value::<Value>()?;
+                        }
                         FaceField::Ignore => {
                             let _: de::IgnoredAny = map.next_value()?;
                         }
                     }
                 }
-                Ok(LightFace { unknown_group })
+                Ok(LightFace {
+                    unknown_group,
+                    matches,
+                })
             }
         }
         deserializer.deserialize_any(FaceVisitor)
@@ -489,6 +500,8 @@ struct LightTaskData {
     suggested: Value,
     #[serde(default)]
     candidates: Value,
+    #[serde(default)]
+    text_candidates: Value,
     #[serde(default)]
     face: LightFace,
 }
@@ -623,9 +636,17 @@ fn load_lightweight_tasks(
             "kind": light.kind,
             "suggested": light.suggested,
             "candidates": light.candidates,
+            "text_candidates": light.text_candidates,
+            "face": {
+                "matches": light.face.matches,
+            },
         });
         canonical_fields(&mut light_data, "", aliases)?;
         crate::processing_result::re_resolve_task_data(&mut light_data);
+        if let Some(obj) = light_data.as_object_mut() {
+            obj.remove("text_candidates");
+            obj.remove("face");
+        }
         let mut hasher = Sha256::new();
         hasher.update(raw_data);
         hasher.update([0u8]);

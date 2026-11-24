@@ -1,4 +1,4 @@
-import { peopleCatalog } from '@/lib/people-catalog'
+import { peopleCatalog, pickerPeopleCatalog } from '@/lib/people-catalog'
 import { reviewScope } from "@/lib/review-scope"
 import { resolvedVids } from "@/lib/review-store"
 import { NextRequest, NextResponse } from "next/server"
@@ -6,7 +6,7 @@ import { loadReport, integratedStatsAsync, peachPersons } from "@/lib/integratio
 import { cachedRedisJson } from "@/lib/redis"
 
 export async function GET(req:NextRequest) {
-  if(req.nextUrl.searchParams.get("picker")==="1")return NextResponse.json({persons:peopleCatalog()},{headers:{'Cache-Control':'no-store'}})
+  if(req.nextUrl.searchParams.get("picker")==="1")return NextResponse.json({persons:await pickerPeopleCatalog()},{headers:{'Cache-Control':'no-store'}})
   try {
     const payload = await cachedRedisJson('persons:full', 180, async () => {
       const r = loadReport(), scope=reviewScope(), handled=resolvedVids()

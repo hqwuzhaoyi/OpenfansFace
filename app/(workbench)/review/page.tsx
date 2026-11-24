@@ -8,20 +8,16 @@ import { workspaceToast as toast } from '@/components/workbench/feedback'
 import { api } from '@/lib/face-api'
 import type { ProcessingTask } from '@/lib/processing-model'
 import { reviewSelectionKey, toggleReviewSelection, removeReviewSelection, type ReviewSelections } from '@/lib/review-selection'
-import { PersonPicker, type PersonChoice, type PersonNameHint } from '@/components/review/person-picker'
-import { VideoCover } from '@/components/review/video-cover'
-import { Card } from '@/components/beui/motion/card'
+import { ActorInspector, type ActorInspectorHandle } from '@/components/review/actor-inspector'
+import { buildPickerRecommendations, isRememberableWatermark, pickRuleCandidates, type PersonChoice } from '@/lib/person-picker-model'
 import { AnimatedBadge } from '@/components/beui/motion/animated-badge'
-import { Collapsible, CollapsibleContent } from '@/components/beui/motion/collapsible'
-import { AvatarGroup } from '@/components/beui/motion/avatar-group'
 import { DigitSwap } from '@/components/beui/motion/digit-swap'
 import { reviewListSummary } from '@/lib/review-list-summary'
 import { QueueReceipt } from '@/components/review/workflow'
 import { ResponsiveDialogContent } from '@/components/review/responsive-dialog'
 import { Dialog, DialogTitle, DialogDescription } from '@/components/ui/dialog'
 import { Button as NavigationButton } from '@/components/ui/button'
-import { WorkspaceButton as Button, WorkspaceSelect, WorkspaceField, WorkspaceCard, WorkspacePath, WorkspaceMedia, getMediaPosition, rememberMediaPosition } from '@/components/workbench/inner'
-import { EvidencePanel } from '@/components/review/evidence-panel'
+import { WorkspaceButton as Button, WorkspaceSelect, WorkspaceField, WorkspaceMedia, WorkspacePath, getMediaPosition, rememberMediaPosition } from '@/components/workbench/inner'
 import { ReferencePanel, usePersonReferences } from '@/components/review/reference-panel'
 import { useWorkspaceQuery, useWorkspaceScroll, readWorkbenchCache, readPersistedWorkbenchCache, writeWorkbenchCache, deleteWorkbenchCache } from '@/components/workbench/state'
 import { applyPendingReviewMutations, hasProtectedReviewSelections, pruneSettledReviewMutations, resolveEmptyReviewPageTarget, reviewTaskBucket, shouldAutoRecoverExpiredReviewSession, shouldDiscardReviewRefreshResponse, type PendingReviewMutation } from '@/lib/review-continuity-model'
@@ -89,15 +85,17 @@ export default function Review() {
     })
   },[])
   const [instantEntry,setInstantEntry]=useState(false)
-  const [previewOpen,setPreviewOpen]=useState(false),[detailMode,setDetailMode]=useState<'video'|'selection'>('video')
+  const [previewOpen,setPreviewOpen]=useState(false)
   const [drafts,setDrafts]=useState<Record<string,{creator?:string;watermarkKey:string}>>({}),[notes,setNotes]=useState<Record<string,string>>({}),[submitError,setSubmitError]=useState('')
   const [pickerSearch,setPickerSearch]=useState<Record<string,string>>({})
   const [selectionPreviewVid,setSelectionPreviewVid]=useState<string|null>(null)
-  const [reference,setReference]=useState<{name:string;returnTo:'video'|'selection';scroll:number}|null>(null)
-  const [people,setPeople]=useState<PersonChoice[]>(()=>readWorkbenchCache<PersonChoice[]>('review:people',REVIEW_CACHE_TTL_MS)??[]),[peopleError,setPeopleError]=useState(''),[receipt,setReceipt]=useState<{vids:string[];creator:string;session:string}|null>(null)
+  const [ruleCandidateIdx,setRuleCandidateIdx]=useState(0)
+  const [reference,setReference]=useState<{name:string;scroll:number}|null>(null)
+  const [people,setPeople]=useState<PersonChoice[]>(()=>readWorkbenchCache<PersonChoice[]>('review:people',REVIEW_CACHE_TTL_MS)??[]),[peopleLoading,setPeopleLoading]=useState(()=>(readWorkbenchCache<PersonChoice[]>('review:people',REVIEW_CACHE_TTL_MS)??[]).length===0),[peopleError,setPeopleError]=useState(''),[receipt,setReceipt]=useState<{vids:string[];creator:string;session:string}|null>(null)
   const pendingMutations=useRef(new Map<string,string>())
   const mutate=async<T=any>(path:string,body:Record<string,unknown>,method='POST',explicitId?:string):Promise<T>=>{const key=JSON.stringify([path,method,body]),id=explicitId||pendingMutations.current.get(key)||uuid();pendingMutations.current.set(key,id);localReviewOpIdsRef.current.add(id);if(localReviewOpIdsRef.current.size>256){const oldest=localReviewOpIdsRef.current.values().next().value;if(oldest!==undefined)localReviewOpIdsRef.current.delete(oldest)};try{const result=await api<T>(path,{method,body:JSON.stringify({...body,operation_id:id})});pendingMutations.current.delete(key);return result}catch(error:any){if(!error.resultUnknown)pendingMutations.current.delete(key);else error.message+=`（操作 ${id}，重试将查询同一回执）`;throw error}}
   const refreshFocus=useRef<HTMLElement|null>(null)
+  const actorInspectorRef=useRef<ActorInspectorHandle>(null)
   const returnFocus=useRef<HTMLElement|null>(null),session=useRef<string|undefined>(undefined),pendingSessionResetRef=useRef(false),noteBaseline=useRef<Record<string,string>>({}),notesRef=useRef(notes),polling=useRef(false),scrollAnchor=useRef<{vid:string;offset:number}[]|null>(null)
   notesRef.current=notes
   const [updates,setUpdates]=useState<{has_updates:boolean;refreshing:number;blocked:number;waiting?:number}|null>(null),[refreshConfirm,setRefreshConfirm]=useState(false),[sessionExpired,setSessionExpired]=useState(false)
@@ -127,7 +125,7 @@ export default function Review() {
   hasManualSelectionsRef.current=hasManualSelections
   const hasDraftsRef=useRef(hasDrafts)
   hasDraftsRef.current=hasDrafts
-  const protectedWork=busy||pendingVids.size>0||loading||hasManualSelections||hasDrafts||previewOpen||lightbox.open||autoMergeOpen||Boolean(deleteDialog?.open)||!!reference||(reviewDesktop&&stageOpen&&stageTab==='reference')||refreshConfirm||detailMode==='selection'
+  const protectedWork=busy||pendingVids.size>0||loading||hasManualSelections||hasDrafts||previewOpen||lightbox.open||autoMergeOpen||Boolean(deleteDialog?.open)||!!reference||(reviewDesktop&&stageOpen&&stageTab==='reference')||refreshConfirm
   const protectedWorkRef=useRef(protectedWork)
   protectedWorkRef.current=protectedWork
   const {version:activityVersion,canApply:canAutoApply,markAutoRefreshed}=useReviewActivity(protectedWork)
@@ -217,7 +215,7 @@ export default function Review() {
       const projectedNext=applyPendingReviewMutations(next,startedAtSeq,remainingPending,view)
       setUpdates(previous=>shouldCreateFresh?null:({has_updates:projectedNext.has_updates??previous?.has_updates??false,refreshing:previous?.refreshing||0,blocked:previous?.blocked||0,waiting:projectedNext.waiting}));setSelections(current=>Object.fromEntries(Object.entries(current).map(([key,tasks])=>[key,tasks.map(t=>projectedNext.rows.find(r=>r.vid===t.vid)||t)])));setInspected(current=>Object.fromEntries(Object.entries(current).map(([key,t])=>[key,projectedNext.rows.find(r=>r.vid===t.vid)||t])));setError('');setSessionExpired(false)
       for(const row of projectedNext.rows)if(notesRef.current[row.vid]===undefined)noteBaseline.current[row.vid]=row.note
-      if(options.refresh){initializedScopesRef.current.clear();autoSelectedScopesRef.current=new Set();setAutoSelectedScopes(new Set());setSelections({});setDrafts({});setNotes({});setPickerSearch({});noteBaseline.current={};setInspected({});setReference(null);setDetailMode('video');setPreviewOpen(false);setSubmitError('');setUpdates(null);void loadAutoMergePreview()}
+      if(options.refresh){initializedScopesRef.current.clear();autoSelectedScopesRef.current=new Set();setAutoSelectedScopes(new Set());setSelections({});setDrafts({});setNotes({});setPickerSearch({});noteBaseline.current={};setInspected({});setReference(null);setPreviewOpen(false);setSubmitError('');setUpdates(null);void loadAutoMergePreview()}
       const visibleNextRows=projectedNext.rows.filter(r=>!pendingVidsRef.current.has(r.vid))
       const currentGroupKey=projectedNext.group?.key||group
       if(!options.silent&&currentGroupKey&&(!projectedNext.group||(!search&&!folder&&(projectedNext.remaining??visibleNextRows.length)===0))){
@@ -256,7 +254,7 @@ export default function Review() {
     const area=listScroll.ref.current,top=area.getBoundingClientRect().top,anchors=scrollAnchor.current;scrollAnchor.current=null
     for(const anchor of anchors){const row=[...area.querySelectorAll<HTMLElement>('[data-vid]')].find(e=>e.dataset.vid===anchor.vid);if(row){area.scrollTop+=row.getBoundingClientRect().top-top-anchor.offset;break}}
   },[data,loading,listScroll.ref])
-  const loadPeople=useCallback(async()=>{const cachedPeople=readPersistedWorkbenchCache<PersonChoice[]>('review:people',REVIEW_CACHE_TTL_MS);if(cachedPeople?.length)setPeople(prev=>prev.length?prev:cachedPeople);try{const list=(await api<{persons:PersonChoice[]}>('/api/persons?picker=1')).persons;writeWorkbenchCache('review:people',list,{persist:true});setPeople(list);setPeopleError('')}catch(e:any){setPeopleError(e.message)}},[])
+  const loadPeople=useCallback(async()=>{const cachedPeople=readPersistedWorkbenchCache<PersonChoice[]>('review:people',REVIEW_CACHE_TTL_MS);if(cachedPeople?.length){setPeople(prev=>prev.length?prev:cachedPeople);setPeopleLoading(false)}try{const list=(await api<{persons:PersonChoice[]}>('/api/persons?picker=1')).persons;writeWorkbenchCache('review:people',list,{persist:true});setPeople(list);setPeopleError('')}catch(e:any){setPeopleError(e.message)}finally{setPeopleLoading(false)}},[])
   useEffect(()=>{
     if(!initialized)return
     if(syncedQueryKeyRef.current===queryFetchKey){syncedQueryKeyRef.current=null;return}
@@ -348,7 +346,7 @@ export default function Review() {
       const workareaW=el.clientWidth
       if(workareaW<=0)return
       const vw=window.innerWidth
-      const inspectorW=vw<1280?284:vw<=1360?288:308
+      const inspectorW=vw<1280?284:vw<=1360?296:336
       const groupsW=groupsCollapsed?56:(vw<1280?180:196)
       const minStageW=vw<1280?340:400
       const max=Math.max(200,Math.min(500,Math.floor(workareaW-groupsW-7-minStageW-inspectorW)))
@@ -375,50 +373,24 @@ export default function Review() {
   const evidenceTokens=(vids:string[])=>Object.fromEntries(vids.map(id=>[id,[...rows,...Object.values(selections).flat(),...Object.values(inspected)].find(t=>t.vid===id)?.review_token]));
   useEffect(()=>{if(!loading&&!refreshConfirm&&refreshFocus.current){const target=refreshFocus.current;requestAnimationFrame(()=>{if(!target.matches(':disabled')){target.focus({preventScroll:true});refreshFocus.current=null}})}},[loading,refreshConfirm])
   const requestRefresh=(event:{currentTarget:HTMLElement})=>{if(busy||loading)return;refreshFocus.current=event.currentTarget;if(hasManualSelections||hasDrafts)setRefreshConfirm(true);else void load({refresh:true})}
-  const commonMarks=actionTargets.length ? (actionTargets[0].data?.watermark?.candidates||[]).filter(c=>c.kind==='account'&&c.platform!=='Telegram'&&actionTargets.every(t=>(t.data?.watermark?.candidates||[]).some(other=>other.key===c.key))) : []
-  const selectionSuggestions:PersonChoice[]=actionTargets.length?(()=>{
-    const map=new Map<string,{count:number;sim?:number;thumb:string|null;sources:Set<string>}>()
-    for(const t of actionTargets){
-      const faceThumb=t.data?.face?.thumbs?.[0]?`/thumb?p=${encodeURIComponent(t.data.face.thumbs[0])}`:null
-      for(const c of t.data?.candidates||[]){
-        const prev=map.get(c.name)||{count:0,sim:undefined,thumb:faceThumb,sources:new Set<string>()}
-        prev.count++
-        if(!prev.thumb&&faceThumb)prev.thumb=faceThumb
-        for(const s of c.sources||[])prev.sources.add(s)
-        for(const e of c.evidence||[])if(e.source==='face'&&typeof e.score==='number')prev.sim=prev.sim===undefined?e.score:Math.max(prev.sim,e.score)
-        if(typeof (c as {score?:unknown}).score==='number'){const sc=(c as {score:number}).score;prev.sim=prev.sim===undefined?sc:Math.max(prev.sim,sc)}
-        map.set(c.name,prev)
-      }
-    }
-    return [...map.entries()].sort((a,b)=>Number(b[1].sources.has('watermark'))-Number(a[1].sources.has('watermark'))||b[1].count-a[1].count||(b[1].sim||0)-(a[1].sim||0)).map(([name,info])=>{
-      const existing=people.find(p=>p.name===name)
-      const parts=[`${info.count}/${actionTargets.length} 命中`]
-      if(info.sources.has('watermark'))parts.push('水印线索')
-      if(info.sim!==undefined)parts.push(`相似度 ${info.sim.toFixed(2)}`)
-      return {name,rep_thumb:existing?.rep_thumb||info.thumb||null,aliases:existing?.aliases,sim:info.sim,match_count:info.count,match_reason:parts.join(' · ')}
-    })
-  })():[]
-  const selectionSampleFaces=actionTargets.length?[...new Set(actionTargets.flatMap(t=>(t.data.face?.thumbs||[]).slice(0,2).map(p=>`/thumb?p=${encodeURIComponent(p)}`)))].slice(0,6):[]
-  const selectionNameHints:PersonNameHint[]=actionTargets.length?(()=>{
-    const map=new Map<string,string>()
-    for(const t of actionTargets){
-      for(const c of t.data.candidates||[])if(c.name.trim()&&!map.has(c.name.trim()))map.set(c.name.trim(),'候选线索')
-      for(const w of t.data.watermark?.candidates||[]){
-        if(w.platform==='Telegram')continue
-        const token=(w.token||w.text||'').replace(/^@+/,'').trim()
-        if(token&&token.length>=2&&token.length<=60&&!/[\\/]/.test(token)&&!map.has(token))map.set(token,w.platform?`${w.platform}水印`:'水印线索')
-      }
-      for(const f of t.data.folder||[])if(f.name.trim()&&!map.has(f.name.trim()))map.set(f.name.trim(),'目录线索')
-    }
-    return [...map.entries()].slice(0,6).map(([name,source])=>({name,source}))
-  })():[]
+  const firstTargetMarks=actionTargets[0]?.data?.watermark?.candidates||[]
+  const commonMarks=actionTargets.length ? firstTargetMarks.filter(c=>isRememberableWatermark(c,firstTargetMarks)&&actionTargets.every(t=>(t.data?.watermark?.candidates||[]).some(other=>other.key===c.key))) : []
+  const existingPeople=useMemo(()=>new Set(people.map(p=>p.name)),[people])
+  const suggestedGroupLabel=data?.group?.kind==='suggested'?data.group.label:null
+  const recommendationTargets=chosen.length>1?actionTargets:(focused?[focused]:actionTargets)
+  const selectionRecommendations=useMemo(()=>buildPickerRecommendations(recommendationTargets,people,suggestedGroupLabel),[recommendationTargets,people,suggestedGroupLabel])
+  const selectionSuggestions=selectionRecommendations.suggestions
+  const selectionSampleFaces=recommendationTargets.length?[...new Set(recommendationTargets.flatMap(t=>(t.data.face?.thumbs||[]).slice(0,2).map(p=>`/thumb?p=${encodeURIComponent(p)}`)))].slice(0,6):[]
+  const selectionNameHints=selectionRecommendations.nameHints
+  const focusedRecommendations=useMemo(()=>focused?buildPickerRecommendations([focused],people,suggestedGroupLabel):null,[focused,people,suggestedGroupLabel])
+  const focusedRelatedPeople=focusedRecommendations?.related||[]
   const selectionPreviewTask=selectionPreviewVid?actionTargets.find(t=>t.vid===selectionPreviewVid)||null:null
   const changeQuery=(value:string)=>{advanceSequenceRef.current++;if(!group&&data?.group)setGroup(data.group.key);updateFilters({q:value,page:'0',vid:''})}
   const chooseGroup=(key:string)=>{advanceSequenceRef.current++;const targetScope=reviewSelectionKey(key,view==='deferred');if(!(selections[targetScope]?.length)){initializedScopesRef.current.delete(`${targetScope}:0`);forceSelectAllScopeRef.current=targetScope}setGroup(key);setPage(0);setLinkFocus('');setPreviewOpen(false)}
   const toggle=(tasks:ProcessingTask[])=>{const currentIds=new Set((selectionsRef.current[scope]||[]).map(t=>t.vid));const allowed=tasks.filter(t=>!lockedVidsRef.current.has(t.vid)||currentIds.has(t.vid));if(!allowed.length)return;markScopeManual(scope);setSelections(current=>({...current,[scope]:toggleReviewSelection(current[scope]||[],allowed)}));setWatermarkKey('')}
   const clear=()=>{markScopeManual(scope);setSelections(current=>({...current,[scope]:[]}))}
-  const inspect=(task:ProcessingTask)=>{setReference(null);setSelectionPreviewVid(null);if(!reviewDesktop&&!previewOpen){returnFocus.current=document.activeElement as HTMLElement;setInstantEntry(!!document.activeElement?.matches(':focus-visible')||matchMedia('(prefers-reduced-motion: reduce)').matches)}setInspected(current=>({...current,[scope]:task}));if(data?.group?.kind!=='suggested'&&chosen.length<=1)setDrafts(current=>({...current,[scope]:{creator:preferredTaskCreator(task),watermarkKey:''}}));setDetailMode('video');setExplicitStageRefName(null);setStageTab('current');if(reviewDesktop)setStageOpen(true);else setPreviewOpen(true)}
-  const openSelection=()=>{if(!previewOpen){returnFocus.current=document.activeElement as HTMLElement;setInstantEntry(!!document.activeElement?.matches(':focus-visible')||matchMedia('(prefers-reduced-motion: reduce)').matches)}if(!chosen.length&&focused&&!lockedVidsRef.current.has(focused.vid)){markScopeManual(scope);setSelections(current=>({...current,[scope]:[focused]}))}if(!creator&&defaultCreator)setCreator(defaultCreator);setReference(null);setSubmitError('');setDetailMode('selection');if(!reviewDesktop)setPreviewOpen(true);else requestAnimationFrame(()=>selectionHeading.current?.focus())}
+  const inspect=(task:ProcessingTask)=>{setReference(null);setSelectionPreviewVid(null);if(!reviewDesktop&&!previewOpen){returnFocus.current=document.activeElement as HTMLElement;setInstantEntry(!!document.activeElement?.matches(':focus-visible')||matchMedia('(prefers-reduced-motion: reduce)').matches)}setInspected(current=>({...current,[scope]:task}));if(data?.group?.kind!=='suggested'&&chosen.length<=1)setDrafts(current=>({...current,[scope]:{creator:preferredTaskCreator(task),watermarkKey:''}}));setExplicitStageRefName(null);setStageTab('current');if(reviewDesktop)setStageOpen(true);else setPreviewOpen(true)}
+  const openSelection=()=>{if(!previewOpen){returnFocus.current=document.activeElement as HTMLElement;setInstantEntry(!!document.activeElement?.matches(':focus-visible')||matchMedia('(prefers-reduced-motion: reduce)').matches)}if(!chosen.length&&focused&&!lockedVidsRef.current.has(focused.vid)){markScopeManual(scope);setSelections(current=>({...current,[scope]:[focused]}))}if(!creator&&defaultCreator)setCreator(defaultCreator);setReference(null);setSubmitError('');if(!reviewDesktop){setPreviewOpen(true);requestAnimationFrame(()=>actorInspectorRef.current?.openSwitcher())}else{actorInspectorRef.current?.openSwitcher()}}
   const stepFocus=(delta:-1|1)=>{
     if(!rows.length)return
     const currentIdx=focused?rows.findIndex(t=>t.vid===focused.vid):-1
@@ -438,9 +410,10 @@ export default function Review() {
     const onKey=(e:KeyboardEvent)=>{
       if(e.defaultPrevented||e.metaKey||e.ctrlKey||e.altKey)return
       const target=e.target as HTMLElement|null
-      if(target&&(['INPUT','TEXTAREA','SELECT'].includes(target.tagName)||target.isContentEditable||target.closest('[role="dialog"],[role="alertdialog"]')))return
+      if(target&&(['INPUT','TEXTAREA','SELECT'].includes(target.tagName)||target.isContentEditable||target.closest('[role="dialog"],[role="alertdialog"],[data-combobox-content]')))return
       if(e.key==='['){e.preventDefault();stepFocusRef.current(-1)}
       else if(e.key===']'){e.preventDefault();stepFocusRef.current(1)}
+      else if((e.key==='p'||e.key==='P')&&!e.shiftKey){e.preventDefault();actorInspectorRef.current?.openSwitcher()}
     }
     window.addEventListener('keydown',onKey)
     return()=>window.removeEventListener('keydown',onKey)
@@ -578,7 +551,7 @@ export default function Review() {
   }
   const sourceOnly=async(key:string)=>{
     setBusy(true)
-    try{await api('/api/watermarks',{method:'PUT',body:JSON.stringify({key,kind:'source'})});clearReviewSessionCaches(false);setPreviewOpen(false);setSelections({});setDetailMode('video');await load({preservePosition:true});toast.success('已标为来源，相关人物建议将重新分析');return true}
+    try{await api('/api/watermarks',{method:'PUT',body:JSON.stringify({key,kind:'source'})});clearReviewSessionCaches(false);setPreviewOpen(false);setSelections({});await load({preservePosition:true});toast.success('已标为来源，相关人物建议将重新分析');return true}
     catch(e:any){setSubmitError(e.message);if(isSessionExpiredError(e?.message)){clearReviewSessionCaches(true);setSessionExpired(true)}toast.error(e.message);return false}finally{setBusy(false)}
   }
   const confirmTargets=async(targets:ProcessingTask[],targetCreator:string)=>{
@@ -673,16 +646,16 @@ export default function Review() {
       toast.error(e.message)
     }
   }
-  const openReference=(name:string)=>{
+  const openReference=(name:string,refIndex=0)=>{
     if(reviewDesktop){
       setReference(null)
       setExplicitStageRefName(name)
-      setStageRefIndex(0)
+      setStageRefIndex(refIndex)
       setStageOpen(true)
       setStageTab('reference')
       return
     }
-    setReference({name,returnTo:detailMode,scroll:document.querySelector('.ws-detail-content')?.scrollTop||0})
+    setReference({name,scroll:document.querySelector('.ws-detail-content')?.scrollTop||0})
     requestAnimationFrame(()=>selectionHeading.current?.focus())
   }
   const backReference=()=>{const previous=reference;setReference(null);if(previous)requestAnimationFrame(()=>{const area=document.querySelector('.ws-detail-content');if(area)area.scrollTop=previous.scroll;const trigger=[...document.querySelectorAll<HTMLButtonElement>('.ws-detail-content button')].find(b=>b.getAttribute('aria-label')===`看 ${previous.name} 的对照视频`);trigger?.focus({preventScroll:true})})}
@@ -703,7 +676,19 @@ export default function Review() {
     return()=>abort.abort()
   },[stageCurrentTask?.path,stageCurrentStamp,stageCurrentSampleTime,stageCurrentPosterKey])
   const stageCurrentPoster=stagePosterState?.key===stageCurrentPosterKey?stagePosterState.src:undefined
-  const stageRefName=explicitStageRefName||reference?.name||creator.trim()||defaultCreator||focused?.data.candidates?.[0]?.name||null
+  const stageRefName=useMemo(()=>{
+    if(explicitStageRefName)return explicitStageRefName
+    if(reference?.name)return reference.name
+    const trimmed=creator.trim()
+    if(trimmed&&(!existingPeople.size||existingPeople.has(trimmed)))return trimmed
+    const topExistingSuggestion=focusedRecommendations?.suggestions.find(s=>!s.is_new)?.name
+    if(topExistingSuggestion)return topExistingSuggestion
+    const existingCandidate=focused?.data.candidates?.find(c=>!existingPeople.size||existingPeople.has(c.name))?.name
+    if(existingCandidate)return existingCandidate
+    if(focusedRelatedPeople[0]?.name)return focusedRelatedPeople[0].name
+    if(defaultCreator&&(!existingPeople.size||existingPeople.has(defaultCreator)))return defaultCreator
+    return trimmed||defaultCreator||focused?.data.candidates?.[0]?.name||null
+  },[explicitStageRefName,reference?.name,creator,existingPeople,focusedRecommendations,focused,focusedRelatedPeople,defaultCreator])
   const {current:stageRefData,loading:stageRefLoading,retry:retryStageRef}=usePersonReferences(reviewDesktop||lightbox.open?stageRefName:null)
   const refVideos=stageRefData?.videos||[]
   const clampedRefIdx=refVideos.length?Math.min(stageRefIndex,refVideos.length-1):0
@@ -733,6 +718,13 @@ export default function Review() {
   const trimmedCreator=creator.trim()
   const creatorLock=trimmedCreator?lockedPeople.get(trimmedCreator):undefined
   const creatorDestructiveLock=creatorLock&&isDestructivePersonAction(creatorLock.action)?creatorLock:undefined
+  useEffect(()=>{setRuleCandidateIdx(0)},[scope,trimmedCreator])
+  const creatorPersonObj=useMemo(()=>trimmedCreator?(people.find(p=>p.name===trimmedCreator)||{name:trimmedCreator}):null,[trimmedCreator,people])
+  const ruleCandidates=useMemo(()=>pickRuleCandidates(commonMarks,creatorPersonObj,(focused||actionTargets[0])?.data?.watermark?.candidates||[],actionTargets),[commonMarks,creatorPersonObj,focused,actionTargets])
+  const armedRuleMark=watermarkKey?commonMarks.find(c=>c.key===watermarkKey)||null:null
+  const activeRuleIdx=ruleCandidates.length?Math.min(ruleCandidateIdx,ruleCandidates.length-1):0
+  const suggestedRuleMark=armedRuleMark||ruleCandidates[activeRuleIdx]||null
+  const displayRuleIdx=suggestedRuleMark?ruleCandidates.findIndex(c=>c.key===suggestedRuleMark.key):-1
   const chosenLocked=chosen.some(t=>lockedVids.has(t.vid))
   const unlockedRows=rows.filter(t=>!lockedVids.has(t.vid))
   const activeLocalAutoMerge=tasks.find(t=>t.kind==='auto-merge'&&(t.status==='running'||t.status==='queued'||t.status==='recovery_needed'))
@@ -742,55 +734,81 @@ export default function Review() {
   const autoMergeActiveLabel=activeLocalAutoMerge?.status==='recovery_needed'?'待恢复':activeLocalAutoMerge?.status==='queued'?'排队合入':activeLocalAutoMerge?'合入中':(activeServerAutoMerge?.label||(activeServerAutoMerge?.status==='recovery_needed'?'待恢复':'合入中'))
   const detail=<>
 
-    <div className="ws-detail-heading"><h2 ref={selectionHeading} tabIndex={-1}>{reference?`${reference.name} · 对照视频`:detailMode==='selection'?<>核对所选 · <DigitSwap value={actionTargets.length}/></>:'证据与归名'}</h2><div className="ws-actions">{detailMode==='video'&&!reference&&focused&&<Button className="ws-icon ws-danger-icon" variant="ghost" size="sm" aria-label="将当前视频移入回收站" title={focusedLock?`${focusedLock.label}，暂不可删除`:'删除当前视频（移入回收站）'} disabled={disabled||Boolean(focusedLock)||blockedIds.has(focused.vid)||pendingVids.has(focused.vid)} onClick={e=>openDeleteDialog('single',[focused],e.currentTarget)}><Trash2 size={14} aria-hidden="true"/></Button>}{reference?<Button variant="ghost" onClick={backReference}><ArrowLeft size={14} aria-hidden="true"/>返回{reference.returnTo==='selection'?'人物选择':'证据'}</Button>:detailMode==='selection'?<Button variant="ghost" size="sm" onClick={()=>setDetailMode('video')}><ArrowLeft size={14} aria-hidden="true"/>返回证据</Button>:<Button variant="ghost" size="sm" disabled={!actionTargets.length} onClick={openSelection}><ListChecks size={14} aria-hidden="true"/>改选人物 · <DigitSwap value={actionTargets.length}/></Button>}{reviewDesktop&&!stageOpen&&!reference&&focused&&rows.length>0&&<div className="ws-actions"><Button className="ws-icon" variant="ghost" size="sm" aria-label="上一条视频" title="上一条视频" disabled={focusedIndex<=0} onClick={()=>stepFocus(-1)}><ChevronLeft size={14} aria-hidden="true"/></Button><span className="ws-muted tabular-nums">{focusedIndex>=0?`${focusedIndex+1} / ${rows.length}`:'已查看'}</span><Button className="ws-icon" variant="ghost" size="sm" aria-label="下一条视频" title="下一条视频" disabled={focusedIndex<0||focusedIndex>=rows.length-1} onClick={()=>stepFocus(1)}><ChevronRight size={14} aria-hidden="true"/></Button></div>}</div></div>
+    <div className="ws-detail-heading">
+      <h2 ref={selectionHeading} tabIndex={-1}>{reference?`${reference.name} · 对照视频`:'归名与证据'}</h2>
+      <div className="ws-actions">
+        {!reference&&focused&&<Button className="ws-icon ws-danger-icon" variant="ghost" size="sm" aria-label="将当前视频移入回收站" title={focusedLock?`${focusedLock.label}，暂不可删除`:'删除当前视频（移入回收站）'} disabled={disabled||Boolean(focusedLock)||blockedIds.has(focused.vid)||pendingVids.has(focused.vid)} onClick={e=>openDeleteDialog('single',[focused],e.currentTarget)}><Trash2 size={14} aria-hidden="true"/></Button>}
+        {reference?<Button variant="ghost" size="sm" onClick={backReference}><ArrowLeft size={14} aria-hidden="true"/>返回证据</Button>:null}
+        {reviewDesktop&&!stageOpen&&!reference&&focused&&rows.length>0&&<div className="ws-actions"><Button className="ws-icon" variant="ghost" size="sm" aria-label="上一条视频" title="上一条视频" disabled={focusedIndex<=0} onClick={()=>stepFocus(-1)}><ChevronLeft size={14} aria-hidden="true"/></Button><span className="ws-muted tabular-nums">{focusedIndex>=0?`${focusedIndex+1} / ${rows.length}`:'已查看'}</span><Button className="ws-icon" variant="ghost" size="sm" aria-label="下一条视频" title="下一条视频" disabled={focusedIndex<0||focusedIndex>=rows.length-1} onClick={()=>stepFocus(1)}><ChevronRight size={14} aria-hidden="true"/></Button></div>}
+      </div>
+    </div>
     <div className="ws-detail-content" data-sheet-scroll>
-      {reference?<ReferencePanel name={reference.name}/>:detailMode==='video'?(focused?<EvidencePanel key={focused.vid} hideMedia={reviewDesktop&&stageOpen} activeReferenceName={reviewDesktop&&stageOpen?stageRefName:null} poster={stageCurrentTask?.vid===focused.vid?stageCurrentPoster:undefined} task={focused} note={notes[focused.vid]??focused.note} onNoteChange={note=>{if(noteBaseline.current[focused.vid]===undefined)noteBaseline.current[focused.vid]=focused.note;setNotes(current=>{const next={...current};if(note===focused.note)delete next[focused.vid];else next[focused.vid]=note;return next})}} onSaveNote={()=>action('note',[focused.vid],notes[focused.vid]??focused.note)} onSource={sourceOnly} busy={busy} locked={hasLockedTarget||Boolean(focusedLock)} lockedPeople={lockedPeople} creator={creator} onChoose={name=>{setCreator(name);if(!chosen.length&&!lockedVidsRef.current.has(focused.vid)){markScopeManual(scope);setSelections(current=>({...current,[scope]:[focused]}))}}} onConfirmCandidate={name=>{setCreator(name);void confirmTargets(chosen.length>0?chosen:[focused],name)}} onReference={openReference}/>:<p className="ws-empty">选择视频查看证据</p>):<div className="ws-decision">
-        <div>
-          <p className="mb-2 text-xs text-muted-foreground">{data?.group?.label||'当前确认组'} · <DigitSwap value={actionTargets.length}/> 个视频{hiddenCount>0?`，其中 ${hiddenCount} 个不在当前页`:''}</p>
-          {(!reviewDesktop||!stageOpen)&&<Collapsible open={Boolean(selectionPreviewTask)}>
-            <CollapsibleContent>
-              {selectionPreviewTask&&<Card size="compact" variant="muted" className="ws-confirm-preview" role="region" aria-label={`原位预览 ${selectionPreviewTask.name}`}>
-                <div className="ws-confirm-preview-head">
-                  <strong title={selectionPreviewTask.name}>{selectionPreviewTask.name}</strong>
-                  <div className="ws-confirm-preview-actions">
-                    <Button variant="ghost" size="sm" onClick={()=>inspect(selectionPreviewTask)}>完整证据</Button>
-                    <Button variant="ghost" size="icon" aria-label="收起原位预览" title="收起预览" onClick={()=>setSelectionPreviewVid(null)}><X size={14} aria-hidden="true"/></Button>
-                  </div>
-                </div>
-                <WorkspaceMedia key={selectionPreviewTask.vid} path={selectionPreviewTask.path} name={selectionPreviewTask.name} poster={stageCurrentTask?.vid===selectionPreviewTask.vid?stageCurrentPoster:undefined} compact autoPlay/>
-              </Card>}
-            </CollapsibleContent>
-          </Collapsible>}
-          <div className="ws-confirm-list" aria-label="本次完整归名范围">{actionTargets.map(t=>{
-            const summary=reviewListSummary(t),faceThumbs=t.data.face?.thumbs?.slice(0,3)||[],isPreviewing=selectionPreviewTask?.vid===t.vid,itemLock=lockedVids.get(t.vid)
-            return <div key={t.vid} className="ws-confirm-file" data-active={isPreviewing||undefined} data-locked={Boolean(itemLock)||undefined}>
-              <button type="button" className="ws-confirm-thumb" aria-label={`预览 ${t.name}`} title="在舞台预览此视频" onClick={()=>{setInspected(current=>({...current,[scope]:t}));if(reviewDesktop){setSelectionPreviewVid(t.vid);setStageTab('current');setStageOpen(true)}else{setSelectionPreviewVid(prev=>prev===t.vid?null:t.vid)}}}>
-                <VideoCover video={{path:t.path,thumb:faceThumbs[0]?`/thumb?p=${encodeURIComponent(faceThumbs[0])}`:null,size:t.size,mtime_ns:t.mtime_ns}} sampleTime={summary.sampleTime}/>
-                <span className="ws-confirm-thumb-play"><Play size={11} aria-hidden="true"/></span>
-              </button>
-              <div className="ws-confirm-body">
-                <div className="ws-confirm-top">
-                  <Button variant="ghost" className="ws-confirm-name" onClick={()=>{setInspected(current=>({...current,[scope]:t}));if(reviewDesktop){setSelectionPreviewVid(t.vid);setStageTab('current');setStageOpen(true)}else{setSelectionPreviewVid(prev=>prev===t.vid?null:t.vid)}}} aria-label={`核对所选 ${t.name}`}><Play size={12} aria-hidden="true"/><span>{t.name}</span></Button>
-                  {itemLock&&<AnimatedBadge size="sm" status={lockBadgeStatus(itemLock.status)} className="h-5 px-1.5 text-[10px]">{itemLock.label}</AnimatedBadge>}
-                  {faceThumbs.length>0&&<AvatarGroup size="sm" max={3} label="检出人脸" className="ws-confirm-faces" members={faceThumbs.map((path,idx)=>({id:`${t.vid}-${idx}`,name:`${t.name} 人脸 ${idx+1}`,src:`/thumb?p=${encodeURIComponent(path)}`}))}/>}
-                  {chosen.length>0&&<Button className="ws-icon" variant="ghost" size="sm" aria-label={`取消选择 ${t.name}`} title="取消选择" onClick={()=>toggle([t])}><X size={14} aria-hidden="true"/></Button>}
-                </div>
-                <WorkspacePath value={t.path} compact/>
-              </div>
-            </div>
-          })}</div>
-        </div>
-        <PersonPicker search={pickerSearch[scope]||''} onSearchChange={value=>setPickerSearch(current=>({...current,[scope]:value}))} onReference={openReference} compact people={people} suggestions={selectionSuggestions} sampleFaces={selectionSampleFaces} nameHints={selectionNameHints} value={creator} onChange={setCreator} disabled={false} error={peopleError} onRetry={loadPeople}/>
-        {commonMarks.length>0&&<WorkspaceField label="共同账号规则"><WorkspaceSelect label="保存共同账号规则" value={watermarkKey} disabled={false} onChange={setWatermarkKey} options={[{value:'',label:'仅归名，不保存账号规则'},...commonMarks.map(c=>({value:c.key,label:`${c.platform} · ${c.token}`}))]}/></WorkspaceField>}
-        <p className="text-xs text-muted-foreground">确认后自动选中下一条并在后台加入待归档，文件暂不移动。</p>
-      </div>}
+      {reference?<ReferencePanel name={reference.name}/>:actionTargets.length>0?<ActorInspector
+        ref={actorInspectorRef}
+        task={focused||actionTargets[0]}
+        hideMedia={reviewDesktop&&stageOpen}
+        poster={stageCurrentTask?.vid===(focused||actionTargets[0])?.vid?stageCurrentPoster:undefined}
+        note={focused?(notes[focused.vid]??focused.note):''}
+        onNoteChange={note=>{if(!focused)return;if(noteBaseline.current[focused.vid]===undefined)noteBaseline.current[focused.vid]=focused.note;setNotes(current=>{const next={...current};if(note===focused.note)delete next[focused.vid];else next[focused.vid]=note;return next})}}
+        onSaveNote={()=>{if(focused)void action('note',[focused.vid],notes[focused.vid]??focused.note)}}
+        onSource={sourceOnly}
+        busy={busy}
+        locked={hasLockedTarget||Boolean(focusedLock)}
+        lockedPeople={lockedPeople}
+        lockedVids={lockedVids}
+        people={people}
+        peopleLoading={peopleLoading}
+        peopleError={peopleError}
+        onRetryPeople={loadPeople}
+        existingPeople={existingPeople}
+        suggestions={selectionSuggestions}
+        sampleFaces={selectionSampleFaces}
+        nameHints={selectionNameHints}
+        creator={creator}
+        onChoose={name=>{
+          setCreator(name)
+          if(name&&focused&&!chosen.length&&!lockedVidsRef.current.has(focused.vid)){
+            markScopeManual(scope)
+            setSelections(current=>({...current,[scope]:[focused]}))
+          }
+          if(reviewDesktop&&stageTab==='reference'&&name&&(!existingPeople.size||existingPeople.has(name))){
+            setExplicitStageRefName(name)
+            setStageRefIndex(0)
+          }
+        }}
+        search={pickerSearch[scope]||''}
+        onSearchChange={value=>setPickerSearch(current=>({...current,[scope]:value}))}
+        actionTargets={actionTargets}
+        commonMarks={commonMarks}
+        watermarkKey={watermarkKey}
+        onWatermarkKeyChange={setWatermarkKey}
+        hiddenCount={hiddenCount}
+        groupLabel={data?.group?.label}
+        selectionPreviewVid={selectionPreviewVid}
+        onPreviewTarget={t=>{
+          setInspected(current=>({...current,[scope]:t}))
+          if(reviewDesktop){
+            setSelectionPreviewVid(t.vid)
+            setStageTab('current')
+            setStageOpen(true)
+          }
+        }}
+        onToggleTarget={t=>toggle([t])}
+        activeReferenceName={stageRefName}
+        stageTab={activeStageTab}
+        stageRefData={stageRefData}
+        stageRefLoading={stageRefLoading}
+        onRetryStageRef={retryStageRef}
+        onReference={openReference}
+      />:<p className="ws-empty">选择视频查看证据</p>}
       {targetLock&&<div role="status" className="ws-lock-notice"><AnimatedBadge size="sm" status={lockBadgeStatus(targetLock.status)}>{targetLock.label}</AnimatedBadge><span>当前视频正在处理，暂不可操作</span></div>}
       {creatorDestructiveLock&&<div role="status" className="ws-lock-notice"><AnimatedBadge size="sm" status={lockBadgeStatus(creatorDestructiveLock.status)}>{creatorDestructiveLock.label}</AnimatedBadge><span>「{trimmedCreator}」暂不可归名</span></div>}
       {actionTargets.some(t=>blockedIds.has(t.vid))&&<p role="alert" className="ws-error">部分已选项的文件或规则已变化，请更新列表后重新核对。</p>}
-      {focused?.review_blocked&&detailMode==='video'&&<p role="alert" className="ws-error">{focused.review_blocked}</p>}
+      {focused?.review_blocked&&!reference&&<p role="alert" className="ws-error">{focused.review_blocked}</p>}
       {submitError&&<p role="alert" className="ws-error">{submitError}</p>}
     </div>
-    <div className="ws-detail-actions">{reference?<><Button variant="outline" onClick={backReference}>返回{reference.returnTo==='selection'?'人物选择':'证据'}</Button><Button className="ws-action-primary" onClick={()=>{setCreator(reference.name);backReference()}}><span className="ws-btn-truncate">选择 {reference.name}</span></Button></>:detailMode==='selection'?<><Button variant="outline" disabled={!actionTargets.length||sessionExpired||hasLockedTarget} onClick={()=>void action(view==='deferred'?'restore':'defer',actionTargets.map(t=>t.vid))}>{view==='deferred'?'恢复':'暂缓'}</Button><Button className="ws-danger-btn" variant="outline" disabled={!actionTargets.length||disabled||hasLockedTarget||actionTargets.some(t=>blockedIds.has(t.vid)||pendingVids.has(t.vid))} aria-label={`将所选 ${actionTargets.length} 个视频移入回收站`} onClick={e=>openDeleteDialog('batch',actionTargets,e.currentTarget)}><Trash2 size={14} aria-hidden="true"/><span>移入回收站</span></Button><Button className="ws-action-primary" disabled={!actionTargets.length||!trimmedCreator||sessionExpired||hasLockedTarget||Boolean(creatorDestructiveLock)||actionTargets.some(t=>blockedIds.has(t.vid)||pendingVids.has(t.vid))} title={creatorDestructiveLock?`${trimmedCreator} ${creatorDestructiveLock.label}`:undefined} onClick={()=>void confirm()}><span className="ws-btn-truncate">归给 {trimmedCreator||'所选人物'}</span><span className="ws-btn-badge">· <DigitSwap value={actionTargets.length}/></span></Button></>:<><Button variant="outline" disabled={!focused||(Boolean(focusedLock)&&!selected.has(focused.vid))||(!!focused?.review_blocked&&!selected.has(focused.vid))} onClick={()=>focused&&toggle([focused])}>{focused&&selected.has(focused.vid)?'取消选择':'选择此项'}</Button><Button variant="outline" disabled={!actionTargets.length||sessionExpired||hasLockedTarget} onClick={()=>void action(view==='deferred'?'restore':'defer',actionTargets.map(t=>t.vid))}>{view==='deferred'?'恢复':'暂缓'}</Button>{trimmedCreator?<Button className="ws-action-primary" disabled={!actionTargets.length||sessionExpired||hasLockedTarget||Boolean(creatorDestructiveLock)||actionTargets.some(t=>blockedIds.has(t.vid)||pendingVids.has(t.vid))} title={creatorDestructiveLock?`${trimmedCreator} ${creatorDestructiveLock.label}`:undefined} onClick={()=>void confirm()}><span className="ws-btn-truncate">归给 {trimmedCreator}</span><span className="ws-btn-badge">· <DigitSwap value={actionTargets.length}/></span></Button>:<Button className="ws-action-primary" disabled={!actionTargets.length} onClick={openSelection}><span>核对所选</span><span className="ws-btn-badge">· <DigitSwap value={actionTargets.length}/></span></Button>}</>}</div>
+    {!reference&&trimmedCreator&&actionTargets.length>0&&suggestedRuleMark&&<div className="ws-rule-optin" title={`勾选后将在归给 ${trimmedCreator} 时保存为已确认账号规则，后续同水印自动识别并跳过人脸分析`}><label className="ws-rule-optin-label"><Checkbox motionPreset="instant" aria-label={`归名时记住水印 ${suggestedRuleMark.text} 归属 ${trimmedCreator}`} checked={watermarkKey===suggestedRuleMark.key} disabled={busy||sessionExpired||hasLockedTarget} onCheckedChange={checked=>setWatermarkKey(checked?suggestedRuleMark.key:'')}/><span className="ws-rule-optin-text"><span>记住水印</span><code className="ws-rule-optin-token" title={suggestedRuleMark.text}>{suggestedRuleMark.text}</code><span className="ws-muted">→ {trimmedCreator}</span></span></label>{ruleCandidates.length>1&&<Button variant="ghost" size="sm" className="ws-rule-optin-switch" aria-label="切换要记住的候选水印" title="切换另一条匹配水印" onClick={()=>{const cur=displayRuleIdx>=0?displayRuleIdx:0;const next=(cur+1)%ruleCandidates.length;setRuleCandidateIdx(next);if(watermarkKey)setWatermarkKey(ruleCandidates[next].key)}}><span className="tabular-nums">{(displayRuleIdx>=0?displayRuleIdx:activeRuleIdx)+1}/{ruleCandidates.length}</span></Button>}</div>}
+    <div className="ws-detail-actions">{reference?<><Button variant="outline" onClick={backReference}>返回证据</Button><Button className="ws-action-primary" onClick={()=>{setCreator(reference.name);backReference()}}><span className="ws-btn-truncate">选择 {reference.name}</span></Button></>:<><Button variant="outline" disabled={!actionTargets.length||sessionExpired||hasLockedTarget} onClick={()=>void action(view==='deferred'?'restore':'defer',actionTargets.map(t=>t.vid))}>{view==='deferred'?'恢复':'暂缓'}</Button><Button className="ws-danger-btn" variant="outline" disabled={!actionTargets.length||disabled||hasLockedTarget||actionTargets.some(t=>blockedIds.has(t.vid)||pendingVids.has(t.vid))} aria-label={`将所选 ${actionTargets.length} 个视频移入回收站`} onClick={e=>openDeleteDialog(chosen.length>1?'batch':'single',actionTargets,e.currentTarget)}><Trash2 size={14} aria-hidden="true"/><span>删除</span></Button>{trimmedCreator?<Button className="ws-action-primary" disabled={!actionTargets.length||sessionExpired||hasLockedTarget||Boolean(creatorDestructiveLock)||actionTargets.some(t=>blockedIds.has(t.vid)||pendingVids.has(t.vid))} title={creatorDestructiveLock?`${trimmedCreator} ${creatorDestructiveLock.label}`:undefined} onClick={()=>void confirm()}><span className="ws-btn-truncate">归给 {trimmedCreator}</span><span className="ws-btn-badge">· <DigitSwap value={actionTargets.length}/></span></Button>:<Button className="ws-action-primary" disabled={!actionTargets.length} onClick={()=>actorInspectorRef.current?.openSwitcher()}><span>选人归名</span><span className="ws-btn-badge">· <DigitSwap value={actionTargets.length}/></span></Button>}</>}</div>
   </>
   const midScopeSegment:WorkbenchBreadcrumbSegment|null=personScope?{key:`person:${personScope}`,label:personScope}:clusterScope?{key:`cluster:${clusterScope}`,label:`相似组 ${clusterScope}`}:view!=='all'?{key:`view:${view}`,label:views.find(v=>v.value===view)?.label||view}:null
   const leafGroupSegment:WorkbenchBreadcrumbSegment|null=data?.group?.label?{key:`group:${data.group.key}`,label:data.group.label}:null
@@ -1007,7 +1025,7 @@ export default function Review() {
       </>}
       {reviewDesktop&&<aside className="ws-inspector" aria-label="视频与归名">{detail}</aside>}
     </div>
-    {!reviewDesktop&&<Dialog open={previewOpen} onOpenChange={open=>setPreviewOpen(open)}><ResponsiveDialogContent open={previewOpen} className="ws-detail-sheet" style={{animationDuration:instantEntry?'0ms':'180ms'}} overlayProps={{style:{animationDuration:instantEntry?'0ms':'140ms'}}} inert={!previewOpen} onCloseAutoFocus={e=>{e.preventDefault();const target=returnFocus.current;if(target?.isConnected&&!target.matches(':disabled')&&!target.closest('[inert]'))target.focus();else document.querySelector<HTMLButtonElement>('[aria-label="更新人工确认列表"]')?.focus()}} onEscapeKeyDown={e=>{if(reference){e.preventDefault();backReference()}}}><DialogTitle className="sr-only">{reference?`${reference.name} 的对照视频`:detailMode==='selection'?'核对所选视频':'视频与证据'}</DialogTitle><DialogDescription className="sr-only">关闭后保留筛选、勾选与列表位置。</DialogDescription>{detail}</ResponsiveDialogContent></Dialog>}
+    {!reviewDesktop&&<Dialog open={previewOpen} onOpenChange={open=>setPreviewOpen(open)}><ResponsiveDialogContent open={previewOpen} className="ws-detail-sheet" style={{animationDuration:instantEntry?'0ms':'180ms'}} overlayProps={{style:{animationDuration:instantEntry?'0ms':'140ms'}}} inert={!previewOpen} onCloseAutoFocus={e=>{e.preventDefault();const target=returnFocus.current;if(target?.isConnected&&!target.matches(':disabled')&&!target.closest('[inert]'))target.focus();else document.querySelector<HTMLButtonElement>('[aria-label="更新人工确认列表"]')?.focus()}} onEscapeKeyDown={e=>{if(reference){e.preventDefault();backReference()}}}><DialogTitle className="sr-only">{reference?`${reference.name} 的对照视频`:'归名与证据'}</DialogTitle><DialogDescription className="sr-only">关闭后保留筛选、勾选与列表位置。</DialogDescription>{detail}</ResponsiveDialogContent></Dialog>}
     <VideoPreviewDialog
       open={lightbox.open&&!!lightboxVideoPath}
       onOpenChange={open=>{if(!open)setLightbox(prev=>({...prev,open:false}))}}
