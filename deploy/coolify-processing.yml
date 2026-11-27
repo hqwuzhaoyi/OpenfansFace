@@ -1,0 +1,46 @@
+services:
+  face-processing:
+    build:
+      context: .
+      dockerfile: maintenance/Dockerfile.processing
+    container_name: face-processing
+    network_mode: host
+    restart: unless-stopped
+    user: "1000:1000"
+    volumes:
+      - /home/prajna/workspace/face-clusters:/home/prajna/workspace/face-clusters
+      - /home/prajna/workspace/face-clusters:/data/base
+      - /mnt/media2:/mnt/media2:ro
+      - /home/prajna/.insightface:/root/.insightface:ro
+      - /home/prajna/.insightface:/home/prajna/.insightface:ro
+      - face-watermark-models:/root/.paddlex
+      - face-watermark-models:/home/prajna/.paddlex
+    environment:
+      - FACE_ADMIN_URL=${FACE_ADMIN_URL}
+      - FACES_BASE=${FACES_BASE}
+      - FILE_OPERATIONS_BACKEND=${FILE_OPERATIONS_BACKEND}
+      - FILE_OPERATIONS_RUST_TOKEN=${FILE_OPERATIONS_RUST_TOKEN}
+      - FILE_OPERATIONS_RUST_URL=${FILE_OPERATIONS_RUST_URL}
+      - HOME=${HOME}
+      - INSIGHTFACE_HOME=${INSIGHTFACE_HOME}
+      - MEDIA2_ROOT=${MEDIA2_ROOT}
+      - MKL_NUM_THREADS=${MKL_NUM_THREADS}
+      - OMP_NUM_THREADS=${OMP_NUM_THREADS}
+      - OPENBLAS_NUM_THREADS=${OPENBLAS_NUM_THREADS}
+      - PROCESSING_FACE_BACKEND=${PROCESSING_FACE_BACKEND}
+      - PROCESSING_GPU_MODEL_SHA256=${PROCESSING_GPU_MODEL_SHA256}
+      - PROCESSING_GPU_PREPROCESS_VERSION=${PROCESSING_GPU_PREPROCESS_VERSION}
+      - PROCESSING_GPU_PRIVATE_HTTP=${PROCESSING_GPU_PRIVATE_HTTP}
+      - PROCESSING_GPU_TOKEN=${PROCESSING_GPU_TOKEN}
+      - PROCESSING_GPU_URL=${PROCESSING_GPU_URL}
+      - PROCESSING_MAX_CONCURRENCY=${PROCESSING_MAX_CONCURRENCY}
+      - WATERMARK_CPU_THREADS=${WATERMARK_CPU_THREADS}
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import pathlib; assert any('processing_worker.py' in p.read_text(errors='ignore') for p in pathlib.Path('/proc').glob('[0-9]*/cmdline'))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  face-watermark-models:
+    external: true

@@ -1,0 +1,24 @@
+services:
+  face-calibrator:
+    build:
+      context: ./sidecar
+      dockerfile: Dockerfile
+    container_name: face-calibrator
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - /home/prajna/workspace/face-clusters:/home/prajna/workspace/face-clusters
+    environment:
+      - CAL_PYBIN=${CAL_PYBIN}
+      - CAL_PORT=${CAL_PORT}
+      - FACES_BASE=${FACES_BASE}
+      - FILE_OPERATIONS_BACKEND=${FILE_OPERATIONS_BACKEND}
+      - FILE_OPERATIONS_RUST_TOKEN=${FILE_OPERATIONS_RUST_TOKEN}
+      - FILE_OPERATIONS_RUST_URL=${FILE_OPERATIONS_RUST_URL}
+      - F_MULTI=${F_MULTI}
+      - F_MULTI_EXCLUDE=${F_MULTI_EXCLUDE}
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import urllib.request; r=urllib.request.urlopen('http://127.0.0.1:8921/health', timeout=3); assert r.status==200"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
