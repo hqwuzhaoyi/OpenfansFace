@@ -298,11 +298,12 @@ def ensure_rust_builder_image(worktree: Path) -> tuple[str, str]:
                 "WORKDIR /build",
                 "COPY Cargo.toml Cargo.lock ./",
                 "RUN mkdir -p src/bin \\",
+                "  && : > src/lib.rs \\",
                 "  && echo 'fn main() {}' > src/main.rs \\",
                 "  && echo 'fn main() {}' > src/bin/storage-probe.rs \\",
                 "  && cargo build --release --locked --bins \\",
                 "  && cargo test --lib --no-run --locked \\",
-                "  && rm -rf src target/release/deps/face_file_operations* target/release/deps/storage_probe* target/release/face-file-operations target/release/storage-probe",
+                "  && rm -rf src target/release/deps/face_file_operations* target/release/deps/libface_file_operations* target/release/deps/storage_probe* target/debug/deps/face_file_operations* target/debug/deps/libface_file_operations* target/release/face-file-operations target/release/storage-probe",
                 "",
             ]
         )
@@ -325,7 +326,7 @@ def build_rust_image(worktree: Path, ts: str, short_sha: str, skip_tests: bool) 
         steps = [
             "cp /repo-src/Cargo.toml /repo-src/Cargo.lock /build/",
             "rm -rf /build/src && cp -r /repo-src/src /build/src",
-            "touch /build/src/main.rs",
+            "touch /build/src/lib.rs /build/src/main.rs",
         ]
         if not skip_tests:
             steps.append("cargo test --lib --locked")
