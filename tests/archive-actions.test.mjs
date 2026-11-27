@@ -1,12 +1,19 @@
 import {test} from 'node:test'
 import assert from 'node:assert/strict'
-import {archiveShortcut,autoArchiveReasonLabel,autoMatchTierLabel,buildAutoMergeApplyItems,canResolveArchiveRow,canStageArchiveRow,canUnarchiveHistoryItem,formatAutoMergeSize,isArchiveResolutionApplied} from '../lib/archive-actions.ts'
+import {archiveShortcut,autoArchiveReasonLabel,autoMatchTierLabel,buildAutoMergeApplyItems,canResolveArchiveRow,canStageArchiveRow,canUnarchiveHistoryItem,formatAutoMergeSize,isArchiveResolutionApplied,isSameSizeConflict} from '../lib/archive-actions.ts'
 const page={editing:false,modal:false,nativeAction:false}
-test('same-size duplicate is eligible for staging, but creators records never get conflict actions',()=>{
+test('same-size and different-size regular conflicts are eligible for staging, while missing/empty/creators records are not',()=>{
  const duplicate={status:'duplicate',size:123,original_size:123,src:'/media/a.mp4'}
  assert.equal(canResolveArchiveRow(duplicate),true)
  assert.equal(canStageArchiveRow(duplicate),true)
- assert.equal(canStageArchiveRow({...duplicate,original_size:124}),false)
+ assert.equal(canStageArchiveRow({...duplicate,status:'conflict',original_size:124}),true)
+ assert.equal(isSameSizeConflict(duplicate),true)
+ assert.equal(isSameSizeConflict({...duplicate,original_size:124}),false)
+ assert.equal(isSameSizeConflict({...duplicate,original_size:undefined}),false)
+ assert.equal(isSameSizeConflict({...duplicate,size:0,original_size:0}),false)
+ assert.equal(canStageArchiveRow({...duplicate,original_size:0}),false)
+ assert.equal(canStageArchiveRow({...duplicate,original_size:undefined}),false)
+ assert.equal(canStageArchiveRow({...duplicate,status:'dupe-target',original_size:undefined}),false)
  assert.equal(canStageArchiveRow({...duplicate,size:0,original_size:0}),false)
  assert.equal(canStageArchiveRow({...duplicate,src:null}),false)
  assert.equal(canResolveArchiveRow({...duplicate,status:'organized',resolution:{kind:'rename',name:'old.mp4'}}),false)

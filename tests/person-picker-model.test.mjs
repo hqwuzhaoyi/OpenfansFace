@@ -8,6 +8,7 @@ import {
   isTelegramTwinMark,
   pickRuleCandidates,
   rankPersonChoices,
+  resolveEffectiveWatermarkRule,
   watermarkMatchesPerson,
 } from '../lib/person-picker-model.ts'
 
@@ -405,4 +406,138 @@ test('supports kind=text domain watermarks like xiaogoupro.com and suppresses Te
   const rec = buildPickerRecommendations([zyTask], zyCatalog, 'ZYFLS66')
   assert.equal(rec.suggestions[0]?.name, 'xiaogoupro')
   assert.equal(rec.suggestions.some(s => s.name === 'ZYFLS66'), false)
+})
+
+test('resolveEffectiveWatermarkRule checks top matching candidate by default and respects manual override/uncheck', () => {
+  const mExact = { key: 'k-exact', text: 'xiaogoupro.com' }
+  const mPrefix = { key: 'k-prefix', text: 'xiaogou' }
+  const mOther = { key: 'k-other', text: 'studio_mark' }
+  const commonMarks = [mExact, mPrefix, mOther]
+  const ruleCandidates = [mExact, mPrefix]
+
+  // 1. Default state (undefined) auto-checks ruleCandidates[0]
+  assert.deepEqual(
+    resolveEffectiveWatermarkRule({
+      draftWatermarkKey: undefined,
+      commonMarks,
+      ruleCandidates,
+      candidateIdx: 0,
+    }),
+    {
+      suggestedMark: mExact,
+      effectiveKey: 'k-exact',
+      checked: true,
+      candidateIndex: 0,
+    },
+  )
+
+  // 2. Prefix-only candidate is also auto-checked when it is the top candidate
+  assert.deepEqual(
+    resolveEffectiveWatermarkRule({
+      draftWatermarkKey: undefined,
+      commonMarks: [mPrefix],
+      ruleCandidates: [mPrefix],
+      candidateIdx: 0,
+    }),
+    {
+      suggestedMark: mPrefix,
+      effectiveKey: 'k-prefix',
+      checked: true,
+      candidateIndex: 0,
+    },
+  )
+
+  // 3. No matching candidates leaves rule unchecked and bar hidden
+  assert.deepEqual(
+    resolveEffectiveWatermarkRule({
+      draftWatermarkKey: undefined,
+      commonMarks: [mOther],
+      ruleCandidates: [],
+      candidateIdx: 0,
+    }),
+    {
+      suggestedMark: null,
+      effectiveKey: '',
+      checked: false,
+      candidateIndex: -1,
+    },
+  )
+
+  // 4. Explicit uncheck ('') keeps suggestedMark visible while unchecking effectiveKey
+  assert.deepEqual(
+    resolveEffectiveWatermarkRule({
+      draftWatermarkKey: '',
+      commonMarks,
+      ruleCandidates,
+      candidateIdx: 0,
+    }),
+    {
+      suggestedMark: mExact,
+      effectiveKey: '',
+      checked: false,
+      candidateIndex: 0,
+    },
+  )
+
+  // 5. Cycling candidateIdx while checked or unchecked updates suggestedMark cleanly
+  assert.deepEqual(
+    resolveEffectiveWatermarkRule({
+      draftWatermarkKey: 'k-prefix',
+      commonMarks,
+      ruleCandidates,
+      candidateIdx: 1,
+    }),
+    {
+      suggestedMark: mPrefix,
+      effectiveKey: 'k-prefix',
+      checked: true,
+      candidateIndex: 1,
+    },
+  )
+  assert.deepEqual(
+    resolveEffectiveWatermarkRule({
+      draftWatermarkKey: '',
+      commonMarks,
+      ruleCandidates,
+      candidateIdx: 1,
+    }),
+    {
+      suggestedMark: mPrefix,
+      effectiveKey: '',
+      checked: false,
+      candidateIndex: 1,
+    },
+  )
+
+  // 6. Manual selection of a non-candidate common mark from the drawer
+  assert.deepEqual(
+    resolveEffectiveWatermarkRule({
+      draftWatermarkKey: 'k-other',
+      commonMarks,
+      ruleCandidates,
+      candidateIdx: 0,
+    }),
+    {
+      suggestedMark: mOther,
+      effectiveKey: 'k-other',
+      checked: true,
+      candidateIndex: -1,
+    },
+  )
+
+  // 7. Stale manual key no longer in commonMarks falls back to current default candidate
+  assert.deepEqual(
+    resolveEffectiveWatermarkRule({
+      draftWatermarkKey: 'k-missing',
+      commonMarks: [mPrefix],
+      ruleCandidates: [mPrefix],
+      candidateIdx: 0,
+    }),
+    {
+      suggestedMark: mPrefix,
+      effectiveKey: 'k-prefix',
+      checked: true,
+      candidateIndex: 0,
+    },
+  )
 })

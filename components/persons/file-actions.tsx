@@ -8,7 +8,6 @@ import type { PersonFileAction, PersonFilePlan, PersonFileRequest, PersonFileRes
 import { WorkbenchDialogContent as DialogContent, WorkbenchButton as Button, WorkbenchInput as Input } from './ui'
 
 export interface FileActionSelection {action:PersonFileAction;files:PersonVideo[];resumePlan?:PersonFilePlan}
-export const FILE_OPERATION_STORAGE_KEY='person-file-operation-v1'
 const labels:Record<PersonFileAction,string>={'rename-file':'重命名文件','move-files':'移动视频','delete-files':'删除视频','review-delete':'移入回收站','rename-person':'人物重命名','merge-person':'合并人物','delete-person':'删除人物'}
 export function FileActionDialog({selection,person,people,theme,onClose,onSaved,onRolledBack,onBusyChange,onSubmitted,onForget,onEnqueueBackground}:{selection:FileActionSelection;person:string;people:LibraryPerson[];theme:'light'|'dark';onClose:()=>void;onSaved:(result:PersonFileResult)=>Promise<void>;onRolledBack:()=>Promise<void>;onBusyChange:(busy:boolean)=>void;onSubmitted:(plan:PersonFilePlan)=>void;onForget:()=>void;onEnqueueBackground?:(payload:{plan:PersonFilePlan;person:string})=>void}) {
   const [name,setName]=useState(selection.action==='rename-person'?person:selection.files[0]?.name||'')
@@ -72,8 +71,7 @@ export function FileActionDialog({selection,person,people,theme,onClose,onSaved,
     }
     updateBusy(true);setError('')
     if(plan.backend==='rust'){
-      try{localStorage.setItem(FILE_OPERATION_STORAGE_KEY,JSON.stringify(plan));onSubmitted(plan);setSubmitted(true);setStatus('submitting')}
-      catch{setError('无法保存操作编号，请允许浏览器本地存储后再提交。');updateBusy(false);return}
+      onSubmitted(plan);setSubmitted(true);setStatus('submitting')
     }
     try{
       const result=await api<PersonFileResult>('/api/persons/manage',{method:'POST',body:JSON.stringify({mode:'apply',request:plan.request,version:plan.version})})

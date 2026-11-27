@@ -21,7 +21,7 @@ import { WorkbenchButton as Button, WorkbenchInput as Input, WorkbenchBadge as B
 import { PersonSearch } from './person-search'
 import { PeopleActionDialog } from './people-actions'
 import type { PersonBatchAction, PersonBatchResult } from '@/lib/person-batch-model'
-import { FileActionDialog, FILE_OPERATION_STORAGE_KEY, type FileActionSelection } from './file-actions'
+import { FileActionDialog, type FileActionSelection } from './file-actions'
 import type { PersonFileAction, PersonFileResult, PersonFilePlan } from '@/lib/person-file-model'
 import { PersonVideoDialog, type PlayerContextKind } from './video-player-modal'
 import { FolderInput, Merge } from 'lucide-react'
@@ -355,7 +355,7 @@ function PersonWorkbenchContent({initialName=''}:{initialName?:string}) {
     </div>
     <AnimatePresence initial={false}>{message&&<WorkbenchNotice><span>{message}</span>{undo&&<Button disabled={busy} onClick={()=>void undoLast()}><Undo2 size={13}/>撤销这次</Button>}<Button aria-label="关闭提示" onClick={()=>setMessage('')}><X size={14}/></Button></WorkbenchNotice>}</AnimatePresence>
     {peopleAction&&<PeopleActionDialog action={peopleAction} people={selectedPeople} directoryPeople={people} theme={theme} onClose={()=>setPeopleAction(null)} onSaved={savedPeopleAction} onBusyChange={()=>{}} onEnqueueBackground={({plan,people:batchPeople,thumbs})=>{enqueuePersonBatch({plan,people:batchPeople,thumbs});setSelectedPeople(prev=>prev.filter(p=>!batchPeople.includes(p)))}}/>}
-    {fileAction&&<FileActionDialog key={`${fileAction.action}:${fileAction.files.map(v=>v.vid).join()}`} selection={fileAction} person={fileAction.resumePlan?.person||name} people={people} theme={theme} onClose={()=>setFileAction(null)} onSaved={savedFileAction} onRolledBack={rolledBackFileAction} onBusyChange={()=>{}} onSubmitted={setPendingFilePlan} onForget={()=>{localStorage.removeItem(FILE_OPERATION_STORAGE_KEY);setPendingFilePlan(null)}} onEnqueueBackground={({plan,person:targetPerson})=>{enqueuePersonFile({plan,person:targetPerson});const targetVids=new Set(fileAction.files.map(f=>f.vid));setSelected(prev=>prev.filter(id=>!targetVids.has(id)))}}/>}
+    {fileAction&&<FileActionDialog key={`${fileAction.action}:${fileAction.files.map(v=>v.vid).join()}`} selection={fileAction} person={fileAction.resumePlan?.person||name} people={people} theme={theme} onClose={()=>setFileAction(null)} onSaved={savedFileAction} onRolledBack={rolledBackFileAction} onBusyChange={()=>{}} onSubmitted={setPendingFilePlan} onForget={()=>{setPendingFilePlan(null)}} onEnqueueBackground={({plan,person:targetPerson})=>{enqueuePersonFile({plan,person:targetPerson});const targetVids=new Set(fileAction.files.map(f=>f.vid));setSelected(prev=>prev.filter(id=>!targetVids.has(id)))}}/>}
     {accountPerson&&<AccountAssociation key={accountPerson} name={accountPerson} theme={theme} onClose={()=>setAccountPerson(null)} onChanged={()=>{setAccountsRevision(n=>n+1);void loadPeople()}}/>}
     <PersonVideoDialog
       video={playing?.video||null}

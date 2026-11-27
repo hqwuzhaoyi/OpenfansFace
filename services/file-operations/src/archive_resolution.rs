@@ -70,13 +70,13 @@ pub fn prepare(config: &Config, body: &Value) -> Result<Prepared> {
     }
     if kind == "stage-duplicate"
         && selected.iter().any(|r| {
-            r["original_size"] != r["size"]
+            r["original_size"].as_u64().unwrap_or(0) == 0
                 || r["size"].as_u64().unwrap_or(0) == 0
                 || r["src"].is_null()
         })
     {
         return Err(Error::conflict(
-            "体积不同，无法作为重复件移入回收站；请选择保留两份",
+            "目标路径缺少可保留的常规文件，无法将源文件移入回收站；请选择保留两份",
         ));
     }
     let (_, mut queue) = review::read(config, "integration-queue.json", json!([]))?;

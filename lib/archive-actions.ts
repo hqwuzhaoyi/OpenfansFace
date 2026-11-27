@@ -165,7 +165,10 @@ export function canResolveArchiveRow(row: Pick<PlanRow, 'status' | 'resolution'>
   return ['duplicate', 'conflict', 'dupe-target'].includes(row.status) || (row.status === 'ok' && !!row.resolution)
 }
 export function canStageArchiveRow(row: Pick<PlanRow, 'status' | 'resolution' | 'size' | 'original_size' | 'src'>) {
-  return canResolveArchiveRow(row) && !!row.src && row.size > 0 && row.original_size === row.size
+  return canResolveArchiveRow(row) && !!row.src && row.size > 0 && typeof row.original_size === 'number' && row.original_size > 0
+}
+export function isSameSizeConflict(row: Pick<PlanRow, 'size' | 'original_size'>) {
+  return row.size > 0 && typeof row.original_size === 'number' && row.original_size === row.size
 }
 export function isArchiveResolutionApplied(row: Pick<PlanRow, 'status' | 'resolution'>, kind: 'rename' | 'stage-duplicate') {
   return row.status === 'ok' && row.resolution?.kind === kind

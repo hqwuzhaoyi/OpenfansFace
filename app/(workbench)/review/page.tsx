@@ -9,7 +9,7 @@ import { api } from '@/lib/face-api'
 import type { ProcessingTask } from '@/lib/processing-model'
 import { reviewSelectionKey, toggleReviewSelection, removeReviewSelection, type ReviewSelections } from '@/lib/review-selection'
 import { ActorInspector, type ActorInspectorHandle } from '@/components/review/actor-inspector'
-import { buildPickerRecommendations, isRememberableWatermark, pickRuleCandidates, type PersonChoice } from '@/lib/person-picker-model'
+import { buildPickerRecommendations, isRememberableWatermark, pickRuleCandidates, resolveEffectiveWatermarkRule, type PersonChoice } from '@/lib/person-picker-model'
 import { AnimatedBadge } from '@/components/beui/motion/animated-badge'
 import { DigitSwap } from '@/components/beui/motion/digit-swap'
 import { reviewListSummary } from '@/lib/review-list-summary'
@@ -86,7 +86,7 @@ export default function Review() {
   },[])
   const [instantEntry,setInstantEntry]=useState(false)
   const [previewOpen,setPreviewOpen]=useState(false)
-  const [drafts,setDrafts]=useState<Record<string,{creator?:string;watermarkKey:string}>>({}),[notes,setNotes]=useState<Record<string,string>>({}),[submitError,setSubmitError]=useState('')
+  const [drafts,setDrafts]=useState<Record<string,{creator?:string;watermarkKey?:string}>>({}),[notes,setNotes]=useState<Record<string,string>>({}),[submitError,setSubmitError]=useState('')
   const [pickerSearch,setPickerSearch]=useState<Record<string,string>>({})
   const [selectionPreviewVid,setSelectionPreviewVid]=useState<string|null>(null)
   const [ruleCandidateIdx,setRuleCandidateIdx]=useState(0)
@@ -120,7 +120,7 @@ export default function Review() {
   const [lightbox,setLightbox]=useState<{open:boolean;tab:'current'|'reference';initialTime:number}>({open:false,tab:'current',initialTime:0})
   const lightboxTriggerRef=useRef<HTMLElement|null>(null)
   const reviewDesktop=useReviewDesktop(),sequence=useRef(0),selectionHeading=useRef<HTMLHeadingElement>(null)
-  const hasManualSelections=hasProtectedReviewSelections(selections,autoSelectedScopes),hasDrafts=Object.values(drafts).some(d=>!!d.creator||!!d.watermarkKey)||Object.entries(notes).some(([id,note])=>note!==noteBaseline.current[id])
+  const hasManualSelections=hasProtectedReviewSelections(selections,autoSelectedScopes),hasDrafts=Object.values(drafts).some(d=>!!d.creator||d.watermarkKey!==undefined)||Object.entries(notes).some(([id,note])=>note!==noteBaseline.current[id])
   const hasManualSelectionsRef=useRef(hasManualSelections)
   hasManualSelectionsRef.current=hasManualSelections
   const hasDraftsRef=useRef(hasDrafts)
@@ -146,9 +146,9 @@ export default function Review() {
   const actionTargets=chosen.length>0?chosen:(focused?[focused]:[])
   const preferredTaskCreator=(task?:ProcessingTask)=>task?.data.suggested||task?.data.candidates?.find(c=>c.sources?.includes('watermark'))?.name||(task?.data.candidates?.length===1?task.data.candidates[0].name:undefined)
   const defaultCreator=data?.group?.kind==='suggested'?data.group.label:(preferredTaskCreator(focused)||'')
-  const creator=drafts[scope]?.creator!==undefined?drafts[scope].creator!:defaultCreator,watermarkKey=drafts[scope]?.watermarkKey||''
-  const setCreator=(creator:string)=>setDrafts(current=>({...current,[scope]:{...current[scope],creator,watermarkKey:''}}))
-  const setWatermarkKey=(watermarkKey:string)=>setDrafts(current=>({...current,[scope]:{creator:current[scope]?.creator,watermarkKey}}))
+  const creator=drafts[scope]?.creator!==undefined?drafts[scope].creator!:defaultCreator,draftWatermarkKey=drafts[scope]?.watermarkKey
+  const setCreator=(creator:string)=>setDrafts(current=>({...current,[scope]:{...current[scope],creator,watermarkKey:undefined}}))
+  const setWatermarkKey=(watermarkKey?:string)=>setDrafts(current=>({...current,[scope]:{creator:current[scope]?.creator,watermarkKey}}))
   const disabled=loading||query!==search||!!error||sessionExpired
   const currentPage=data?.page??page
   const activeGroupRef=useRef(activeGroup)
@@ -375,6 +375,12 @@ export default function Review() {
   const requestRefresh=(event:{currentTarget:HTMLElement})=>{if(busy||loading)return;refreshFocus.current=event.currentTarget;if(hasManualSelections||hasDrafts)setRefreshConfirm(true);else void load({refresh:true})}
   const firstTargetMarks=actionTargets[0]?.data?.watermark?.candidates||[]
   const commonMarks=actionTargets.length ? firstTargetMarks.filter(c=>isRememberableWatermark(c,firstTargetMarks)&&actionTargets.every(t=>(t.data?.watermark?.candidates||[]).some(other=>other.key===c.key))) : []
+  const trimmedCreator=creator.trim()
+  useEffect(()=>{setRuleCandidateIdx(0)},[scope,trimmedCreator])
+  const creatorPersonObj=useMemo(()=>trimmedCreator?(people.find(p=>p.name===trimmedCreator)||{name:trimmedCreator}):null,[trimmedCreator,people])
+  const ruleCandidates=useMemo(()=>pickRuleCandidates(commonMarks,creatorPersonObj,(focused||actionTargets[0])?.data?.watermark?.candidates||[],actionTargets),[commonMarks,creatorPersonObj,focused,actionTargets])
+  const activeRuleIdx=ruleCandidates.length?Math.min(ruleCandidateIdx,ruleCandidates.length-1):0
+  const {suggestedMark:suggestedRuleMark,effectiveKey:effectiveWatermarkKey,checked:ruleChecked,candidateIndex:displayRuleIdx}=useMemo(()=>resolveEffectiveWatermarkRule({draftWatermarkKey,commonMarks,ruleCandidates,candidateIdx:activeRuleIdx}),[draftWatermarkKey,commonMarks,ruleCandidates,activeRuleIdx])
   const existingPeople=useMemo(()=>new Set(people.map(p=>p.name)),[people])
   const suggestedGroupLabel=data?.group?.kind==='suggested'?data.group.label:null
   const recommendationTargets=chosen.length>1?actionTargets:(focused?[focused]:actionTargets)
@@ -387,9 +393,9 @@ export default function Review() {
   const selectionPreviewTask=selectionPreviewVid?actionTargets.find(t=>t.vid===selectionPreviewVid)||null:null
   const changeQuery=(value:string)=>{advanceSequenceRef.current++;if(!group&&data?.group)setGroup(data.group.key);updateFilters({q:value,page:'0',vid:''})}
   const chooseGroup=(key:string)=>{advanceSequenceRef.current++;const targetScope=reviewSelectionKey(key,view==='deferred');if(!(selections[targetScope]?.length)){initializedScopesRef.current.delete(`${targetScope}:0`);forceSelectAllScopeRef.current=targetScope}setGroup(key);setPage(0);setLinkFocus('');setPreviewOpen(false)}
-  const toggle=(tasks:ProcessingTask[])=>{const currentIds=new Set((selectionsRef.current[scope]||[]).map(t=>t.vid));const allowed=tasks.filter(t=>!lockedVidsRef.current.has(t.vid)||currentIds.has(t.vid));if(!allowed.length)return;markScopeManual(scope);setSelections(current=>({...current,[scope]:toggleReviewSelection(current[scope]||[],allowed)}));setWatermarkKey('')}
+  const toggle=(tasks:ProcessingTask[])=>{const currentIds=new Set((selectionsRef.current[scope]||[]).map(t=>t.vid));const allowed=tasks.filter(t=>!lockedVidsRef.current.has(t.vid)||currentIds.has(t.vid));if(!allowed.length)return;markScopeManual(scope);setSelections(current=>({...current,[scope]:toggleReviewSelection(current[scope]||[],allowed)}));setDrafts(current=>current[scope]?.watermarkKey!==undefined?{...current,[scope]:{...current[scope],watermarkKey:undefined}}:current)}
   const clear=()=>{markScopeManual(scope);setSelections(current=>({...current,[scope]:[]}))}
-  const inspect=(task:ProcessingTask)=>{setReference(null);setSelectionPreviewVid(null);if(!reviewDesktop&&!previewOpen){returnFocus.current=document.activeElement as HTMLElement;setInstantEntry(!!document.activeElement?.matches(':focus-visible')||matchMedia('(prefers-reduced-motion: reduce)').matches)}setInspected(current=>({...current,[scope]:task}));if(data?.group?.kind!=='suggested'&&chosen.length<=1)setDrafts(current=>({...current,[scope]:{creator:preferredTaskCreator(task),watermarkKey:''}}));setExplicitStageRefName(null);setStageTab('current');if(reviewDesktop)setStageOpen(true);else setPreviewOpen(true)}
+  const inspect=(task:ProcessingTask)=>{setReference(null);setSelectionPreviewVid(null);if(!reviewDesktop&&!previewOpen){returnFocus.current=document.activeElement as HTMLElement;setInstantEntry(!!document.activeElement?.matches(':focus-visible')||matchMedia('(prefers-reduced-motion: reduce)').matches)}setInspected(current=>({...current,[scope]:task}));if(data?.group?.kind!=='suggested'&&chosen.length<=1)setDrafts(current=>({...current,[scope]:{creator:preferredTaskCreator(task),watermarkKey:undefined}}));setExplicitStageRefName(null);setStageTab('current');if(reviewDesktop)setStageOpen(true);else setPreviewOpen(true)}
   const openSelection=()=>{if(!previewOpen){returnFocus.current=document.activeElement as HTMLElement;setInstantEntry(!!document.activeElement?.matches(':focus-visible')||matchMedia('(prefers-reduced-motion: reduce)').matches)}if(!chosen.length&&focused&&!lockedVidsRef.current.has(focused.vid)){markScopeManual(scope);setSelections(current=>({...current,[scope]:[focused]}))}if(!creator&&defaultCreator)setCreator(defaultCreator);setReference(null);setSubmitError('');if(!reviewDesktop){setPreviewOpen(true);requestAnimationFrame(()=>actorInspectorRef.current?.openSwitcher())}else{actorInspectorRef.current?.openSwitcher()}}
   const stepFocus=(delta:-1|1)=>{
     if(!rows.length)return
@@ -431,14 +437,14 @@ export default function Review() {
     if(nextRow){
       setInspected(current=>{const next=Object.fromEntries(Object.entries(current).filter(([,task])=>!completedSet.has(task.vid)));next[scope]=nextRow;return next})
       setSelections(current=>{const cleaned=removeReviewSelection(current,vids);const remainingChosen=cleaned[scope]||[];cleaned[scope]=remainingChosen.length>0?remainingChosen:(lockedVidsRef.current.has(nextRow.vid)?[]:[nextRow]);return cleaned})
-      setDrafts(current=>({...current,[scope]:{creator:data?.group?.kind==='suggested'?data.group.label:preferredTaskCreator(nextRow),watermarkKey:''}}))
+      setDrafts(current=>({...current,[scope]:{creator:data?.group?.kind==='suggested'?data.group.label:preferredTaskCreator(nextRow),watermarkKey:undefined}}))
       setLinkFocus('')
       requestAnimationFrame(()=>{document.querySelector<HTMLElement>(`[data-vid="${CSS.escape(nextRow.vid)}"]`)?.scrollIntoView({block:'nearest'})})
       return
     }
     setSelections(current=>removeReviewSelection(current,vids))
     setInspected(current=>Object.fromEntries(Object.entries(current).filter(([,task])=>!completedSet.has(task.vid))))
-    setDrafts(current=>({...current,[scope]:{creator:undefined,watermarkKey:''}}))
+    setDrafts(current=>({...current,[scope]:{creator:undefined,watermarkKey:undefined}}))
     if(nextRemainingInGroup>0&&data?.next_page!=null){
       initializedScopesRef.current.delete(`${scope}:${data.next_page}`)
       forceSelectAllScopeRef.current=scope
@@ -560,7 +566,7 @@ export default function Review() {
     if(!session.current||!targets.length||!name||sessionExpired||targets.some(t=>blockedIds.has(t.vid)||pendingVidsRef.current.has(t.vid)||lockedVidsRef.current.has(t.vid))||(personLock&&isDestructivePersonAction(personLock.action)))return
     setSubmitError('')
     clearReviewSessionCaches(false)
-    const vids=targets.map(t=>t.vid),confirmationSession=session.current,tokens=evidenceTokens(vids),currentGroupKey=activeGroup,isDeferredLane=view==='deferred',currentWatermarkKey=watermarkKey||undefined
+    const vids=targets.map(t=>t.vid),confirmationSession=session.current,tokens=evidenceTokens(vids),currentGroupKey=activeGroup,isDeferredLane=view==='deferred',currentWatermarkKey=effectiveWatermarkKey||undefined
     const originGroup=currentGroupKey,originPage=currentPage,advanceToken=++advanceSequenceRef.current
     const fingerprints=Object.fromEntries(targets.map(t=>[t.vid,{path:t.path,size:t.size,mtime_ns:t.mtime_ns}]))
     const pendingId=beginPendingMutation({action:'confirm',groupKey:currentGroupKey,isDeferred:isDeferredLane,vids,buckets:countBuckets(targets)})
@@ -715,16 +721,10 @@ export default function Review() {
   const hasLockedTarget=Boolean(targetLock)
   const focusedLock=focused?lockedVids.get(focused.vid):undefined
   const stageCurrentLock=stageCurrentTask?lockedVids.get(stageCurrentTask.vid):undefined
-  const trimmedCreator=creator.trim()
   const creatorLock=trimmedCreator?lockedPeople.get(trimmedCreator):undefined
   const creatorDestructiveLock=creatorLock&&isDestructivePersonAction(creatorLock.action)?creatorLock:undefined
-  useEffect(()=>{setRuleCandidateIdx(0)},[scope,trimmedCreator])
-  const creatorPersonObj=useMemo(()=>trimmedCreator?(people.find(p=>p.name===trimmedCreator)||{name:trimmedCreator}):null,[trimmedCreator,people])
-  const ruleCandidates=useMemo(()=>pickRuleCandidates(commonMarks,creatorPersonObj,(focused||actionTargets[0])?.data?.watermark?.candidates||[],actionTargets),[commonMarks,creatorPersonObj,focused,actionTargets])
-  const armedRuleMark=watermarkKey?commonMarks.find(c=>c.key===watermarkKey)||null:null
-  const activeRuleIdx=ruleCandidates.length?Math.min(ruleCandidateIdx,ruleCandidates.length-1):0
-  const suggestedRuleMark=armedRuleMark||ruleCandidates[activeRuleIdx]||null
-  const displayRuleIdx=suggestedRuleMark?ruleCandidates.findIndex(c=>c.key===suggestedRuleMark.key):-1
+  const defaultRuleKey=ruleCandidates[activeRuleIdx]?.key
+  const ruleOptinBar=trimmedCreator&&actionTargets.length>0&&suggestedRuleMark?<div className="ws-rule-optin" title={`勾选后将在归给 ${trimmedCreator} 时保存为已确认账号规则，后续同水印自动识别并跳过人脸分析`}><label className="ws-rule-optin-label"><Checkbox motionPreset="instant" aria-label={`归名时记住水印 ${suggestedRuleMark.text} 归属 ${trimmedCreator}`} checked={ruleChecked} disabled={busy||sessionExpired||hasLockedTarget} onCheckedChange={checked=>setWatermarkKey(checked?(suggestedRuleMark.key===defaultRuleKey?undefined:suggestedRuleMark.key):'')}/><span className="ws-rule-optin-text"><span>记住水印</span><code className="ws-rule-optin-token" title={suggestedRuleMark.text}>{suggestedRuleMark.text}</code><span className="ws-muted">→ {trimmedCreator}</span></span></label>{ruleCandidates.length>1&&<Button variant="ghost" size="sm" className="ws-rule-optin-switch" aria-label="切换要记住的候选水印" title="切换另一条匹配水印" onClick={()=>{const next=displayRuleIdx>=0?(displayRuleIdx+1)%ruleCandidates.length:0;setRuleCandidateIdx(next);if(ruleChecked)setWatermarkKey(ruleCandidates[next].key)}}><span className="tabular-nums">{(displayRuleIdx>=0?displayRuleIdx:activeRuleIdx)+1}/{ruleCandidates.length}</span></Button>}</div>:null
   const chosenLocked=chosen.some(t=>lockedVids.has(t.vid))
   const unlockedRows=rows.filter(t=>!lockedVids.has(t.vid))
   const activeLocalAutoMerge=tasks.find(t=>t.kind==='auto-merge'&&(t.status==='running'||t.status==='queued'||t.status==='recovery_needed'))
@@ -780,8 +780,8 @@ export default function Review() {
         onSearchChange={value=>setPickerSearch(current=>({...current,[scope]:value}))}
         actionTargets={actionTargets}
         commonMarks={commonMarks}
-        watermarkKey={watermarkKey}
-        onWatermarkKeyChange={setWatermarkKey}
+        watermarkKey={effectiveWatermarkKey}
+        onWatermarkKeyChange={key=>{if(!key)setWatermarkKey('');else setWatermarkKey(key===defaultRuleKey?undefined:key)}}
         hiddenCount={hiddenCount}
         groupLabel={data?.group?.label}
         selectionPreviewVid={selectionPreviewVid}
@@ -807,7 +807,7 @@ export default function Review() {
       {focused?.review_blocked&&!reference&&<p role="alert" className="ws-error">{focused.review_blocked}</p>}
       {submitError&&<p role="alert" className="ws-error">{submitError}</p>}
     </div>
-    {!reference&&trimmedCreator&&actionTargets.length>0&&suggestedRuleMark&&<div className="ws-rule-optin" title={`勾选后将在归给 ${trimmedCreator} 时保存为已确认账号规则，后续同水印自动识别并跳过人脸分析`}><label className="ws-rule-optin-label"><Checkbox motionPreset="instant" aria-label={`归名时记住水印 ${suggestedRuleMark.text} 归属 ${trimmedCreator}`} checked={watermarkKey===suggestedRuleMark.key} disabled={busy||sessionExpired||hasLockedTarget} onCheckedChange={checked=>setWatermarkKey(checked?suggestedRuleMark.key:'')}/><span className="ws-rule-optin-text"><span>记住水印</span><code className="ws-rule-optin-token" title={suggestedRuleMark.text}>{suggestedRuleMark.text}</code><span className="ws-muted">→ {trimmedCreator}</span></span></label>{ruleCandidates.length>1&&<Button variant="ghost" size="sm" className="ws-rule-optin-switch" aria-label="切换要记住的候选水印" title="切换另一条匹配水印" onClick={()=>{const cur=displayRuleIdx>=0?displayRuleIdx:0;const next=(cur+1)%ruleCandidates.length;setRuleCandidateIdx(next);if(watermarkKey)setWatermarkKey(ruleCandidates[next].key)}}><span className="tabular-nums">{(displayRuleIdx>=0?displayRuleIdx:activeRuleIdx)+1}/{ruleCandidates.length}</span></Button>}</div>}
+    {!reference&&ruleOptinBar}
     <div className="ws-detail-actions">{reference?<><Button variant="outline" onClick={backReference}>返回证据</Button><Button className="ws-action-primary" onClick={()=>{setCreator(reference.name);backReference()}}><span className="ws-btn-truncate">选择 {reference.name}</span></Button></>:<><Button variant="outline" disabled={!actionTargets.length||sessionExpired||hasLockedTarget} onClick={()=>void action(view==='deferred'?'restore':'defer',actionTargets.map(t=>t.vid))}>{view==='deferred'?'恢复':'暂缓'}</Button><Button className="ws-danger-btn" variant="outline" disabled={!actionTargets.length||disabled||hasLockedTarget||actionTargets.some(t=>blockedIds.has(t.vid)||pendingVids.has(t.vid))} aria-label={`将所选 ${actionTargets.length} 个视频移入回收站`} onClick={e=>openDeleteDialog(chosen.length>1?'batch':'single',actionTargets,e.currentTarget)}><Trash2 size={14} aria-hidden="true"/><span>删除</span></Button>{trimmedCreator?<Button className="ws-action-primary" disabled={!actionTargets.length||sessionExpired||hasLockedTarget||Boolean(creatorDestructiveLock)||actionTargets.some(t=>blockedIds.has(t.vid)||pendingVids.has(t.vid))} title={creatorDestructiveLock?`${trimmedCreator} ${creatorDestructiveLock.label}`:undefined} onClick={()=>void confirm()}><span className="ws-btn-truncate">归给 {trimmedCreator}</span><span className="ws-btn-badge">· <DigitSwap value={actionTargets.length}/></span></Button>:<Button className="ws-action-primary" disabled={!actionTargets.length} onClick={()=>actorInspectorRef.current?.openSwitcher()}><span>选人归名</span><span className="ws-btn-badge">· <DigitSwap value={actionTargets.length}/></span></Button>}</>}</div>
   </>
   const midScopeSegment:WorkbenchBreadcrumbSegment|null=personScope?{key:`person:${personScope}`,label:personScope}:clusterScope?{key:`cluster:${clusterScope}`,label:`相似组 ${clusterScope}`}:view!=='all'?{key:`view:${view}`,label:views.find(v=>v.value===view)?.label||view}:null
@@ -916,6 +916,7 @@ export default function Review() {
         <div ref={listScroll.ref} className="ws-list" aria-busy={loading||!groupMatched||query!==search} onScroll={listScroll.onScroll}>
           {(!data||!groupMatched)&&!error?<ReviewQueueSkeleton count={6} label="正在读取待确认视频"/>:!rows.length?<div className="ws-empty"><p>{group&&!data?.group?'该组已处理完，选择另一组继续。':query||folder?'当前筛选下没有视频。':data?.remaining===0?'本组已完成，可选择其他组继续。':'本批已处理完，可继续下一批。'}</p>{(query||folder)&&<Button variant="ghost" onClick={()=>{changeQuery('');setFolder('')}}>清除筛选</Button>}{!query&&!folder&&(data?.remaining??0)>0&&(data?.next_page!=null||data?.previous_page!=null)&&<Button variant="outline" onClick={()=>{advanceSequenceRef.current++;setPage((data.next_page??data.previous_page)!);setLinkFocus('')}}>继续剩余批次</Button>}{!query&&!folder&&nextAvailableGroup&&<Button variant="outline" onClick={()=>chooseGroup(nextAvailableGroup.key)}>下一待确认组 · {nextAvailableGroup.label}（{nextAvailableGroup.count}）</Button>}</div>:rows.map(t=><ReviewSummaryRow key={t.vid} task={t} selected={selected.has(t.vid)} active={focused?.vid===t.vid} disabled={disabled||!!t.review_blocked&&!selected.has(t.vid)} lock={lockedVids.get(t.vid)} onToggle={()=>toggle([t])} onInspect={()=>inspect(t)}/>)}
         </div>
+        {!reviewDesktop&&chosen.length>0&&ruleOptinBar}
         {chosen.length>0&&<div className="ws-bulk" aria-label="所选视频操作">
           <span className="ws-muted ws-bulk-count tabular-nums">已选 {chosen.length}</span>
           {reviewDesktop&&stageOpen?(

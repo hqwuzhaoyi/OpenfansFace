@@ -1471,6 +1471,7 @@ pub fn regular_stat(path: &str) -> Result<fs::Metadata> {
 }
 /// Bounded full byte comparison and SHA-256, with pinned descriptors and path
 /// fingerprints checked on both sides before and after the complete read.
+#[allow(dead_code)]
 pub fn identical_files(
     config: &Config,
     source: &FileMove,

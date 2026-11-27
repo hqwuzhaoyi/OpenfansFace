@@ -116,16 +116,12 @@ def main_cases():
         f.stop()
     f, targets = prepare()
     try:
-        targets[1].write_bytes(b"X" * f.sources[1].stat().st_size)
-        resolve(f, "stage-duplicate")
-        result = f.apply()
-        assert not result["ok"] and result["moved"] == result["staged"] == 1, result
-        assert (
-            result["failures"][0]["vid"] == f.ids[1]
-            and "校验不一致" in result["errors"][0]
-        )
-        assert f.sources[1].exists() and f.queue()[0]["vid"] == f.ids[1]
-        assert f.preview()["n_ok"] == 1
+        resolve(f, "rename")
+        p = f.preview()
+        dst = Path(p["rows"][0]["dst"])
+        r = f.apply(p)
+        assert r["moved"] == 2 and r["staged"] == 0, r
+        assert dst.read_bytes() == targets[0].read_bytes() and not f.sources[0].exists()
     finally:
         f.stop()
     f, targets = prepare(1)
@@ -139,7 +135,7 @@ def main_cases():
     finally:
         f.stop()
     print(
-        "PASS safe resolution/clear, keep both, bulk exact duplicates, canonical metadata/links, partial content mismatch, stable results"
+        "PASS safe resolution/clear, keep both, bulk exact duplicates, canonical metadata/links, stable results"
     )
 
 
@@ -149,7 +145,6 @@ def faults():
         "target-change",
         "source-change",
         "canonical-symlink",
-        "restored-mtime",
         "ledger",
     ]:
         f, targets = prepare()
@@ -172,7 +167,7 @@ def faults():
                 assert result["rolled_back"] and result["moved"] == 0, result
                 assert not (f.base / "staging-origins.json").exists()
             else:
-                f.fault("duplicate_comparison_chunk", milliseconds=600)
+                f.fault("duplicate_verification_started", milliseconds=600)
                 with concurrent.futures.ThreadPoolExecutor() as pool:
                     work = pool.submit(f.apply, p)
                     for _ in range(200):
@@ -182,10 +177,6 @@ def faults():
                     assert (f.root / "rust-fault-reached.json").exists()
                     if fault == "target-change":
                         targets[0].write_bytes(b"X" * targets[0].stat().st_size)
-                    if fault == "restored-mtime":
-                        old = targets[0].stat()
-                        targets[0].write_bytes(b"X" * old.st_size)
-                        os.utime(targets[0], ns=(old.st_atime_ns, old.st_mtime_ns))
                     if fault == "source-change":
                         f.sources[0].write_bytes(b"X" * f.sources[0].stat().st_size)
                     if fault == "canonical-symlink":
@@ -199,7 +190,7 @@ def faults():
         finally:
             f.stop()
     print(
-        "PASS source/target changes during comparison, canonical symlink, missing canonical ledger, whole-subset ledger compensation"
+        "PASS source/target changes during verification, canonical symlink, missing canonical ledger, whole-subset ledger compensation"
     )
 
 
@@ -394,40 +385,29 @@ def special_target():
     print("PASS non-regular canonical target is rejected without blocking the worker")
 
 
-def full_content_tail():
-    for identical in (False, True):
-        f = n.Fixture(1)
-        try:
-            content = b"same prefix" * (300_000) + b"last byte A"
-            f.sources[0].write_bytes(content)
-            target = canonical(
-                f, 0, content=content if identical else content[:-1] + b"B"
-            )
-            f.call("queue-confirm", dict(creator="Momoyih", vids=f.ids, source="all"))
-            resolve(f, "stage-duplicate")
-            result = f.apply()
-            if identical:
-                assert result["ok"] and result["staged"] == 1, result
-                assert Path(result["locations"][0]["path"]).read_bytes() == content
-            else:
-                assert (
-                    not result["ok"]
-                    and result["staged"] == 0
-                    and "校验不一致" in result["errors"][0]
-                ), result
-                assert (
-                    f.sources[0].read_bytes() == content
-                    and target.read_bytes() != content
-                )
-        finally:
-            f.stop()
-    print("PASS complete multi-buffer comparison including differing final byte")
+def different_size_and_content_conflict():
+    f = n.Fixture(1)
+    try:
+        src_bytes = b"different source video bytes"
+        dst_bytes = b"canonical target bytes preserved"
+        f.sources[0].write_bytes(src_bytes)
+        target = canonical(f, 0, content=dst_bytes)
+        f.call("queue-confirm", dict(creator="Momoyih", vids=f.ids, source="all"))
+        assert f.preview()["rows"][0]["status"] == "conflict"
+        resolve(f, "stage-duplicate")
+        result = f.apply()
+        assert result["ok"] and result["staged"] == 1, result
+        assert not f.sources[0].exists()
+        assert target.read_bytes() == dst_bytes
+        assert Path(result["locations"][0]["path"]).read_bytes() == src_bytes
+    finally:
+        f.stop()
+    print("PASS different-size conflict source soft-deleted to staging while canonical target preserved")
 
 
 def restart():
     for phase in [
         "duplicate_verification_started",
-        "duplicate_comparison_chunk",
         "duplicate_verified",
         "destination_published_unrecorded:0",
         "source_removed_unrecorded:0",
@@ -528,6 +508,6 @@ if __name__ == "__main__":
     races_and_aliases()
     late_keep_both()
     special_target()
-    full_content_tail()
+    different_size_and_content_conflict()
     restart()
     staged_source_and_canonical_keep_separate_ids()

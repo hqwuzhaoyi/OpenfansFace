@@ -18,13 +18,14 @@ export function batchCreator(batch: ArchiveBatch<PlanRow>) {
   return names.length > 1 ? `${names[0]} 等 ${names.length} 人` : batch.creator
 }
 
-export function ArchiveBatchList({ batches, selected, active, disabled, lockedPeople, lockedVids, onToggle, onOpen, onResolve, onCustomize, onUndo }: {
+export function ArchiveBatchList({ batches, selected, active, disabled, lockedPeople, lockedVids, onToggle, onOpen, onResolve, onStage, onCustomize, onUndo }: {
   batches: ArchiveBatch<PlanRow>[]; selected: Set<string>; active?: string
   disabled: boolean
   lockedPeople?: ReadonlyMap<string, ScopeLockInfo>
   lockedVids?: ReadonlyMap<string, ScopeLockInfo>
   onToggle: (ids: string[]) => void; onOpen: (key: string) => void
-  onResolve: (rows: PlanRow[], kind: 'rename' | 'stage-duplicate') => void
+  onResolve: (rows: PlanRow[], kind: 'rename') => void
+  onStage: (rows: PlanRow[]) => void
   onCustomize: (rows: PlanRow[]) => void; onUndo: (rows: PlanRow[]) => void
 }) {
   return <>{batches.map(batch => {
@@ -45,7 +46,7 @@ export function ArchiveBatchList({ batches, selected, active, disabled, lockedPe
         <span className="archive-batchMeta"><span><Layers size={12} />{batch.rows.length} 个视频</span>{batchLock && <AnimatedBadge size="sm" status={lockBadgeStatus(batchLock.status)} className="archive-lockBadge">{batchLock.label}</AnimatedBadge>}{autoCount > 0 && <span className="archive-autoBadge">自动水印{autoCount < batch.rows.length ? ` ${autoCount}` : ''}</span>}{!batchLock && (issues ? <span className="archive-warning">{issues} 个需处理</span> : <span className="archive-good">可归档</span>)}{count > 0 && <span className="archive-selectedCount">已选 {count}/{batch.rows.length}</span>}</span>
         <span className="archive-batchExcerpt">{batch.rows[0]?.name}{batch.rows.length > 1 ? ` 等 ${batch.rows.length} 个` : ''}{batch.inferred ? ' · 旧记录' : ''}</span>
       </button></div>
-      <ArchiveRowActions rows={batch.rows} disabled={disabled || Boolean(batchLock)} onResolve={onResolve} onCustomize={onCustomize} onUndo={onUndo} />
+      <ArchiveRowActions rows={batch.rows} disabled={disabled || Boolean(batchLock)} onResolve={onResolve} onStage={onStage} onCustomize={onCustomize} onUndo={onUndo} />
     </article>
   })}</>
 }

@@ -45,9 +45,14 @@ import {
   MorphPopoverTrigger,
 } from "@/components/beui/motion/popover-morph";
 import { ButtonGroup } from "@/components/ui/button-group";
-import { FILE_OPERATION_STORAGE_KEY } from "@/components/persons/file-actions";
 import { deleteWorkbenchCache } from "@/components/workbench/state";
-import { settleBackgroundTask } from "@/lib/background-operations-model";
+import {
+  clearLegacyOperationStorage,
+  filterExternalServerActiveOps,
+  formatServerActiveOpCard,
+  isUnadmittedNotStarted,
+  settleBackgroundTask,
+} from "@/lib/background-operations-model";
 
 function invalidatePersonLibraryCaches(
   people: Iterable<string | undefined | null>,
@@ -113,9 +118,6 @@ export type {
   ServerLockSnapshot,
   ServerSettledOp,
 };
-
-const BATCH_STORAGE_KEY = "person-batch-operation-v1";
-const ARCHIVE_STORAGE_KEY = "face-archive-operation";
 
 function makeUuid(): string {
   if (
@@ -299,6 +301,7 @@ interface BackgroundOperationsContextValue {
     creators: string[];
     sizeGb?: string;
     personName?: string;
+    title?: string;
   }) => string;
   enqueueAutoMerge: (input: {
     version: string;
@@ -629,101 +632,10 @@ export function BackgroundOperationsProvider({
     [],
   );
 
-  // Restore any interrupted operation from localStorage on mount
+  // Clear any legacy operation keys from localStorage; active operations come from server lock SSE.
   useEffect(() => {
-    try {
-      const rawFile = localStorage.getItem(FILE_OPERATION_STORAGE_KEY);
-      if (rawFile) {
-        const plan = JSON.parse(rawFile) as PersonFilePlan;
-        if (plan?.backend === "rust" && plan.id && plan.request?.id === plan.id) {
-          rememberLocalOpId(plan.id);
-          const payloadVids = Array.isArray(plan.request.payload?.vids)
-            ? plan.request.payload.vids.filter((v): v is string => typeof v === "string")
-            : [];
-          const restoredVids = [
-            ...new Set([
-              ...payloadVids,
-              ...plan.files.flatMap((f) => f.vids || []),
-            ]),
-          ];
-          const restoredTitle =
-            plan.action === "review-delete"
-              ? "移入回收站 · 人工确认"
-              : `${fileActionLabels[plan.action] || "文件操作"} · ${plan.person}${plan.target_person ? ` → ${plan.target_person}` : ""}`;
-          setTasks((prev) =>
-            prev.some((t) => t.id === plan.id)
-              ? prev
-              : [
-                  ...prev,
-                  {
-                    id: plan.id,
-                    kind: "person-file",
-                    action: plan.action,
-                    title: restoredTitle,
-                    subtitle: `${plan.files.length} 个文件 · ${(plan.total_bytes / 2 ** 20).toFixed(1)} MB`,
-                    person: plan.person,
-                    targetPerson: plan.target_person,
-                    vids: restoredVids,
-                    plan,
-                    status: "running",
-                    createdAt: Date.now(),
-                    startedAt: Date.now(),
-                  },
-                ],
-          );
-        }
-      }
-    } catch {
-      // Ignore malformed storage
-    }
-    try {
-      const rawBatch = localStorage.getItem(BATCH_STORAGE_KEY);
-      if (rawBatch) {
-        const saved = JSON.parse(rawBatch) as {
-          plan: PersonBatchPlan;
-          people: string[];
-          thumbs?: Record<string, string | null>;
-        };
-        if (saved?.plan?.id) {
-          rememberLocalOpId(saved.plan.id);
-          const merging = saved.plan.request.action === "merge";
-          const totalFiles = saved.plan.plans.reduce(
-            (s, p) => s + p.files.length,
-            0,
-          );
-          const totalMb = (
-            saved.plan.plans.reduce((s, p) => s + p.total_bytes, 0) /
-            2 ** 20
-          ).toFixed(1);
-          setTasks((prev) =>
-            prev.some((t) => t.id === saved.plan.id)
-              ? prev
-              : [
-                  ...prev,
-                  {
-                    id: saved.plan.id,
-                    kind: "person-batch",
-                    action: saved.plan.request.action,
-                    title: merging
-                      ? `合并 ${saved.people.filter((p) => p !== saved.plan.request.target).join("、")} → ${saved.plan.request.target}`
-                      : `删除人物 ${saved.people.join("、")}`,
-                    subtitle: `${totalFiles} 个文件 · ${totalMb} MB`,
-                    people: saved.people,
-                    target: saved.plan.request.target,
-                    thumbs: saved.thumbs || {},
-                    plan: saved.plan,
-                    status: "running",
-                    createdAt: Date.now(),
-                    startedAt: Date.now(),
-                  },
-                ],
-          );
-        }
-      }
-    } catch {
-      // Ignore malformed storage
-    }
-  }, [rememberLocalOpId]);
+    clearLegacyOperationStorage();
+  }, []);
 
   const enqueuePersonBatch = useCallback(
     ({
@@ -832,12 +744,14 @@ export function BackgroundOperationsProvider({
       creators,
       sizeGb,
       personName,
+      title,
     }: {
       vids: string[];
       version: string;
       creators: string[];
       sizeGb?: string;
       personName?: string;
+      title?: string;
     }) => {
       const operationId = makeUuid();
       const uniqueCreators = [...new Set(creators.filter(Boolean))];
@@ -853,7 +767,7 @@ export function BackgroundOperationsProvider({
       const task: ArchiveTask = {
         id: operationId,
         kind: "archive",
-        title: `归档 · ${creatorLabel}`,
+        title: title || `归档 · ${creatorLabel}`,
         subtitle: `${vids.length} 个视频${sizeGb ? ` · ${sizeGb} GB` : ""}`,
         vids,
         creators: uniqueCreators,
@@ -1063,16 +977,6 @@ export function BackgroundOperationsProvider({
             t.kind === "person-batch" ? { ...t, plan: currentPlan } : t,
           );
         }
-        try {
-          localStorage.setItem(
-            BATCH_STORAGE_KEY,
-            JSON.stringify({
-              plan: currentPlan,
-              people: initialTask.people,
-              thumbs: initialTask.thumbs,
-            }),
-          );
-        } catch {}
 
         startPolling(currentPlan.id);
 
@@ -1129,11 +1033,7 @@ export function BackgroundOperationsProvider({
           : saved.recovery_needed
             ? "recovery_needed"
             : "failed";
-        if (saved.ok) {
-          try {
-            localStorage.removeItem(BATCH_STORAGE_KEY);
-          } catch {}
-        } else {
+        if (!saved.ok) {
           setOpen(true);
         }
 
@@ -1218,12 +1118,6 @@ export function BackgroundOperationsProvider({
           );
         }
         if (currentPlan.backend === "rust") {
-          try {
-            localStorage.setItem(
-              FILE_OPERATION_STORAGE_KEY,
-              JSON.stringify(currentPlan),
-            );
-          } catch {}
           const poll = async () => {
             try {
               const receipt = await api<FileReceipt>(
@@ -1325,6 +1219,52 @@ export function BackgroundOperationsProvider({
               terminalReceipt = receipt;
               break;
             }
+            if (receipt.status === "not_started") {
+              try {
+                const locksRes = await fetch("/api/locks", {
+                  cache: "no-store",
+                });
+                const snap = locksRes.ok
+                  ? parseLockSnapshotJson(await locksRes.text())
+                  : null;
+                if (
+                  snap &&
+                  isUnadmittedNotStarted(
+                    receipt.status,
+                    currentPlan.id,
+                    snap.active_ops,
+                  )
+                ) {
+                  const recheck = await api<FileReceipt>(
+                    `/api/persons/manage?id=${encodeURIComponent(currentPlan.id)}`,
+                  );
+                  if (
+                    [
+                      "complete",
+                      "rolled_back",
+                      "failed",
+                      "recovery_needed",
+                      "cancelled",
+                    ].includes(recheck.status)
+                  ) {
+                    terminalReceipt = recheck;
+                    break;
+                  }
+                  if (recheck.status === "not_started") {
+                    terminalReceipt = {
+                      ...recheck,
+                      status: "failed",
+                      error:
+                        recheck.error ||
+                        "排队期间文件或账本已变化，操作未执行，请刷新后重试",
+                    };
+                    break;
+                  }
+                }
+              } catch {
+                // Keep polling if the lock snapshot check transiently fails.
+              }
+            }
           }
           if (terminalReceipt.status === "complete" && terminalReceipt.result) {
             result = terminalReceipt.result;
@@ -1343,11 +1283,6 @@ export function BackgroundOperationsProvider({
                 : terminalReceipt.status === "recovery_needed"
                   ? "recovery_needed"
                   : "failed";
-            if (nextStatus === "rolled_back") {
-              try {
-                localStorage.removeItem(FILE_OPERATION_STORAGE_KEY);
-              } catch {}
-            }
             invalidatePersonLibraryCaches([
               initialTask.person,
               initialTask.targetPerson,
@@ -1387,10 +1322,6 @@ export function BackgroundOperationsProvider({
         } else {
           result = outcome as PersonFileResult;
         }
-
-        try {
-          localStorage.removeItem(FILE_OPERATION_STORAGE_KEY);
-        } catch {}
 
         invalidatePersonLibraryCaches([
           initialTask.person,
@@ -1476,9 +1407,6 @@ export function BackgroundOperationsProvider({
           }
           currentVersion = fresh.version;
         }
-        try {
-          localStorage.setItem(ARCHIVE_STORAGE_KEY, initialTask.operationId);
-        } catch {}
 
         const poll = async () => {
           try {
@@ -1582,11 +1510,7 @@ export function BackgroundOperationsProvider({
                 ? "complete"
                 : "failed";
 
-        if (nextStatus === "complete") {
-          try {
-            localStorage.removeItem(ARCHIVE_STORAGE_KEY);
-          } catch {}
-        } else {
+        if (nextStatus !== "complete") {
           setOpen(true);
         }
 
@@ -1869,11 +1793,6 @@ export function BackgroundOperationsProvider({
             : saved.recovery_needed
               ? "recovery_needed"
               : "failed";
-          if (saved.ok) {
-            try {
-              localStorage.removeItem(BATCH_STORAGE_KEY);
-            } catch {}
-          }
           invalidatePersonLibraryCaches([
             ...target.people,
             target.target,
@@ -1916,11 +1835,6 @@ export function BackgroundOperationsProvider({
                 : receipt.status === "recovery_needed"
                   ? "recovery_needed"
                   : "failed";
-          if (nextStatus === "complete" || nextStatus === "rolled_back") {
-            try {
-              localStorage.removeItem(FILE_OPERATION_STORAGE_KEY);
-            } catch {}
-          }
           invalidatePersonLibraryCaches([
             target.person,
             target.targetPerson,
@@ -1968,11 +1882,6 @@ export function BackgroundOperationsProvider({
                 : res.ok
                   ? "complete"
                   : "failed";
-            if (nextStatus === "complete") {
-              try {
-                localStorage.removeItem(ARCHIVE_STORAGE_KEY);
-              } catch {}
-            }
             invalidatePersonLibraryCaches(target.creators);
             deleteWorkbenchCache("integration:plan");
             invalidateReviewCaches({ resetSession: true });
@@ -2521,6 +2430,55 @@ function TaskIcon({ task }: { task: BackgroundTask }) {
   return <Pencil className="size-3.5" />;
 }
 
+function ServerOpIcon({ action }: { action: string }) {
+  if (action === "archive" || action === "archive-unarchive") {
+    return <Archive className="size-3.5" />;
+  }
+  if (
+    action === "auto-archive" ||
+    action === "auto-merge" ||
+    action === "auto-watermark-apply"
+  ) {
+    return <Sparkles className="size-3.5" />;
+  }
+  if (action === "batch-merge" || action === "merge-person") {
+    return <Merge className="size-3.5" />;
+  }
+  if (
+    action === "batch-delete" ||
+    action === "delete-person" ||
+    action === "delete-files" ||
+    action === "review-delete" ||
+    action === "staging-delete"
+  ) {
+    return <Trash2 className="size-3.5" />;
+  }
+  if (action === "move-files" || action === "restore-files") {
+    return <FolderInput className="size-3.5" />;
+  }
+  return <Pencil className="size-3.5" />;
+}
+
+function ServerOpProgress({
+  label,
+  startedAt,
+}: {
+  label: string;
+  startedAt: number;
+}) {
+  const [mountNow] = useState(() => Date.now());
+  const initialSeconds =
+    startedAt > 0 ? Math.max(0, (mountNow - startedAt) / 1000) : 0;
+  return (
+    <AgentProgress
+      label={label}
+      initialSeconds={initialSeconds}
+      labels={{ inProgress: "{label}，进行中" }}
+      className="w-full min-w-0 gap-2 text-[12px] [&>span:nth-child(2)]:min-w-0 [&>span:nth-child(2)]:flex-1 [&>span:nth-child(2)]:truncate"
+    />
+  );
+}
+
 function TaskActivityFeedback({
   task,
   items,
@@ -2570,6 +2528,7 @@ export function BackgroundOperationsDock({
     tasks,
     open,
     setOpen,
+    serverActiveOps,
     cancelQueuedTask,
     dismissTask,
     clearCompleted,
@@ -2586,11 +2545,29 @@ export function BackgroundOperationsDock({
     return () => mql.removeEventListener("change", update);
   }, []);
 
+  const externalServerOps = useMemo(
+    () => filterExternalServerActiveOps(serverActiveOps, tasks),
+    [serverActiveOps, tasks],
+  );
+  const externalServerCards = useMemo(
+    () => externalServerOps.map((op) => ({ op, card: formatServerActiveOpCard(op) })),
+    [externalServerOps],
+  );
+
   if (mobile !== isMobileViewport) return null;
-  if (tasks.length === 0) return null;
+  if (tasks.length === 0 && externalServerCards.length === 0) return null;
 
   const runningTask = tasks.find((t) => t.status === "running");
+  const runningServerCard = externalServerCards.find(
+    ({ card }) => card.status === "running",
+  );
   const queuedCount = tasks.filter((t) => t.status === "queued").length;
+  const queuedServerCount = externalServerCards.filter(
+    ({ card }) => card.status === "queued",
+  ).length;
+  const recoveryServerCount = externalServerCards.filter(
+    ({ card }) => card.status === "recovery_needed",
+  ).length;
   const errorTasks = tasks.filter(
     (t) =>
       t.status === "failed" ||
@@ -2598,22 +2575,27 @@ export function BackgroundOperationsDock({
       t.status === "rolled_back",
   );
   const completedCount = tasks.filter((t) => t.status === "complete").length;
+  const totalCount = tasks.length + externalServerCards.length;
+  const totalQueuedCount = queuedCount + queuedServerCount;
 
-  const stateTone: "running" | "error" | "complete" = runningTask || queuedCount
-    ? "running"
-    : errorTasks.length > 0
-      ? "error"
-      : "complete";
+  const stateTone: "running" | "error" | "complete" =
+    runningTask || runningServerCard || totalQueuedCount > 0
+      ? "running"
+      : errorTasks.length > 0 || recoveryServerCount > 0
+        ? "error"
+        : "complete";
 
   const pillLabel = runningTask
     ? runningTask.title
-    : queuedCount > 0
-      ? `排队等待执行 · ${queuedCount} 项`
-      : errorTasks.length > 0
-        ? `${errorTasks.length} 项操作需核对`
-        : `已完成 ${completedCount} 项操作`;
+    : runningServerCard
+      ? runningServerCard.card.title
+      : totalQueuedCount > 0
+        ? `排队等待执行 · ${totalQueuedCount} 项`
+        : errorTasks.length + recoveryServerCount > 0
+          ? `${errorTasks.length + recoveryServerCount} 项操作需核对`
+          : `已完成 ${completedCount} 项操作`;
 
-  const badgeCount = queuedCount > 0 ? queuedCount : tasks.length;
+  const badgeCount = totalQueuedCount > 0 ? totalQueuedCount : totalCount;
 
   return (
     <div
@@ -2644,13 +2626,13 @@ export function BackgroundOperationsDock({
 
             {mobile ? (
               <span className="bg-ops-trigger-count">
-                {queuedCount > 0 ? (
-                  <DigitSwap value={queuedCount} />
+                {totalQueuedCount > 0 ? (
+                  <DigitSwap value={totalQueuedCount} />
                 ) : (
                   <>
                     <DigitSwap value={completedCount} />
                     <span>/</span>
-                    <DigitSwap value={tasks.length} />
+                    <DigitSwap value={totalCount} />
                   </>
                 )}
               </span>
@@ -2673,7 +2655,7 @@ export function BackgroundOperationsDock({
             <div className="bg-ops-panel-title">
               <span>后台任务队列</span>
               <AnimatedBadge status="neutral" showIcon={false}>
-                <DigitSwap value={tasks.length} />
+                <DigitSwap value={totalCount} />
               </AnimatedBadge>
             </div>
             <ButtonGroup className="bg-ops-action-group">
@@ -2699,6 +2681,64 @@ export function BackgroundOperationsDock({
           </div>
 
           <div className="bg-ops-list">
+            {externalServerCards.map(({ op, card }) => (
+              <div
+                key={`server:${card.id}`}
+                className="bg-ops-card"
+                data-status={card.status}
+              >
+                <div className="bg-ops-card-head">
+                  <div className="bg-ops-card-main">
+                    <span className="bg-ops-trigger-icon">
+                      <ServerOpIcon action={op.action} />
+                    </span>
+                    <div className="bg-ops-card-title">
+                      <strong title={card.title}>{card.title}</strong>
+                      <span>{card.subtitle}</span>
+                    </div>
+                  </div>
+
+                  <AnimatedBadge status={card.badgeStatus}>
+                    {card.badgeText}
+                  </AnimatedBadge>
+                </div>
+
+                {card.status === "running" && (
+                  <ServerOpProgress
+                    label={card.stageLabel}
+                    startedAt={card.startedAt}
+                  />
+                )}
+
+                {card.status === "recovery_needed" && (
+                  <Alert
+                    variant="warning"
+                    className="rounded-lg p-2.5 text-[11.5px]"
+                    contentClassName="gap-2"
+                  >
+                    <AlertIcon className="mt-0.5 size-3.5 [&>svg]:size-3.5" />
+                    <AlertContent className="space-y-0">
+                      <AlertDescription className="text-current leading-[1.45]">
+                        服务端写入已暂停，待核对恢复
+                      </AlertDescription>
+                    </AlertContent>
+                  </Alert>
+                )}
+
+                <div className="bg-ops-card-foot">
+                  <span className="text-[11px] text-muted-foreground">
+                    {card.status === "queued" ? (
+                      <span className="inline-flex items-center gap-1">
+                        <Clock3 className="size-3" />
+                        等待前序任务完成
+                      </span>
+                    ) : (
+                      `编号 ${card.id.slice(0, 8)}`
+                    )}
+                  </span>
+                </div>
+              </div>
+            ))}
             {[...tasks].reverse().map((task) => {
               const items = buildActivityItems(task);
               const isRunning = task.status === "running";

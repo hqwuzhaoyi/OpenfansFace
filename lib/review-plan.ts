@@ -54,12 +54,12 @@ export function buildPlan(queue = queuedWithOrigin()) {
         row.dst_size = dest.size; row.dst_mtime = dest.mtimeMs
         row.status = dest.isFile() && dest.size === stat.size ? 'duplicate' : 'conflict'
         row.reason = row.status === 'duplicate' ? '目标存在同名同体积文件，需核对是否重复' : '目标存在同名但体积不同的文件，需先处理冲突'
-        if (row.status === 'duplicate' && item.resolution?.kind === 'stage-duplicate') {
+        if (dest.isFile() && dest.size > 0 && item.resolution?.kind === 'stage-duplicate') {
           row.operation = 'stage-duplicate'; row.status = 'ok'
-          row.reason = '已选择保留目标文件；执行时完整校验内容，完全一致才把源文件移入回收站'
+          row.reason = '已选择保留目标文件，归档时将源文件移入回收站'
         }
       } else if (targets.has(row.dst)) { row.status = 'dupe-target'; row.reason = '队列里另一个视频也将使用此目标文件名' }
-      if (item.resolution?.kind === 'stage-duplicate' && row.operation !== 'stage-duplicate') { row.status = 'conflict'; row.reason = '目标文件已变化，无法将重复件移入回收站，请重新选择处理方式' }
+      if (item.resolution?.kind === 'stage-duplicate' && row.operation !== 'stage-duplicate') { row.status = 'conflict'; row.reason = '目标文件已变化，无法将源文件移入回收站，请重新选择处理方式' }
       targets.add(row.dst)
       if(row.status==='ok'){
         try{requireMovePermissions(src,row.operation==='stage-duplicate'?path.join(STAGE,'archive-duplicates','pending'):row.dst)}

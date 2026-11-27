@@ -174,29 +174,30 @@ pub fn preview_queue(config: &Config, queue: &Value) -> Result<Value> {
             row["dst"] = json!(dst.to_string_lossy());
             if dst.symlink_metadata().is_ok() {
                 let target = std::fs::symlink_metadata(&dst)?;
+                let is_regular_target = target.is_file() && !target.file_type().is_symlink();
                 row["dst_size"] = json!(target.len());
                 row["dst_mtime"] =
                     json!(files::mtime_ns(&target).parse::<i128>().unwrap_or(0) / 1_000_000);
-                row["status"] = json!(if target.is_file()
-                    && !target.file_type().is_symlink()
-                    && target.len() == stat.len()
-                {
+                row["status"] = json!(if is_regular_target && target.len() == stat.len() {
                     "duplicate"
                 } else {
                     "conflict"
                 });
-                if row["status"] == "duplicate" && item["resolution"]["kind"] == "stage-duplicate" {
+                if is_regular_target && item["resolution"]["kind"] == "stage-duplicate" {
                     let target = files::regular_stat(&dst.to_string_lossy())?;
+                    if target.len() == 0 {
+                        return Err(Error::conflict("目标文件为空，无法将源文件移入回收站"));
+                    }
                     row["canonical_version"] =
                         json!(files::fingerprint(&dst.to_string_lossy(), &target));
                     row["operation"] = json!("stage-duplicate");
                     row["status"] = json!("ok");
-                    row["reason"] = json!("执行时完整校验内容，完全一致才把源文件移入回收站");
+                    row["reason"] = json!("已选择保留目标文件，归档时将源文件移入回收站");
                 } else {
                     return Err(Error::conflict("目标存在同名文件，需先处理冲突"));
                 }
             } else if item["resolution"]["kind"] == "stage-duplicate" {
-                return Err(Error::conflict("目标文件已变化，无法将重复件移入回收站"));
+                return Err(Error::conflict("目标文件已变化，无法将源文件移入回收站"));
             }
             if row["operation"] != "stage-duplicate" && !targets.insert(dst.clone()) {
                 row["status"] = json!("dupe-target");
@@ -819,11 +820,14 @@ pub fn verify_duplicate(config: &Config, plan: &Plan, index: usize, compare: boo
     let version = row["canonical_version"].as_str().unwrap();
     if compare {
         crate::fault::checkpoint(config, "duplicate_verification_started")?;
-        files::identical_files(config, &plan.files[index], target, version)?;
+    }
+    let stat = files::regular_stat(target)?;
+    if stat.len() == 0 || files::fingerprint(target, &stat) != version {
+        return Err(Error::conflict("目标文件已变化，请重新核对").at(target));
+    }
+    if compare {
         crate::fault::checkpoint(config, "duplicate_verified")?;
         crate::fault::checkpoint(config, &format!("duplicate_verified:{index}"))?;
-    } else if files::fingerprint(target, &files::regular_stat(target)?) != version {
-        return Err(Error::conflict("重复件目标文件已变化，请重新核对").at(target));
     }
     Ok(())
 }

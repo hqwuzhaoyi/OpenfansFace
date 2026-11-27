@@ -844,3 +844,51 @@ export function pickRuleCandidates<
       return (b.frames ?? 0) - (a.frames ?? 0)
     })
 }
+
+export interface ResolvedWatermarkRule<T extends { key: string }> {
+  suggestedMark: T | null
+  effectiveKey: string
+  checked: boolean
+  candidateIndex: number
+}
+
+export function resolveEffectiveWatermarkRule<T extends { key: string }>(params: {
+  draftWatermarkKey: string | undefined
+  commonMarks: T[]
+  ruleCandidates: T[]
+  candidateIdx: number
+}): ResolvedWatermarkRule<T> {
+  const { draftWatermarkKey, commonMarks, ruleCandidates, candidateIdx } = params
+  const clampedIdx = ruleCandidates.length
+    ? Math.max(0, Math.min(candidateIdx, ruleCandidates.length - 1))
+    : 0
+  const defaultMark = ruleCandidates[clampedIdx] ?? null
+
+  if (draftWatermarkKey === '') {
+    return {
+      suggestedMark: defaultMark,
+      effectiveKey: '',
+      checked: false,
+      candidateIndex: defaultMark ? clampedIdx : -1,
+    }
+  }
+
+  if (draftWatermarkKey) {
+    const explicit = commonMarks.find(m => m.key === draftWatermarkKey)
+    if (explicit) {
+      return {
+        suggestedMark: explicit,
+        effectiveKey: explicit.key,
+        checked: true,
+        candidateIndex: ruleCandidates.findIndex(m => m.key === explicit.key),
+      }
+    }
+  }
+
+  return {
+    suggestedMark: defaultMark,
+    effectiveKey: defaultMark?.key ?? '',
+    checked: Boolean(defaultMark),
+    candidateIndex: defaultMark ? clampedIdx : -1,
+  }
+}

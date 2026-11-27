@@ -170,9 +170,10 @@ html[data-input=keyboard] .ws-resizer,html[data-input=keyboard] .ws-resizer-grip
 .ws-rule-optin-text{display:flex;align-items:center;gap:5px;min-width:0;flex:1;flex-wrap:wrap;line-height:1.35}
 .ws-rule-optin-token{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;padding:1px 5px;border-radius:5px;border:1px solid var(--border);background:var(--muted);color:var(--foreground);max-width:145px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .ws-rule-optin-text>.ws-muted{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:110px}
-.ws-control.ws-rule-optin-switch{height:24px!important;min-height:24px!important;padding:0 7px!important;font-size:11px!important;flex-shrink:0;border-radius:999px!important}
+.ws-control.ws-rule-optin-switch{height:24px!important;min-height:24px!important;min-width:0!important;padding:0 7px!important;font-size:11px!important;flex-shrink:0;border-radius:999px!important}
 @media(max-width:767px){
   .ws-rule-optin{min-height:44px;padding:6px 12px}
+  .ws-control.ws-rule-optin-switch{height:28px!important;min-height:28px!important;min-width:34px!important}
   .ws-actor-avatar-trigger{width:44px;height:44px;min-width:44px;min-height:44px}
   .ws-actor-combobox-trigger{height:44px!important}
   .ws-actor-combobox-trigger input{height:40px!important;font-size:16px!important}
