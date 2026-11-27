@@ -2,7 +2,7 @@
 ARG NODE_IMAGE=node:22-slim
 FROM ${NODE_IMAGE} AS deps
 WORKDIR /app
-RUN apt-get update && apt-get install -y --no-install-recommends python3 make g++ && rm -rf /var/lib/apt/lists/*
+RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources && apt-get update && apt-get install -y --no-install-recommends python3 make g++ && rm -rf /var/lib/apt/lists/*
 COPY package.json pnpm-lock.yaml pnpm-workspace.yaml ./
 RUN npm install --global node-gyp@11 && corepack enable && corepack prepare pnpm@10.10.0 --activate && pnpm install --frozen-lockfile
 RUN node -e "const Database=require('better-sqlite3'); const db=new Database(':memory:'); db.prepare('SELECT 1').get(); db.close()"
