@@ -1,7 +1,7 @@
 services:
   face-admin-prod:
     build:
-      context: ..
+      context: .
       dockerfile: Dockerfile
     container_name: face-admin-prod
     network_mode: host

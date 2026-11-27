@@ -1,7 +1,7 @@
 services:
   face-file-operations:
     build:
-      context: ..
+      context: .
       dockerfile: services/file-operations/Dockerfile
     container_name: face-file-operations
     network_mode: host
