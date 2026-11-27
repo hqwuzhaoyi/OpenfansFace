@@ -1,0 +1,30 @@
+services:
+  face-file-operations:
+    build:
+      context: ..
+      dockerfile: services/file-operations/Dockerfile
+    container_name: face-file-operations
+    network_mode: host
+    restart: unless-stopped
+    user: "1000:1000"
+    volumes:
+      - /mnt/media2:/mnt/media2
+      - /home/prajna/workspace/face-clusters:/home/prajna/workspace/face-clusters
+      - /opt/peach/data/database:/opt/peach/data/database
+    environment:
+      - FACES_BASE=${FACES_BASE}
+      - FILE_OPERATIONS_ADMISSION=${FILE_OPERATIONS_ADMISSION}
+      - FILE_OPERATIONS_BIND=${FILE_OPERATIONS_BIND}
+      - FILE_OPERATIONS_RUST_TOKEN=${FILE_OPERATIONS_RUST_TOKEN}
+      - MALLOC_ARENA_MAX=${MALLOC_ARENA_MAX}
+      - MEDIA2_ROOT=${MEDIA2_ROOT}
+      - MEDIA_NFS_SOURCE=${MEDIA_NFS_SOURCE}
+      - PEACH_LEDGER_PATH=${PEACH_LEDGER_PATH}
+      - VIDEO_HEALTH_BUDGET=${VIDEO_HEALTH_BUDGET}
+      - VIDEO_HEALTH_ENABLED=${VIDEO_HEALTH_ENABLED}
+      - VIDEO_HEALTH_SECONDS=${VIDEO_HEALTH_SECONDS}
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8930"]
+      interval: 15s
+      timeout: 5s
+      retries: 3

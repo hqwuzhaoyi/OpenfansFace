@@ -1,0 +1,31 @@
+services:
+  face-admin-prod:
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    container_name: face-admin-prod
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - /mnt/media2:/mnt/media2
+      - /home/prajna/workspace/face-clusters:/home/prajna/workspace/face-clusters
+      - /opt/peach/data/database:/opt/peach/data/database
+    environment:
+      - DOCKER_SOCK=${DOCKER_SOCK}
+      - FACES_BASE=${FACES_BASE}
+      - FILE_OPERATIONS_RUST_TOKEN=${FILE_OPERATIONS_RUST_TOKEN}
+      - FILE_OPERATIONS_RUST_URL=${FILE_OPERATIONS_RUST_URL}
+      - HOSTNAME=${HOSTNAME}
+      - MEDIA2_ROOT=${MEDIA2_ROOT}
+      - NEXT_PUBLIC_APP_ENV=${NEXT_PUBLIC_APP_ENV}
+      - NEXT_TELEMETRY_DISABLED=${NEXT_TELEMETRY_DISABLED}
+      - NODE_ENV=${NODE_ENV}
+      - PEACH_LEDGER_PATH=${PEACH_LEDGER_PATH}
+      - PORT=${PORT}
+      - REDIS_URL=${REDIS_URL}
+      - UV_THREADPOOL_SIZE=${UV_THREADPOOL_SIZE}
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:8919/api/locks').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
