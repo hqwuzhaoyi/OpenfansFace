@@ -6,7 +6,7 @@ export function canAutoRefreshReview({now,lastActivity,protectedWork,requestActi
   return !protectedWork && now-idleSince>=REVIEW_IDLE_MS && requestActivity===currentActivity
 }
 
-export function isReviewAvailable(task:ProcessingTask){return task.stage==='review'||!!task.manual||task.data.ready===true&&(task.stage==='face'||task.stage==='face_queued'||(task.stage==='retry'||task.stage==='error')&&task.retry_stage==='face')}
+export function isReviewAvailable(task:ProcessingTask){return task.stage==='review'||!!task.manual||task.data.ready===true&&(['queued','text','face','face_queued'].includes(task.stage)||task.stage==='retry'&&(task.retry_stage==='face'||task.retry_stage==='text')||task.stage==='error'&&task.retry_stage==='face')}
 
 export function isCachedReviewPageReusable(
   cached:{session?:string;group?:{key:string}|null;page:number}|undefined|null,

@@ -2,7 +2,7 @@
 
 import Link from 'next/link'
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
-import { Check, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, Film, Maximize2, Play, RefreshCw, Search, SlidersHorizontal, Sparkles, Trash2, X, ArrowLeft, ListChecks } from 'lucide-react'
+import { Check, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight, Film, Folder, Maximize2, Play, RefreshCw, Search, SlidersHorizontal, Sparkles, Trash2, X, ArrowLeft, ListChecks } from 'lucide-react'
 import * as Popover from '@radix-ui/react-popover'
 import { workspaceToast as toast } from '@/components/workbench/feedback'
 import { api } from '@/lib/face-api'
@@ -886,7 +886,9 @@ export default function Review() {
             </div>
           ):data?.groups.map(g=>{
             const personLock=g.key.startsWith('person:')?(lockedPeople.get(g.label)??lockedPeople.get(g.key.slice('person:'.length))):undefined
-            return <button key={g.key} type="button" className="ws-group" data-locked={Boolean(personLock)||undefined} title={`${g.label} (${g.count})${personLock?` · ${personLock.label}`:''}`} aria-pressed={activeGroup===g.key} onClick={()=>chooseGroup(g.key)}><span className="ws-group-pill" aria-hidden="true">{Array.from(g.label).slice(0,2).join('')}</span><span className="ws-group-label">{g.label}</span>{personLock&&<AnimatedBadge size="sm" status={lockBadgeStatus(personLock.status)} className="ws-group-lock">{personLock.label}</AnimatedBadge>}<span className="ws-count">{g.count}</span>{(selections[reviewSelectionKey(g.key,view==='deferred')]||[]).length>0&&<><Check size={12} className="ws-group-check" aria-hidden="true"/><span className="sr-only">（有已选视频）</span></>}</button>
+            const isFolderGroup=g.key.startsWith('folder:')
+            const groupTitle=isFolderGroup?g.key.slice('folder:'.length):g.label
+            return <button key={g.key} type="button" className="ws-group" data-locked={Boolean(personLock)||undefined} title={`${groupTitle} (${g.count})${personLock?` · ${personLock.label}`:''}`} aria-pressed={activeGroup===g.key} onClick={()=>chooseGroup(g.key)}><span className="ws-group-pill" aria-hidden="true">{isFolderGroup?<Folder size={13} aria-hidden="true"/>:Array.from(g.label).slice(0,2).join('')}</span>{isFolderGroup&&<Folder size={13} className="ws-group-folder-icon shrink-0 opacity-60" aria-hidden="true"/>}<span className="ws-group-label">{g.label}</span>{personLock&&<AnimatedBadge size="sm" status={lockBadgeStatus(personLock.status)} className="ws-group-lock">{personLock.label}</AnimatedBadge>}<span className="ws-count">{g.count}</span>{(selections[reviewSelectionKey(g.key,view==='deferred')]||[]).length>0&&<><Check size={12} className="ws-group-check" aria-hidden="true"/><span className="sr-only">（有已选视频）</span></>}</button>
           })}
         </div>
       </aside>

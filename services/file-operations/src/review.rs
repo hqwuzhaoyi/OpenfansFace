@@ -298,6 +298,58 @@ fn provenance(source: &str, id: &str) -> Result<Value> {
     };
     Ok(json!({"source":source,"source_id":id,"return_href":href}))
 }
+pub fn folder_group_parts(config: &Config, path: &str) -> Option<(String, String)> {
+    if path.is_empty() {
+        return None;
+    }
+    let normalized = path.replace('\\', "/");
+    let raw_path = Path::new(&normalized);
+    let relative = raw_path
+        .strip_prefix(&config.media)
+        .unwrap_or(raw_path);
+    let mut parts: Vec<String> = relative
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(os) => {
+                let s = os.to_string_lossy();
+                (!s.is_empty()).then(|| s.into_owned())
+            }
+            _ => None,
+        })
+        .collect();
+    if parts.first().map(String::as_str) == Some("pikpak") {
+        parts.remove(0);
+    }
+    if parts.len() <= 1 {
+        return None;
+    }
+    parts.pop();
+    if parts.is_empty()
+        || (parts.len() == 1
+            && matches!(parts[0].as_str(), "My Telegram" | "share" | "creators"))
+        || (parts.len() == 2 && parts[0] == "share" && parts[1] == "收藏")
+    {
+        return None;
+    }
+    let leaf = parts.last()?.clone();
+    Some((format!("folder:{}", parts.join("/")), leaf))
+}
+
+pub fn matches_group_scope(
+    config: &Config,
+    task: &Value,
+    data: &Value,
+    scope_key: &str,
+) -> bool {
+    let base = group(task, data);
+    if scope_key == base {
+        return true;
+    }
+    base == "none"
+        && folder_group_parts(config, task["path"].as_str().unwrap_or(""))
+            .is_some_and(|(key, _)| key == scope_key)
+}
+
 fn group(task: &Value, data: &Value) -> String {
     if number(&task["manual"]).unwrap_or(0) != 0 {
         return "manual".into();
@@ -557,15 +609,21 @@ pub fn prepare(
                 if task["stage"] != "review"
                     && !manual
                     && !(data["ready"] == true
-                        && (task["stage"] == "face"
+                        && (task["stage"] == "queued"
+                            || task["stage"] == "text"
+                            || task["stage"] == "face"
                             || task["stage"] == "face_queued"
-                            || (task["stage"] == "retry" || task["stage"] == "error")
-                                && task["retry_stage"] == "face"))
+                            || (task["stage"] == "retry"
+                                && (task["retry_stage"] == "face"
+                                    || task["retry_stage"] == "text"))
+                            || (task["stage"] == "error" && task["retry_stage"] == "face")))
                 {
                     return Err(Error::conflict("视频尚未就绪或状态已变化"));
                 }
                 if let Some(scope) = body.get("review_group").filter(|s| !s.is_null())
-                    && (scope["key"].as_str() != Some(group(task, &data).as_str())
+                    && (!scope["key"]
+                        .as_str()
+                        .is_some_and(|k| matches_group_scope(config, task, &data, k))
                         || scope["deferred"].as_bool()
                             != Some(number(&task["deferred"]).unwrap_or(0) != 0))
                 {

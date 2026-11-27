@@ -356,12 +356,17 @@ fn has_watermark_candidate(data: &Value) -> bool {
     })
 }
 pub fn available(t: &Value) -> bool {
+    let stage = t["stage"].as_str().unwrap_or("");
+    let retry_stage = t["retry_stage"].as_str().unwrap_or("");
     review::number(&t["manual"]).unwrap_or(0) != 0
-        || t["stage"] == "review"
+        || stage == "review"
         || (t["data"]["ready"] == true
-            && (t["stage"] == "face"
-                || t["stage"] == "face_queued"
-                || (t["stage"] == "retry" || t["stage"] == "error") && t["retry_stage"] == "face"))
+            && (stage == "queued"
+                || stage == "text"
+                || stage == "face"
+                || stage == "face_queued"
+                || (stage == "retry" && (retry_stage == "face" || retry_stage == "text"))
+                || (stage == "error" && retry_stage == "face")))
 }
 fn public(mut t: Value) -> Result<Value> {
     for v in t.as_object_mut().unwrap().values_mut() {
@@ -616,13 +621,16 @@ fn load_lightweight_tasks(
             _ => None,
         };
         let light: LightTaskData = serde_json::from_slice(raw_data)?;
+        let rs = retry_stage.as_deref().unwrap_or("");
         let is_available = manual != 0
             || stage == "review"
             || (light.ready == Value::Bool(true)
-                && (stage == "face"
+                && (stage == "queued"
+                    || stage == "text"
+                    || stage == "face"
                     || stage == "face_queued"
-                    || ((stage == "retry" || stage == "error")
-                        && retry_stage.as_deref() == Some("face"))));
+                    || (stage == "retry" && (rs == "face" || rs == "text"))
+                    || (stage == "error" && rs == "face")));
         if !is_available {
             continue;
         }
@@ -689,12 +697,68 @@ fn load_lightweight_tasks(
         item[key] = json!(index);
         items.push(item);
     }
+    assign_folder_groups(config, &mut items);
     Ok(LightweightScan {
         items,
         live_ids,
         waiting,
         refreshing,
     })
+}
+
+fn assign_folder_groups(config: &Config, items: &mut [Value]) {
+    let mut counts: BTreeMap<(bool, String), usize> = BTreeMap::new();
+    let mut parts_by_idx: Vec<Option<(bool, String, String)>> = vec![None; items.len()];
+    for (idx, item) in items.iter().enumerate() {
+        if item["group"]["key"].as_str() != Some("none") {
+            continue;
+        }
+        let deferred = item["deferred"].as_i64().unwrap_or(0) != 0;
+        if let Some((key, leaf)) =
+            review::folder_group_parts(config, item["path"].as_str().unwrap_or(""))
+        {
+            *counts.entry((deferred, key.clone())).or_default() += 1;
+            parts_by_idx[idx] = Some((deferred, key, leaf));
+        }
+    }
+    let mut leaf_keys: BTreeMap<(bool, String), BTreeSet<String>> = BTreeMap::new();
+    for ((deferred, key), count) in &counts {
+        if *count < 2 {
+            continue;
+        }
+        if let Some(leaf) = key
+            .strip_prefix("folder:")
+            .and_then(|rel| rel.rsplit('/').next())
+        {
+            leaf_keys
+                .entry((*deferred, leaf.to_owned()))
+                .or_default()
+                .insert(key.clone());
+        }
+    }
+    for (idx, maybe_part) in parts_by_idx.into_iter().enumerate() {
+        let Some((deferred, key, leaf)) = maybe_part else {
+            continue;
+        };
+        if counts.get(&(deferred, key.clone())).copied().unwrap_or(0) < 2 {
+            continue;
+        }
+        let multi_leaf = leaf_keys
+            .get(&(deferred, leaf.clone()))
+            .is_some_and(|keys| keys.len() > 1);
+        let label = if multi_leaf {
+            let rel = key.strip_prefix("folder:").unwrap_or(&key);
+            let segs: Vec<&str> = rel.split('/').collect();
+            if segs.len() >= 2 {
+                format!("{}/{}", segs[segs.len() - 2], segs[segs.len() - 1])
+            } else {
+                leaf
+            }
+        } else {
+            leaf
+        };
+        items[idx]["group"] = json!({"key": key, "label": label, "kind": "none"});
+    }
 }
 
 #[cfg(test)]
@@ -1426,6 +1490,9 @@ fn materialize_v3_items(
                 "disposition": null,
             })
         };
+        if !base_skel["group"].is_null() {
+            ev["group"] = base_skel["group"].clone();
+        }
         copy_v3_order_flags(&mut ev, base_skel);
         out.insert((*vid).to_owned(), ev);
     }
@@ -1843,9 +1910,26 @@ pub fn execute(engine: &mut Engine, command: &str, body: Value) -> Result<Value>
     }
     let mut groups: Vec<Value> = grouped.into_values().collect();
     // Original snapshot counts determine order; receipt counts never reorder groups.
+    let group_tier = |g: &Value| -> u8 {
+        let kind = g["kind"].as_str().unwrap_or("");
+        let key = g["key"].as_str().unwrap_or("");
+        if kind == "suggested" {
+            0
+        } else if kind == "conflict" {
+            1
+        } else if key.starts_with("face:") {
+            2
+        } else if key.starts_with("folder:") {
+            3
+        } else if key == "none" {
+            4
+        } else {
+            5
+        }
+    };
     groups.sort_by(|a, b| {
-        (a["kind"] != "suggested")
-            .cmp(&(b["kind"] != "suggested"))
+        group_tier(a)
+            .cmp(&group_tier(b))
             .then_with(|| {
                 totals
                     .get(b["key"].as_str().unwrap_or(""))
@@ -2936,6 +3020,120 @@ mod alias_snapshot_tests {
         drop(store);
         drop(jobs);
         drop(faces);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn none_bucket_groups_multi_video_subfolders_and_keeps_ready_reocr_reviewable() {
+        let root = fs::canonicalize("/tmp")
+            .unwrap()
+            .join(format!("face-review-folders-{}", uuid::Uuid::new_v4()));
+        let base = root.join("base");
+        let media = root.join("media");
+        fs::create_dir_all(base.join("processing")).unwrap();
+        fs::create_dir_all(&media).unwrap();
+        let config = Config {
+            base: base.clone(),
+            media: media.clone(),
+            ledger: root.join("ledger.db"),
+            bind: "127.0.0.1:0".into(),
+            token: None,
+            fixture: None,
+            parity_root: None,
+        };
+        let faces = rusqlite::Connection::open(base.join("faces.db")).unwrap();
+        faces
+            .execute_batch("CREATE TABLE videos(vid TEXT PRIMARY KEY,path TEXT);")
+            .unwrap();
+        let proc_db = rusqlite::Connection::open(base.join("processing/processing.db")).unwrap();
+        proc_db
+            .execute_batch(
+                "CREATE TABLE tasks(vid TEXT PRIMARY KEY,path TEXT,name TEXT,size INTEGER,mtime_ns TEXT,stage TEXT,retry_stage TEXT,manual INTEGER,deferred INTEGER,note TEXT,priority INTEGER,is_new INTEGER,created_at REAL,batch_id TEXT,data TEXT);",
+            )
+            .unwrap();
+        let make_row = |vid: &str, rel_path: &str, name: &str, stage: &str| {
+            let full = media.join(rel_path).to_string_lossy().into_owned();
+            let data = json!({
+                "kind": "none",
+                "ready": true,
+                "candidates": [],
+                "face": {"matches": []},
+                "watermark": {"pipeline": "v2", "status": "done", "candidates": []}
+            });
+            proc_db
+                .execute(
+                    "INSERT INTO tasks VALUES(?,?,?,?,?,?,?,0,0,'',0,0,1.0,'b1',?)",
+                    params![vid, full, name, 100i64, "1", stage, "text", data.to_string()],
+                )
+                .unwrap();
+        };
+        // Two multi-video folders sharing the leaf name "sub" -> disambiguated labels
+        make_row("v1", "pikpak/My Telegram/PackA/sub/a1.mp4", "a1.mp4", "review");
+        make_row("v2", "pikpak/My Telegram/PackA/sub/a2.mp4", "a2.mp4", "queued");
+        make_row("v3", "pikpak/My Telegram/PackB/sub/b1.mp4", "b1.mp4", "review");
+        make_row("v4", "pikpak/My Telegram/PackB/sub/b2.mp4", "b2.mp4", "text");
+        // Unique leaf folder >=2 -> leaf label only
+        make_row("v5", "pikpak/My Telegram/GroupC/c1.mp4", "c1.mp4", "review");
+        make_row("v6", "pikpak/My Telegram/GroupC/c2.mp4", "c2.mp4", "review");
+        // Single-video subfolder -> stays in catch-all "none"
+        make_row("v7", "pikpak/My Telegram/Lonely/d1.mp4", "d1.mp4", "review");
+        // Broad root My Telegram -> stays in catch-all "none"
+        make_row("v8", "pikpak/My Telegram/root1.mp4", "root1.mp4", "review");
+        make_row("v9", "pikpak/My Telegram/root2.mp4", "root2.mp4", "review");
+        drop(proc_db);
+
+        let mut engine = Engine::new(config.clone()).unwrap();
+        let page = execute(&mut engine, "review-page", json!({"view": "none"})).unwrap();
+        let groups = page["groups"].as_array().unwrap();
+        let keys: BTreeSet<&str> = groups.iter().filter_map(|g| g["key"].as_str()).collect();
+        assert!(keys.contains("folder:My Telegram/PackA/sub"));
+        assert!(keys.contains("folder:My Telegram/PackB/sub"));
+        assert!(keys.contains("folder:My Telegram/GroupC"));
+        assert!(keys.contains("none"));
+        assert!(!keys.contains("folder:My Telegram/Lonely"));
+        assert!(!keys.contains("folder:My Telegram"));
+
+        let label_of = |k: &str| {
+            groups
+                .iter()
+                .find(|g| g["key"] == k)
+                .unwrap()["label"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        assert_eq!(label_of("folder:My Telegram/PackA/sub"), "PackA/sub");
+        assert_eq!(label_of("folder:My Telegram/PackB/sub"), "PackB/sub");
+        assert_eq!(label_of("folder:My Telegram/GroupC"), "GroupC");
+        assert_eq!(groups.iter().find(|g| g["key"] == "none").unwrap()["count"], 3);
+
+        // Verify scope validation & ready re-OCR availability
+        let folder_page = execute(
+            &mut engine,
+            "review-page",
+            json!({"session": page["session"], "view": "none", "group": "folder:My Telegram/PackA/sub"}),
+        )
+        .unwrap();
+        assert_eq!(folder_page["rows"].as_array().unwrap().len(), 2);
+
+        let v2_path = media.join("pikpak/My Telegram/PackA/sub/a2.mp4").to_string_lossy().into_owned();
+        let v2_task = json!({"vid": "v2", "path": v2_path, "manual": 0, "stage": "queued", "retry_stage": "text", "data": {"kind": "none", "ready": true}});
+        assert!(available(&v2_task));
+        assert!(review::matches_group_scope(
+            &config,
+            &v2_task,
+            &v2_task["data"],
+            "folder:My Telegram/PackA/sub"
+        ));
+        assert!(!review::matches_group_scope(
+            &config,
+            &v2_task,
+            &v2_task["data"],
+            "folder:My Telegram/GroupC"
+        ));
+        assert!(!available(&json!({"stage": "error", "retry_stage": "text", "manual": 0, "data": {"ready": true}})));
+
+        drop(engine);
         fs::remove_dir_all(root).unwrap();
     }
 }

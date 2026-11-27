@@ -27,6 +27,7 @@ test('idle boundary and responses started before new activity never replace a re
 
 test('ready face evidence remains reviewable after terminal failure, without reviving text failures or missing evidence',()=>{
  for(const stage of ['face_queued','face','retry','error'])assert.equal(isReviewAvailable({stage,retry_stage:'face',manual:0,data:{ready:true}}),true)
+ for(const stage of ['queued','text','retry'])assert.equal(isReviewAvailable({stage,retry_stage:'text',manual:0,data:{ready:true}}),true)
  assert.equal(isReviewAvailable({stage:'error',retry_stage:'text',manual:0,data:{ready:true}}),false)
  assert.equal(isReviewAvailable({stage:'error',retry_stage:'face',manual:0,data:{ready:false}}),false)
  assert.equal(isReviewAvailable({stage:'excluded',retry_stage:'face',manual:0,data:{ready:true}}),false)

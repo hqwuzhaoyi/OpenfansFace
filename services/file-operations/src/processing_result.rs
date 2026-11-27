@@ -178,6 +178,76 @@ pub fn folder_hints(file: &str, people: &[String]) -> Vec<Value> {
     output
 }
 
+fn valid_extracted_handle(handle: &str) -> bool {
+    let handle = handle.trim_end_matches('.');
+    let mut chars = handle.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphanumeric() || first == '_') {
+        return false;
+    }
+    let count = 1 + chars
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.' || *c == '-')
+        .count();
+    count == handle.chars().count() && (3..=64).contains(&count)
+}
+
+fn extract_account_from_text(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    for marker in ["myfans.jp/", "candfans.jp/"] {
+        if let Some(pos) = trimmed.to_ascii_lowercase().find(marker) {
+            let rest = &trimmed[pos + marker.len()..];
+            let handle: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.' || *c == '-')
+                .collect();
+            let handle = handle.trim_end_matches('.');
+            if valid_extracted_handle(handle) {
+                return Some(handle.to_owned());
+            }
+        }
+    }
+    for prefix in ["twitter", "推特", "x"] {
+        let lower = trimmed.to_ascii_lowercase();
+        let mut search_from = 0usize;
+        while let Some(rel_pos) = lower[search_from..].find(prefix) {
+            let start = search_from + rel_pos;
+            let boundary_ok = start == 0
+                || !trimmed[..start]
+                    .chars()
+                    .next_back()
+                    .is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+            let after = &trimmed[start + prefix.len()..];
+            if boundary_ok {
+                let mut rest = after.trim_start();
+                if let Some(stripped) = rest
+                    .strip_prefix(':')
+                    .or_else(|| rest.strip_prefix('：'))
+                    .or_else(|| rest.strip_prefix('='))
+                {
+                    rest = stripped.trim_start();
+                }
+                if let Some(after_at) = rest.strip_prefix('@') {
+                    let after_at = after_at.trim_start();
+                    let handle: String = after_at
+                        .chars()
+                        .take_while(|c| {
+                            c.is_ascii_alphanumeric() || *c == '_' || *c == '.' || *c == '-'
+                        })
+                        .collect();
+                    let handle = handle.trim_end_matches('.');
+                    if valid_extracted_handle(handle) {
+                        return Some(handle.to_owned());
+                    }
+                }
+            }
+            search_from = start + prefix.len();
+        }
+    }
+    None
+}
+
 pub fn candidates_from_text(
     watermark: &Value,
     mappings: &Value,
@@ -251,6 +321,19 @@ pub fn candidates_from_text(
                     "detail": format!("账号尚未确认：{}", mark["text"].as_str().unwrap_or("")),
                 }));
             }
+        } else if let Some(handle) = mark["text"].as_str().and_then(extract_account_from_text)
+            && !telegram_tokens.contains(&handle.to_lowercase())
+            && !handle
+                .chars()
+                .any(|c| c == '/' || c == '\\' || ('\x00'..='\x1f').contains(&c))
+        {
+            result.push(json!({
+                "name": handle,
+                "source": "watermark",
+                "confirmed": false,
+                "key": key,
+                "detail": format!("账号尚未确认：{}", mark["text"].as_str().unwrap_or("")),
+            }));
         }
     }
     result

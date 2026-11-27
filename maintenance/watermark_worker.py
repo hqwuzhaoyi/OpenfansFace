@@ -14,7 +14,8 @@ import threading
 import time
 import unicodedata
 
-PIPELINE = 'paddleocr-3.3.2-ppocrv5-mobile-watermark-v2'
+PIPELINE = 'paddleocr-3.3.2-ppocrv5-mobile-watermark-v3'
+DOMAIN_HANDLE_SUFFIXES = ('.com', '.net', '.org', '.cn', '.jp', '.club', '.vip', '.tv', '.io')
 
 
 def now():
@@ -86,17 +87,17 @@ def text_identity(text):
     platform, token, kind = 'unknown', text, 'text'
     # Platform URLs and TG-prefixed handles are common in real video watermarks.
     # Recognizing an account never establishes that it is the person in the video.
-    link = re.search(r'(?<![\w.])(onlyfans\.com|fansly\.com|twitter\.com|x\.com|t\.me|patreon\.com|instagram\.com)/([A-Za-z0-9_][A-Za-z0-9_.-]{2,63})(?![\w.-])', text, re.I)
+    link = re.search(r'(?<![\w.])(onlyfans\.com|fansly\.com|twitter\.com|x\.com|t\.me|patreon\.com|instagram\.com|myfans\.jp|candfans\.jp)/([A-Za-z0-9_][A-Za-z0-9_.-]{2,63})(?![\w.-])', text, re.I)
     telegram = re.search(r'(?<!\w)(?:TG|Telegram|电报)\s*[:：]?\s*@([A-Za-z0-9_]{3,64})', text, re.I)
-    prefixed = re.search(r'(?<!\w)(OnlyFans|Fansly|Twitter|X|Instagram|IG)\s*[:：]?\s*@([A-Za-z0-9_][A-Za-z0-9_.-]{2,63})', text, re.I)
+    prefixed = re.search(r'(?<!\w)(OnlyFans|Fansly|Twitter|X|Instagram|IG|推特|推)\s*[:：=]?\s*@\s*([A-Za-z0-9_][A-Za-z0-9_.-]{2,63})', text, re.I)
     match = re.search(r'(抖音号|快手号|小红书号|小红书ID|TikTok)\s*[:：]?\s*@?([\w.-]{3,64})', text, re.I)
     if link:
-        platform = {'onlyfans.com': 'OnlyFans', 'fansly.com': 'Fansly', 'twitter.com': 'X', 'x.com': 'X', 't.me': 'Telegram', 'patreon.com': 'Patreon', 'instagram.com': 'Instagram'}[link[1].lower()]
+        platform = {'onlyfans.com': 'OnlyFans', 'fansly.com': 'Fansly', 'twitter.com': 'X', 'x.com': 'X', 't.me': 'Telegram', 'patreon.com': 'Patreon', 'instagram.com': 'Instagram', 'myfans.jp': 'MyFans', 'candfans.jp': 'CandFans'}[link[1].lower()]
         token, kind = link[2], 'account'
     elif telegram:
         platform, token, kind = 'Telegram', telegram[1], 'account'
     elif prefixed:
-        platform = {'onlyfans': 'OnlyFans', 'fansly': 'Fansly', 'twitter': 'X', 'x': 'X', 'instagram': 'Instagram', 'ig': 'Instagram'}[prefixed[1].lower()]
+        platform = {'onlyfans': 'OnlyFans', 'fansly': 'Fansly', 'twitter': 'X', 'x': 'X', '推特': 'X', '推': 'X', 'instagram': 'Instagram', 'ig': 'Instagram'}[prefixed[1].lower()]
         token, kind = prefixed[2], 'account'
     elif match:
         platform = {'抖音号': '抖音', '快手号': '快手', '小红书号': '小红书', '小红书id': '小红书', 'tiktok': 'TikTok'}[match[1].lower()]
@@ -105,6 +106,10 @@ def text_identity(text):
         match = re.fullmatch(r'@\s*([\w.-]{3,64})', text)
         if match:
             token, kind = '@' + match[1], 'account'
+        else:
+            embedded = re.search(r'(?<![\w.])@\s*([A-Za-z0-9_][A-Za-z0-9_.-]{2,63})(?![\w.-])', text)
+            if embedded and not embedded[1].lower().endswith(DOMAIN_HANDLE_SUFFIXES):
+                token, kind = '@' + embedded[1], 'account'
     key = hashlib.sha256((platform + '\0' + token).encode()).hexdigest()
     return dict(key=key, text=text, token=token, platform=platform, kind=kind)
 
@@ -114,23 +119,26 @@ def aggregate(observations):
     for observation in observations:
         identity = text_identity(observation['text'])
         score = float(observation['score'])
-        if not identity or not math.isfinite(score) or score < .60:
+        if not identity or not math.isfinite(score) or score < .50:
             continue
-        key = identity['key']
-        entry = groups.setdefault(key, dict(identity, seen=set(), times=set(), best=observation))
+        group_key = (identity['platform'], identity['token'].lower())
+        entry = groups.setdefault(group_key, dict(identity=identity, seen=set(), times=set(), best=observation))
         entry['seen'].add(observation['frame'])
         entry['times'].add(observation['timestamp'])
-        if score > entry['best']['score']:
+        if score > float(entry['best']['score']):
             entry['best'] = observation
+            entry['identity'] = identity
     # Multiple crops from one frame are one vote, not independent evidence.
     candidates = []
     for entry in groups.values():
-        if len(entry['seen']) < 2:
+        frames = len(entry['seen'])
+        best = entry['best']
+        best_score = float(best['score'])
+        if frames < 2 or (best_score < .60 and frames < 3):
             continue
-        best = entry.pop('best')
-        frames = len(entry.pop('seen'))
-        timestamps = sorted(entry.pop('times'))
-        candidates.append(dict(entry, frames=frames, score=round(float(best['score']), 4),
+        identity = entry['identity']
+        timestamps = sorted(entry['times'])
+        candidates.append(dict(identity, frames=frames, score=round(best_score, 4),
                                timestamp=best['timestamp'], evidence=best['evidence'], timestamps=timestamps,
                                box=best.get('source_box', []), frame_size=best.get('frame_size', [])))
     return sorted(candidates, key=lambda c: (c['kind'] != 'account', -c['frames'], -c['score']))[:24]
@@ -156,15 +164,58 @@ class PaddleEngine:
 
 
 def scan_video(item, root, directory, engine, job_id, progress=None):
-    from PIL import Image
+    from PIL import Image, ImageFilter, ImageOps
     file = validate_source(item, root)
     probe = subprocess.run(['ffprobe', '-v', 'error', '-show_entries', 'format=duration', '-of', 'json', str(file)],
                            capture_output=True, text=True, timeout=30, check=True)
     duration = float(json.loads(probe.stdout)['format']['duration'])
     observations, successes, best_scores = [], 0, {}
+    fallback_frames = []
     evidence_dir = directory / 'evidence'
     evidence_dir.mkdir(exist_ok=True)
     prefix = hashlib.sha256((item['vid'] + job_id).encode()).hexdigest()
+
+    def scan_crop(original_img, region, index, timestamp, enhance=False):
+        if region[2] <= region[0] or region[3] <= region[1]:
+            return
+        crop = original_img.crop(region)
+        is_subregion = region != (0, 0, original_img.width, original_img.height)
+        scale = min(2 if is_subregion else 1, 1600 / max(1, max(crop.size)))
+        crop = crop.resize((max(1, round(crop.width * scale)), max(1, round(crop.height * scale))))
+        if enhance:
+            crop = ImageOps.autocontrast(crop, cutoff=0).filter(ImageFilter.SHARPEN)
+        for result in engine.recognize(crop):
+            identity = text_identity(result['text'])
+            if not identity or result['score'] < .50:
+                continue
+            key = identity['key']
+            filename = f'{prefix}-{key}.jpg'
+            if result['score'] > best_scores.get(key, 0):
+                x1, y1, x2, y2 = result['box']
+                box = (max(0, x1 - 18), max(0, y1 - 18), min(crop.width, x2 + 18), min(crop.height, y2 + 18))
+                if box[2] <= box[0] or box[3] <= box[1]:
+                    continue
+                evidence = crop.crop(box)
+                evidence.thumbnail((800, 400))
+                evidence.save(evidence_dir / filename, quality=90)
+                best_scores[key] = result['score']
+            x1, y1, x2, y2 = result['box']
+            source_box = [round(region[0] + x1 / scale), round(region[1] + y1 / scale),
+                          round(region[0] + x2 / scale), round(region[1] + y2 / scale)]
+            observations.append(dict(result, frame=index, timestamp=timestamp, evidence=filename,
+                                     source_box=source_box, frame_size=[original_img.width, original_img.height]))
+
+    def regions_for(width, height):
+        regions = [(0, 0, width, height)]
+        # Full-frame detection covers central/moving marks; enlarged corners and centered bands recover small edge text.
+        regions += [(x, y, x + width // 2, y + height // 3)
+                    for x in (0, width - width // 2) for y in (0, height - height // 3)]
+        regions += [
+            (width // 4, 0, width - width // 4, height // 3),
+            (width // 4, height - height // 3, width - width // 4, height),
+        ]
+        return regions
+
     with tempfile.TemporaryDirectory(prefix='face-watermark-') as temp:
         times = sample_times(duration)
         for index, timestamp in enumerate(times):
@@ -183,35 +234,16 @@ def scan_video(item, root, directory, engine, job_id, progress=None):
             except (subprocess.SubprocessError, OSError):
                 continue
             successes += 1
-            width, height = original.size
-            regions = [(0, 0, width, height)]
-            # Full-frame detection covers central/moving marks; enlarged corners recover small text.
-            regions += [(x, y, x + width // 2, y + height // 3)
-                        for x in (0, width - width // 2) for y in (0, height - height // 3)]
-            for region in regions:
-                crop = original.crop(region)
-                scale = min(2 if region != regions[0] else 1, 1600 / max(crop.size))
-                crop = crop.resize((max(1, round(crop.width * scale)), max(1, round(crop.height * scale))))
-                for result in engine.recognize(crop):
-                    identity = text_identity(result['text'])
-                    if not identity or result['score'] < .60:
-                        continue
-                    key = identity['key']
-                    filename = f'{prefix}-{key}.jpg'
-                    if result['score'] > best_scores.get(key, 0):
-                        x1, y1, x2, y2 = result['box']
-                        box = (max(0, x1 - 18), max(0, y1 - 18), min(crop.width, x2 + 18), min(crop.height, y2 + 18))
-                        if box[2] <= box[0] or box[3] <= box[1]:
-                            continue
-                        evidence = crop.crop(box)
-                        evidence.thumbnail((800, 400))
-                        evidence.save(evidence_dir / filename, quality=90)
-                        best_scores[key] = result['score']
-                    x1, y1, x2, y2 = result['box']
-                    source_box = [round(region[0] + x1 / scale), round(region[1] + y1 / scale),
-                                  round(region[0] + x2 / scale), round(region[1] + y2 / scale)]
-                    observations.append(dict(result, frame=index, timestamp=timestamp, evidence=filename,
-                                             source_box=source_box, frame_size=[width, height]))
+            for region in regions_for(original.width, original.height):
+                scan_crop(original, region, index, timestamp, enhance=False)
+            if (index in (0, 2, 5, 7) or len(fallback_frames) < 2) and len(fallback_frames) < 4:
+                fallback_frames.append((index, timestamp, original.copy()))
+    if successes >= 2 and not aggregate(observations) and fallback_frames:
+        if progress:
+            progress.update(stage="对比度增强复查", done=len(times), total=len(times), unit="帧")
+        for index, timestamp, original in fallback_frames:
+            for region in regions_for(original.width, original.height)[1:]:
+                scan_crop(original, region, index, timestamp, enhance=True)
     if progress:
         progress.update(stage="汇总文字线索", done=len(times), total=len(times), unit="帧")
     if successes < 2:

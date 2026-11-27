@@ -1006,7 +1006,7 @@ fn discover_inner(config: &Config, conn: &mut Connection, body: &Value) -> Resul
     let stamp = now_sec(&tx)?;
     tx.execute(
         "UPDATE tasks SET stage='queued',retry_stage='text',text_attempts=0,face_attempts=0,next_retry=0,
-        updated_at=? WHERE stage='review' AND manual=0 AND json_extract(data,'$.watermark.pipeline')<>?",
+        updated_at=? WHERE stage='review' AND manual=0 AND json_extract(data,'$.watermark.pipeline')<>? AND (json_extract(data,'$.kind')='none' OR json_extract(data,'$.kind') IS NULL)",
         params![stamp, pipeline],
     )?;
     if let Some(refs) = &references
@@ -1952,9 +1952,12 @@ fn is_review_available(task: &Value) -> bool {
     stage == "review"
         || manual
         || (ready
-            && (stage == "face"
+            && (stage == "queued"
+                || stage == "text"
+                || stage == "face"
                 || stage == "face_queued"
-                || ((stage == "retry" || stage == "error") && retry_stage == "face")))
+                || (stage == "retry" && (retry_stage == "face" || retry_stage == "text"))
+                || (stage == "error" && retry_stage == "face")))
 }
 
 struct ActiveState {

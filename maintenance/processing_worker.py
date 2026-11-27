@@ -170,7 +170,7 @@ def discover(base, root, api_url, assets=None):
         with con:
             count = reconcile(con, items, batch, bootstrapped)
             con.execute("""UPDATE tasks SET stage='queued',retry_stage='text',text_attempts=0,face_attempts=0,next_retry=0,
-                updated_at=? WHERE stage='review' AND manual=0 AND json_extract(data,'$.watermark.pipeline')<>?""", (time.time(), PIPELINE))
+                updated_at=? WHERE stage='review' AND manual=0 AND json_extract(data,'$.watermark.pipeline')<>? AND (json_extract(data,'$.kind')='none' OR json_extract(data,'$.kind') IS NULL)""", (time.time(), PIPELINE))
             con.execute("""UPDATE tasks SET stage='face_queued',retry_stage='face',face_attempts=0,next_retry=0,
                 updated_at=? WHERE stage='review' AND manual=0 AND (json_extract(data,'$.face.reference_version')<>? OR json_extract(data,'$.face.version')<>?)""", (time.time(), references['version'], FACE_VERSION))
             set_setting(con, 'bootstrapped', True)

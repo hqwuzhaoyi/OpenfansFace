@@ -34,11 +34,30 @@ class WatermarkWorkerTests(unittest.TestCase):
                                      ('TG@ysjcc', 'Telegram', 'ysjcc'),
                                      ('onlyfans@cocopie0218', 'OnlyFans', 'cocopie0218'),
                                      ('X:@yuumeilyn', 'X', 'yuumeilyn'),
+                                     ('X=@ne__6i', 'X', 'ne__6i'),
+                                     ('推特 @alice_x', 'X', 'alice_x'),
+                                     ('https://myfans.jp/secret_japan', 'MyFans', 'secret_japan'),
+                                     ('candfans.jp/creator_1', 'CandFans', 'creator_1'),
+                                     ('作者 @creator_99', 'unknown', '@creator_99'),
                                      ('ig: @yuumei_daily', 'Instagram', 'yuumei_daily'),
                                      ('patreon.com/laurus0711', 'Patreon', 'laurus0711')]:
             identity = text_identity(text)
             self.assertEqual((identity['platform'], identity['token'], identity['kind']), (platform, token, 'account'))
         self.assertEqual(text_identity('ooyq@aas.com/papaxmama')['kind'], 'text')
+
+    def test_case_insensitive_vote_merge_and_faint_three_frame_threshold(self):
+        def observed(text, frame, score):
+            return dict(text=text, frame=frame, score=score, timestamp=frame, evidence='example.jpg')
+        # Case variants merge votes while keeping highest-scoring casing
+        merged = aggregate([observed('Comerzz', 0, .82), observed('ComerZz', 1, .94)])
+        self.assertEqual(len(merged), 1)
+        self.assertEqual((merged[0]['token'], merged[0]['frames']), ('ComerZz', 2))
+        # Faint 0.50-0.59 detections require 3 frames; 2 faint frames or <0.50 stay rejected
+        self.assertEqual(aggregate([observed('@faint', 0, .54), observed('@faint', 1, .56)]), [])
+        self.assertEqual(aggregate([observed('@too_low', 0, .45), observed('@too_low', 1, .45), observed('@too_low', 2, .45)]), [])
+        promoted = aggregate([observed('@faint', 0, .54), observed('@faint', 1, .56), observed('@faint', 2, .55)])
+        self.assertEqual(len(promoted), 1)
+        self.assertEqual(promoted[0]['frames'], 3)
 
     def test_sampling_covers_video_and_rejects_invalid_duration(self):
         samples = sample_times(100)
@@ -104,6 +123,33 @@ class WatermarkWorkerTests(unittest.TestCase):
             with patch('maintenance.watermark_worker.subprocess.run', side_effect=run):
                 with self.assertRaisesRegex(ValueError, '有效视频帧不足'):
                     scan_video(dict(fingerprint(video), vid='one'), root, root, engine, 'job')
+
+    @unittest.skipUnless(find_spec('PIL'), 'Pillow needed for contrast fallback test')
+    def test_scan_video_contrast_fallback_recovers_faint_watermarks(self):
+        from PIL import Image, ImageStat
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            video = root / 'faint.mp4'
+            video.write_bytes(b'video')
+            def run(command, **kwargs):
+                if command[0] == 'ffprobe':
+                    return SimpleNamespace(stdout='{"format":{"duration":10}}')
+                img = Image.new('RGB', (160, 120), (120, 120, 120))
+                img.putpixel((10, 10), (200, 200, 200))
+                img.save(command[-1])
+                return SimpleNamespace(returncode=0)
+            def recognize(image):
+                # Non-enhanced image has low contrast (min 120 -> max 200); autocontrast stretches pixels to 0..255
+                extrema = ImageStat.Stat(image).extrema
+                if extrema[0][0] == 0:
+                    return [dict(text='myfans.jp/faint_star', score=0.72, box=[5, 5, 60, 25])]
+                return []
+            engine = SimpleNamespace(recognize=recognize)
+            with patch('maintenance.watermark_worker.subprocess.run', side_effect=run):
+                res = scan_video(dict(fingerprint(video), vid='faint'), root, root, engine, 'job-faint')
+            self.assertEqual(res['sampled_frames'], 8)
+            self.assertEqual(len(res['candidates']), 1)
+            self.assertEqual((res['candidates'][0]['platform'], res['candidates'][0]['token']), ('MyFans', 'faint_star'))
 
 
 if __name__ == '__main__':

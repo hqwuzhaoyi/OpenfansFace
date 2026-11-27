@@ -50,7 +50,7 @@ html[data-input=keyboard] .ws-resizer,html[data-input=keyboard] .ws-resizer-grip
 .ws-workarea-review>.ws-groups .ws-panel-heading-left{display:flex;align-items:center;gap:6px;min-width:0}
 .ws-group-pill{display:none;place-items:center;width:24px;height:24px;border-radius:6px;background:var(--muted);color:var(--foreground);font-size:11px;font-weight:600;flex-shrink:0}
 .ws-workarea-review>.ws-groups[data-collapsed=true] .ws-group{flex-direction:column;justify-content:center;gap:2px;padding:6px 2px;min-height:46px}
-.ws-workarea-review>.ws-groups[data-collapsed=true] .ws-group-label,.ws-workarea-review>.ws-groups[data-collapsed=true] .ws-group-check,.ws-workarea-review>.ws-groups[data-collapsed=true] .ws-group-lock{display:none}
+.ws-workarea-review>.ws-groups[data-collapsed=true] .ws-group-label,.ws-workarea-review>.ws-groups[data-collapsed=true] .ws-group-folder-icon,.ws-workarea-review>.ws-groups[data-collapsed=true] .ws-group-check,.ws-workarea-review>.ws-groups[data-collapsed=true] .ws-group-lock{display:none}
 .ws-workarea-review>.ws-groups[data-collapsed=true] .ws-group-pill{display:grid}
 .ws-workarea-review>.ws-groups[data-collapsed=true] .ws-group[data-locked=true] .ws-group-pill{outline:1.5px solid var(--wb-warning);outline-offset:1px}
 .ws-workarea-review>.ws-groups[data-collapsed=true] .ws-group[aria-pressed=true] .ws-group-pill{background:var(--primary);color:var(--primary-foreground)}
