@@ -493,16 +493,34 @@
 }
 
 /* Mobile responsiveness */
-@media (max-width: 768px) {
+@media (max-width: 767px) {
   .ws-deploy-root {
-    padding: 14px 12px;
-    gap: 14px;
+    padding: 10px 12px;
+    gap: 10px;
+  }
+  .ws-deploy-pinned-banner {
+    padding: 8px 10px;
+    gap: 0;
+  }
+  .ws-deploy-banner-title {
+    font-size: 12px;
+    min-width: 0;
+  }
+  .ws-deploy-banner-title > span:first-of-type {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .ws-deploy-banner-stats,
+  .ws-deploy-banner-hashes {
+    display: none;
   }
   .ws-deploy-toolbar {
     display: grid;
     grid-template-columns: minmax(0, 1fr);
     align-items: center;
-    gap: 10px 8px;
+    gap: 8px;
+    padding-bottom: 8px;
   }
   .ws-deploy-toolbar-left {
     display: contents;

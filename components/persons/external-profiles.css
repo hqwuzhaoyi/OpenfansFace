@@ -33,7 +33,7 @@
 .pw-profile-warning{font-size:12px;color:var(--wb-warning);margin:0 0 10px!important;overflow-wrap:anywhere}
 .pw-profile-account:focus-visible,.pw-profile-source a:focus-visible{outline:2px solid var(--wb-focus);outline-offset:3px;border-radius:4px}
 @media(hover:hover) and (pointer:fine){.pw-profile-account:hover strong,.pw-profile-source a:hover{text-decoration:underline;text-underline-offset:3px}}
-@media(max-width:600px){.pw-profile-cards{grid-template-columns:minmax(0,1fr)}.pw-profile-panel{max-height:38dvh}.pw .pw-profile-toggle,.pw .pw-profile-manage{min-height:40px}}
+@media(max-width:767px){.pw-profile-disclosure{margin:0 12px 8px}.pw-profile-cards{grid-template-columns:minmax(0,1fr)}.pw-profile-panel{max-height:none;overflow:visible}.pw .pw-profile-toggle,.pw .pw-profile-manage{min-height:34px;height:34px}}
 .pw .pw-profile-toggle,.pw .pw-profile-manage{background:transparent}
 .pw .pw-profile-toggle[aria-expanded=true]{background:var(--wb-subtle);border-color:var(--wb-border)}
 @media(hover:hover) and (pointer:fine){.pw .pw-profile-toggle:hover,.pw .pw-profile-manage:hover{background:var(--wb-hover)}}

@@ -379,10 +379,10 @@
 
 @media (max-width: 767px) {
   .home-topbar {
-    height: 52px;
-    min-height: 52px;
-    padding: 0 10px;
-    gap: 6px;
+    height: calc(48px + env(safe-area-inset-top, 0px));
+    min-height: calc(48px + env(safe-area-inset-top, 0px));
+    padding: env(safe-area-inset-top, 0px) 8px 0;
+    gap: 4px;
   }
 
   .home-topbar-left {
@@ -393,14 +393,16 @@
   }
 
   .home-topbar-trigger {
-    width: 40px;
-    height: 40px;
-    min-width: 40px;
-    min-height: 40px;
+    width: 36px;
+    height: 36px;
+    min-width: 36px;
+    min-height: 36px;
   }
 
   .home-topbar-brand-mobile {
     display: inline-flex;
+    min-width: 32px;
+    min-height: 36px;
   }
 
   .home-topbar-divider,
@@ -410,20 +412,53 @@
 
   .home-topbar-mobile-dock {
     display: inline-flex;
+    align-items: center;
+    gap: 4px;
+  }
+
+  .home-topbar-mobile-inline {
+    display: inline-flex;
+    align-items: center;
+    gap: 2px;
+    flex-shrink: 0;
+  }
+
+  .home-topbar-mobile-inline:empty {
+    display: none;
+  }
+
+  .home-topbar-mobile-inline :is(button, a, [data-slot="button"], .ws-control[data-ui="beui-button"]) {
+    height: 36px;
+    min-height: 36px;
+    min-width: 36px;
+    padding: 0 8px;
+    border-radius: 8px;
+    flex-shrink: 0;
+    white-space: nowrap;
+  }
+
+  .home-topbar-mobile-inline :is(button, a, [data-slot="button"], .ws-control[data-ui="beui-button"]):not(:has(> span)):not(:has(> svg + *)) {
+    width: 36px;
+    padding: 0;
   }
 
   .home-mobile-dock {
-    height: 44px;
-    padding: 3px;
+    height: 40px;
+    padding: 2px;
     gap: 2px;
   }
 
   .home-topbar-mobile-dock .bg-ops-trigger[data-variant="mobile"],
   .home-topbar-mobile-dock .privacy-control-mobile,
   .home-topbar-mobile-dock .home-mobile-theme {
-    height: 36px;
-    min-height: 36px;
-    min-width: 36px;
+    height: 34px;
+    min-height: 34px;
+    min-width: 34px;
+  }
+
+  .home-topbar-mobile-dock .privacy-control-mobile,
+  .home-topbar-mobile-dock .home-mobile-theme {
+    width: 34px;
   }
 
   .home-topbar-mobile-dock .bg-ops-trigger[data-variant="mobile"] {
@@ -438,8 +473,8 @@
     overflow-x: auto;
     scrollbar-width: none;
     gap: 6px;
-    padding: 4px 10px;
-    min-height: 44px;
+    padding: 3px 10px;
+    min-height: 40px;
     border-bottom: 1px solid var(--border);
     background: color-mix(in oklab, var(--muted) 35%, var(--background));
     flex-shrink: 0;
@@ -454,11 +489,15 @@
     margin-right: auto;
   }
 
-  .home-mobile-actionbar :is(button, a, [data-slot="button"]) {
-    min-height: 36px;
-    height: 36px;
+  .home-mobile-actionbar :is(button, a, [data-slot="button"], .ws-control[data-ui="beui-button"]) {
+    min-height: 34px;
+    height: 34px;
     flex-shrink: 0;
     white-space: nowrap;
+  }
+
+  .home-content-area:not(.home-content-split) {
+    padding-bottom: env(safe-area-inset-bottom, 0px);
   }
 }
 
@@ -1192,42 +1231,75 @@ html.dark .home-badge.is-running {
 
 @media (max-width: 767px) {
   [data-mobile="true"] .home-brand,
-  .home-metric-value,
   .home-report > summary {
     min-height: 44px;
   }
+  .home-metric-value {
+    min-height: 32px;
+  }
   .home-dashboard {
-    padding: 14px 12px 32px;
+    padding: 12px 12px 24px;
   }
   .home-link,
   .home-primary {
-    min-height: 44px;
+    min-height: 40px;
     padding: 0 12px;
     font-size: 12px;
     gap: 6px;
   }
   .home-icon-button {
-    width: 44px;
-    height: 44px;
-    min-width: 44px;
-    min-height: 44px;
+    width: 36px;
+    height: 36px;
+    min-width: 36px;
+    min-height: 36px;
   }
   .home-section-heading {
     gap: 8px;
     flex-wrap: wrap;
+    margin-bottom: 10px;
   }
   .home-jobs {
     grid-template-columns: 1fr;
+    gap: 10px;
+  }
+  .home-job[data-slot] {
+    padding: 12px 12px 0;
+  }
+  .home-job-heading {
+    margin-bottom: 8px;
+  }
+  .home-job-icon {
+    width: 28px;
+    height: 28px;
+  }
+  .home-job h2 {
+    font-size: 13px;
+  }
+  .home-job-value {
+    margin: 8px 0 6px;
+    min-height: 26px;
+  }
+  .home-job-value strong {
+    font-size: 22px;
+  }
+  .home-job-stage {
+    margin: 8px 0 4px;
+  }
+  .home-job footer {
+    min-height: 38px;
+    padding: 4px 10px 4px 12px;
+    margin: 8px -12px 0;
   }
   .home-job footer button {
-    min-height: 44px;
+    min-height: 34px;
+    height: 34px;
   }
   .home-metrics {
     grid-template-columns: repeat(2, minmax(0, 1fr));
     padding: 0;
   }
   .home-metrics .home-metric {
-    padding: 12px;
+    padding: 10px 12px;
     border-bottom: 1px solid var(--border);
   }
   .home-metrics .home-metric:nth-child(even) {
@@ -1236,8 +1308,11 @@ html.dark .home-badge.is-running {
   .home-metrics .home-metric:nth-last-child(-n+2) {
     border-bottom: 0;
   }
+  .home-library {
+    padding-block: 10px;
+  }
   .home-library .home-metric {
-    padding: 0 10px;
+    padding: 0 8px;
   }
   .home-capacity {
     padding-inline: 12px;
@@ -1246,7 +1321,7 @@ html.dark .home-badge.is-running {
     position: fixed;
     left: 16px;
     right: 16px;
-    bottom: 24px;
+    bottom: max(20px, env(safe-area-inset-bottom, 0px));
     top: auto;
     width: auto;
     max-height: 40dvh;
@@ -1255,8 +1330,16 @@ html.dark .home-badge.is-running {
     z-index: 101;
   }
   .home-definition summary {
-    width: 44px;
-    height: 44px;
+    position: relative;
+    width: 24px;
+    height: 24px;
+    min-width: 24px;
+    min-height: 24px;
+  }
+  .home-definition summary::after {
+    content: '';
+    position: absolute;
+    inset: -10px;
   }
   .home-distribution > div {
     grid-template-columns: 116px 1fr;

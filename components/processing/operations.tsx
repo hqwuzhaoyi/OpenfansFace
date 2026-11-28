@@ -48,35 +48,57 @@ export default function Operations({ defaultView = 'dashboard' }: { defaultView?
     [update]
   )
 
+  const mobileTabValue =
+    activeTab === 'tasks' ? (activeView === 'queue' ? 'queue' : 'overview') : activeTab
+
   return (
     <div className="ws-operations-root">
-      <div className="ws-view-tabs ws-operations-tabs" role="navigation" aria-label="操作台三视图">
-        <WorkspaceTabs
-          value={activeTab}
-          onChange={(tab) => update({ tab: tab as OperationsTab })}
-          label="操作台视图"
-          className="ws-operations-primary-tabs"
-          listClassName="ws-operations-primary-list"
-          items={[
-            { value: 'tasks', label: '任务视图', icon: <Layers3 size={14} /> },
-            { value: 'nodes', label: '节点视图', icon: <Server size={14} /> },
-            { value: 'deploy', label: '部署视图', icon: <ShieldCheck size={14} /> },
-          ]}
-        />
-        {activeTab === 'tasks' && (
+      <div className="ws-view-tabs ws-operations-tabs" role="navigation" aria-label="操作台视图">
+        <div className="ws-operations-desktop-tabs">
           <WorkspaceTabs
-            value={activeView}
-            onChange={(view) => update({ view: view as OperationsView })}
-            label="任务子视图"
-            variant="segment"
-            className="ws-subview-toggle"
-            listClassName="ws-subview-tablist"
+            value={activeTab}
+            onChange={(tab) => update({ tab: tab as OperationsTab })}
+            label="操作台视图"
+            className="ws-operations-primary-tabs"
+            listClassName="ws-operations-primary-list"
             items={[
-              { value: 'dashboard', label: '批次总览', icon: <LayoutGrid size={13} /> },
-              { value: 'queue', label: '任务队列', icon: <ListTodo size={13} /> },
+              { value: 'tasks', label: '任务视图', icon: <Layers3 size={14} /> },
+              { value: 'nodes', label: '节点视图', icon: <Server size={14} /> },
+              { value: 'deploy', label: '部署视图', icon: <ShieldCheck size={14} /> },
             ]}
           />
-        )}
+          {activeTab === 'tasks' && (
+            <WorkspaceTabs
+              value={activeView}
+              onChange={(view) => update({ view: view as OperationsView })}
+              label="任务子视图"
+              variant="segment"
+              className="ws-subview-toggle"
+              listClassName="ws-subview-tablist"
+              items={[
+                { value: 'dashboard', label: '批次总览', icon: <LayoutGrid size={13} /> },
+                { value: 'queue', label: '任务队列', icon: <ListTodo size={13} /> },
+              ]}
+            />
+          )}
+        </div>
+        <WorkspaceTabs
+          value={mobileTabValue}
+          onChange={(next) => {
+            if (next === 'overview') update({ tab: 'tasks', view: 'dashboard' })
+            else if (next === 'queue') update({ tab: 'tasks', view: 'queue' })
+            else update({ tab: next as OperationsTab })
+          }}
+          label="操作台视图"
+          className="ws-operations-mobile-tabs"
+          listClassName="ws-operations-mobile-list"
+          items={[
+            { value: 'overview', label: '总览', icon: <LayoutGrid size={13} /> },
+            { value: 'queue', label: '队列', icon: <ListTodo size={13} /> },
+            { value: 'nodes', label: '节点', icon: <Server size={13} /> },
+            { value: 'deploy', label: '部署', icon: <ShieldCheck size={13} /> },
+          ]}
+        />
       </div>
 
       <div className="ws-operations-view-container">

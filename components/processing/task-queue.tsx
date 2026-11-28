@@ -505,9 +505,61 @@ export default function ProcessingTaskQueue({ onNavigateOverview }: { onNavigate
   ]
   useSyncWorkbenchBreadcrumb(breadcrumbItems)
 
+  const logSection = (
+    <div className="ws-log">
+      <WorkspaceSection title="运行记录" defaultOpen={false}>
+        <p className="ws-muted">{data?.references?.people ?? '—'} 个人物参考</p>
+        <p className="ws-muted">
+          上次发现 {date(data?.last_discovery?.at)} · 新增 {data?.last_discovery?.registered ?? '—'} 个
+        </p>
+        <ol>
+          {(data?.events || []).map((e) => (
+            <li key={e.id}>
+              <time>{date(e.at)}</time>
+              <span className="min-w-0 break-all">{e.message}</span>
+            </li>
+          ))}
+        </ol>
+        <div className="flex flex-wrap gap-2 pb-3">
+          {(data?.batches || []).slice(0, 4).map((b) => (
+            <Button
+              key={b.id}
+              size="sm"
+              variant="outline"
+              onClick={() => {
+                setBatch(b.id)
+                updateStage('')
+              }}
+            >
+              {b.id} · {b.ready}/{b.total}
+            </Button>
+          ))}
+        </div>
+      </WorkspaceSection>
+    </div>
+  )
+
   return (
     <main className="ws-page" aria-label="处理任务列表工作区">
-      <WorkbenchHeaderActions>
+      <WorkbenchHeaderActions
+        mobileInline={
+          <>
+            <Button
+              variant="ghost"
+              size="icon"
+              aria-label={data?.paused ? '恢复分析' : '暂停分析'}
+              title={data?.paused ? '恢复分析' : '暂停分析'}
+              disabled={busy || !data}
+              onClick={() => act(data?.paused ? 'resume' : 'pause')}
+            >
+              {data?.paused ? <CirclePlay size={15} /> : <CirclePause size={15} />}
+            </Button>
+            <Button variant="ghost" size="icon" aria-label="刷新处理状态" title="刷新" onClick={load}>
+              <RefreshCw size={15} />
+            </Button>
+          </>
+        }
+      >
         <Button
           variant="outline"
           size="sm"
@@ -687,8 +739,12 @@ export default function ProcessingTaskQueue({ onNavigateOverview }: { onNavigate
                 </p>
               )
             )}
+            {!wide && logSection}
           </div>
-          <div className="ws-pagination">
+          <div
+            className="ws-pagination"
+            data-single-page={data && Math.ceil(data.total / data.limit) <= 1 && data.page === 0 ? 'true' : undefined}
+          >
             <span className="tabular-nums">
               {data ? (
                 `第 ${data.page + 1} / ${Math.max(1, Math.ceil(data.total / data.limit))} 页`
@@ -727,37 +783,7 @@ export default function ProcessingTaskQueue({ onNavigateOverview }: { onNavigate
               </Button>
             </div>
           </div>
-          <div className="ws-log">
-            <WorkspaceSection title="运行记录" defaultOpen={false}>
-              <p className="ws-muted">{data?.references?.people ?? '—'} 个人物参考</p>
-              <p className="ws-muted">
-                上次发现 {date(data?.last_discovery?.at)} · 新增 {data?.last_discovery?.registered ?? '—'} 个
-              </p>
-              <ol>
-                {(data?.events || []).map((e) => (
-                  <li key={e.id}>
-                    <time>{date(e.at)}</time>
-                    <span className="min-w-0 break-all">{e.message}</span>
-                  </li>
-                ))}
-              </ol>
-              <div className="flex flex-wrap gap-2 pb-3">
-                {(data?.batches || []).slice(0, 4).map((b) => (
-                  <Button
-                    key={b.id}
-                    size="sm"
-                    variant="outline"
-                    onClick={() => {
-                      setBatch(b.id)
-                      updateStage('')
-                    }}
-                  >
-                    {b.id} · {b.ready}/{b.total}
-                  </Button>
-                ))}
-              </div>
-            </WorkspaceSection>
-          </div>
+          {wide && logSection}
         </section>
         {wide && focused && (
           <aside className="ws-inspector ws-task-inspector" aria-label="任务详情">

@@ -742,7 +742,7 @@ export default function Review() {
   const detail=<>
 
     <div className="ws-detail-heading">
-      <h2 ref={selectionHeading} tabIndex={-1}>{reference?`${reference.name} · 对照视频`:'归名与证据'}</h2>
+      <h2 ref={selectionHeading} tabIndex={-1}>{reference?`${reference.name} · 对照视频`:(focused||actionTargets[0])?.name||'归名与证据'}</h2>
       <div className="ws-actions">
         {!reference&&focused&&<Button className="ws-icon ws-danger-icon" variant="ghost" size="sm" aria-label="将当前视频移入回收站" title={focusedLock?`${focusedLock.label}，暂不可删除`:'删除当前视频（移入回收站）'} disabled={disabled||Boolean(focusedLock)||blockedIds.has(focused.vid)||pendingVids.has(focused.vid)} onClick={e=>openDeleteDialog('single',[focused],e.currentTarget)}><Trash2 size={14} aria-hidden="true"/></Button>}
         {reference?<Button variant="ghost" size="sm" onClick={backReference}><ArrowLeft size={14} aria-hidden="true"/>返回证据</Button>:null}
@@ -858,8 +858,24 @@ export default function Review() {
       </Popover.Portal>
     </Popover.Root>
   )
+  const hasMobileAlertBar=Boolean((autoMergePreview?.eligible_count??0)>0||autoMergeActive||updates?.has_updates)
+  const paginationBar=(
+    <div className="ws-pagination" data-single-page={isSinglePage?'true':undefined}><span className="tabular-nums">{data&&groupMatched?`${data.remaining??data.total} 个待核对 · 第 ${currentPage+1} / ${Math.max(1,Math.ceil(data.total/data.limit))} 批`:activeGroupInfo?`${activeGroupInfo.count} 个待核对 · 读取中`:'读取中'}</span><div className="ws-actions"><Button className="ws-icon" variant="ghost" size="sm" aria-label="上一页" title="上一页" disabled={disabled||!groupMatched||(data?.session?data.previous_page==null:currentPage===0)} onClick={()=>{advanceSequenceRef.current++;setPage(data?.previous_page??currentPage-1);setLinkFocus('')}}><ChevronLeft size={15} aria-hidden="true"/></Button><Button className="ws-icon" variant="ghost" size="sm" aria-label="下一页" title="下一页" disabled={disabled||!groupMatched||!data||(data.session?data.next_page==null:(currentPage+1)*data.limit>=data.total)} onClick={()=>{advanceSequenceRef.current++;setPage(data?.next_page??currentPage+1);setLinkFocus('')}}><ChevronRight size={15} aria-hidden="true"/></Button></div></div>
+  )
   return <main className="ws-page" aria-label="人工确认工作区" data-review-session={data?.session}>
-    <WorkbenchHeaderActions>{((autoMergePreview?.eligible_count??0)>0||autoMergeActive)&&<Button ref={autoMergeTriggerRef} variant="outline" size="sm" aria-label={autoMergeActive?`自动合入（${autoMergeActiveLabel}）`:`自动合入 ${autoMergePreview!.eligible_count} 个已匹配视频`} title={autoMergeActive?`自动合入：${autoMergeActiveLabel}`:`可直接合入 ${autoMergePreview!.eligible_count} 个视频（${autoMergePreview!.group_count} 位人物）`} onClick={()=>setAutoMergeOpen(true)}><Sparkles size={14} aria-hidden="true"/><span>自动合入</span>{autoMergeActive?<AnimatedBadge size="sm" status={lockBadgeStatus(autoMergeActiveStatus)} className="ws-topbar-lock-badge">{autoMergeActiveLabel}</AnimatedBadge>:<span className="ws-count">{autoMergePreview!.eligible_count}</span>}</Button>}<NavigationButton variant="ghost" size="sm" asChild className="ws-review-status-link"><Link href="/operations"><span className="ws-link-label">分析中</span><span className="ws-count">{updates?.waiting??data?.waiting??'—'}</span><ChevronRight size={14} aria-hidden="true"/></Link></NavigationButton><Button variant={updates?.has_updates?"outline":"ghost"} aria-label="更新人工确认列表" title={updates?.refreshing?`后台正在更新 ${updates.refreshing} 条建议，当前列表保持不变`:'更新建议和分组'} disabled={loading} onClick={requestRefresh}><RefreshCw size={15} aria-hidden="true"/>{updates?.has_updates?<span>有更新</span>:updates?.refreshing?<span className="ws-muted">后台更新中</span>:null}</Button></WorkbenchHeaderActions>
+    <WorkbenchHeaderActions
+      mobileInline={
+        <Button variant={updates?.has_updates?"outline":"ghost"} size="icon" aria-label={updates?.has_updates?'有新建议，更新人工确认列表':'更新人工确认列表'} title={updates?.has_updates?'有新建议，点击刷新':updates?.refreshing?`后台正在更新 ${updates.refreshing} 条建议，当前列表保持不变`:'更新建议和分组'} disabled={loading} onClick={requestRefresh}>
+          <RefreshCw size={15} aria-hidden="true"/>
+        </Button>
+      }
+      mobileBar={hasMobileAlertBar?(
+        <>
+          {((autoMergePreview?.eligible_count??0)>0||autoMergeActive)&&<Button ref={autoMergeTriggerRef} variant="outline" size="sm" aria-label={autoMergeActive?`自动合入（${autoMergeActiveLabel}）`:`自动合入 ${autoMergePreview!.eligible_count} 个已匹配视频`} onClick={()=>setAutoMergeOpen(true)}><Sparkles size={14} aria-hidden="true"/><span>自动合入</span>{autoMergeActive?<AnimatedBadge size="sm" status={lockBadgeStatus(autoMergeActiveStatus)} className="ws-topbar-lock-badge">{autoMergeActiveLabel}</AnimatedBadge>:<span className="ws-count">{autoMergePreview!.eligible_count}</span>}</Button>}
+          {updates?.has_updates&&<Button variant="outline" size="sm" disabled={loading} onClick={requestRefresh}><RefreshCw size={13} aria-hidden="true"/><span>有新建议 · 刷新</span></Button>}
+        </>
+      ):null}
+    >{((autoMergePreview?.eligible_count??0)>0||autoMergeActive)&&<Button ref={autoMergeTriggerRef} variant="outline" size="sm" aria-label={autoMergeActive?`自动合入（${autoMergeActiveLabel}）`:`自动合入 ${autoMergePreview!.eligible_count} 个已匹配视频`} title={autoMergeActive?`自动合入：${autoMergeActiveLabel}`:`可直接合入 ${autoMergePreview!.eligible_count} 个视频（${autoMergePreview!.group_count} 位人物）`} onClick={()=>setAutoMergeOpen(true)}><Sparkles size={14} aria-hidden="true"/><span>自动合入</span>{autoMergeActive?<AnimatedBadge size="sm" status={lockBadgeStatus(autoMergeActiveStatus)} className="ws-topbar-lock-badge">{autoMergeActiveLabel}</AnimatedBadge>:<span className="ws-count">{autoMergePreview!.eligible_count}</span>}</Button>}<NavigationButton variant="ghost" size="sm" asChild className="ws-review-status-link"><Link href="/operations"><span className="ws-link-label">分析中</span><span className="ws-count">{updates?.waiting??data?.waiting??'—'}</span><ChevronRight size={14} aria-hidden="true"/></Link></NavigationButton><Button variant={updates?.has_updates?"outline":"ghost"} aria-label="更新人工确认列表" title={updates?.refreshing?`后台正在更新 ${updates.refreshing} 条建议，当前列表保持不变`:'更新建议和分组'} disabled={loading} onClick={requestRefresh}><RefreshCw size={15} aria-hidden="true"/>{updates?.has_updates?<span>有更新</span>:updates?.refreshing?<span className="ws-muted">后台更新中</span>:null}</Button></WorkbenchHeaderActions>
     {receipt&&<div className="ws-receipt"><QueueReceipt count={receipt.vids.length} creator={receipt.creator} onUndo={undo} onDismiss={()=>setReceipt(null)} busy={false}/></div>}
     {error&&<p role="alert" className="ws-error">{error}</p>}
     {data?.focus_missing&&<p className="ws-error">链接中的视频尚未就绪或已归名。</p>}
@@ -923,6 +939,7 @@ export default function Review() {
         </div>
         <div ref={listScroll.ref} className="ws-list" aria-busy={loading||!groupMatched||query!==search} onScroll={listScroll.onScroll}>
           {(!data||!groupMatched)&&!error?<ReviewQueueSkeleton count={6} label="正在读取待确认视频"/>:!rows.length?<div className="ws-empty"><p>{group&&!data?.group?'该组已处理完，选择另一组继续。':query||folder?'当前筛选下没有视频。':data?.remaining===0?'本组已完成，可选择其他组继续。':'本批已处理完，可继续下一批。'}</p>{(query||folder)&&<Button variant="ghost" onClick={()=>{changeQuery('');setFolder('')}}>清除筛选</Button>}{!query&&!folder&&(data?.remaining??0)>0&&(data?.next_page!=null||data?.previous_page!=null)&&<Button variant="outline" onClick={()=>{advanceSequenceRef.current++;setPage((data.next_page??data.previous_page)!);setLinkFocus('')}}>继续剩余批次</Button>}{!query&&!folder&&nextAvailableGroup&&<Button variant="outline" onClick={()=>chooseGroup(nextAvailableGroup.key)}>下一待确认组 · {nextAvailableGroup.label}（{nextAvailableGroup.count}）</Button>}</div>:rows.map(t=><ReviewSummaryRow key={t.vid} task={t} selected={selected.has(t.vid)} active={focused?.vid===t.vid} disabled={disabled||!!t.review_blocked&&!selected.has(t.vid)} lock={lockedVids.get(t.vid)} onToggle={()=>toggle([t])} onInspect={()=>inspect(t)}/>)}
+          {!reviewDesktop&&paginationBar}
         </div>
         {!reviewDesktop&&chosen.length>0&&ruleOptinBar}
         {chosen.length>0&&<div className="ws-bulk" aria-label="所选视频操作">
@@ -943,7 +960,7 @@ export default function Review() {
             </>
           )}
         </div>}
-        <div className="ws-pagination" data-single-page={isSinglePage?'true':undefined}><span className="tabular-nums">{data&&groupMatched?`${data.remaining??data.total} 个待核对 · 第 ${currentPage+1} / ${Math.max(1,Math.ceil(data.total/data.limit))} 批`:activeGroupInfo?`${activeGroupInfo.count} 个待核对 · 读取中`:'读取中'}</span><div className="ws-actions"><Button className="ws-icon" variant="ghost" size="sm" aria-label="上一页" title="上一页" disabled={disabled||!groupMatched||(data?.session?data.previous_page==null:currentPage===0)} onClick={()=>{advanceSequenceRef.current++;setPage(data?.previous_page??currentPage-1);setLinkFocus('')}}><ChevronLeft size={15} aria-hidden="true"/></Button><Button className="ws-icon" variant="ghost" size="sm" aria-label="下一页" title="下一页" disabled={disabled||!groupMatched||!data||(data.session?data.next_page==null:(currentPage+1)*data.limit>=data.total)} onClick={()=>{advanceSequenceRef.current++;setPage(data?.next_page??currentPage+1);setLinkFocus('')}}><ChevronRight size={15} aria-hidden="true"/></Button></div></div>
+        {reviewDesktop&&paginationBar}
       </section>
       {reviewDesktop&&stageOpen&&<>
         <div

@@ -179,7 +179,24 @@ export function StagingWorkbench() {
     </div></div><div className="ws-detail-actions"><Button variant="outline" disabled={busy || !!error} onClick={() => begin('restore-files', focused)}><RotateCcw size={14} />恢复</Button><Button className="staging-danger" variant="outline" disabled={busy || !!error} onClick={() => begin('delete-staged', focused)}><Trash2 size={14} />永久删除</Button></div>
   </>
   return <main className="ws-page staging-page" aria-label={health ? '回收站工作区' : '回收站文件工作区'}>
-    <WorkbenchHeaderActions>
+    <WorkbenchHeaderActions
+      mobileInline={
+        health ? (
+          <Button variant="ghost" size="icon" aria-label="刷新视频体检" title="刷新视频体检" disabled={healthBusy} onClick={() => setHealthRefreshSignal(n => n + 1)}>
+            <RefreshCw size={15} />
+          </Button>
+        ) : (
+          <>
+            <Button variant="ghost" size="icon" aria-label="刷新回收站" title="刷新回收站" disabled={loading || busy} onClick={() => load(offsetRef.current)}>
+              <RefreshCw size={15} />
+            </Button>
+            <Button className="staging-danger" variant="ghost" size="icon" aria-label="清空回收站" title="清空回收站" disabled={!list?.files || !!error || busy} onClick={() => begin('clear-staging')}>
+              <Trash2 size={15} />
+            </Button>
+          </>
+        )
+      }
+    >
       {health ? (
         <Button variant="ghost" size="icon" aria-label="刷新视频体检" title="刷新视频体检" disabled={healthBusy} onClick={() => setHealthRefreshSignal(n => n + 1)}>
           <RefreshCw size={15} />
@@ -215,7 +232,7 @@ export function StagingWorkbench() {
           {rows.map(row => <article key={row.path} className="staging-record" data-active={focused?.path === row.path}><div className="staging-file-line"><Checkbox className="ws-check" motionPreset="instant" checked={selected.has(row.path)} disabled={busy || !!error} aria-label={`选择文件 ${row.path}`} onCheckedChange={checked => toggle(row, checked)} /><button type="button" className="staging-file-open" aria-label={`查看文件 ${row.path}`} aria-expanded={focused?.path === row.path} onClick={event => { rowTrigger.current = event.currentTarget; setFocused(focused?.path === row.path ? null : row) }}><span className="staging-file-icon">{videoFile.test(row.name) ? <FileVideo size={18} /> : <File size={18} />}</span><span className="ws-row-copy"><span className="ws-row-name" title={row.name}>{row.name}</span><span className="ws-row-meta" title={row.origin?.original_path || row.path}>{origin(row)} · {row.origin?.original_path || row.path}</span></span><span className="staging-file-size">{bytes(row.size)}</span></button></div>{!wide && focused?.path === row.path && <section className="staging-inline-detail">{detail}</section>}</article>)}
         </div>
         {selected.size > 0 && <div className="ws-selection staging-file-actions"><span className="ws-selection-summary">已选 {selected.size} 个</span><Button variant="ghost" disabled={busy} onClick={() => setSelected(new Map())}>取消选择</Button><Button variant="outline" disabled={busy || !!error || selected.size !== 1} title={selected.size !== 1 ? '每次恢复一个文件，分别核对目标' : '恢复所选文件'} onClick={() => begin('restore-files')}><RotateCcw size={14} />恢复</Button><Button className="staging-danger" variant="outline" disabled={busy || !!error || selected.size > 500} onClick={() => begin('delete-staged')}><Trash2 size={14} />永久删除</Button></div>}
-        <footer className="ws-pagination"><span>{list ? `${list.matched.toLocaleString()} 个匹配 · ${list.matched ? list.offset + 1 : 0}–${list.offset + rows.length}` : '数量未知'}</span><div className="ws-actions"><Button variant="ghost" size="icon" aria-label="上一页" title="上一页" disabled={loading || !list?.offset} onClick={() => load(Math.max(0, (list?.offset || 0) - 100))}><ChevronLeft size={15} /></Button><Button variant="ghost" size="icon" aria-label="下一页" title="下一页" disabled={loading || list?.next_offset == null} onClick={() => load(list!.next_offset!)}><ChevronRight size={15} /></Button></div></footer>
+        <footer className="ws-pagination" data-single-page={list && !list.offset && list.next_offset == null ? 'true' : undefined}><span>{list ? `${list.matched.toLocaleString()} 个匹配 · ${list.matched ? list.offset + 1 : 0}–${list.offset + rows.length}` : '数量未知'}</span><div className="ws-actions"><Button variant="ghost" size="icon" aria-label="上一页" title="上一页" disabled={loading || !list?.offset} onClick={() => load(Math.max(0, (list?.offset || 0) - 100))}><ChevronLeft size={15} /></Button><Button variant="ghost" size="icon" aria-label="下一页" title="下一页" disabled={loading || list?.next_offset == null} onClick={() => load(list!.next_offset!)}><ChevronRight size={15} /></Button></div></footer>
       </section>{wide && <aside className="ws-inspector staging-inspector" aria-label="文件详情">{detail || <div className="staging-detail-empty"><FolderOpen size={28} /><p>选择文件查看原路径</p></div>}</aside>}
     </div>
     <Dialog open={open} onOpenChange={value => { setOpen(value); if (!value) { previewSequence.current++; setPreparing(false) } }}><ResponsiveDialogContent open={open} inert={!open} className="ws-detail-sheet staging-confirm" style={{ animationName: open ? 'review-dialog-in' : 'review-dialog-out', animationDuration: instant ? '0ms' : '180ms' }} overlayProps={{ style: { animationName: open ? 'review-overlay-in' : 'review-dialog-out', animationDuration: instant ? '0ms' : '140ms' } }} onCloseAutoFocus={event => { event.preventDefault(); if (dialogTrigger.current?.isConnected) dialogTrigger.current.focus(); else searchRef.current?.querySelector('input')?.focus() }}>

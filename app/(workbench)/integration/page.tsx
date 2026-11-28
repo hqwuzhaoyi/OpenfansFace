@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { useRouter } from 'next/navigation'
 import Link from 'next/link'
-import { Archive, ArrowDown, ArrowLeft, ArrowRight, Check, CheckCheck, ChevronLeft, ChevronRight, CircleAlert, CircleCheck, Folder, FolderInput, History, PanelLeft, RefreshCw, Search, ShieldCheck, Undo2, X } from 'lucide-react'
+import { Archive, ArrowDown, ArrowLeft, ArrowRight, Check, CheckCheck, ChevronDown, ChevronLeft, ChevronRight, CircleAlert, CircleCheck, Folder, FolderInput, History, PanelLeft, RefreshCw, Search, ShieldCheck, Undo2, X } from 'lucide-react'
 import { toast } from 'sonner'
 import { WorkbenchMotion, WorkbenchStep, useWorkbenchMotion } from '@/components/persons/motion'
 import { Progress } from '@/components/ui/progress'
@@ -57,7 +57,7 @@ function Integration() {
   const [selected, setSelected] = useState<Set<string>>(new Set())
   const [filter, setFilter] = useState<BatchFilter>('all'), [query, setQuery] = useState(''), [history, setHistory] = useState(false)
   const [active, setActive] = useState<string | null>(null), [collapsed, setCollapsed] = useState<Set<string>>(new Set())
-  const [mobileDetail, setMobileDetail] = useState(false), [listHidden, setListHidden] = useState(false)
+  const [mobileDetail, setMobileDetail] = useState(false), [mobileWaveOpen, setMobileWaveOpen] = useState(false), [listHidden, setListHidden] = useState(false)
   const [confirm, setConfirm] = useState(false)
   const [result, setResult] = useState<ApplyResult | null>(null), [undoResult, setUndoResult] = useState<UndoItem[]>([])
   const [resolving, setResolving] = useState<Row[] | null>(null), [waveKey, setWaveKey] = useState<string | null>(null)
@@ -213,12 +213,12 @@ function Integration() {
   }, [confirmUnarchiveKey, currentKey])
 
   const chooseWave = (key: string, mobile = true) => {
-    setWaveKey(key); setActive(null)
+    setWaveKey(key); setActive(null); setMobileWaveOpen(false)
     if (mobile) setMobileDetail(true)
     scrollDetail.current?.scrollTo(0, 0)
   }
   const setView = (value: boolean) => {
-    setHistory(value); setActive(null); setConfirmUnarchiveKey(null); setCollapsed(new Set()); setFilter('all'); setQuery(''); setMobileDetail(false)
+    setHistory(value); setActive(null); setConfirmUnarchiveKey(null); setCollapsed(new Set()); setFilter('all'); setQuery(''); setMobileDetail(false); setMobileWaveOpen(false)
     const url = new URL(window.location.href)
     if (value) url.searchParams.set('view', 'history'); else url.searchParams.delete('view')
     window.history.replaceState(window.history.state, '', url)
@@ -460,7 +460,18 @@ function Integration() {
   useSyncWorkbenchBreadcrumb(topBreadcrumbItems)
 
   return <main className="archive-workbench">
-    <WorkbenchHeaderActions>
+    <WorkbenchHeaderActions
+      mobileInline={
+        <>
+          <WorkspaceButton variant="ghost" size="icon" aria-label={history ? '返回待归档' : '查看已归档记录'} title={history ? '返回待归档' : '已归档记录'} disabled={busy} onClick={() => setView(!history)}>
+            {history ? <Archive size={15} /> : <History size={15} />}
+          </WorkspaceButton>
+          <WorkspaceButton variant="ghost" size="icon" aria-label="刷新归档预览" title="刷新" disabled={busy || loading} onClick={() => load()}>
+            <RefreshCw size={15} className={loading ? 'animate-spin motion-reduce:animate-none' : ''} />
+          </WorkspaceButton>
+        </>
+      }
+    >
       <WorkspaceButton variant="outline" size="sm" aria-label={history ? '返回待归档' : '查看已归档记录'} title={history ? '返回待归档' : '已归档记录'} disabled={busy} onClick={() => setView(!history)}>
         {history ? <Archive size={14} /> : <History size={14} />}
         <span>{history ? '返回待归档' : '已归档记录'}</span>
@@ -491,7 +502,8 @@ function Integration() {
         <div ref={scrollDetail} className="archive-detailScroll">
           {!history && wave && <section className="archive-waveDetail" aria-label="本波视频">
             <div className="archive-waveHeading"><div><div className="archive-waveHeadingTitle"><h2>{batchCreator(wave)}</h2>{waveLock && <AnimatedBadge size="sm" status={lockBadgeStatus(waveLock.status)} className="archive-lockBadge">{waveLock.label}</AnimatedBadge>}</div><p>{waveTime(wave.at)} · {waveRows.length} 个视频 · 已选 {waveRows.filter(r => selected.has(r.vid)).length} 个</p></div><ArchiveCheckbox label="选择详情中的整波视频" checked={selectableWaveRows.length > 0 && selectableWaveRows.every(r => selected.has(r.vid))} mixed={selectableWaveRows.some(r => selected.has(r.vid)) && !selectableWaveRows.every(r => selected.has(r.vid))} disabled={disabled || !selectableWaveRows.length} onChange={() => toggle(selectableWaveRows.map(r => r.vid))} /></div>
-            <div className="archive-waveVideos">{waveRows.map(row => {
+            {waveRows.length > 1 && <button type="button" className="archive-waveMobileToggle" aria-expanded={mobileWaveOpen} onClick={() => setMobileWaveOpen(v => !v)}><span>{mobileWaveOpen ? '收起本波视频列表' : `展开本波 ${waveRows.length} 个视频切换`}</span><ChevronDown size={14} className={mobileWaveOpen ? 'rotate-180 transition-transform' : 'transition-transform'} /></button>}
+            <div className="archive-waveVideos" data-mobile-open={mobileWaveOpen || waveRows.length <= 1 ? 'true' : 'false'}>{waveRows.map(row => {
               const rowLock = getRowLock(row)
               return <div className="archive-waveVideo" key={row.vid} data-vid={row.vid} data-active={current?.vid === row.vid} data-locked={Boolean(rowLock) || undefined}>
               <div className="archive-waveVideoMain"><ArchiveCheckbox label={`选择视频 ${row.name}`} checked={selected.has(row.vid)} disabled={disabled || Boolean(rowLock)} onChange={() => toggle([row.vid])} />
@@ -533,7 +545,7 @@ function Integration() {
         </div>
       </section>
     </div>
-    <footer className="archive-actionbar" data-instant={instant}>
+    <footer className="archive-actionbar" data-instant={instant} data-mobile-hidden={(!archiving && !result && (history || chosen.length === 0)) ? 'true' : undefined}>
       {archiving||result ? <div ref={runStatus} tabIndex={-1} className="archive-run">
         <WorkbenchStep phase={archiving?'running':'result'} className="archive-runBody">
           <strong role="status" aria-live="polite">{archiving?(connection||job?.stage||'正在提交归档…'):resultTitle}{archiving&&job?.done!=null&&job.total!=null?` · ${job.done} / ${job.total} ${job.unit}`:''}</strong>

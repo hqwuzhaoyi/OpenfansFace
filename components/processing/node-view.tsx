@@ -149,7 +149,20 @@ export default function NodeView({ onNavigateOverview }: { onNavigateOverview?: 
 
   return (
     <div className="ws-node-view">
-      <WorkbenchHeaderActions>
+      <WorkbenchHeaderActions
+        mobileInline={
+          <Button
+            variant="ghost"
+            size="icon"
+            disabled={isFetching}
+            onClick={() => void refetch()}
+            aria-label="刷新节点列表"
+            title="刷新节点列表"
+          >
+            <RefreshCw size={15} className={isFetching ? 'animate-spin' : ''} />
+          </Button>
+        }
+      >
         <Button
           variant="ghost"
           size="sm"

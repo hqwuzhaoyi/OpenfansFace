@@ -199,28 +199,64 @@ interface BreadcrumbActionsValue {
   handlersRef: React.MutableRefObject<Map<string, () => void>>
 }
 
+interface WorkbenchHeaderSlotContextValue {
+  target: HTMLDivElement | null
+  mobileInlineTarget: HTMLDivElement | null
+  isMobile: boolean
+}
+
 const BreadcrumbItemsContext = createContext<SyncedBreadcrumbRecord | null>(null)
 const BreadcrumbActionsContext = createContext<BreadcrumbActionsValue | null>(null)
-const WorkbenchHeaderSlotContext = createContext<HTMLDivElement | null>(null)
+const WorkbenchHeaderSlotContext = createContext<WorkbenchHeaderSlotContextValue>({
+  target: null,
+  mobileInlineTarget: null,
+  isMobile: false,
+})
 
 export function WorkbenchHeaderSlotProvider({
   target,
+  mobileInlineTarget = null,
+  isMobile = false,
   children,
 }: {
   target: HTMLDivElement | null
+  mobileInlineTarget?: HTMLDivElement | null
+  isMobile?: boolean
   children: ReactNode
 }) {
+  const value = useMemo<WorkbenchHeaderSlotContextValue>(
+    () => ({ target, mobileInlineTarget, isMobile }),
+    [target, mobileInlineTarget, isMobile],
+  )
   return (
-    <WorkbenchHeaderSlotContext.Provider value={target}>
+    <WorkbenchHeaderSlotContext.Provider value={value}>
       {children}
     </WorkbenchHeaderSlotContext.Provider>
   )
 }
 
-export function WorkbenchHeaderActions({ children }: { children: ReactNode }) {
-  const target = useContext(WorkbenchHeaderSlotContext)
-  if (!target) return null
-  return createPortal(children, target)
+export function WorkbenchHeaderActions({
+  children,
+  mobileInline,
+  mobileBar,
+}: {
+  children: ReactNode
+  mobileInline?: ReactNode
+  mobileBar?: ReactNode
+}) {
+  const { target, mobileInlineTarget, isMobile } = useContext(WorkbenchHeaderSlotContext)
+  if (!isMobile) {
+    return target ? createPortal(children, target) : null
+  }
+  if (mobileInline !== undefined || mobileBar !== undefined) {
+    return (
+      <>
+        {mobileInlineTarget && mobileInline ? createPortal(mobileInline, mobileInlineTarget) : null}
+        {target && mobileBar ? createPortal(mobileBar, target) : null}
+      </>
+    )
+  }
+  return target ? createPortal(children, target) : null
 }
 
 export function WorkbenchBreadcrumbProvider({ children }: { children: ReactNode }) {

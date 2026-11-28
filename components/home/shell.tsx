@@ -197,9 +197,11 @@ function buildFallbackBreadcrumb(pathname: string): WorkbenchBreadcrumbSegment[]
 function WorkbenchTopBar({
   pathname,
   desktopActionsRef,
+  mobileInlineActionsRef,
 }: {
   pathname: string
   desktopActionsRef: (node: HTMLDivElement | null) => void
+  mobileInlineActionsRef: (node: HTMLDivElement | null) => void
 }) {
   const { isMobile, open } = useAnimatedSidebar()
   const { tasks, open: opsOpen } = useBackgroundOperations()
@@ -222,11 +224,13 @@ function WorkbenchTopBar({
         >
           <PanelLeft size={16} />
         </AnimatedSidebarTrigger>
-        <Link href="/" className="home-topbar-brand-mobile" aria-label="返回首页" title="返回首页">
-          <span className="home-brand-mark home-brand-mark-sm">
-            <Clapperboard size={15} />
-          </span>
-        </Link>
+        {pathname !== '/' && (
+          <Link href="/" className="home-topbar-brand-mobile" aria-label="返回首页" title="返回首页">
+            <span className="home-brand-mark home-brand-mark-sm">
+              <Clapperboard size={15} />
+            </span>
+          </Link>
+        )}
         <span className="home-topbar-divider" aria-hidden="true" />
         <WorkbenchBreadcrumb
           items={displayBreadcrumbItems}
@@ -238,6 +242,7 @@ function WorkbenchTopBar({
       </div>
       <div ref={desktopActionsRef} className="home-topbar-actions" />
       <div className="home-topbar-mobile-dock">
+        <div ref={mobileInlineActionsRef} className="home-topbar-mobile-inline" />
         <Dock size={36} className="home-mobile-dock">
           {tasks.length > 0 && (
             <>
@@ -283,10 +288,15 @@ function WorkbenchShellFrame({
   const { isMobile } = useAnimatedSidebar()
   const [desktopActionsSlot, setDesktopActionsSlot] = useState<HTMLDivElement | null>(null)
   const [mobileActionsSlot, setMobileActionsSlot] = useState<HTMLDivElement | null>(null)
+  const [mobileInlineSlot, setMobileInlineSlot] = useState<HTMLDivElement | null>(null)
   const activeActionsSlot = isMobile ? mobileActionsSlot : desktopActionsSlot
 
   return (
-    <WorkbenchHeaderSlotProvider target={activeActionsSlot}>
+    <WorkbenchHeaderSlotProvider
+      target={activeActionsSlot}
+      mobileInlineTarget={mobileInlineSlot}
+      isMobile={isMobile}
+    >
       <AnimatedSidebar ariaLabel="工作台导航" panelClassName="home-sidebar">
         <AnimatedSidebarHeader className="home-sidebar-header">
           <SidebarHeaderBrand />
@@ -368,7 +378,11 @@ function WorkbenchShellFrame({
         <AnimatedSidebarRail />
       </AnimatedSidebar>
       <AnimatedSidebarInset className={`home-inset ${isSplitPane ? 'home-inset-split' : ''}`}>
-        <WorkbenchTopBar pathname={pathname} desktopActionsRef={setDesktopActionsSlot} />
+        <WorkbenchTopBar
+          pathname={pathname}
+          desktopActionsRef={setDesktopActionsSlot}
+          mobileInlineActionsRef={setMobileInlineSlot}
+        />
         <div ref={setMobileActionsSlot} className="home-mobile-actionbar" />
         <div className={`home-content-area ${isSplitPane ? 'home-content-split' : ''}`}>
           {children}

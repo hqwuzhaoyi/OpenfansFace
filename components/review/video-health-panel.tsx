@@ -132,7 +132,7 @@ export function VideoHealthPanel({
 
   const workarea = (
     <div className="staging-workarea">
-      <aside className="staging-storage" aria-label="回收站概况">{storageSummary}</aside>
+      <aside className={embedded ? 'staging-storage staging-storage-embedded' : 'staging-storage'} aria-label="回收站概况">{storageSummary}</aside>
       <section id="video-health" className="ws-queue staging-health" aria-labelledby="staging-health-title">
         <div className="staging-health-heading"><div><Activity size={16} /><h2 id="staging-health-title">视频体检</h2></div>{data && <span className="staging-run-state" role="status" data-running={data.status === 'running'}>{status}</span>}</div>
         <div className="staging-health-summary" aria-label="体检统计">

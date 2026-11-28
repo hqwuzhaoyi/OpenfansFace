@@ -18,7 +18,7 @@ export function ResponsiveDialogContent({open,className,onEscapeKeyDown,onPointe
       node.style.setProperty('--sheet-height',`${height}px`)
       node.style.setProperty('--sheet-top',`${Math.round(viewport?.offsetTop||0)}px`)
       node.dataset.keyboard=String(keyboard)
-      if(keyboard&&focused instanceof HTMLElement&&matchMedia('(max-width:1023px)').matches){
+      if(keyboard&&focused instanceof HTMLElement&&matchMedia('(max-width:1099px)').matches){
         cancelAnimationFrame(scrollFrame)
         scrollFrame=requestAnimationFrame(()=>{
           const area=node.querySelector('[data-sheet-scroll]')?.getBoundingClientRect(),rect=focused.getBoundingClientRect()
@@ -38,5 +38,5 @@ export function ResponsiveDialogContent({open,className,onEscapeKeyDown,onPointe
       node?.closest('[inert]') ||
         document.querySelector('[data-combobox-content][aria-hidden="false"]'),
     )
-  return <DialogContent {...props} onEscapeKeyDown={event=>{if(nestedOverlayActive()||event.isComposing||event.keyCode===229||(event.target instanceof HTMLInputElement&&event.target.type==='search'&&!!event.target.value&&!!event.target.closest('[data-slot=input-group]'))){event.preventDefault();return}onEscapeKeyDown?.(event)}} onPointerDownOutside={event=>{if(nestedOverlayActive()){event.preventDefault();return}onPointerDownOutside?.(event)}} onFocusOutside={event=>{if(nestedOverlayActive()){event.preventDefault();return}onFocusOutside?.(event)}} ref={setNode} className={cn('mobile-review-sheet top-0 left-0 translate-x-0 translate-y-0 lg:top-1/2 lg:left-1/2 lg:-translate-x-1/2 lg:-translate-y-1/2',className)}/>
+  return <DialogContent {...props} onEscapeKeyDown={event=>{if(nestedOverlayActive()||event.isComposing||event.keyCode===229||(event.target instanceof HTMLInputElement&&event.target.type==='search'&&!!event.target.value&&!!event.target.closest('[data-slot=input-group]'))){event.preventDefault();return}onEscapeKeyDown?.(event)}} onPointerDownOutside={event=>{if(nestedOverlayActive()){event.preventDefault();return}onPointerDownOutside?.(event)}} onFocusOutside={event=>{if(nestedOverlayActive()){event.preventDefault();return}onFocusOutside?.(event)}} ref={setNode} className={cn('mobile-review-sheet top-0 left-0 translate-x-0 translate-y-0 min-[1100px]:top-1/2 min-[1100px]:left-1/2 min-[1100px]:-translate-x-1/2 min-[1100px]:-translate-y-1/2',className)}/>
 }

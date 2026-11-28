@@ -170,7 +170,20 @@ export default function DeploymentView({ onNavigateOverview }: { onNavigateOverv
 
   return (
     <div className="ws-deploy-root">
-      <WorkbenchHeaderActions>
+      <WorkbenchHeaderActions
+        mobileInline={
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={() => refetch()}
+            disabled={isFetching}
+            aria-label="刷新部署状态"
+            title="刷新部署状态"
+          >
+            <RefreshCw size={15} className={isFetching ? 'animate-spin' : ''} />
+          </Button>
+        }
+      >
         <Button
           variant="ghost"
           size="sm"
@@ -233,11 +246,11 @@ export default function DeploymentView({ onNavigateOverview }: { onNavigateOverv
             onChange={setFilter}
             label="部署状态过滤"
             items={[
-              { value: 'all', label: '全部' },
-              { value: 'synced', label: '已同步' },
-              { value: 'deploying', label: '部署中' },
+              { value: 'all', label: '全部', count: data?.summary?.total_nodes },
+              { value: 'synced', label: '已同步', count: data?.summary?.synced_nodes },
+              { value: 'deploying', label: '部署中', count: data?.summary?.in_progress },
               { value: 'mismatched', label: '版本偏离' },
-              { value: 'failed', label: '异常' },
+              { value: 'failed', label: '异常', count: data?.summary?.failed_nodes },
             ]}
           />
           <WorkspaceSearch
