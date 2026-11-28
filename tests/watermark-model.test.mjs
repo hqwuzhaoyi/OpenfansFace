@@ -14,6 +14,14 @@ test('cached OCR never follows a replaced, moved, or differently processed video
   }
 })
 
+test('evidence lookup accepts an earlier pipeline record while the source fingerprint still matches', () => {
+  const record = { path: '/media/a.mp4', size: 10, mtime_ns: '123456789', pipeline: 'paddleocr-3.3.2-ppocrv5-mobile-watermark-v2' }
+  assert.equal(watermarkMatches(record, record.path, 10, '123456789'), true)
+  for (const [path, size, time] of [['/media/b.mp4', 10, '123456789'], [record.path, 11, '123456789'], [record.path, 10, '123456790']]) {
+    assert.equal(watermarkMatches(record, path, size, time), false)
+  }
+})
+
 test('result lists separate unprocessed/empty/error videos and constrain filename searches before selecting', () => {
   const videos = [
     { vid: 'a', name: 'alpha.mp4', path: '/folder/alpha.mp4', watermark: { status: 'done', candidates: [candidate('account')] } },

@@ -2,7 +2,7 @@ import fs from 'fs'
 import {acceptedAttemptFile} from '@/lib/processing-artifacts'
 import path from 'path'
 import { NextRequest, NextResponse } from 'next/server'
-import { loadWatermarkRecords, watermarkState, WATERMARK_DIR } from '@/lib/watermarks'
+import { loadWatermarkRecords, WATERMARK_DIR } from '@/lib/watermarks'
 import { readVideoSources, videoSource } from '@/lib/video-sources'
 import { watermarkMatches } from '@/lib/watermark-model'
 
@@ -14,7 +14,9 @@ export async function GET(req: NextRequest) {
     if (!filePath) return new NextResponse(null, { status: 404 })
     const stat = fs.statSync(filePath, { bigint: true })
     const record = loadWatermarkRecords()[vid]
-    if (!watermarkMatches(record, filePath, Number(stat.size), stat.mtimeNs.toString(), watermarkState().worker.pipeline)) return new NextResponse(null, { status: 404 })
+    // Accepted evidence from an earlier OCR pipeline remains valid while the file fingerprint matches;
+    // acceptedAttemptFile still enforces receipt authenticity and supersession.
+    if (!watermarkMatches(record, filePath, Number(stat.size), stat.mtimeNs.toString()) || record.status !== 'done') return new NextResponse(null, { status: 404 })
     const candidate = record?.candidates.find(c => c.key === key)
     if (!candidate || !/^[a-f0-9-]+\.jpg$/.test(candidate.evidence)) return new NextResponse(null, { status: 404 })
     const attempt=(record as typeof record & {artifact_attempt?:string})?.artifact_attempt
