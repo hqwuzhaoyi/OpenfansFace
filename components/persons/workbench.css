@@ -252,7 +252,8 @@
   .pw .pw-person-rename, .pw .pw-icon, .pw .pw-people-search-group .pw-group-action { width:34px; min-width:34px; height:34px; min-height:34px; }
   .pw .pw-checkbox, .pw .pw-people-selection .pw-checkbox { min-height:36px; min-width:36px; }
   .pw .pw-people-search-group { height:40px; }
-  .pw-library-body { display:flex; flex-direction:column; flex:1; min-height:0; overflow-y:auto; overscroll-behavior:contain; }
+  .pw-library-body { display:block; flex:1; min-height:0; overflow-y:auto; overscroll-behavior:contain; }
+  .pw-library-head { flex-shrink:0; }
   .pw-live .pw-library .pw-library-title { max-height:none; overflow:visible; }
   .pw-live .pw-tabs { flex-shrink:0; }
   .pw-live .pw-toolbar { flex-shrink:0; }
@@ -260,8 +261,10 @@
   .pw-live .pw-folders[data-has-subfolders="false"] { display:none; }
   .pw-live .pw-folders button { flex-shrink:0; white-space:nowrap; min-height:32px; height:32px; min-width:0; }
   .pw-live .pw-library-scroll { overflow:visible; flex:none; padding:10px 12px max(20px,env(safe-area-inset-bottom)); }
-  .pw-live .pw-card-actions { flex-wrap:nowrap; padding:4px 0; }
-  .pw-live .pw-card-actions .pw-control, .pw-live .pw-file-actions button { min-height:34px; height:34px; min-width:34px; }
+  .pw-live .pw-card-actions { flex-wrap:nowrap; gap:2px; padding:4px 0; }
+  .pw.pw-live .pw-card-actions > .pw-control[data-ui=beui-button] { min-height:32px; height:32px; min-width:0; padding:0 4px; gap:3px; white-space:nowrap; font-size:11px; flex-shrink:0; }
+  .pw-live .pw-file-actions { width:auto; gap:2px; justify-content:flex-end; }
+  .pw.pw-live .pw-file-actions .pw-control[data-ui=beui-button] { width:28px; min-width:28px; height:32px; min-height:32px; padding:0; }
   .pw-foot-count { display:none; }
   .pw-person-foot:not(:has(.pw-people-bulk)):not(:has(.pw-foot-note:not(.pw-foot-count))) { display:none; }
   .pw-person-foot .pw-people-bulk { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:6px; }
@@ -343,4 +346,9 @@
   .pw-theater-header-pill{height:44px;min-height:44px;min-width:44px}
   .pw-theater-path-btn{min-height:44px}
   .pw-theater-shortcuts-head button{width:44px;height:44px;min-width:44px;min-height:44px}
+}
+@media(max-width:767px){
+  .pw-theater-modal{width:100vw!important;max-width:100vw!important;height:100dvh!important;max-height:100dvh!important;border-radius:0!important;border:0!important}
+  .pw-theater-footer{padding-bottom:max(10px,env(safe-area-inset-bottom))}
+  .pw-theater-shortcuts-btn{display:none}
 }

@@ -101,7 +101,7 @@ export function PersonVideoDialog({
   useEffect(() => {
     const isOpen = Boolean(video)
     if (isOpen && !wasDialogOpenRef.current) {
-      setShowEpisodes(typeof window !== 'undefined' ? window.innerHeight >= 780 : false)
+      setShowEpisodes(typeof window !== 'undefined' ? window.innerWidth >= 768 && window.innerHeight >= 780 : false)
       setShowShortcuts(false)
     }
     wasDialogOpenRef.current = isOpen
@@ -255,7 +255,7 @@ export function PersonVideoDialog({
           <Popover.Trigger asChild>
             <button
               type="button"
-              className="pw-theater-icon-btn"
+              className="pw-theater-icon-btn pw-theater-shortcuts-btn"
               aria-label="快捷键说明"
               aria-expanded={showShortcuts}
               title="快捷键 (?)"
@@ -348,7 +348,7 @@ export function PersonVideoDialog({
   return (
     <Dialog open={!!video} onOpenChange={open => !open && onClose()}>
       <DialogContent
-        className="pw-modal pw-theater-modal"
+        className="pw-modal pw-theater-modal top-0 left-0 translate-x-0 translate-y-0 md:top-[50%] md:left-[50%] md:translate-x-[-50%] md:translate-y-[-50%]"
         data-theme={theme}
         showCloseButton={false}
       >

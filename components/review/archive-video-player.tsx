@@ -47,7 +47,9 @@ export function ArchiveVideoPlayer({ video, detailVisibleOnMobile }: { video: Re
   }
   return (
     <div ref={hostRef} tabIndex={-1} className="archive-inlinePlayer outline-none">
-      {!lightbox.open && (
+      {lightbox.open ? (
+        <div className="wb-vstage" aria-hidden="true" />
+      ) : (
         <WorkbenchVideoPlayer
           videoRef={player}
           key={attempt}

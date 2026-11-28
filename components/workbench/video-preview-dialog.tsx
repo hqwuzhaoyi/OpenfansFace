@@ -140,9 +140,9 @@ export function VideoPreviewDialog({
             })
           }
         }}
-        className="w-full max-w-[min(1120px,94vw)] lg:max-w-[min(1120px,94vw)] h-[min(88dvh,860px)] max-h-[92dvh] flex! flex-col! gap-0! p-0! overflow-hidden! overscroll-contain"
+        className="w-full max-w-[min(1120px,94vw)] lg:max-w-[min(1120px,94vw)] h-[min(88dvh,860px)] max-h-[92dvh] flex! flex-col! gap-0! p-0 overflow-hidden! overscroll-contain"
       >
-        <DialogHeader className="shrink-0 flex-row items-center justify-between gap-2 border-b px-4 py-2.5 pr-14 text-left">
+        <DialogHeader className="shrink-0 min-h-[52px] flex-row items-center justify-between gap-2 border-b px-4 py-2 pr-14 text-left">
           <div className="flex min-w-0 flex-1 items-center gap-2">
             <DialogTitle className="truncate text-sm font-semibold">{title}</DialogTitle>
             {badge}
@@ -204,11 +204,11 @@ export function VideoPreviewDialog({
               />
             </div>
 
-            {errorSlot && <div className="shrink-0 border-t px-4 py-2">{errorSlot}</div>}
+            {errorSlot && <div className="shrink-0 max-h-[36dvh] overflow-y-auto border-t px-4 py-2">{errorSlot}</div>}
             {stripSlot}
 
             {(path || footerActions) && (
-              <div className="shrink-0 flex flex-wrap items-center justify-between gap-3 border-t bg-background px-4 py-2.5">
+              <div className="shrink-0 flex flex-wrap items-center justify-between gap-3 border-t bg-background px-4 py-2.5 pb-[max(0.625rem,env(safe-area-inset-bottom,0px))]">
                 <div className="min-w-0 flex-1">
                   {path && <WorkspacePath value={path} compact />}
                 </div>
