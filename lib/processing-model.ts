@@ -25,17 +25,43 @@ export const stageLabel: Record<ProcessingStage, string> = { queued: '排队中'
 export function reviewBucket(task: ProcessingTask): 'suggested' | 'conflict' | 'none' | 'manual' {
   return task.manual ? 'manual' : task.data.kind || 'none'
 }
+function rawParentFolderName(filePath?: string): string {
+  if (!filePath) return ''
+  const parts = filePath.replace(/\\/g, '/').split('/').filter(Boolean)
+  return parts.length >= 2 ? parts[parts.length - 2] : ''
+}
+
 export function reviewGroup(task: ProcessingTask) {
   const bucket = reviewBucket(task)
   if (bucket === 'suggested' && task.data.suggested) return { key: 'person:' + task.data.suggested, label: task.data.suggested, kind: bucket }
-  if (bucket === 'none' && task.data.face?.unknown_group) return { key: 'face:' + task.data.face.unknown_group, label: '未命名相似组 ' + task.data.face.unknown_group.slice(-5), kind: bucket }
+  if (bucket === 'none' && task.data.face?.unknown_group) return { key: 'face:' + task.data.face.unknown_group, label: rawParentFolderName(task.path) || '未命名相似组', kind: bucket }
   return { key: bucket, label: { conflict: '证据冲突', none: '无候选人物', manual: '人工接管', suggested: '无候选人物' }[bucket], kind: bucket }
 }
 export function groupReviewTasks(tasks: ProcessingTask[]) {
   const groups = new Map<string, ReturnType<typeof reviewGroup> & { count: number }>()
+  const faceFolders = new Map<string, Map<string, number>>()
   for (const task of tasks) {
     const group = reviewGroup(task), old = groups.get(group.key)
     groups.set(group.key, { ...group, count: (old?.count || 0) + 1 })
+    if (group.key.startsWith('face:')) {
+      const folder = rawParentFolderName(task.path)
+      if (folder) {
+        const counts = faceFolders.get(group.key) ?? new Map<string, number>()
+        counts.set(folder, (counts.get(folder) || 0) + 1)
+        faceFolders.set(group.key, counts)
+      }
+    }
+  }
+  for (const [key, counts] of faceFolders) {
+    let bestFolder = '', bestCount = -1
+    for (const [folder, count] of counts) {
+      if (count > bestCount || (count === bestCount && folder < bestFolder)) {
+        bestFolder = folder
+        bestCount = count
+      }
+    }
+    const group = groups.get(key)
+    if (group && bestFolder) group.label = bestFolder
   }
   return [...groups.values()].sort((a, b) => Number(a.kind !== 'suggested') - Number(b.kind !== 'suggested') || b.count - a.count || a.label.localeCompare(b.label, 'zh-CN'))
 }

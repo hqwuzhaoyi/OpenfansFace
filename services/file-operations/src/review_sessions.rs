@@ -698,6 +698,7 @@ fn load_lightweight_tasks(
         items.push(item);
     }
     assign_folder_groups(config, &mut items);
+    assign_face_group_labels(&mut items);
     Ok(LightweightScan {
         items,
         live_ids,
@@ -758,6 +759,66 @@ fn assign_folder_groups(config: &Config, items: &mut [Value]) {
             leaf
         };
         items[idx]["group"] = json!({"key": key, "label": label, "kind": "none"});
+    }
+}
+
+fn raw_parent_folder_name(path: &str) -> Option<String> {
+    if path.is_empty() {
+        return None;
+    }
+    let normalized = path.replace('\\', "/");
+    std::path::Path::new(&normalized)
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.is_empty())
+        .map(str::to_owned)
+}
+
+fn assign_face_group_labels(items: &mut [Value]) {
+    let mut folder_counts: BTreeMap<(bool, String), BTreeMap<String, usize>> = BTreeMap::new();
+    for item in items.iter() {
+        let Some(key) = item["group"]["key"].as_str() else {
+            continue;
+        };
+        if !key.starts_with("face:") {
+            continue;
+        }
+        let deferred = item["deferred"].as_i64().unwrap_or(0) != 0;
+        if let Some(folder) = raw_parent_folder_name(item["path"].as_str().unwrap_or("")) {
+            *folder_counts
+                .entry((deferred, key.to_owned()))
+                .or_default()
+                .entry(folder)
+                .or_default() += 1;
+        }
+    }
+    let best_labels: BTreeMap<(bool, String), String> = folder_counts
+        .into_iter()
+        .filter_map(|(scope, counts)| {
+            let mut best: Option<(String, usize)> = None;
+            for (folder, count) in counts {
+                if best
+                    .as_ref()
+                    .is_none_or(|(_, best_count)| count > *best_count)
+                {
+                    best = Some((folder, count));
+                }
+            }
+            best.map(|(folder, _)| (scope, folder))
+        })
+        .collect();
+    for item in items.iter_mut() {
+        let Some(key) = item["group"]["key"].as_str().map(str::to_owned) else {
+            continue;
+        };
+        if !key.starts_with("face:") {
+            continue;
+        }
+        let deferred = item["deferred"].as_i64().unwrap_or(0) != 0;
+        if let Some(label) = best_labels.get(&(deferred, key)) {
+            item["group"]["label"] = json!(label);
+        }
     }
 }
 
@@ -866,22 +927,10 @@ fn group_from(manual: i64, data: &Value, unknown_group: Option<&str>) -> Value {
     };
     let suggested = data["suggested"].as_str().unwrap_or("");
     let face = unknown_group.unwrap_or("");
-    let (key, label) = if kind == "suggested" && !suggested.is_empty() {
+    let (key, label): (String, String) = if kind == "suggested" && !suggested.is_empty() {
         (format!("person:{suggested}"), suggested.into())
     } else if kind == "none" && !face.is_empty() {
-        (
-            format!("face:{face}"),
-            format!(
-                "未命名相似组 {}",
-                face.chars()
-                    .rev()
-                    .take(5)
-                    .collect::<String>()
-                    .chars()
-                    .rev()
-                    .collect::<String>()
-            ),
-        )
+        (format!("face:{face}"), "未命名相似组".into())
     } else {
         (
             kind.into(),
@@ -3132,6 +3181,83 @@ mod alias_snapshot_tests {
             "folder:My Telegram/GroupC"
         ));
         assert!(!available(&json!({"stage": "error", "retry_stage": "text", "manual": 0, "data": {"ready": true}})));
+
+        drop(engine);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn face_group_labels_use_raw_most_common_folder_name_without_hash() {
+        let root = fs::canonicalize("/tmp")
+            .unwrap()
+            .join(format!("face-group-label-{}", uuid::Uuid::new_v4()));
+        let base = root.join("base");
+        let media = root.join("media");
+        fs::create_dir_all(base.join("processing")).unwrap();
+        fs::create_dir_all(&media).unwrap();
+        let config = Config {
+            base: base.clone(),
+            media: media.clone(),
+            ledger: root.join("ledger.db"),
+            bind: "127.0.0.1:0".into(),
+            token: None,
+            fixture: None,
+            parity_root: None,
+        };
+        let faces = rusqlite::Connection::open(base.join("faces.db")).unwrap();
+        faces
+            .execute_batch("CREATE TABLE videos(vid TEXT PRIMARY KEY,path TEXT);")
+            .unwrap();
+        let proc_db = rusqlite::Connection::open(base.join("processing/processing.db")).unwrap();
+        proc_db
+            .execute_batch(
+                "CREATE TABLE tasks(vid TEXT PRIMARY KEY,path TEXT,name TEXT,size INTEGER,mtime_ns TEXT,stage TEXT,retry_stage TEXT,manual INTEGER,deferred INTEGER,note TEXT,priority INTEGER,is_new INTEGER,created_at REAL,batch_id TEXT,data TEXT);",
+            )
+            .unwrap();
+        let make_row = |vid: &str, full_or_rel: &str, name: &str, unknown_group: &str, is_rel: bool| {
+            let full = if is_rel {
+                media.join(full_or_rel).to_string_lossy().into_owned()
+            } else {
+                full_or_rel.to_owned()
+            };
+            let data = json!({
+                "kind": "none",
+                "ready": true,
+                "candidates": [],
+                "face": {"matches": [], "unknown_group": unknown_group},
+                "watermark": {"pipeline": "v2", "status": "done", "candidates": []}
+            });
+            proc_db
+                .execute(
+                    "INSERT INTO tasks VALUES(?,?,?,?,?,'review','text',0,0,'',0,0,1.0,'b1',?)",
+                    params![vid, full, name, 100i64, "1", data.to_string()],
+                )
+                .unwrap();
+        };
+        make_row("v1", "pikpak/My Telegram/From-摸鱼评论区-AgADrBMAAistyVU/1.mov", "1.mov", "0bdabbf147fdb8bf", true);
+        make_row("v2", "pikpak/My Telegram/From-摸鱼评论区-AgADrBMAAistyVU/2.mov", "2.mov", "0bdabbf147fdb8bf", true);
+        make_row("v3", "pikpak/My Telegram/From-摸鱼评论区-AgADrBMAAistyVU/3.mov", "3.mov", "0bdabbf147fdb8bf", true);
+        make_row("v4", "pikpak/My Telegram/From-异世界摸鱼协会-AgADWxAAAsZGyFU/4.mov", "4.mov", "0bdabbf147fdb8bf", true);
+        make_row("t1", "pikpak/My Telegram/DirB/1.mov", "1.mov", "tie00001", true);
+        make_row("t2", "pikpak/My Telegram/DirA/2.mov", "2.mov", "tie00001", true);
+        make_row("b1", "alone.mp4", "alone.mp4", "bare0001", false);
+        drop(proc_db);
+
+        let mut engine = Engine::new(config.clone()).unwrap();
+        let page = execute(&mut engine, "review-page", json!({"view": "none"})).unwrap();
+        let groups = page["groups"].as_array().unwrap();
+        let label_of = |k: &str| {
+            groups
+                .iter()
+                .find(|g| g["key"] == k)
+                .unwrap()["label"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        assert_eq!(label_of("face:0bdabbf147fdb8bf"), "From-摸鱼评论区-AgADrBMAAistyVU");
+        assert_eq!(label_of("face:tie00001"), "DirA");
+        assert_eq!(label_of("face:bare0001"), "未命名相似组");
 
         drop(engine);
         fs::remove_dir_all(root).unwrap();
