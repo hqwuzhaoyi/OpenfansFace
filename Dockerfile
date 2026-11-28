@@ -10,7 +10,7 @@ RUN node -e "const Database=require('better-sqlite3'); const db=new Database(':m
 FROM deps AS build
 ARG NEXT_SKIP_TYPECHECK=0
 ENV NEXT_TELEMETRY_DISABLED=1 NEXT_SKIP_TYPECHECK=${NEXT_SKIP_TYPECHECK}
-COPY next.config.ts next-env.d.ts tsconfig.json ./
+COPY next.config.ts tsconfig.json ./
 COPY app ./app
 COPY components ./components
 COPY lib ./lib
