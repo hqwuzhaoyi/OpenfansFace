@@ -451,7 +451,7 @@ pub fn prepare(
         return Err(Error::conflict("部分视频已归档，请刷新后检查完成记录"));
     }
     let tasks = if action == "queue-confirm" && body["source"] == "review" {
-        crate::review_sessions::validate(config, body)?
+        crate::review_sessions::resolve_live_tasks(config, body)?
             .into_iter()
             .map(|mut task| {
                 task["data"] = json!(serde_json::to_string(&task["data"]).unwrap());
@@ -603,33 +603,18 @@ pub fn prepare(
             }
             let task = tasks.iter().find(|t| t["vid"] == *vid);
             if src == "review" {
-                let task = task.ok_or_else(|| Error::conflict("视频尚未就绪或状态已变化"))?;
-                let data = task_data(task)?;
-                let manual = number(&task["manual"]).unwrap_or(0) != 0;
-                if task["stage"] != "review"
-                    && !manual
-                    && !(data["ready"] == true
-                        && (task["stage"] == "queued"
-                            || task["stage"] == "text"
-                            || task["stage"] == "face"
-                            || task["stage"] == "face_queued"
-                            || (task["stage"] == "retry"
-                                && (task["retry_stage"] == "face"
-                                    || task["retry_stage"] == "text"))
-                            || (task["stage"] == "error" && task["retry_stage"] == "face")))
-                {
-                    return Err(Error::conflict("视频尚未就绪或状态已变化"));
+                let fp = body["fingerprints"].get(vid).filter(|v| v.is_object());
+                let mut expected_list = Vec::with_capacity(2);
+                if let Some(expected) = fp {
+                    expected_list.push(expected);
                 }
-                if let Some(scope) = body.get("review_group").filter(|s| !s.is_null())
-                    && (!scope["key"]
-                        .as_str()
-                        .is_some_and(|k| matches_group_scope(config, task, &data, k))
-                        || scope["deferred"].as_bool()
-                            != Some(number(&task["deferred"]).unwrap_or(0) != 0))
-                {
-                    return Err(Error::conflict("确认组或暂缓状态已变化，请重新核对"));
+                if let Some(t) = task {
+                    expected_list.push(t);
                 }
-                for expected in [&body["fingerprints"][vid], task] {
+                if expected_list.is_empty() {
+                    return Err(Error::conflict("视频文件指纹缺失，请刷新后核对"));
+                }
+                for expected in expected_list {
                     if expected["path"] != path
                         || number(&expected["size"]) != Some(stat.len() as i64)
                         || expected["mtime_ns"].as_str() != Some(files::mtime_ns(&stat).as_str())
@@ -638,17 +623,35 @@ pub fn prepare(
                     }
                 }
                 if let Some(key) = body["watermark_key"].as_str().filter(|s| !s.is_empty()) {
-                    let candidate = data["watermark"]["candidates"]
-                        .as_array()
-                        .and_then(|rows| {
-                            rows.iter().find(|r| {
-                                r["key"] == key
-                                    && matches!(r["kind"].as_str(), Some("account" | "text"))
-                                    && r["platform"] != "Telegram"
-                            })
+                    let find_candidate = |rows: Option<&Vec<Value>>| {
+                        rows.and_then(|rows| {
+                            rows.iter()
+                                .find(|r| {
+                                    r["key"] == key
+                                        && matches!(r["kind"].as_str(), Some("account" | "text"))
+                                        && r["platform"] != "Telegram"
+                                })
+                                .cloned()
                         })
+                    };
+                    let mut candidate = task
+                        .and_then(|t| task_data(t).ok())
+                        .and_then(|data| find_candidate(data["watermark"]["candidates"].as_array()));
+                    if candidate.is_none() {
+                        let (_, wm_results) = read(config, "watermarks/results.json", json!({}))?;
+                        let wm_rec = &wm_results[vid];
+                        if wm_rec.is_object()
+                            && wm_rec["path"] == path
+                            && number(&wm_rec["size"]) == Some(stat.len() as i64)
+                            && wm_rec["mtime_ns"].as_str()
+                                == Some(files::mtime_ns(&stat).as_str())
+                        {
+                            candidate = find_candidate(wm_rec["candidates"].as_array());
+                        }
+                    }
+                    let candidate = candidate
                         .ok_or_else(|| Error::conflict("选中视频没有共同的可保存水印证据"))?;
-                    rule = Some(candidate.clone());
+                    rule = Some(candidate);
                 }
                 // Confirmation reads readiness/evidence but does not own analysis progress.
                 // Only the explicit optional rule/restoration commands write task rows.
@@ -1088,7 +1091,13 @@ fn prepare_restore(config: &Config, body: &Value) -> Result<Prepared> {
 
 /// Explicit human task fields only; analysis data, leases and stage remain worker-owned.
 fn prepare_edit(config: &Config, action: &str, body: &Value) -> Result<Prepared> {
-    crate::review_sessions::validate(config, body)?;
+    if let Some(session) = body["review_session"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        crate::review_sessions::touch_session(config, session);
+    }
     let ids = vids(&body["vids"])?;
     if action == "review-note"
         && body["note"]

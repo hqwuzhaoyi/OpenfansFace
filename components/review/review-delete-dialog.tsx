@@ -93,8 +93,8 @@ export function ReviewDeleteDialog({
     const currentTargets = targetsRef.current
     const currentSession = reviewSessionRef.current
     const currentGroup = reviewGroupRef.current
-    if (!currentTargets.length || !currentSession) {
-      setError('当前核对会话已失效，请更新列表后重试')
+    if (!currentTargets.length) {
+      setError('请选择需要移入回收站的视频')
       setLoading(false)
       return
     }
@@ -116,7 +116,7 @@ export function ReviewDeleteDialog({
             person: '',
             payload: {
               vids: currentTargets.map(t => t.vid),
-              review_session: currentSession,
+              ...(currentSession ? { review_session: currentSession } : {}),
               review_tokens: Object.fromEntries(
                 currentTargets.map(t => [t.vid, t.review_token]),
               ),

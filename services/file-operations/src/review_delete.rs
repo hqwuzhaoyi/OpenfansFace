@@ -48,15 +48,15 @@ pub fn validate(request: &Request) -> Result<()> {
             "一次最多移入回收站 500 个视频",
         ));
     }
-    if body["review_session"]
-        .as_str()
-        .is_none_or(|s| s.trim().is_empty())
-        || !body["review_tokens"].is_object()
+    if !body["fingerprints"].is_object()
+        && body["review_session"]
+            .as_str()
+            .is_none_or(|s| s.trim().is_empty())
     {
         return Err(Error::new(
             400,
             "invalid_request",
-            "缺少本次核对会话或证据凭据",
+            "缺少文件指纹或核对会话参数",
         ));
     }
     Ok(())
@@ -88,17 +88,14 @@ pub fn plan(config: &Config, request: Request) -> Result<Plan> {
         return Err(Error::conflict("部分视频已归档，请刷新后检查完成记录"));
     }
 
-    let tasks = crate::review_sessions::validate(config, body)?;
+    let tasks = crate::review_sessions::resolve_live_tasks(config, body)?;
     let id_set: BTreeSet<String> = ids.iter().cloned().collect();
     let sources = review::sources_for_vids(config, &id_set)?;
 
     let mut selected_paths = BTreeSet::new();
     let mut verified = Vec::with_capacity(ids.len());
     for vid in &ids {
-        let task = tasks
-            .iter()
-            .find(|t| t["vid"] == *vid)
-            .ok_or_else(|| Error::conflict("视频尚未就绪或状态已变化"))?;
+        let task = tasks.iter().find(|t| t["vid"] == *vid);
         let path = review::source(config, vid, &sources)
             .ok_or_else(|| Error::conflict("源视频无法读取，请核对路径"))?;
         let stat = review::safe_source(config, &path)?;
@@ -109,9 +106,15 @@ pub fn plan(config: &Config, request: Request) -> Result<Plan> {
             return Err(Error::conflict("同一个源文件已在本次选择中"));
         }
         let fingerprint_guard = body.get("fingerprints").and_then(|fp| fp.get(vid));
-        let mut expected_list = vec![task];
+        let mut expected_list = Vec::with_capacity(2);
         if let Some(fp) = fingerprint_guard.filter(|v| v.is_object()) {
             expected_list.push(fp);
+        }
+        if let Some(t) = task {
+            expected_list.push(t);
+        }
+        if expected_list.is_empty() {
+            return Err(Error::conflict("视频文件指纹缺失，请刷新后核对"));
         }
         for expected in expected_list {
             if expected["path"] != path

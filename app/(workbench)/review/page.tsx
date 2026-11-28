@@ -91,14 +91,14 @@ export default function Review() {
   const [selectionPreviewVid,setSelectionPreviewVid]=useState<string|null>(null)
   const [ruleCandidateIdx,setRuleCandidateIdx]=useState(0)
   const [reference,setReference]=useState<{name:string;scroll:number}|null>(null)
-  const [people,setPeople]=useState<PersonChoice[]>(()=>readWorkbenchCache<PersonChoice[]>('review:people',REVIEW_CACHE_TTL_MS)??[]),[peopleLoading,setPeopleLoading]=useState(()=>(readWorkbenchCache<PersonChoice[]>('review:people',REVIEW_CACHE_TTL_MS)??[]).length===0),[peopleError,setPeopleError]=useState(''),[receipt,setReceipt]=useState<{vids:string[];creator:string;session:string}|null>(null)
+  const [people,setPeople]=useState<PersonChoice[]>(()=>readWorkbenchCache<PersonChoice[]>('review:people',REVIEW_CACHE_TTL_MS)??[]),[peopleLoading,setPeopleLoading]=useState(()=>(readWorkbenchCache<PersonChoice[]>('review:people',REVIEW_CACHE_TTL_MS)??[]).length===0),[peopleError,setPeopleError]=useState(''),[receipt,setReceipt]=useState<{vids:string[];creator:string;session?:string}|null>(null)
   const pendingMutations=useRef(new Map<string,string>())
   const mutate=async<T=any>(path:string,body:Record<string,unknown>,method='POST',explicitId?:string):Promise<T>=>{const key=JSON.stringify([path,method,body]),id=explicitId||pendingMutations.current.get(key)||uuid();pendingMutations.current.set(key,id);localReviewOpIdsRef.current.add(id);if(localReviewOpIdsRef.current.size>256){const oldest=localReviewOpIdsRef.current.values().next().value;if(oldest!==undefined)localReviewOpIdsRef.current.delete(oldest)};try{const result=await api<T>(path,{method,body:JSON.stringify({...body,operation_id:id})});pendingMutations.current.delete(key);return result}catch(error:any){if(!error.resultUnknown)pendingMutations.current.delete(key);else error.message+=`（操作 ${id}，重试将查询同一回执）`;throw error}}
   const refreshFocus=useRef<HTMLElement|null>(null)
   const actorInspectorRef=useRef<ActorInspectorHandle>(null)
   const returnFocus=useRef<HTMLElement|null>(null),session=useRef<string|undefined>(undefined),pendingSessionResetRef=useRef(false),noteBaseline=useRef<Record<string,string>>({}),notesRef=useRef(notes),polling=useRef(false),scrollAnchor=useRef<{vid:string;offset:number}[]|null>(null)
   notesRef.current=notes
-  const [updates,setUpdates]=useState<{has_updates:boolean;refreshing:number;blocked:number;waiting?:number}|null>(null),[refreshConfirm,setRefreshConfirm]=useState(false),[sessionExpired,setSessionExpired]=useState(false)
+  const [updates,setUpdates]=useState<{has_updates:boolean;refreshing:number;blocked:number;waiting?:number}|null>(null),[refreshConfirm,setRefreshConfirm]=useState(false)
   const [autoMergePreview,setAutoMergePreview]=useState<AutoWatermarkPreview|null>(null),[autoMergeOpen,setAutoMergeOpen]=useState(false),[autoMergeLoading,setAutoMergeLoading]=useState(false)
   const autoMergeTriggerRef=useRef<HTMLButtonElement>(null),autoMergeSeqRef=useRef(0)
   const [deleteDialog,setDeleteDialog]=useState<{open:boolean;mode:'single'|'batch';targets:ProcessingTask[]}|null>(null)
@@ -149,7 +149,7 @@ export default function Review() {
   const creator=drafts[scope]?.creator!==undefined?drafts[scope].creator!:defaultCreator,draftWatermarkKey=drafts[scope]?.watermarkKey
   const setCreator=(creator:string)=>setDrafts(current=>({...current,[scope]:{...current[scope],creator,watermarkKey:undefined}}))
   const setWatermarkKey=(watermarkKey?:string)=>setDrafts(current=>({...current,[scope]:{creator:current[scope]?.creator,watermarkKey}}))
-  const disabled=loading||query!==search||!!error||sessionExpired
+  const disabled=loading||query!==search||!!error
   const currentPage=data?.page??page
   const activeGroupRef=useRef(activeGroup)
   activeGroupRef.current=activeGroup
@@ -213,7 +213,7 @@ export default function Review() {
       setPendingOps(remainingPending)
       setRawData({payload:next,fetchedAtSeq:startedAtSeq})
       const projectedNext=applyPendingReviewMutations(next,startedAtSeq,remainingPending,view)
-      setUpdates(previous=>shouldCreateFresh?null:({has_updates:projectedNext.has_updates??previous?.has_updates??false,refreshing:previous?.refreshing||0,blocked:previous?.blocked||0,waiting:projectedNext.waiting}));setSelections(current=>Object.fromEntries(Object.entries(current).map(([key,tasks])=>[key,tasks.map(t=>projectedNext.rows.find(r=>r.vid===t.vid)||t)])));setInspected(current=>Object.fromEntries(Object.entries(current).map(([key,t])=>[key,projectedNext.rows.find(r=>r.vid===t.vid)||t])));setError('');setSessionExpired(false)
+      setUpdates(previous=>shouldCreateFresh?null:({has_updates:projectedNext.has_updates??previous?.has_updates??false,refreshing:previous?.refreshing||0,blocked:previous?.blocked||0,waiting:projectedNext.waiting}));setSelections(current=>Object.fromEntries(Object.entries(current).map(([key,tasks])=>[key,tasks.map(t=>projectedNext.rows.find(r=>r.vid===t.vid)||t)])));setInspected(current=>Object.fromEntries(Object.entries(current).map(([key,t])=>[key,projectedNext.rows.find(r=>r.vid===t.vid)||t])));setError('')
       for(const row of projectedNext.rows)if(notesRef.current[row.vid]===undefined)noteBaseline.current[row.vid]=row.note
       if(options.refresh){initializedScopesRef.current.clear();autoSelectedScopesRef.current=new Set();setAutoSelectedScopes(new Set());setSelections({});setDrafts({});setNotes({});setPickerSearch({});noteBaseline.current={};setInspected({});setReference(null);setPreviewOpen(false);setSubmitError('');setUpdates(null);void loadAutoMergePreview()}
       const visibleNextRows=projectedNext.rows.filter(r=>!pendingVidsRef.current.has(r.vid))
@@ -243,7 +243,7 @@ export default function Review() {
         updateFilters({group:syncedGroup,page:String(syncedPage)})
       }
       return projectedNext
-    }catch(e:any){if(token===sequence.current){if(isSessionExpiredError(e?.message)){clearReviewSessionCaches(true);if(shouldAutoRecoverExpiredReviewSession({hasManualSelections:hasManualSelectionsRef.current,hasDrafts:hasDraftsRef.current,inFlightCount:inFlightCountRef.current,alreadyRecovered:options.recovered}))return await latestLoadRef.current({refresh:true,recovered:true});setSessionExpired(true)}if(options.automatic)setUpdates(previous=>({...previous,has_updates:true,refreshing:previous?.refreshing||0,blocked:previous?.blocked||0}));else if(!options.silent)setError(e.message)}return null}
+    }catch(e:any){if(token===sequence.current){if(isSessionExpiredError(e?.message)){clearReviewSessionCaches(true);if(!options.recovered)return await latestLoadRef.current({...options,refresh:false,recovered:true})}if(options.automatic)setUpdates(previous=>({...previous,has_updates:true,refreshing:previous?.refreshing||0,blocked:previous?.blocked||0}));else if(!options.silent)setError(e.message)}return null}
     finally{if(token===sequence.current&&!options.automatic&&!options.silent)setLoading(false)}
   },[initialized,view,group,search,folder,page,linkFocus,personScope,clusterScope,updateFilters,activityVersion,canAutoApply,markAutoRefreshed,findNextAvailableGroup,applyGroupDefaultSelection,clearReviewSessionCaches,loadAutoMergePreview])
   const latestLoadRef=useRef(load)
@@ -365,7 +365,7 @@ export default function Review() {
     let cancelled=false
     const poll=async()=>{if(polling.current||!session.current||document.visibilityState!=='visible')return;polling.current=true;const id=session.current,requestSequence=sequence.current
       try{const next=await api<{has_updates:boolean;refreshing:number;blocked:number;waiting?:number}>('/api/review?status=1&session='+encodeURIComponent(id));if(cancelled||session.current!==id||requestSequence!==sequence.current)return;setUpdates(next);if(next.has_updates&&canAutoApplyRef.current())await latestLoadRef.current({refresh:true,automatic:true})}
-      catch(e:any){if(!cancelled&&session.current===id&&isSessionExpiredError(e?.message)){clearReviewSessionCaches(true);if(!protectedWorkRef.current&&shouldAutoRecoverExpiredReviewSession({hasManualSelections:hasManualSelectionsRef.current,hasDrafts:hasDraftsRef.current,inFlightCount:inFlightCountRef.current})){void latestLoadRef.current({refresh:true,recovered:true})}else{setSessionExpired(true);if(canAutoApplyRef.current())await latestLoadRef.current({refresh:true,automatic:true})}}}
+      catch(e:any){if(!cancelled&&session.current===id&&isSessionExpiredError(e?.message)){clearReviewSessionCaches(true);if(!protectedWorkRef.current&&shouldAutoRecoverExpiredReviewSession({hasManualSelections:hasManualSelectionsRef.current,hasDrafts:hasDraftsRef.current,inFlightCount:inFlightCountRef.current})){void latestLoadRef.current({refresh:true,recovered:true})}else{setUpdates(prev=>({has_updates:true,refreshing:prev?.refreshing||0,blocked:prev?.blocked||0,waiting:prev?.waiting}));if(canAutoApplyRef.current())await latestLoadRef.current({refresh:true,automatic:true})}}}
       finally{polling.current=false}}
     const onVisibility=()=>{
       if(document.visibilityState!=='visible')return
@@ -524,7 +524,7 @@ export default function Review() {
         }catch{setSubmitError('备注已保存；核对凭据暂未刷新，请重新打开该视频后继续。')}
         await load({preservePosition:true,silent:true})
         toast.success('备注已保存')
-      }catch(e:any){setSubmitError(e.message);if(isSessionExpiredError(e?.message)){clearReviewSessionCaches(true);setSessionExpired(true)}toast.error(e.message)}finally{setBusy(false)}
+      }catch(e:any){setSubmitError(e.message);if(isSessionExpiredError(e?.message))clearReviewSessionCaches(true);toast.error(e.message)}finally{setBusy(false)}
       return
     }
     if(vids.some(id=>lockedVidsRef.current.has(id)))return
@@ -554,7 +554,7 @@ export default function Review() {
       toast.success(actionKind==='restore'?'已恢复核对':'已移至暂缓')
     }catch(e:any){
       setSubmitError(e.message)
-      if(isSessionExpiredError(e?.message)){expired=true;clearReviewSessionCaches(true);setSessionExpired(true)}
+      if(isSessionExpiredError(e?.message)){expired=true;clearReviewSessionCaches(true)}
       toast.error(e.message)
     }finally{
       clearReviewSessionCaches(false)
@@ -565,12 +565,12 @@ export default function Review() {
   const sourceOnly=async(key:string)=>{
     setBusy(true)
     try{await api('/api/watermarks',{method:'PUT',body:JSON.stringify({key,kind:'source'})});clearReviewSessionCaches(false);setPreviewOpen(false);setSelections({});await load({preservePosition:true});toast.success('已标为来源，相关人物建议将重新分析');return true}
-    catch(e:any){setSubmitError(e.message);if(isSessionExpiredError(e?.message)){clearReviewSessionCaches(true);setSessionExpired(true)}toast.error(e.message);return false}finally{setBusy(false)}
+    catch(e:any){setSubmitError(e.message);if(isSessionExpiredError(e?.message))clearReviewSessionCaches(true);toast.error(e.message);return false}finally{setBusy(false)}
   }
   const confirmTargets=async(targets:ProcessingTask[],targetCreator:string)=>{
     const name=targetCreator.trim()
     const personLock=name?lockedPeopleRef.current.get(name):undefined
-    if(!session.current||!targets.length||!name||sessionExpired||targets.some(t=>blockedIds.has(t.vid)||pendingVidsRef.current.has(t.vid)||lockedVidsRef.current.has(t.vid))||(personLock&&isDestructivePersonAction(personLock.action)))return
+    if(!targets.length||!name||targets.some(t=>blockedIds.has(t.vid)||pendingVidsRef.current.has(t.vid)||lockedVidsRef.current.has(t.vid))||(personLock&&isDestructivePersonAction(personLock.action)))return
     setSubmitError('')
     clearReviewSessionCaches(false)
     const vids=targets.map(t=>t.vid),confirmationSession=session.current,tokens=evidenceTokens(vids),currentGroupKey=activeGroup,isDeferredLane=view==='deferred',currentWatermarkKey=effectiveWatermarkKey||undefined
@@ -603,7 +603,7 @@ export default function Review() {
       const msg=e?.message||'提交失败'
       const isConflict=e?.status===409||/已变更|已变化|未在本次会话|不属于本次/.test(msg)||isSessionExpiredError(msg)
       setSubmitError(msg)
-      if(isSessionExpiredError(msg)){expired=true;clearReviewSessionCaches(true);setSessionExpired(true)}
+      if(isSessionExpiredError(msg)){expired=true;clearReviewSessionCaches(true)}
       if(isConflict)setUpdates(prev=>({has_updates:true,refreshing:prev?.refreshing||0,blocked:(prev?.blocked||0)+vids.length,waiting:prev?.waiting}))
       toast.error(isConflict?`${name}（${vids.length} 个视频）未入队：${msg}，请点右上角「有更新」刷新列表`:`${name}（${vids.length} 个视频）未入队：${msg}`)
       if(advanceSequenceRef.current===advanceToken&&inFlightCountRef.current===1&&(originGroup!==activeGroupRef.current||originPage!==currentPageRef.current)){
@@ -617,7 +617,7 @@ export default function Review() {
   }
   const confirm=()=>confirmTargets(actionTargets,creator)
   const openDeleteDialog=(mode:'single'|'batch',targets:ProcessingTask[],trigger?:HTMLElement|null)=>{
-    if(!targets.length||sessionExpired||targets.some(t=>blockedIds.has(t.vid)||pendingVidsRef.current.has(t.vid)||lockedVidsRef.current.has(t.vid)))return
+    if(!targets.length||targets.some(t=>blockedIds.has(t.vid)||pendingVidsRef.current.has(t.vid)||lockedVidsRef.current.has(t.vid)))return
     deleteTriggerRef.current=trigger??(document.activeElement as HTMLElement|null)
     if(lightbox.open)setLightbox(prev=>({...prev,open:false}))
     setDeleteDialog({open:true,mode,targets})
@@ -731,7 +731,7 @@ export default function Review() {
   const creatorLock=trimmedCreator?lockedPeople.get(trimmedCreator):undefined
   const creatorDestructiveLock=creatorLock&&isDestructivePersonAction(creatorLock.action)?creatorLock:undefined
   const defaultRuleKey=ruleCandidates[activeRuleIdx]?.key
-  const ruleOptinBar=trimmedCreator&&actionTargets.length>0&&suggestedRuleMark?<div className="ws-rule-optin" title={`勾选后将在归给 ${trimmedCreator} 时保存为已确认账号规则，后续同水印自动识别并跳过人脸分析`}><label className="ws-rule-optin-label"><Checkbox motionPreset="instant" aria-label={`归名时记住水印 ${suggestedRuleMark.text} 归属 ${trimmedCreator}`} checked={ruleChecked} disabled={busy||sessionExpired||hasLockedTarget} onCheckedChange={checked=>setWatermarkKey(checked?(suggestedRuleMark.key===defaultRuleKey?undefined:suggestedRuleMark.key):'')}/><span className="ws-rule-optin-text"><span>记住水印</span><code className="ws-rule-optin-token" title={suggestedRuleMark.text}>{suggestedRuleMark.text}</code><span className="ws-muted">→ {trimmedCreator}</span></span></label>{ruleCandidates.length>1&&<Button variant="ghost" size="sm" className="ws-rule-optin-switch" aria-label="切换要记住的候选水印" title="切换另一条匹配水印" onClick={()=>{const next=displayRuleIdx>=0?(displayRuleIdx+1)%ruleCandidates.length:0;setRuleCandidateIdx(next);if(ruleChecked)setWatermarkKey(ruleCandidates[next].key)}}><span className="tabular-nums">{(displayRuleIdx>=0?displayRuleIdx:activeRuleIdx)+1}/{ruleCandidates.length}</span></Button>}</div>:null
+  const ruleOptinBar=trimmedCreator&&actionTargets.length>0&&suggestedRuleMark?<div className="ws-rule-optin" title={`勾选后将在归给 ${trimmedCreator} 时保存为已确认账号规则，后续同水印自动识别并跳过人脸分析`}><label className="ws-rule-optin-label"><Checkbox motionPreset="instant" aria-label={`归名时记住水印 ${suggestedRuleMark.text} 归属 ${trimmedCreator}`} checked={ruleChecked} disabled={busy||hasLockedTarget} onCheckedChange={checked=>setWatermarkKey(checked?(suggestedRuleMark.key===defaultRuleKey?undefined:suggestedRuleMark.key):'')}/><span className="ws-rule-optin-text"><span>记住水印</span><code className="ws-rule-optin-token" title={suggestedRuleMark.text}>{suggestedRuleMark.text}</code><span className="ws-muted">→ {trimmedCreator}</span></span></label>{ruleCandidates.length>1&&<Button variant="ghost" size="sm" className="ws-rule-optin-switch" aria-label="切换要记住的候选水印" title="切换另一条匹配水印" onClick={()=>{const next=displayRuleIdx>=0?(displayRuleIdx+1)%ruleCandidates.length:0;setRuleCandidateIdx(next);if(ruleChecked)setWatermarkKey(ruleCandidates[next].key)}}><span className="tabular-nums">{(displayRuleIdx>=0?displayRuleIdx:activeRuleIdx)+1}/{ruleCandidates.length}</span></Button>}</div>:null
   const chosenLocked=chosen.some(t=>lockedVids.has(t.vid))
   const unlockedRows=rows.filter(t=>!lockedVids.has(t.vid))
   const activeLocalAutoMerge=tasks.find(t=>t.kind==='auto-merge'&&(t.status==='running'||t.status==='queued'||t.status==='recovery_needed'))
@@ -815,7 +815,7 @@ export default function Review() {
       {submitError&&<p role="alert" className="ws-error">{submitError}</p>}
     </div>
     {!reference&&ruleOptinBar}
-    <div className="ws-detail-actions">{reference?<><Button variant="outline" onClick={backReference}>返回证据</Button><Button className="ws-action-primary" onClick={()=>{setCreator(reference.name);backReference()}}><span className="ws-btn-truncate">选择 {reference.name}</span></Button></>:<><Button variant="outline" disabled={!actionTargets.length||sessionExpired||hasLockedTarget} onClick={()=>void action(view==='deferred'?'restore':'defer',actionTargets.map(t=>t.vid))}>{view==='deferred'?'恢复':'暂缓'}</Button><Button className="ws-danger-btn" variant="outline" disabled={!actionTargets.length||disabled||hasLockedTarget||actionTargets.some(t=>blockedIds.has(t.vid)||pendingVids.has(t.vid))} aria-label={`将所选 ${actionTargets.length} 个视频移入回收站`} onClick={e=>openDeleteDialog(chosen.length>1?'batch':'single',actionTargets,e.currentTarget)}><Trash2 size={14} aria-hidden="true"/><span>删除</span></Button>{trimmedCreator?<Button className="ws-action-primary" disabled={!actionTargets.length||sessionExpired||hasLockedTarget||Boolean(creatorDestructiveLock)||actionTargets.some(t=>blockedIds.has(t.vid)||pendingVids.has(t.vid))} title={creatorDestructiveLock?`${trimmedCreator} ${creatorDestructiveLock.label}`:undefined} onClick={()=>void confirm()}><span className="ws-btn-truncate">归给 {trimmedCreator}</span><span className="ws-btn-badge">· <DigitSwap value={actionTargets.length}/></span></Button>:<Button className="ws-action-primary" disabled={!actionTargets.length} onClick={()=>actorInspectorRef.current?.openSwitcher()}><span>选人归名</span><span className="ws-btn-badge">· <DigitSwap value={actionTargets.length}/></span></Button>}</>}</div>
+    <div className="ws-detail-actions">{reference?<><Button variant="outline" onClick={backReference}>返回证据</Button><Button className="ws-action-primary" onClick={()=>{setCreator(reference.name);backReference()}}><span className="ws-btn-truncate">选择 {reference.name}</span></Button></>:<><Button variant="outline" disabled={!actionTargets.length||hasLockedTarget} onClick={()=>void action(view==='deferred'?'restore':'defer',actionTargets.map(t=>t.vid))}>{view==='deferred'?'恢复':'暂缓'}</Button><Button className="ws-danger-btn" variant="outline" disabled={!actionTargets.length||disabled||hasLockedTarget||actionTargets.some(t=>blockedIds.has(t.vid)||pendingVids.has(t.vid))} aria-label={`将所选 ${actionTargets.length} 个视频移入回收站`} onClick={e=>openDeleteDialog(chosen.length>1?'batch':'single',actionTargets,e.currentTarget)}><Trash2 size={14} aria-hidden="true"/><span>删除</span></Button>{trimmedCreator?<Button className="ws-action-primary" disabled={!actionTargets.length||hasLockedTarget||Boolean(creatorDestructiveLock)||actionTargets.some(t=>blockedIds.has(t.vid)||pendingVids.has(t.vid))} title={creatorDestructiveLock?`${trimmedCreator} ${creatorDestructiveLock.label}`:undefined} onClick={()=>void confirm()}><span className="ws-btn-truncate">归给 {trimmedCreator}</span><span className="ws-btn-badge">· <DigitSwap value={actionTargets.length}/></span></Button>:<Button className="ws-action-primary" disabled={!actionTargets.length} onClick={()=>actorInspectorRef.current?.openSwitcher()}><span>选人归名</span><span className="ws-btn-badge">· <DigitSwap value={actionTargets.length}/></span></Button>}</>}</div>
   </>
   const midScopeSegment:WorkbenchBreadcrumbSegment|null=personScope?{key:`person:${personScope}`,label:personScope}:clusterScope?{key:`cluster:${clusterScope}`,label:`相似组 ${clusterScope}`}:view!=='all'?{key:`view:${view}`,label:views.find(v=>v.value===view)?.label||view}:null
   const leafGroupSegment:WorkbenchBreadcrumbSegment|null=data?.group?.label?{key:`group:${data.group.key}`,label:data.group.label}:null
@@ -859,10 +859,9 @@ export default function Review() {
     </Popover.Root>
   )
   return <main className="ws-page" aria-label="人工确认工作区" data-review-session={data?.session}>
-    <WorkbenchHeaderActions>{((autoMergePreview?.eligible_count??0)>0||autoMergeActive)&&<Button ref={autoMergeTriggerRef} variant="outline" size="sm" aria-label={autoMergeActive?`自动合入（${autoMergeActiveLabel}）`:`自动合入 ${autoMergePreview!.eligible_count} 个已匹配视频`} title={autoMergeActive?`自动合入：${autoMergeActiveLabel}`:`可直接合入 ${autoMergePreview!.eligible_count} 个视频（${autoMergePreview!.group_count} 位人物）`} onClick={()=>setAutoMergeOpen(true)}><Sparkles size={14} aria-hidden="true"/><span>自动合入</span>{autoMergeActive?<AnimatedBadge size="sm" status={lockBadgeStatus(autoMergeActiveStatus)} className="ws-topbar-lock-badge">{autoMergeActiveLabel}</AnimatedBadge>:<span className="ws-count">{autoMergePreview!.eligible_count}</span>}</Button>}<NavigationButton variant="ghost" size="sm" asChild className="ws-review-status-link"><Link href="/operations"><span className="ws-link-label">分析中</span><span className="ws-count">{updates?.waiting??data?.waiting??'—'}</span><ChevronRight size={14} aria-hidden="true"/></Link></NavigationButton><Button variant={updates?.has_updates||sessionExpired?"outline":"ghost"} aria-label="更新人工确认列表" title={updates?.refreshing?`后台正在更新 ${updates.refreshing} 条建议，当前列表保持不变`:'更新建议和分组'} disabled={loading} onClick={requestRefresh}><RefreshCw size={15} aria-hidden="true"/>{updates?.has_updates||sessionExpired?<span>有更新</span>:updates?.refreshing?<span className="ws-muted">后台更新中</span>:null}</Button></WorkbenchHeaderActions>
+    <WorkbenchHeaderActions>{((autoMergePreview?.eligible_count??0)>0||autoMergeActive)&&<Button ref={autoMergeTriggerRef} variant="outline" size="sm" aria-label={autoMergeActive?`自动合入（${autoMergeActiveLabel}）`:`自动合入 ${autoMergePreview!.eligible_count} 个已匹配视频`} title={autoMergeActive?`自动合入：${autoMergeActiveLabel}`:`可直接合入 ${autoMergePreview!.eligible_count} 个视频（${autoMergePreview!.group_count} 位人物）`} onClick={()=>setAutoMergeOpen(true)}><Sparkles size={14} aria-hidden="true"/><span>自动合入</span>{autoMergeActive?<AnimatedBadge size="sm" status={lockBadgeStatus(autoMergeActiveStatus)} className="ws-topbar-lock-badge">{autoMergeActiveLabel}</AnimatedBadge>:<span className="ws-count">{autoMergePreview!.eligible_count}</span>}</Button>}<NavigationButton variant="ghost" size="sm" asChild className="ws-review-status-link"><Link href="/operations"><span className="ws-link-label">分析中</span><span className="ws-count">{updates?.waiting??data?.waiting??'—'}</span><ChevronRight size={14} aria-hidden="true"/></Link></NavigationButton><Button variant={updates?.has_updates?"outline":"ghost"} aria-label="更新人工确认列表" title={updates?.refreshing?`后台正在更新 ${updates.refreshing} 条建议，当前列表保持不变`:'更新建议和分组'} disabled={loading} onClick={requestRefresh}><RefreshCw size={15} aria-hidden="true"/>{updates?.has_updates?<span>有更新</span>:updates?.refreshing?<span className="ws-muted">后台更新中</span>:null}</Button></WorkbenchHeaderActions>
     {receipt&&<div className="ws-receipt"><QueueReceipt count={receipt.vids.length} creator={receipt.creator} onUndo={undo} onDismiss={()=>setReceipt(null)} busy={false}/></div>}
     {error&&<p role="alert" className="ws-error">{error}</p>}
-    {sessionExpired&&!error&&<p role="status" className="ws-error">本次核对已过期，勾选和草稿仍保留。请更新列表后继续。</p>}
     {data?.focus_missing&&<p className="ws-error">链接中的视频尚未就绪或已归名。</p>}
     {(personScope||clusterScope)&&<div className="ws-toolbar"><span className="ws-muted">{personScope||`相似组 ${clusterScope}`}</span><Button size="sm" variant="ghost" onClick={()=>{advanceSequenceRef.current++;updateFilters({person:'',cluster:'',group:'',page:'0',vid:''})}}>查看全部</Button></div>}
     <div className="ws-view-tabs"><WorkspaceTabs value={view} onChange={setView} label="确认状态" disabled={false} items={views.map(v=>({...v,count:data?.counts[v.value]}))}/></div>
@@ -1069,7 +1068,7 @@ export default function Review() {
       reviewSession={data?.session??session.current}
       reviewGroup={{key:activeGroup,deferred:view==='deferred'}}
       onConfirm={confirmDeletePlan}
-      onSessionExpired={()=>{clearReviewSessionCaches(true);setSessionExpired(true)}}
+      onSessionExpired={()=>{clearReviewSessionCaches(true)}}
       returnFocus={deleteTriggerRef}
     />
     <AlertDialog open={refreshConfirm} onOpenChange={setRefreshConfirm}><AlertDialogContent onCloseAutoFocus={e=>{e.preventDefault();refreshFocus.current?.focus({preventScroll:true})}}><AlertDialogHeader><AlertDialogTitle>更新当前核对列表？</AlertDialogTitle><AlertDialogDescription>后台的新建议可能调整分组。更新会清空勾选、未保存的备注和人物输入。取消可继续当前核对。</AlertDialogDescription></AlertDialogHeader><AlertDialogFooter><AlertDialogCancel>继续当前核对</AlertDialogCancel><AlertDialogAction onClick={()=>void load({refresh:true})}>更新列表</AlertDialogAction></AlertDialogFooter></AlertDialogContent></AlertDialog>

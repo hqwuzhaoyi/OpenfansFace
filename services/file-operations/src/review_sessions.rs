@@ -1097,11 +1097,49 @@ fn dispositions(config: &Config) -> Result<Arc<BTreeMap<String, Value>>> {
     }
     Ok(arc)
 }
+pub fn touch_session(config: &Config, id: &str) {
+    touch_sidecar_session(config, id);
+}
+pub fn resolve_live_tasks(config: &Config, body: &Value) -> Result<Vec<Value>> {
+    let ids = review::vids(&body["vids"])?;
+    if let Some(session) = body["review_session"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        touch_sidecar_session(config, session);
+    }
+    let path = config.base.join("processing/processing.db");
+    if !path.exists() {
+        return Ok(vec![]);
+    }
+    let aliases = review::read(config, "person-renames.json", json!({}))?.1;
+    let conn = db::open_readonly(&path)?;
+    let placeholders = std::iter::repeat_n("?", ids.len())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!(
+        "SELECT * FROM tasks WHERE stage!='excluded' AND vid IN ({placeholders}) ORDER BY priority DESC,is_new DESC,created_at DESC,vid"
+    );
+    let raw_rows = db::rows(&conn, &sql, rusqlite::params_from_iter(ids.iter()))?;
+    let mut out = Vec::with_capacity(raw_rows.len());
+    for row in raw_rows {
+        let mut t = public(row)?;
+        canonical_fields(&mut t["data"], "", &aliases)?;
+        crate::processing_result::re_resolve_task_data(&mut t["data"]);
+        out.push(t);
+    }
+    Ok(out)
+}
 pub fn validate_undo(config: &Config, body: &Value) -> Result<()> {
-    let Some(session) = body["review_session"].as_str() else {
+    let Some(session) = body["review_session"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
         return Ok(());
     };
-    read(config, session)?;
+    touch_sidecar_session(config, session);
     let conn = schema_readonly(config)?;
     let queue = review::read(config, "integration-queue.json", json!([]))?.1;
     for vid in review::vids(&body["vids"])? {
@@ -1113,7 +1151,7 @@ pub fn validate_undo(config: &Config, body: &Value) -> Result<()> {
             .and_then(|r| r["batch_id"].as_str())
             .ok_or_else(changed)?;
         let owner:Option<String>=conn.query_row("SELECT json_extract(plan,'$.request.payload.review_session') FROM operations WHERE id=? AND status='complete'",[batch],|r|r.get(0)).optional()?.flatten();
-        if owner.as_deref() != Some(session) {
+        if owner.as_deref().is_some_and(|expected| expected != session) {
             return Err(Error::conflict(
                 "这次归名已被其他会话处置，请核对待归档记录",
             ));

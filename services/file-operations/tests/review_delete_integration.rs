@@ -460,3 +460,144 @@ fn guards_reject_stale_fingerprint_and_cross_action_conflicts() {
     .unwrap_err();
     assert_eq!(confirm_deleted.status, 409);
 }
+
+#[test]
+fn continuous_manual_review_succeeds_across_session_expiry_and_mid_reanalysis_while_preserving_file_and_conflict_guards() {
+    let fx = TestFixture::new("continuous-review");
+    let src1 = fx.add_review_video("My Telegram", "cont-1.mp4", "vid-c1", b"c1-bytes", "菠萝啤beer", true, Some(501));
+    let src2 = fx.add_review_video("My Telegram", "cont-2.mp4", "vid-c2", b"c2-bytes", "菠萝啤beer", true, Some(502));
+    let src3 = fx.add_review_video("My Telegram", "cont-3.mp4", "vid-c3", b"c3-bytes", "菠萝啤beer", true, Some(503));
+
+    let mut engine = Engine::new(fx.config.clone()).unwrap();
+    let page = review_sessions::execute(&mut engine, "review-page", json!({"group": "person:菠萝啤beer"})).unwrap();
+    let expired_session = page["session"].as_str().unwrap().to_owned();
+    let rows = page["rows"].as_array().unwrap();
+    let t1 = rows.iter().find(|r| r["vid"] == "vid-c1").unwrap().clone();
+    let t2 = rows.iter().find(|r| r["vid"] == "vid-c2").unwrap().clone();
+    let t3 = rows.iter().find(|r| r["vid"] == "vid-c3").unwrap().clone();
+
+    // 1. Simulate expired/evicted session, changed watermark mapping, AND mid-reanalysis task state (queued/not ready).
+    let sc = Connection::open(fx.config.base.join("file-operations-rust/review-sessions.sqlite3")).unwrap();
+    sc.execute("UPDATE session_snapshots SET expires = 0 WHERE id = ?", [&expired_session]).unwrap();
+    drop(sc);
+    fs::create_dir_all(fx.config.base.join("watermarks")).unwrap();
+    fs::write(fx.config.base.join("watermarks/mappings.json"), json!({"X:other": {"kind": "source"}}).to_string()).unwrap();
+
+    let proc_conn = processing_scheduler::open_or_init(&fx.config).unwrap();
+    let reanalyzing_data = json!({
+        "kind": "none",
+        "ready": false,
+        "text_complete": false,
+        "face_complete": false,
+        "candidates": []
+    });
+    proc_conn
+        .execute(
+            "UPDATE tasks SET stage='queued', retry_stage='text', deferred=1, data=? WHERE vid IN ('vid-c1','vid-c2')",
+            [serde_json::to_string(&reanalyzing_data).unwrap()],
+        )
+        .unwrap();
+    drop(proc_conn);
+
+    // 2. queue-confirm succeeds with expired session, missing/invalid tokens, changed review_group, and queued/non-ready task.
+    let confirm_res = archive_api::execute(
+        &mut engine,
+        "queue-confirm",
+        json!({
+            "operation_id": uuid::Uuid::new_v4().to_string(),
+            "vids": ["vid-c1"],
+            "creator": "菠萝啤beer",
+            "source": "review",
+            "source_id": "person:菠萝啤beer",
+            "review_session": expired_session,
+            "review_tokens": { "vid-c1": "stale-or-wrong-token" },
+            "review_group": { "key": "person:菠萝啤beer", "deferred": false },
+            "fingerprints": {
+                "vid-c1": { "path": t1["path"], "size": t1["size"], "mtime_ns": t1["mtime_ns"] }
+            }
+        }),
+    )
+    .unwrap();
+    assert_eq!(confirm_res["ok"], true);
+    assert_eq!(confirm_res["added"], 1);
+
+    // 3. queue-confirm STILL rejects when assigned to a different creator in the queue.
+    let diff_creator = archive_api::execute(
+        &mut engine,
+        "queue-confirm",
+        json!({
+            "operation_id": uuid::Uuid::new_v4().to_string(),
+            "vids": ["vid-c1"],
+            "creator": "AnotherCreator",
+            "source": "review",
+            "fingerprints": {
+                "vid-c1": { "path": t1["path"], "size": t1["size"], "mtime_ns": t1["mtime_ns"] }
+            }
+        }),
+    )
+    .unwrap_err();
+    assert_eq!(diff_creator.status, 409);
+
+    // 4. queue-undo succeeds even though the session expired.
+    let undo_res = archive_api::execute(
+        &mut engine,
+        "queue-undo",
+        json!({
+            "vids": ["vid-c1"],
+            "review_session": expired_session
+        }),
+    )
+    .unwrap();
+    assert_eq!(undo_res["ok"], true);
+
+    // 5. review-note, review-defer, review-restore succeed without an active session.
+    for (cmd, extra) in [
+        ("review-note", json!({"note": "manual note without session"})),
+        ("review-defer", json!({})),
+        ("review-restore", json!({})),
+    ] {
+        let mut payload = json!({
+            "vids": ["vid-c2"],
+            "review_session": expired_session
+        });
+        for (k, v) in extra.as_object().unwrap() {
+            payload[k] = v.clone();
+        }
+        let res = archive_api::execute(&mut engine, cmd, payload).unwrap();
+        assert_eq!(res["ok"], true);
+    }
+
+    // 6. review-delete succeeds without session or review_tokens when fingerprint matches, and rejects mismatched fingerprint.
+    let mut bad_del = delete_request(uuid::Uuid::new_v4().to_string(), "", "person:菠萝啤beer", &[&t2]);
+    bad_del.payload.as_mut().unwrap().as_object_mut().unwrap().remove("review_session");
+    bad_del.payload.as_mut().unwrap().as_object_mut().unwrap().remove("review_tokens");
+    bad_del.payload.as_mut().unwrap()["fingerprints"]["vid-c2"]["size"] = json!(999);
+    assert_eq!(engine.preview(bad_del).unwrap_err().status, 409);
+
+    let mut ok_del = delete_request(uuid::Uuid::new_v4().to_string(), "", "person:菠萝啤beer", &[&t2]);
+    ok_del.payload.as_mut().unwrap().as_object_mut().unwrap().remove("review_session");
+    ok_del.payload.as_mut().unwrap().as_object_mut().unwrap().remove("review_tokens");
+    let del_plan = engine.preview(ok_del.clone()).unwrap();
+    let del_res = engine.apply(ok_del, del_plan["version"].as_str().unwrap().to_owned()).unwrap();
+    assert_eq!(del_res["ok"], true);
+    assert!(!src2.exists());
+
+    // 7. queue-confirm STILL rejects when the file on disk was modified or deleted.
+    fs::write(&src3, b"c3-modified-bytes-longer").unwrap();
+    let modified_err = archive_api::execute(
+        &mut engine,
+        "queue-confirm",
+        json!({
+            "operation_id": uuid::Uuid::new_v4().to_string(),
+            "vids": ["vid-c3"],
+            "creator": "菠萝啤beer",
+            "source": "review",
+            "fingerprints": {
+                "vid-c3": { "path": t3["path"], "size": t3["size"], "mtime_ns": t3["mtime_ns"] }
+            }
+        }),
+    )
+    .unwrap_err();
+    assert_eq!(modified_err.status, 409);
+    assert!(src1.exists());
+}
