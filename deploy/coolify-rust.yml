@@ -3,6 +3,7 @@ services:
     build:
       context: .
       dockerfile: services/file-operations/Dockerfile
+      target: runtime
     container_name: face-file-operations
     network_mode: host
     restart: unless-stopped

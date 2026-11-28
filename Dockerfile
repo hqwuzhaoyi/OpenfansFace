@@ -10,11 +10,15 @@ RUN node -e "const Database=require('better-sqlite3'); const db=new Database(':m
 FROM deps AS build
 ARG NEXT_SKIP_TYPECHECK=0
 ENV NEXT_TELEMETRY_DISABLED=1 NEXT_SKIP_TYPECHECK=${NEXT_SKIP_TYPECHECK}
-COPY . .
-RUN pnpm build
+COPY next.config.ts next-env.d.ts tsconfig.json ./
+COPY app ./app
+COPY components ./components
+COPY lib ./lib
+COPY public ./public
+RUN --mount=type=cache,id=face-admin-next-cache,target=/app/.next/cache,sharing=locked pnpm build
 
 FROM ${NODE_IMAGE} AS runtime
-RUN apt-get update && apt-get install -y --no-install-recommends tar && rm -rf /var/lib/apt/lists/*
+RUN sed -i 's|deb.debian.org|mirrors.aliyun.com|g' /etc/apt/sources.list.d/debian.sources && apt-get update && apt-get install -y --no-install-recommends tar && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 ENV NODE_ENV=production HOSTNAME=0.0.0.0 NEXT_TELEMETRY_DISABLED=1 FACES_BASE=/data/base MEDIA2_ROOT=/mnt/media2 DOCKER_SOCK=/var/run/docker.sock
 COPY --from=build /app/.next/standalone ./

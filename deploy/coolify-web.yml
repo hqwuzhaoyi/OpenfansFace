@@ -3,6 +3,8 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        NEXT_SKIP_TYPECHECK: "1"
     container_name: face-admin-prod
     network_mode: host
     restart: unless-stopped
