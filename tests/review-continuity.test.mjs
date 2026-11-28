@@ -12,6 +12,7 @@ import {
   reviewTaskBucket,
   shouldAutoRecoverExpiredReviewSession,
   shouldDiscardReviewRefreshResponse,
+  shouldRefreshReviewOnServerEvent,
 } from '../lib/review-continuity-model.ts'
 test('idle boundary and responses started before new activity never replace a review snapshot',()=>{
  const state={now:REVIEW_IDLE_MS,lastActivity:0,protectedWork:false,requestActivity:7,currentActivity:7}
@@ -77,6 +78,13 @@ test('only automatic background refreshes discard on activity; manual refresh an
  assert.equal(shouldDiscardReviewRefreshResponse({automatic:false,refresh:true,canAutoApply:false,activityChanged:true}),false)
  assert.equal(shouldDiscardReviewRefreshResponse({refresh:true,recovered:true,canAutoApply:false,activityChanged:true}),false)
  assert.equal(shouldDiscardReviewRefreshResponse({canAutoApply:false,activityChanged:true}),false)
+})
+
+test('server-op settlement refreshes only when visible, idle, and without in-flight mutations',()=>{
+ assert.equal(shouldRefreshReviewOnServerEvent({protectedWork:false,inFlightCount:0,visible:true}),true)
+ assert.equal(shouldRefreshReviewOnServerEvent({protectedWork:false,inFlightCount:0,visible:false}),false)
+ assert.equal(shouldRefreshReviewOnServerEvent({protectedWork:true,inFlightCount:0,visible:true}),false)
+ assert.equal(shouldRefreshReviewOnServerEvent({protectedWork:false,inFlightCount:1,visible:true}),false)
 })
 
 test('pending mutation projection keeps left group counts and right queue aligned across in-flight responses',()=>{

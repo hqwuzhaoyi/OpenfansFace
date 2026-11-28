@@ -17,7 +17,7 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
 };
 const TTL: i64 = 8 * 60 * 60;
-pub const MAX_ACTIVE_SESSIONS: i64 = 16;
+pub const MAX_ACTIVE_SESSIONS: i64 = 32;
 
 struct CachedSession {
     db_path: PathBuf,
@@ -48,6 +48,39 @@ fn session_cache_put(db_path: &Path, id: &str, expires: i64, snapshot: Arc<Value
             expires,
             snapshot,
         });
+    }
+}
+fn session_cache_touch(db_path: &Path, id: &str, expires: i64) {
+    if let Ok(mut guard) = session_cache().lock()
+        && let Some(entry) = guard
+            .iter_mut()
+            .find(|entry| entry.db_path == db_path && entry.id == id)
+    {
+        entry.expires = entry.expires.max(expires);
+    }
+}
+fn touch_sidecar_session(config: &Config, id: &str) {
+    if config.parity_root.is_some() || !config.review_sessions_db().exists() {
+        return;
+    }
+    let _guard = session_write_lock()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Ok(rw) = sidecar_write(config) else {
+        return;
+    };
+    let Ok(epoch) = now(&rw) else {
+        return;
+    };
+    let next_expires = epoch + TTL;
+    if rw
+        .execute(
+            "UPDATE session_snapshots SET expires=MAX(expires,?1) WHERE id=?2 AND expires>unixepoch()",
+            params![next_expires, id],
+        )
+        .is_ok_and(|changed| changed > 0)
+    {
+        session_cache_touch(&config.review_sessions_db(), id, next_expires);
     }
 }
 fn expired() -> Error {
@@ -1668,6 +1701,11 @@ pub fn validate(config: &Config, body: &Value) -> Result<Vec<Value>> {
         }
         rows.push(e["task"].clone());
     }
+    let used_sidecar = sidecar_ro.is_some();
+    drop(sidecar_ro);
+    if used_sidecar {
+        touch_sidecar_session(config, session);
+    }
     Ok(rows)
 }
 pub fn execute(engine: &mut Engine, command: &str, body: Value) -> Result<Value> {
@@ -2192,11 +2230,16 @@ pub fn execute(engine: &mut Engine, command: &str, body: Value) -> Result<Value>
             drop(stmt);
             drop(ro);
             if !new_items.is_empty() || !missing_deliveries.is_empty() {
+                let next_expires = current_epoch + TTL;
                 let _guard = session_write_lock()
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
                 let mut rw = sidecar_write(config)?;
                 let tx = rw.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+                tx.execute(
+                    "UPDATE session_snapshots SET expires=MAX(expires,?1) WHERE id=?2 AND expires>unixepoch()",
+                    params![next_expires, &id],
+                )?;
                 if !new_items.is_empty() {
                     let mut item_insert =
                         tx.prepare("INSERT OR IGNORE INTO session_items VALUES(?,?,?)")?;
@@ -2212,6 +2255,7 @@ pub fn execute(engine: &mut Engine, command: &str, body: Value) -> Result<Value>
                     }
                 }
                 tx.commit()?;
+                session_cache_touch(&config.review_sessions_db(), &id, next_expires);
             }
             (delivered, current_epoch)
         }
@@ -2605,7 +2649,7 @@ mod alias_snapshot_tests {
         assert_ne!(first_id, replaced_id);
         assert!(read(&config, &first_id).is_err());
 
-        for _ in 0..20 {
+        for _ in 0..(MAX_ACTIVE_SESSIONS + 4) {
             execute(&mut engine, "review-page", json!({})).unwrap();
         }
         let op_conn = db::open_readonly(&config.state_db()).unwrap();
@@ -3260,6 +3304,112 @@ mod alias_snapshot_tests {
         assert_eq!(label_of("face:bare0001"), "未命名相似组");
 
         drop(engine);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn active_session_touched_by_validate_survives_eviction() {
+        let root = fs::canonicalize("/tmp")
+            .unwrap()
+            .join(format!("face-review-touch-{}", uuid::Uuid::new_v4()));
+        let base = root.join("base");
+        let media = root.join("media");
+        let video_dir = media.join("pikpak/My Telegram");
+        fs::create_dir_all(base.join("file-operations-rust")).unwrap();
+        fs::create_dir_all(base.join("processing")).unwrap();
+        fs::create_dir_all(&video_dir).unwrap();
+        let video_path = video_dir.join("v1.mp4");
+        fs::write(&video_path, b"video").unwrap();
+        let config = Config {
+            base: base.clone(),
+            media,
+            ledger: root.join("ledger.db"),
+            bind: "127.0.0.1:0".into(),
+            token: None,
+            fixture: None,
+            parity_root: None,
+        };
+        drop(crate::store::Store::start(&config).unwrap());
+        let faces = rusqlite::Connection::open(base.join("faces.db")).unwrap();
+        faces
+            .execute_batch("CREATE TABLE videos(vid TEXT PRIMARY KEY,path TEXT);")
+            .unwrap();
+        faces
+            .execute(
+                "INSERT INTO videos VALUES('v1', ?)",
+                [video_path.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+        let jobs = rusqlite::Connection::open(base.join("processing/processing.db")).unwrap();
+        jobs.execute_batch("CREATE TABLE tasks(vid TEXT PRIMARY KEY,path TEXT,stage TEXT,priority INTEGER,is_new INTEGER,created_at REAL,data TEXT,manual INTEGER,deferred INTEGER,note TEXT);").unwrap();
+        jobs.execute(
+            "INSERT INTO tasks VALUES('v1',?,'review',0,0,0,?,0,0,'')",
+            params![
+                video_path.to_string_lossy().as_ref(),
+                json!({"ready":true,"watermark":{"status":"done","pipeline":"ocr-v1","candidates":[]},"candidates":[]}).to_string()
+            ],
+        )
+        .unwrap();
+
+        let mut engine = Engine::open_preview(config.clone()).unwrap();
+        let active_page = execute(&mut engine, "review-page", json!({})).unwrap();
+        let active_id = active_page["session"].as_str().unwrap().to_owned();
+        let active_token = active_page["rows"][0]["review_token"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+
+        let mut idle_ids = Vec::new();
+        for _ in 0..(MAX_ACTIVE_SESSIONS - 2) {
+            let p = execute(&mut engine, "review-page", json!({})).unwrap();
+            idle_ids.push(p["session"].as_str().unwrap().to_owned());
+        }
+
+        // Backdate both active and idle sessions so idle sessions sit older than TTL,
+        // then confirm validate() refreshes active_id's expires so newer leaks evict idle ones first.
+        {
+            let rw = sidecar_write(&config).unwrap();
+            rw.execute(
+                "UPDATE session_snapshots SET expires = expires - 120 WHERE id = ?",
+                [&active_id],
+            )
+            .unwrap();
+            for idle in &idle_ids {
+                rw.execute(
+                    "UPDATE session_snapshots SET expires = expires - 60 WHERE id = ?",
+                    [idle],
+                )
+                .unwrap();
+            }
+        }
+        session_cache().lock().unwrap().clear();
+
+        validate(
+            &config,
+            &json!({
+                "review_session": active_id,
+                "vids": ["v1"],
+                "review_tokens": { "v1": active_token }
+            }),
+        )
+        .unwrap();
+
+        for _ in 0..4 {
+            execute(&mut engine, "review-page", json!({})).unwrap();
+        }
+
+        assert!(
+            read(&config, &active_id).is_ok(),
+            "actively validated session must survive eviction of older idle sessions"
+        );
+        assert!(
+            read(&config, &idle_ids[0]).is_err(),
+            "oldest idle session should have been evicted"
+        );
+
+        drop(engine);
+        drop(jobs);
+        drop(faces);
         fs::remove_dir_all(root).unwrap();
     }
 }

@@ -43,6 +43,14 @@ export function shouldAutoRecoverExpiredReviewSession(state:{
   return !state.alreadyRecovered&&!state.hasManualSelections&&!state.hasDrafts&&state.inFlightCount===0
 }
 
+export function shouldRefreshReviewOnServerEvent(state:{
+  protectedWork:boolean
+  inFlightCount:number
+  visible:boolean
+}):boolean{
+  return !state.protectedWork&&state.inFlightCount===0&&state.visible
+}
+
 export function shouldDiscardReviewRefreshResponse(options:{
   automatic?:boolean
   refresh?:boolean

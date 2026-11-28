@@ -20,7 +20,7 @@ import { Button as NavigationButton } from '@/components/ui/button'
 import { WorkspaceButton as Button, WorkspaceSelect, WorkspaceField, WorkspaceMedia, WorkspacePath, getMediaPosition, rememberMediaPosition } from '@/components/workbench/inner'
 import { ReferencePanel, usePersonReferences } from '@/components/review/reference-panel'
 import { useWorkspaceQuery, useWorkspaceScroll, readWorkbenchCache, readPersistedWorkbenchCache, writeWorkbenchCache, deleteWorkbenchCache } from '@/components/workbench/state'
-import { applyPendingReviewMutations, hasProtectedReviewSelections, pruneSettledReviewMutations, resolveEmptyReviewPageTarget, reviewTaskBucket, shouldAutoRecoverExpiredReviewSession, shouldDiscardReviewRefreshResponse, type PendingReviewMutation } from '@/lib/review-continuity-model'
+import { applyPendingReviewMutations, hasProtectedReviewSelections, pruneSettledReviewMutations, resolveEmptyReviewPageTarget, reviewTaskBucket, shouldAutoRecoverExpiredReviewSession, shouldDiscardReviewRefreshResponse, shouldRefreshReviewOnServerEvent, type PendingReviewMutation } from '@/lib/review-continuity-model'
 import { requestVideoPoster } from '@/lib/video-poster'
 import { InputGroupButton } from '@/components/ui/input-group'
 import { Checkbox } from '@/components/beui/motion/checkbox'
@@ -268,8 +268,8 @@ export default function Review() {
     return subscribe(event=>{
       if(event.type==='archive-settled'||event.type==='auto-merge-settled'){
         void loadAutoMergePreview()
-        if(!protectedWorkRef.current){
-          clearReviewSessionCaches(true)
+        if(shouldRefreshReviewOnServerEvent({protectedWork:protectedWorkRef.current,inFlightCount:inFlightCountRef.current,visible:document.visibilityState==='visible'})){
+          clearReviewSessionCaches(false)
           void latestLoadRef.current({refresh:true})
         }else{
           pendingSessionResetRef.current=true
@@ -289,7 +289,7 @@ export default function Review() {
           if(inFlightCountRef.current===0)void latestLoadRef.current({preservePosition:true,silent:true})
         }else{
           void loadAutoMergePreview()
-          if(!protectedWorkRef.current){
+          if(shouldRefreshReviewOnServerEvent({protectedWork:protectedWorkRef.current,inFlightCount:inFlightCountRef.current,visible:document.visibilityState==='visible'})){
             clearReviewSessionCaches(false)
             void latestLoadRef.current({preservePosition:true,silent:true})
           }else{
@@ -301,8 +301,8 @@ export default function Review() {
         deleteWorkbenchCache('review:people')
         void loadPeople()
         void loadAutoMergePreview()
-        if(!protectedWorkRef.current){
-          clearReviewSessionCaches(true)
+        if(shouldRefreshReviewOnServerEvent({protectedWork:protectedWorkRef.current,inFlightCount:inFlightCountRef.current,visible:document.visibilityState==='visible'})){
+          clearReviewSessionCaches(false)
           void latestLoadRef.current({refresh:true})
         }else{
           pendingSessionResetRef.current=true
@@ -317,8 +317,8 @@ export default function Review() {
           deleteWorkbenchCache('review:people')
           void loadPeople()
         }
-        if(!protectedWorkRef.current&&inFlightCountRef.current===0){
-          clearReviewSessionCaches(true)
+        if(shouldRefreshReviewOnServerEvent({protectedWork:protectedWorkRef.current,inFlightCount:inFlightCountRef.current,visible:document.visibilityState==='visible'})){
+          clearReviewSessionCaches(false)
           void latestLoadRef.current({refresh:true})
         }else{
           pendingSessionResetRef.current=true
@@ -367,7 +367,14 @@ export default function Review() {
       try{const next=await api<{has_updates:boolean;refreshing:number;blocked:number;waiting?:number}>('/api/review?status=1&session='+encodeURIComponent(id));if(cancelled||session.current!==id||requestSequence!==sequence.current)return;setUpdates(next);if(next.has_updates&&canAutoApplyRef.current())await latestLoadRef.current({refresh:true,automatic:true})}
       catch(e:any){if(!cancelled&&session.current===id&&isSessionExpiredError(e?.message)){clearReviewSessionCaches(true);if(!protectedWorkRef.current&&shouldAutoRecoverExpiredReviewSession({hasManualSelections:hasManualSelectionsRef.current,hasDrafts:hasDraftsRef.current,inFlightCount:inFlightCountRef.current})){void latestLoadRef.current({refresh:true,recovered:true})}else{setSessionExpired(true);if(canAutoApplyRef.current())await latestLoadRef.current({refresh:true,automatic:true})}}}
       finally{polling.current=false}}
-    const onVisibility=()=>{if(document.visibilityState==='visible')void poll()}
+    const onVisibility=()=>{
+      if(document.visibilityState!=='visible')return
+      if(pendingSessionResetRef.current&&!protectedWorkRef.current&&inFlightCountRef.current===0){
+        void latestLoadRef.current({refresh:true})
+        return
+      }
+      void poll()
+    }
     const timer=setInterval(poll,10000);document.addEventListener('visibilitychange',onVisibility);void poll();return()=>{cancelled=true;clearInterval(timer);document.removeEventListener('visibilitychange',onVisibility)}
   },[initialized,clearReviewSessionCaches])
   const evidenceTokens=(vids:string[])=>Object.fromEntries(vids.map(id=>[id,[...rows,...Object.values(selections).flat(),...Object.values(inspected)].find(t=>t.vid===id)?.review_token]));
@@ -540,19 +547,19 @@ export default function Review() {
       operationId:opId,
       promise,
     }).catch(()=>{})
-    let succeeded=false
+    let succeeded=false,expired=false
     try{
       await promise
       succeeded=true
       toast.success(actionKind==='restore'?'已恢复核对':'已移至暂缓')
     }catch(e:any){
       setSubmitError(e.message)
-      if(isSessionExpiredError(e?.message)){clearReviewSessionCaches(true);setSessionExpired(true)}
+      if(isSessionExpiredError(e?.message)){expired=true;clearReviewSessionCaches(true);setSessionExpired(true)}
       toast.error(e.message)
     }finally{
       clearReviewSessionCaches(false)
       settlePendingMutation(pendingId,succeeded)
-      if(inFlightCountRef.current===0)void latestLoadRef.current({preservePosition:true,silent:true})
+      if(!expired&&inFlightCountRef.current===0)void latestLoadRef.current({preservePosition:true,silent:true})
     }
   }
   const sourceOnly=async(key:string)=>{
@@ -583,7 +590,7 @@ export default function Review() {
       operationId:opId,
       promise,
     }).catch(()=>{})
-    let succeeded=false
+    let succeeded=false,expired=false
     try{
       const result=await promise
       succeeded=true
@@ -596,7 +603,7 @@ export default function Review() {
       const msg=e?.message||'提交失败'
       const isConflict=e?.status===409||/已变更|已变化|未在本次会话|不属于本次/.test(msg)||isSessionExpiredError(msg)
       setSubmitError(msg)
-      if(isSessionExpiredError(msg)){clearReviewSessionCaches(true);setSessionExpired(true)}
+      if(isSessionExpiredError(msg)){expired=true;clearReviewSessionCaches(true);setSessionExpired(true)}
       if(isConflict)setUpdates(prev=>({has_updates:true,refreshing:prev?.refreshing||0,blocked:(prev?.blocked||0)+vids.length,waiting:prev?.waiting}))
       toast.error(isConflict?`${name}（${vids.length} 个视频）未入队：${msg}，请点右上角「有更新」刷新列表`:`${name}（${vids.length} 个视频）未入队：${msg}`)
       if(advanceSequenceRef.current===advanceToken&&inFlightCountRef.current===1&&(originGroup!==activeGroupRef.current||originPage!==currentPageRef.current)){
@@ -605,7 +612,7 @@ export default function Review() {
     }finally{
       clearReviewSessionCaches(false)
       settlePendingMutation(pendingId,succeeded)
-      if(inFlightCountRef.current===0)void latestLoadRef.current({preservePosition:true,silent:true})
+      if(!expired&&inFlightCountRef.current===0)void latestLoadRef.current({preservePosition:true,silent:true})
     }
   }
   const confirm=()=>confirmTargets(actionTargets,creator)
